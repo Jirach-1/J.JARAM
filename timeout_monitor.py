@@ -9,17 +9,18 @@ class TimeoutMonitor:
                  kill_timeout: int,
                  poll_interval: int,
                  webhook_url: str,
-                 ping_message: str):
+                 ping_message: str,
+                 kill_enabled: bool = True):
         self.kill_timeout        = kill_timeout
         self.poll_interval       = poll_interval
         self.webhook_url         = webhook_url
         self.ping_message        = ping_message
+        self.kill_enabled        = bool(kill_enabled)
 
-        self.proc_state = {}     # pid -> last_active ts
+        self.proc_state = {}
         self.thread   = None
         self.stop_evt = threading.Event()
 
-        # outbound messages for GUI / logs
         self.msg_q: "queue.Queue[str]" = queue.Queue()
 
     # ── public api ──────────────────────────────────────────────────────
@@ -61,12 +62,14 @@ class TimeoutMonitor:
         while not self.stop_evt.is_set():
             try:
                 procs = [p for p in psutil.process_iter(["pid","name","create_time"])
-                        if p.info["name"] == TARGET_NAME]
+                         if p.info["name"] == TARGET_NAME]
 
-                # age-based kill
-                for p in procs:
-                    if time.time() - p.create_time() >= self.kill_timeout:
-                        self._kill(p, "age-limit")
+                # age-based kill (only when enabled)
+                if self.kill_enabled and self.kill_timeout > 0:
+                    now = time.time()
+                    for p in procs:
+                        if now - p.create_time() >= self.kill_timeout:
+                            self._kill(p, "age-limit")
 
                 # webhook when count drops to ≤ 1
                 count = len(procs)
@@ -74,7 +77,8 @@ class TimeoutMonitor:
                     self._send_webhook()
                 last_count = count
 
-                self.msg_q.put(f"TimeoutMon: {count} procs")
+                # status line shows whether kill is enabled
+                self.msg_q.put(f"TimeoutMon: {count} procs (kill={'on' if self.kill_enabled else 'off'})")
 
             except Exception:
                 traceback.print_exc(file=sys.stderr)

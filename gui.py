@@ -6,6 +6,7 @@ import shutil
 import requests
 import psutil
 import re
+from typing import Dict, Set
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen
@@ -15,14 +16,50 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QSpinBox, QTextEdit, QGroupBox,QStackedLayout,
                             QProgressBar, QComboBox, QCheckBox, QSplitter,
                             QHeaderView, QMessageBox, QDialog, QDialogButtonBox,
-                            QFormLayout, QScrollArea, QFrame, QSizePolicy)
+                            QFormLayout, QScrollArea, QFrame, QSizePolicy,
+                            QAbstractItemView, QHeaderView, QScrollArea)
 from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt, QSize,  QBuffer, QByteArray, QIODevice, QRectF, QPointF
 from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QMovie, QRegion, QPainterPath
+# ---------- Qt6 enum shims (keep PyQt5-style constants working) ----------
+# Paste directly below your current PyQt6 imports.
+
+# Alignment flags
+if hasattr(Qt, "AlignmentFlag"):
+    Qt.AlignLeft    = Qt.AlignmentFlag.AlignLeft
+    Qt.AlignRight   = Qt.AlignmentFlag.AlignRight
+    Qt.AlignHCenter = Qt.AlignmentFlag.AlignHCenter
+    Qt.AlignVCenter = Qt.AlignmentFlag.AlignVCenter
+    Qt.AlignCenter  = Qt.AlignmentFlag.AlignCenter
+    Qt.NoFocus      = Qt.FocusPolicy.NoFocus
+
+# Scrollbar policies
+if hasattr(Qt, "ScrollBarPolicy"):
+    Qt.ScrollBarAlwaysOff = Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    Qt.ScrollBarAsNeeded  = Qt.ScrollBarPolicy.ScrollBarAsNeeded
+
+# Table/list selection behavior/mode
+if not hasattr(QAbstractItemView, "SelectRows"):
+    QAbstractItemView.SelectRows      = QAbstractItemView.SelectionBehavior.SelectRows
+if not hasattr(QAbstractItemView, "SingleSelection"):
+    QAbstractItemView.SingleSelection = QAbstractItemView.SelectionMode.SingleSelection
+
+# Header resize modes
+if not hasattr(QHeaderView, "Stretch"):
+    QHeaderView.Stretch          = QHeaderView.ResizeMode.Stretch
+    QHeaderView.ResizeToContents = QHeaderView.ResizeMode.ResizeToContents
+    QHeaderView.Interactive      = QHeaderView.ResizeMode.Interactive
+    
 from main import RobloxManager, ProcessManager, GameLauncher
 from cookie_extractor import CookieExtractor
 from RAM_export import transform         # re-use your parsing helper
 from main import limit_strap_helpers
 from log_utils import find_log_for_username, R_DISC_REASON, R_DISC_NOTIFY, R_DISC_SENDING, R_CONN_LOST
+from biomes import biome_names
+from utilities_tab import setup_UTILITIES_tab
+# Exclude NORMAL from the Settings table (still exists internally, we just don't offer it as a toggle)
+GUI_BIOME_NAMES = [b for b in biome_names() if str(b).upper() != "NORMAL"]
+from multiscope import MultiScopeEngine
+
 
 def _get_icon_path():
 
@@ -56,16 +93,30 @@ class ConfigManager:
 
         self.default_settings = {
             "window_limit": 1,
+            "spares_mode": False,            # ← NEW: launch ~half of good accounts
+            "spares_fraction": "1/2",
             "timeouts": {
                 "strap_threshold": 10,
-                "offline"             : 25,   # restart-after-inactive
-                "launch_delay"        : 10,    # normal relaunch cadence
-                "initial_delay"       : 10,     # seconds between first-run launches
-                "kill_timeout"        : 1740,  # 29m
-                "poll_interval"       : 10,
-                "webhook_url"         : "",     # fill in GUI
-                "ping_message"        : "<@YourPing> This message is sent whenever your active processes drop to 1 or 0, for debugging. Leave webhook empty if not interested"
-            }
+                "offline": 25,
+                "launch_delay": 10,
+                "initial_delay": 10,
+                "kill_timeout": 1740,
+                "poll_interval": 10,
+                "handoff_lead": 25,          # ← NEW: seconds before kill to pre-join spare
+                "early_join_window": 90,     # ← NEW: lookahead to avoid backlog spikes
+                "webhook_url": "",
+                "ping_message": "<@YourPing> This message is sent whenever your active processes drop to 1 or 0, for debugging. Leave webhook empty if not interested",
+            },
+            "multiscope": {
+                "webhooks": [],   # ← NEW
+                "enable_jester": True,
+                "enable_mari": True,
+                "jester_ping": "",
+                "mari_ping": "",
+                "merchant_rate_limit": 15,   # seconds (global cooldown for merchant alerts)
+                "biome_min_interval": 2,     # seconds per server (dampen bursts)
+            },
+
         }
 
 
@@ -519,6 +570,7 @@ class WorkerThread(QThread):
     log_signal     = pyqtSignal(str)
     status_signal  = pyqtSignal(dict)
     process_signal = pyqtSignal(dict)
+    multiscope_signal = pyqtSignal(list)   # NEW: drives the Multiscope tab
 
     def __init__(self, cfg_manager):
         super().__init__()
@@ -527,45 +579,342 @@ class WorkerThread(QThread):
         self.manager          = None
         self.process_mgr      = None
         self.launcher         = None
-        self.user_states      = {}
-        self.log_pointers     = {}      #  NEW  {uid: last_byte_read}
-        self.timing_trackers  = {}
 
-        # thread-local mirrors (set after manager loads)
-        self.restart_threshold = 0
-        self.strap_threshold = 50
-        self.initial_delay     = 0
+        self.user_states      = {}
+        self.log_pointers     = {}
+        self.timing_trackers  = {}
         
+        # cooldown map: uid -> expiry epoch
+        self._recent_handoffs = {}
+        # seconds to protect the spare after we swap pools
+        self.handoff_grace = 20
+
+        self.restart_threshold = 0
+        self.strap_threshold   = 50
+        self.initial_delay     = 0
+
+        # Spare / handoff controls
+        self.spares_mode       = False
+        self.handoff_lead      = 25
+        self.early_join_window = 90
+        
+        self._spares_num = 1    # numerator for fraction like 1/2, 3/4, 4/5
+        self._spares_den = 2
+
+        self.active_pool = set()      # type: Set[str]
+        self.spare_pool  = set()      # type: Set[str]
+        self.handoff_for = {}         # type: Dict[str, str]     # donor_uid -> spare_uid
+        self.last_launch = {}         # type: Dict[str, float]   # uid -> epoch of last launch
+        self._skip_until_by_user = {}   # uid -> epoch (per-user backoff after a conflict)
+        self._restart_cursor = 0        # round-robin pointer into the restartables ring
+
+
         self._last_proc_count = 0
         self._last_growth_ts  = time.time()
+        self.log_inactivity_timeout = 120
+
+        # Multiscope
+        self.ms = None  # ← NEW: MultiScopeEngine instance
         
-        self.log_inactivity_timeout = 120      # seconds (2 min)
+        self._last_good_set = set()  # tracks which users are currently 'good' (bad == False)
+        self._reservations_ttl = 60  # seconds a server is "held" by a handoff pre-join
+        self.preconnect_grace = 120  # seconds to wait for username to show in logs on first connect
+        self._waiting_usernames_since = {}  # uid -> epoch; cleaned up automatically
+
+    # -------------- utilities -----------------
+    def _log(self, msg: str):
+        self.log_signal.emit(msg)
 
     def _trace(self, uid: str, msg: str, *, every: float = 30.0) -> None:
-        """
-        Emit at most one identical trace per user every *every* seconds.
-        Grouping key = (uid, first word of msg).
-        """
         now = time.time()
-        key = (uid, msg.split()[0])               # e.g., (“8735…”, “read”)
+        key = (uid, msg.split()[0])
         if not hasattr(self, "_trace_ts"):
             self._trace_ts = {}
         last = self._trace_ts.get(key, 0.0)
-
         if now - last >= every:
             self.log_signal.emit(f"[SCAN-TRACE] {uid}: {msg}")
             self._trace_ts[key] = now
 
-    def _log(self, msg: str):
-        """Thread-safe logger → GUI Logs tab."""
-        self.log_signal.emit(msg)
+    # -------------- pools ---------------------
+    def _recompute_pools(self):
+        # Prefer live user_states (reflects in-memory bad flips immediately)
+        if getattr(self, "user_states", None):
+            source_items = [
+                (uid, st.get("user_info", {}))
+                for uid, st in self.user_states.items()
+            ]
+        else:
+            # Fallback during very early init
+            source_items = list(self.manager.settings.items())
 
+        good = [uid for uid, info in source_items if not info.get("bad", False)]
+        good_sorted = sorted(good)
+
+        # NEW:
+        if self.spares_mode:
+            n = len(good_sorted)
+            # ceil(n * num/den) without importing math
+            target_active = max(1, (n * self._spares_num + self._spares_den - 1) // self._spares_den)
+        else:
+            target_active = len(good_sorted)
+
+        self.active_pool = set(good_sorted[:target_active])
+        self.spare_pool  = set(good_sorted[target_active:])
+
+        self._log(
+            f"Pools set — spares_mode={self.spares_mode} active={len(self.active_pool)} spare={len(self.spare_pool)}"
+        )
+
+
+    def _eligible_spares(self):
+        now = time.time()
+        for uid in sorted(self.spare_pool):
+            st = self.user_states.get(uid)
+            # Skip if bad in live state OR in settings (covers recent flips + reloads)
+            is_bad_live = bool(st and st.get("user_info", {}).get("bad", False))
+            is_bad_cfg  = bool(self.manager.settings.get(uid, {}).get("bad", False))
+            if is_bad_live or is_bad_cfg:
+                continue
+
+            live = [
+                pid for pid in self.manager.process_tracker.user_processes.get(uid, [])
+                if self.process_mgr.verify_process_active(pid)
+            ]
+            if live:
+                continue
+
+            if now - st.get("last_launch", 0) < self.manager.timeouts["launch_delay"]:
+                continue
+
+            yield uid
+    
+    def _pick_spare_for(self, target_owner: str, target_code: str) -> str | None:
+        """
+        Return a spare uid, *preferring* the one that OWNS the target server.
+        Ownership is determined by users.json private_server_linkCode -> uid.
+        Falls back to any eligible spare if the owner is unavailable.
+        """
+        target_owner = (target_owner or "").strip().lower()
+        target_code  = (target_code  or "").strip()
+
+        elig = list(self._eligible_spares())
+        if not elig:
+            return None
+
+        # Load users.json once
+        try:
+            users_cfg = self.cfg_manager.load_users() or {}
+        except Exception:
+            users_cfg = {}
+
+        # Quick helpers
+        import re
+        def _code_from_link(link: str) -> str:
+            if not link:
+                return ""
+            m = re.search(r'privateServerLinkCode=([A-Za-z0-9_-]+)', link)
+            if m:
+                return m.group(1)
+            m = re.search(r'/share\?code=([A-Za-z0-9_-]+)&type=Server', link)
+            return m.group(1) if m else ""
+
+        # Resolve owner UID by code first, then by username
+        owner_uid = None
+        if target_code:
+            for _uid, info in users_cfg.items():
+                if _code_from_link((info.get("private_server_link") or "").strip()) == target_code:
+                    owner_uid = _uid
+                    break
+        if not owner_uid and target_owner:
+            for _uid, info in users_cfg.items():
+                if (info.get("username","").strip().lower() == target_owner):
+                    owner_uid = _uid
+                    break
+
+        owners, others = [], []
+        for uid in elig:
+            info  = users_cfg.get(uid, {}) if isinstance(users_cfg, dict) else {}
+            uname = (info.get("username") or "").strip().lower()
+            code  = _code_from_link((info.get("private_server_link") or "").strip())
+
+            if (owner_uid and uid == owner_uid) or \
+            (target_owner and uname == target_owner) or \
+            (target_code and code == target_code):
+                owners.append(uid)
+            else:
+                others.append(uid)
+
+        return (owners[0] if owners else (others[0] if others else None))
+
+    def _compute_server_label_gui(self, info: dict) -> str:
+        """
+        Compute the exact server label the launcher will use:
+        - Private server => first 10 chars of resolved linkCode
+        - Public => 'Public:<placeId>'
+        Prefer the launcher's helper if it exists; else resolve here.
+        """
+        cookie = (info or {}).get("cookie", "")
+        # If the launcher exposes a canonical helper, use it (best case)
+        if hasattr(self.launcher, "compute_server_label"):
+            try:
+                return self.launcher.compute_server_label(info or {}, cookie)
+            except Exception:
+                pass
+
+        # Fallback: local resolve, matching launcher's behavior
+        ps_link = (info or {}).get("private_server_link", "")
+        place   = (info or {}).get("place", "") or str(self.manager.target_place)
+
+        place_id, code, link_type = self.launcher._extract_private_server_info(ps_link, cookie=None)
+        if link_type == "share" and code:
+            rp, rc = self.launcher._convert_share_link(code, cookie)
+            if rp and rc:
+                place_id, code, link_type = rp, rc, "resolved"
+
+        target_place = str(place_id or place or self.manager.target_place)
+        return (f"{(code or '')[:10]}" if code else f"Public:{target_place}")
+
+    def _normal_launch_conflict(self, uid: str, info: dict) -> tuple[bool, str, str]:
+        """
+        Preflight: would a *normal* launch for this user collide with a server already active
+        or currently reserved by someone else (e.g., a handoff pre-join)?
+        Returns (True/False, server_label, conflicting_uid_or_empty).
+        """
+        server_label = self._compute_server_label_gui(info)
+
+        # 1) Live occupant check
+        for other_uid, other_label in (self.manager.process_tracker.user_server or {}).items():
+            if other_uid == uid or not other_label:
+                continue
+            if other_label == server_label:
+                return True, server_label, other_uid
+
+        # 2) Reservation check (blocks races during handoffs)
+        rs = getattr(self.manager.process_tracker, "reserved_servers", {})
+        r  = rs.get(server_label)
+        if r and r.get("by") != uid and r.get("exp", 0) > time.time():
+            return True, server_label, (r.get("by") or "")
+
+        # 3) Owner-based fallback (same PS under a different label variant)
+        ps_link = (info or {}).get("private_server_link", "")
+        # When label is public we pass empty code; when private we pass the short code (label itself).
+        owner = self.launcher._find_ps_owner_username(ps_link, "" if server_label.startswith("Public:") else server_label)
+        if owner:
+            owner_lc = owner.strip().lower()
+            for other_uid, _ in (self.manager.process_tracker.user_server or {}).items():
+                if other_uid == uid:
+                    continue
+                o_name = (self.manager.settings.get(other_uid, {}).get("username") or "").strip().lower()
+                if o_name and o_name == owner_lc:
+                    return True, server_label, other_uid
+
+        return False, server_label, ""
+
+
+
+    # -------------- handoff -------------------
+    def _launch_spare_into_donors_server(self, donor_uid: str, donor_info: dict) -> bool:
+        """
+        Launch a spare to pre-join donor's exact server.
+        Preference: pick a spare that owns that server.
+        Also reserves the server so normal launches won't collide during the race.
+        """
+        # Determine donor's live place+code (authoritative if captured at launch)
+        donor_live_code  = self.manager.process_tracker.user_ps_code.get(donor_uid, "")
+        donor_live_place = self.manager.process_tracker.user_ps_place.get(donor_uid, "") \
+                        or donor_info.get("place", "") \
+                        or str(self.manager.target_place)
+
+        # Owner (from tracker, already resolved by launcher)
+        donor_owner = (self.manager.process_tracker.server_owner.get(donor_uid, "") or "").strip()
+
+        # Pick a spare (prefer real owner, else any eligible)
+        spare_uid = self._pick_spare_for(donor_owner, donor_live_code)
+        if not spare_uid:
+            return False
+
+        # Build override to force joining donor's exact server
+        spare_info = self.user_states[spare_uid]["user_info"]
+        override   = dict(spare_info)
+        override["allow_shared_server"] = True  # handoff exception: joining donor’s live server
+
+        # Double-check disk bad flag
+        users_cfg = self.cfg_manager.load_users() or {}
+        if users_cfg.get(spare_uid, {}).get("bad", False):
+            self._log(f"Skip spare {spare_uid}: marked bad in users.json")
+            return False
+
+        if donor_live_code:
+            override["private_server_link"] = (
+                f"https://www.roblox.com/games/{donor_live_place}/_/join"
+                f"?privateServerLinkCode={donor_live_code}"
+            )
+            override["place"] = str(donor_live_place)
+            server_label = donor_live_code[:10]
+        else:
+            override["private_server_link"] = ""
+            override["place"] = str(donor_live_place)
+            server_label = f"Public:{donor_live_place}"
+
+        # Reserve this server while the spare is spinning up
+        self._reserve_server(server_label, spare_uid, "handoff")
+
+        cookie = override.get("cookie", "")
+        ok = self.launcher.start_game_session(spare_uid, cookie, override)
+        if ok:
+            self.handoff_for[donor_uid] = spare_uid
+            self.user_states[spare_uid]["last_launch"] = time.time()
+            self._log(
+                f"Spare {spare_uid} pre-joined {donor_uid}'s server"
+                + (f" (owner-pref: {donor_owner})" if donor_owner else "")
+            )
+            if self.ms:
+                self.ms.begin_handoff(donor_uid, spare_uid)
+            return True
+
+        # If failed, drop the reservation immediately
+        try:
+            rs = getattr(self.manager.process_tracker, "reserved_servers", {})
+            meta = rs.get(server_label)
+            if meta and meta.get("by") == spare_uid:
+                rs.pop(server_label, None)
+        except Exception:
+            pass
+        return False
+
+
+
+
+    def _complete_handoff(self, donor_uid: str, spare_uid: str):
+        """Swap pools once donor is down and spare is up."""
+        if donor_uid in self.active_pool:
+            self.active_pool.remove(donor_uid)
+            self.spare_pool.add(donor_uid)
+        if spare_uid in self.spare_pool:
+            self.spare_pool.remove(spare_uid)
+            self.active_pool.add(spare_uid)
+        self.handoff_for.pop(donor_uid, None)
+        st = self.user_states.get(donor_uid, {})
+        if st:
+            st["requires_restart"] = False
+            st["inactive_since"] = None
+            st["status"] = "Standby"
+        self._log(f"Completed handoff: {spare_uid} replaced {donor_uid}")
+
+        # Multiscope: tell engine donor is done
+        if self.ms:
+            self.ms.complete_handoff(donor_uid)
+        # NEW: protect the new active user for a short window so dedupe never snipes it
+        self._recent_handoffs[spare_uid] = time.time() + self.handoff_grace
+        
+
+
+    # -------------- manager init --------------
     def initialize_manager(self) -> bool:
         try:
             self.manager = RobloxManager(config_manager=self.cfg_manager)
-
             self.manager.timeout_monitor.start()
-            
+
             self.restart_threshold = self.manager.timeouts["offline"]
             self.initial_delay     = self.manager.timeouts["initial_delay"]
 
@@ -576,13 +925,17 @@ class WorkerThread(QThread):
                 self.manager.auth_handler,
                 self.manager.process_tracker,
                 self.manager.config_manager,
-                launch_delay = self.manager.timeouts["launch_delay"],
-                initial_delay= self.manager.timeouts["initial_delay"]
+                launch_delay=self.manager.timeouts["launch_delay"],
+                initial_delay=self.manager.timeouts["initial_delay"],
+                log_fn=self._log,   # <-- add this
             )
+            
+
 
             now = time.time()
             while not self.manager.timeout_monitor.msg_q.empty():
                 self.log_signal.emit(self.manager.timeout_monitor.msg_q.get_nowait())
+
             self.user_states = {
                 uid: {
                     "last_active"    : now,
@@ -600,243 +953,509 @@ class WorkerThread(QThread):
                 else:
                     self.log_pointers[uid] = 0
 
+            self.timing_trackers = {'window': 0, 'cleanup': 0, 'relaunch': 0}
 
-            self.timing_trackers = {
-                'window'  : 0,
-                'cleanup' : 0,
-                'relaunch': 0
-            }
+            # ───────────── Multiscope: set up the engine here ─────────────
+            from multiscope import MultiScopeEngine
+
+            def _get_username(uid: str) -> str:
+                info = self.manager.settings.get(uid, {})
+                return str(info.get("username", ""))
+
+            def _get_ps_link(uid: str) -> str:
+                # Hide link if this account is currently flagged bad
+                st = self.user_states.get(uid, {}) if hasattr(self, "user_states") else {}
+                is_bad = bool(st.get("user_info", {}).get("bad", False)
+                            or self.manager.settings.get(uid, {}).get("bad", False))
+                if is_bad:
+                    return ""
+
+                # 1) Prefer the live code/place captured at launch for THIS uid
+                code  = (self.manager.process_tracker.user_ps_code or {}).get(uid, "")  # e.g., ABCDEFGH
+                place = (self.manager.process_tracker.user_ps_place or {}).get(uid, "") # e.g., "15532962292"
+
+                # 2) If missing, try to borrow from any teammate currently on the same server label
+                if not code:
+                    my_label = self.manager.process_tracker.user_server.get(uid, "")
+                    if my_label:
+                        for other_uid, other_label in (self.manager.process_tracker.user_server or {}).items():
+                            if other_uid == uid:
+                                continue
+                            if other_label == my_label:
+                                oc = (self.manager.process_tracker.user_ps_code or {}).get(other_uid, "")
+                                op = (self.manager.process_tracker.user_ps_place or {}).get(other_uid, "")
+                                if oc:
+                                    code, place = oc, op
+                                    break
+
+                # 3) If we still have no code, there’s no private link to show
+                if not code:
+                    return ""
+
+                # 4) Build a canonical PS join link
+                place = str(place or self.manager.target_place or "15532962292").strip()
+                return f"https://www.roblox.com/games/{place}/join?privateServerLinkCode={code}"
+
+            # Prefer owner from main.py tracker; fallback to users.json by matching PS code
+            def _get_owner_for_ms(uid: str) -> str:
+                # 1) main.py authoritative owner (separate path)
+                owner = self.manager.process_tracker.server_owner.get(uid, "")
+                if owner:
+                    return owner.strip()
+
+                # 2) fallback: derive from users.json via current PS label code
+                import re
+                server_label = self.manager.process_tracker.user_server.get(uid, "")
+                m = re.search(r"PS[:\s•-]*([A-Za-z0-9_-]{5,})", server_label, re.I)
+                label_code = m.group(1) if m else ""
+
+                try:
+                    users_cfg = self.cfg_manager.load_users() or {}
+                except Exception:
+                    users_cfg = {}
+
+                def _code_from_link(link: str) -> str:
+                    if not link:
+                        return ""
+                    m1 = re.search(r'privateServerLinkCode=([A-Za-z0-9_-]+)', link)
+                    if m1:
+                        return m1.group(1)
+                    m2 = re.search(r'/share\?code=([A-Za-z0-9_-]+)&type=Server', link)
+                    if m2:
+                        return m2.group(1)
+                    return ""
+
+                if label_code:
+                    for _uid, info in users_cfg.items():
+                        link = (info.get("private_server_link") or "").strip()
+                        if _code_from_link(link) == label_code:
+                            return (info.get("username") or "").strip()
+
+                # 3) last resort
+                info = self.manager.settings.get(uid, {})
+                return str(info.get("username", "")).strip()
+            
+            def _get_cookie(uid: str) -> str:
+                info = self.manager.settings.get(uid, {}) or {}
+                return str(info.get("cookie") or "")
+
+            self.ms = MultiScopeEngine(
+                get_username=_get_username,
+                get_server_label=lambda uid: self.manager.process_tracker.user_server.get(uid, ""),
+                get_ps_link_for_user=_get_ps_link,
+                get_server_owner_for_user=_get_owner_for_ms,   # ← now fully separate
+                get_cookie_for_user=_get_cookie,             # ← NEW
+                log_fn=self._log,
+            )
+
+
+
+            # Provide full user list AFTER user_states are built
+            self.ms.update_users(list(self.user_states.keys()))
+
+            # Load and push webhook config
+            cfg = self.cfg_manager.load_settings() or {}
+            ms_cfg = (cfg.get("multiscope") or {})
+            self.ms.configure_webhooks(
+                biome_webhooks=cfg.get("webhooks", []),             # [{ "url": "...", "biomes": [...] }, ...]
+                merchant_hook=ms_cfg.get("merchant_webhook", ""),
+                enable_jester=ms_cfg.get("enable_jester", True),
+                enable_mari=ms_cfg.get("enable_mari", True),
+                jester_ping=ms_cfg.get("jester_ping", ""),
+                mari_ping=ms_cfg.get("mari_ping", ""),
+                merchant_rate_limit=float(ms_cfg.get("merchant_rate_limit", 15)),
+                biome_min_interval=float(ms_cfg.get("biome_min_interval", 2)),
+            )
+
+            # ↓↓↓ ensure spares_mode, delays, and pools are live before first launch
+            self.apply_new_settings(cfg)
+
             return True
         except Exception as e:
             self.log_signal.emit(f"Manager init failed: {e}")
             return False
 
+
+
     def apply_new_settings(self, cfg: dict):
-        if not self.manager:
+        if not cfg:
             return
-        self.manager.window_limit               = cfg["window_limit"]
-        self.manager.timeouts["launch_delay"]   = cfg["timeouts"]["launch_delay"]
-        self.manager.timeouts["offline"]        = cfg["timeouts"]["offline"]
-        self.manager.timeouts["initial_delay"]  = cfg["timeouts"]["initial_delay"]
-        self.strap_threshold = cfg["timeouts"].get("strap_threshold", 50)
+        # base timings
+        self.manager.window_limit               = cfg.get("window_limit", 1)
+        t = cfg.get("timeouts", {})
+        self.manager.timeouts["launch_delay"]  = t.get("launch_delay", 4)
+        self.manager.timeouts["offline"]       = t.get("offline", 35)
+        self.manager.timeouts["initial_delay"] = t.get("initial_delay", 4)
+        self.strap_threshold                    = t.get("strap_threshold", 50)
 
+        tm = cfg.get("timeout_monitor", {})
+        self.manager.timeout_monitor.kill_enabled  = bool(tm.get("kill_enabled", True))
+        self.manager.timeout_monitor.kill_timeout  = tm.get("kill_timeout", 1740)
+        self.manager.timeout_monitor.poll_interval = tm.get("poll_interval", 10)
+        self.manager.timeout_monitor.webhook_url   = tm.get("webhook_url", "")
+        self.manager.timeout_monitor.ping_message  = tm.get("ping_message", "")
+
+
+        # spare / handoff
+        self.spares_mode       = cfg.get("spares_mode", False)
+        self.handoff_lead      = t.get("handoff_lead", 25)
+        self.early_join_window = t.get("early_join_window", 90)
         
-        tm = cfg["timeout_monitor"]
-        self.manager.timeout_monitor.kill_timeout        = tm["kill_timeout"]
-        self.manager.timeout_monitor.poll_interval       = tm["poll_interval"]
-        self.manager.timeout_monitor.webhook_url         = tm["webhook_url"]
-        self.manager.timeout_monitor.ping_message        = tm["ping_message"]
+        # NEW: parse "spares_fraction" like "3/4" into ints (fallback to 1/2)
+        frac = str(cfg.get("spares_fraction", "1/2")).strip()
+        try:
+            num_s, den_s = frac.split("/", 1)
+            num, den = int(num_s), int(den_s)
+            if 1 <= num < den <= 10:   # simple sanity guard
+                self._spares_num, self._spares_den = num, den
+            else:
+                self._spares_num, self._spares_den = 1, 2
+        except Exception:
+            self._spares_num, self._spares_den = 1, 2
 
-        self.restart_threshold = cfg["timeouts"]["offline"]
-        self.initial_delay     = cfg["timeouts"]["initial_delay"]
-
+        self.restart_threshold = self.manager.timeouts["offline"]
+        self.initial_delay     = self.manager.timeouts["initial_delay"]
         if self.launcher:
-            self.launcher.launch_delay  = cfg["timeouts"]["launch_delay"]
-            self.launcher.initial_delay = cfg["timeouts"]["initial_delay"]
+            self.launcher.launch_delay  = self.manager.timeouts["launch_delay"]
+            self.launcher.initial_delay = self.manager.timeouts["initial_delay"]
+
+        # ── Multiscope webhooks (biomes + merchants) ──
+        try:
+            if self.ms:
+                ms_cfg = (cfg.get("multiscope") or {})
+                self.ms.configure_webhooks(
+                    biome_webhooks=cfg.get("webhooks", []),             # [{"url": "...", "biomes": [...], "biome_modes": {...}}, ...]
+                    merchant_hook=ms_cfg.get("merchant_webhook", ""),
+                    enable_jester=ms_cfg.get("enable_jester", True),
+                    enable_mari=ms_cfg.get("enable_mari", True),
+                    jester_ping=ms_cfg.get("jester_ping", ""),
+                    mari_ping=ms_cfg.get("mari_ping", ""),
+                    merchant_rate_limit=float(ms_cfg.get("merchant_rate_limit", 15)),
+                    biome_min_interval=float(ms_cfg.get("biome_min_interval", 2)),
+                    # if you persist per-biome modes, you can pass a merged map here:
+                    # biome_modes=_merge_modes_from_webhooks(cfg.get("webhooks", []))
+                )
+        except Exception:
+            pass
+
+        self._recompute_pools()
 
 
-
+    # -------------- actions -------------------
     def restart_user_session(self, user_id):
         if not self.manager or user_id not in self.user_states:
             return False
-
         try:
-            state = self.user_states[user_id]
+            # cancel in-flight mapping on manual restart
+            self.handoff_for.pop(user_id, None)
 
             for pid in self.manager.process_tracker.user_processes.get(user_id, []):
                 if self.process_mgr.verify_process_active(pid):
                     self.process_mgr.terminate_process(pid, self.manager.process_tracker)
-
-            cookie = state["user_info"].get("cookie", "") if isinstance(state["user_info"], dict) else state["user_info"]
-            try:
-                if self.launcher.start_game_session(user_id, cookie, state["user_info"]):
-                    self.user_states[user_id]["inactive_since"] = None
-                    self.user_states[user_id]["requires_restart"] = False
-                    self.user_states[user_id]["status"] = "Restarting"
-                    return True
-                else:
-                    return False
-            except Exception as e:
-                return False
-        except Exception as e:
+            info = self.user_states[user_id]["user_info"]
+            cookie = info.get("cookie", "") if isinstance(info, dict) else info
+            ok = self.launcher.start_game_session(user_id, cookie, info)
+            if ok:
+                self.user_states[user_id]["inactive_since"] = None
+                self.user_states[user_id]["requires_restart"] = False
+                self.user_states[user_id]["status"] = "Restarting"
+                self.user_states[user_id]["last_launch"] = time.time()
+            return ok
+        except Exception:
             return False
 
     def kill_user_processes(self, user_id: str) -> bool:
-        if not self.manager or user_id not in self.user_states:
-            return False
-
         try:
             for pid in self.manager.process_tracker.user_processes.get(user_id, []).copy():
-                # always attempt to kill – even if verify() says it's gone or renamed
                 self.process_mgr.terminate_process(pid, self.manager.process_tracker)
             return True
         except Exception:
             return False
 
-
     def kill_all_processes(self):
-        if not self.process_mgr:
-            return False
-
         try:
-            killed = self.process_mgr.terminate_process(None, self.manager.process_tracker)
-            return killed
-        except Exception as e:
+            return self.process_mgr.terminate_process(None, self.manager.process_tracker)
+        except Exception:
             return False
 
     def cleanup_dead_processes(self):
-        if not self.process_mgr:
-            return False
-
         try:
             self.process_mgr.cleanup_dead_processes(self.manager.process_tracker)
             return True
-        except Exception as e:
+        except Exception:
             return False
 
+    # -------------- thread loop ---------------
     def run(self):
         if not self.initialize_manager():
             return
-
         self.running = True
+        # Safety: if spare mode is on but pools haven’t been computed yet, do it now.
+        if self.spares_mode and not self.active_pool:
+            self._recompute_pools()
 
-        # one-by-one first launch
-        self.launcher.initialize_all_sessions(self.manager.settings)
+        # first launch: either half (active_pool) or everyone
+        if self.spares_mode:
+            for i, uid in enumerate(sorted(self.active_pool)):
+                info = self.user_states[uid]["user_info"]
+                if info.get("bad", False):
+                    continue
+                cookie = info.get("cookie", "")
+                self.launcher.start_game_session(uid, cookie, info, skip_cleanup=True)
+                self.user_states[uid]["last_launch"] = time.time()
+                if i < len(self.active_pool) - 1:
+                    time.sleep(self.initial_delay)
+        else:
+            self.launcher.initialize_all_sessions(self.manager.settings)
+            now = time.time()
+            for uid in self.user_states:
+                self.user_states[uid]["last_launch"] = now
 
         while self.running:
             now = time.time()
+            
+            # ---- Hot reload users.json (propagate "bad" flips etc.) ----
+            try:
+                fresh_map = self.cfg_manager.get_users_for_manager() or {}
+            except Exception:
+                fresh_map = {}
 
-            # -- housekeeping
+            # Only do work if something actually changed
+            if fresh_map and fresh_map != self.manager.settings:
+                old_ids = set(self.manager.settings.keys())
+                new_ids = set(fresh_map.keys())
+
+                # 1) Remove users that no longer exist
+                for uid in (old_ids - new_ids):
+                    # Optional: terminate any lingering processes
+                    for pid in self.manager.process_tracker.user_processes.get(uid, []).copy():
+                        if self.process_mgr.verify_process_active(pid):
+                            self.process_mgr.terminate_process(pid, self.manager.process_tracker)
+                    self.user_states.pop(uid, None)
+                    self.handoff_for.pop(uid, None)
+                    self.active_pool.discard(uid)
+                    self.spare_pool.discard(uid)
+
+                # 2) Add new users (if any)
+                now2 = time.time()
+                for uid in (new_ids - old_ids):
+                    info = fresh_map.get(uid, {})
+                    self.user_states[uid] = {
+                        "last_active": now2,
+                        "inactive_since": None,
+                        "user_info": info,
+                        "requires_restart": False,
+                        "status": "Initializing",
+                    }
+
+                # 3) Update info for existing users (this brings in new "bad" flags)
+                for uid in (new_ids & old_ids):
+                    self.user_states[uid]["user_info"] = fresh_map[uid]
+
+                # 4) Swap the snapshot and recompute pools
+                self.manager.settings = fresh_map
+                self._recompute_pools()           # pools depend on "bad" flags in settings
+                if self.ms:
+                    self.ms.update_users(list(self.user_states.keys()))
+            # ---- end hot reload ----
+
+
+            # housekeeping
             if now - self.timing_trackers['cleanup'] >= self.manager.check_intervals['cleanup']:
                 self.process_mgr.cleanup_dead_processes(self.manager.process_tracker)
                 self.timing_trackers['cleanup'] = now
-
             if now - self.timing_trackers['window'] >= self.manager.check_intervals['window']:
                 for pid, nwin in self.process_mgr.count_windows_by_process().items():
                     if nwin > self.manager.window_limit and pid != self.manager.excluded_pid:
                         self.process_mgr.terminate_process(pid, self.manager.process_tracker)
                 self.timing_trackers['window'] = now
             
-            # ── low-count watchdog ───────────────────────────────────────────
-            STUCK_TIMEOUT = 300        # seconds without growth  → action (5 min)
+            # After housekeeping, before relaunch logic
+            self._enforce_one_per_server()
+            self._prune_reservations()
 
-            total_users = len(self.manager.settings)
+            # --- sync bad flags + evict from pools immediately ---
+            try:
+                changed = False
+                for uid, cfg_info in self.manager.settings.items():
+                    st = self.user_states.get(uid)
+                    if not st:
+                        continue
+                    bad_disk = bool(cfg_info.get("bad", False))
+                    if st["user_info"].get("bad", False) != bad_disk:
+                        st["user_info"]["bad"] = bad_disk
+                        changed = True
 
+                    # If bad, evict from both pools and cancel any in-flight handoff roles
+                    if bad_disk:
+                        if uid in self.active_pool or uid in self.spare_pool:
+                            self.active_pool.discard(uid)
+                            self.spare_pool.discard(uid)
+                            changed = True
+                        # If this bad user is being used as a spare for a donor, cancel it
+                        donors = [d for d, s in self.handoff_for.items() if s == uid]
+                        for d in donors:
+                            self.handoff_for.pop(d, None)
+            except Exception as _e:
+                self._log(f"[Sync] bad-flag sync error: {_e}")
+
+            # If the good-set changed, rebuild pools from the live state (keeps odd/even split correct)
+            try:
+                current_good = {
+                    u for u, s in self.user_states.items()
+                    if not s.get("user_info", {}).get("bad", False)
+                }
+                if current_good != getattr(self, "_last_good_set", set()):
+                    self._last_good_set = current_good
+                    self._recompute_pools()
+            except Exception as _e:
+                self._log(f"[Pools] good-set recompute error: {_e}")
+
+
+            # low-count watchdog
+            STUCK_TIMEOUT = 300
+            total_users = len([u for u, i in self.manager.settings.items() if not i.get("bad", False)])
             active_processes = sum(
-                1
-                for p in psutil.process_iter(['name', 'pid'])
-                if p.info['name'] == 'RobloxPlayerBeta.exe'
-                and p.info['pid'] != self.manager.excluded_pid
+                1 for p in psutil.process_iter(['name','pid'])
+                if p.info['name'] == 'RobloxPlayerBeta.exe' and p.info['pid'] != self.manager.excluded_pid
             )
-
-            # reset timer whenever the process count grows
             if active_processes > self._last_proc_count:
                 self._last_proc_count = active_processes
-                self._last_growth_ts  = now
+                self._last_growth_ts = now
             else:
                 self._last_proc_count = active_processes
-
-            # condition met: fewer PIDs than users **and** no growth for ≥ STUCK_TIMEOUT
             if active_processes < total_users and (now - self._last_growth_ts) >= STUCK_TIMEOUT:
-                # Trim helpers but preserve the single oldest instance
                 limit_strap_helpers(threshold=1, kill_all=False)
-                self._last_growth_ts = now    # restart the timer
+                self._last_growth_ts = now
 
-
-            # -- per-user heartbeat ----------------------------------------
+            # per-user heartbeat
             status = {}
             kill_t = self.manager.timeout_monitor.kill_timeout
 
             for uid, st in self.user_states.items():
-
-                # ── 1. bad-cookie rows stay, but never launch ───────────────
-                if st["user_info"].get("bad", False):
-                    st["status"] = "Bad"
-
-                    # make a minimal row so the GUI can display it
+                info = st["user_info"]
+                # bad users
+                if info.get("bad", False):
                     status[uid] = {
-                        "status"        : "Bad",
-                        "pids"          : [],          # none running
-                        "needs_restart" : False,
-                        "last_active"   : st["last_active"],
-                        "inactive_since": st["inactive_since"],
-                        "ttl"           : []
+                        "status": "Bad",
+                        "pids": [],
+                        "needs_restart": False,
+                        "last_active": st.get("last_active", 0),
+                        "inactive_since": st.get("inactive_since"),
+                        "ttl": [],
+                        "server": self.manager.process_tracker.user_server.get(uid, ""),
                     }
-                    continue                           # skip launch / restart logic # do NOT manage this account
-                live = [
-                    pid for pid in self.manager.process_tracker.user_processes.get(uid, [])
-                    if self.process_mgr.verify_process_active(pid)
-                ]
+                    continue
                 
-                # ── instant disconnect detection ─────────────────────────────
-                uname     = str(st.get("user_info", {}).get("username", "")).lower()
-                log_path  = find_log_for_username(uname, allow_fallback=False)
-                disconnect_code = None         # will hold “276”, “17”, etc.
+                live = [pid for pid in self.manager.process_tracker.user_processes.get(uid, []) if self.process_mgr.verify_process_active(pid)]
+                
+                # --- NEW: pre-connect watchdog -------------------------------------------
+                # If this account has live processes but we still don't have a strict log
+                # match for its username within 2 minutes of launch, assume it failed to
+                # connect and recycle it.
+                now = time.time()
+                uname = str(info.get("username", "")).lower()
 
-                if not live:
-                    self._trace(uid, "skip — no live proc")
-                elif not log_path or not os.path.isfile(log_path):
-                    self._trace(uid, f"skip — log not found ({log_path})")
-                else:
+                if live:
+                    # Strict lookup: only returns a path once the username actually appears in logs
+                    log_path = find_log_for_username(uname, allow_fallback=False)
+
+                    if not log_path:
+                        # oldest process start for this user
+                        oldest_ct = min(self.manager.process_tracker.creation_timestamps.get(pid, now) for pid in live)
+                        waited = now - oldest_ct
+
+                        # (optional) remember we're waiting; handy for trace logs
+                        # self._waiting_usernames_since.setdefault(uid, oldest_ct)
+
+                        if waited >= self.preconnect_grace:
+                            self._log(f"⚠️  {uname} did not appear in logs within {self.preconnect_grace}s — terminating")
+                            self.kill_user_processes(uid)
+                            st["requires_restart"] = True
+                            # clean up a bit so next launch is fresh
+                            self.log_pointers.pop(uid, None)
+                            self.manager.process_tracker.user_server[uid] = "DISCONNECTED"
+                            # (optional) stop tracking the wait
+                            # self._waiting_usernames_since.pop(uid, None)
+                            # Skip the rest of the log-based disconnect checks for this uid this tick
+                            continue
+                    else:
+                        # (optional) we *did* see the username; stop tracking waits
+                        # self._waiting_usernames_since.pop(uid, None)
+                        pass
+                # --- END new watchdog -----------------------------------------------------
+
+
+                # disconnect via logs
+                uname = str(info.get("username", "")).lower()
+                log_path = find_log_for_username(uname, allow_fallback=False)
+                if live and log_path and os.path.isfile(log_path):
                     try:
                         last_pos   = self.log_pointers.get(uid, 0)
-                        current_sz = os.path.getsize(log_path)
-
-                        # log rotated? → start scanning from END to avoid old lines
-                        if current_sz < last_pos:
-                            last_pos = current_sz
-
-                        # read only new bytes
+                        cur_sz     = os.path.getsize(log_path)
+                        if cur_sz < last_pos:
+                            last_pos = cur_sz
                         with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
                             f.seek(last_pos)
                             chunk = f.read()
-
-                        self.log_pointers[uid] = current_sz
+                        self.log_pointers[uid] = cur_sz
                         if chunk:
-                            self._trace(uid, f"read {len(chunk)} bytes")
-
                             for line in chunk.splitlines():
-                                # ── skip chat-relay lines like
-                                #    “… Incoming MessageReceived … Text: [FLog::Network] …”
                                 pos_net = line.lower().find("[flog::network]")
                                 pos_txt = line.lower().find("text:")
-
                                 if pos_txt != -1 and pos_txt < pos_net:
-                                    continue          # embedded quote – not a genuine network log
-
-                                # --- genuine disconnect markers ---------------------------------
-                                if   (m := R_DISC_REASON.search(line)) \
-                                or (m := R_DISC_NOTIFY.search(line)) \
-                                or (m := R_DISC_SENDING.search(line)):
-                                    disconnect_code = m.group(1)
+                                    continue
+                                if (m := R_DISC_REASON.search(line)) or (m := R_DISC_NOTIFY.search(line)) or (m := R_DISC_SENDING.search(line)) or R_CONN_LOST.search(line):
+                                    self._log(f"⚠️  {uname} disconnect detected – terminating")
+                                    self.kill_user_processes(uid)
+                                    st["requires_restart"] = True
+                                    live = []
                                     break
-                                elif R_CONN_LOST.search(line):
-                                    disconnect_code = "unknown"
-                                    break
-                            if disconnect_code is not None:
-                                self.log_signal.emit(
-                                    f"⚠️  {uname} disconnect detected (reason {disconnect_code}) – terminating process"
-                                )
-                                self.kill_user_processes(uid)
-                                st["requires_restart"] = True
-
                     except Exception as e:
                         self._trace(uid, f"log scan error: {e}")
 
-                # ----- TTL list (for display) -----------------------------
+                # TTLs
                 ttl_list = []
+                min_ttl = None
                 for pid in live:
                     ct  = self.manager.process_tracker.creation_timestamps.get(pid, now)
                     ttl = max(0, int(kill_t - (now - ct)))
                     ttl_list.append(ttl)
+                    if min_ttl is None or ttl < min_ttl:
+                        min_ttl = ttl
 
-                # ----- state machine --------------------------------------
-                if live:                                        # client running
-                    st["last_active"]     = now
-                    st["inactive_since"]  = None
-                    st["requires_restart"]= False
-                    st["status"]          = "Active"
-                else:                                           # all windows gone
+                # donor standby
+                if self.spares_mode and uid in self.handoff_for:
+                    spare_uid = self.handoff_for[uid]
+                    spare_live = any(
+                        self.process_mgr.verify_process_active(pid)
+                        for pid in self.manager.process_tracker.user_processes.get(spare_uid, [])
+                    )
+                    if spare_live:
+                        st["status"] = "Standby (handoff)"
+                        st["requires_restart"] = False
+                        st["inactive_since"] = None
+                        if not live:
+                            self._complete_handoff(uid, spare_uid)
+
+                        status[uid] = {
+                            "status": st["status"],
+                            "pids": live,
+                            "needs_restart": False,
+                            "last_active": st.get("last_active", 0),
+                            "inactive_since": st.get("inactive_since"),
+                            "ttl": ttl_list,
+                            "server": self.manager.process_tracker.user_server.get(uid, ""),
+                        }
+                        continue
+
+                # normal state
+                if live:
+                    st["last_active"] = now
+                    st["inactive_since"] = None
+                    st["requires_restart"] = False
+                    st["status"] = "Active"
+                else:
                     if st["inactive_since"] is None:
                         st["inactive_since"] = now
                     idle = now - st["inactive_since"]
@@ -844,57 +1463,219 @@ class WorkerThread(QThread):
                     if idle >= self.restart_threshold:
                         st["requires_restart"] = True
 
-                # ----- row sent to GUI ------------------------------------
                 status[uid] = {
-                    "status"        : st["status"],
-                    "pids"          : live,
-                    "needs_restart" : st["requires_restart"],
-                    "last_active"   : st["last_active"],
-                    "inactive_since": st["inactive_since"],
-                    "ttl"           : ttl_list
-
+                    "status": st["status"],
+                    "pids": live,
+                    "needs_restart": st["requires_restart"],
+                    "last_active": st.get("last_active", 0),
+                    "inactive_since": st.get("inactive_since"),
+                    "ttl": ttl_list,
+                    "server": self.manager.process_tracker.user_server.get(uid, ""),
                 }
 
-            self.status_signal.emit(status)
+                # pre-join spare
+                if (self.spares_mode and uid in self.active_pool and min_ttl is not None
+                    and uid not in self.handoff_for and not info.get("bad", False)):
+                    if min_ttl <= self.handoff_lead or min_ttl <= self.early_join_window:
+                        self._launch_spare_into_donors_server(uid, info)
+            
+            # --- detect changes to the good-set and rebuild pools on-the-fly ---
+            try:
+                current_good = {
+                    u for u, s in self.user_states.items()
+                    if not s.get("user_info", {}).get("bad", False)
+                }
+                if current_good != getattr(self, "_last_good_set", set()):
+                    self._last_good_set = current_good
+                    self._recompute_pools()
+            except Exception as _e:
+                self._log(f"[Pools] good-set recompute error: {_e}")
 
-            # 1️⃣  build a dict:  pid -> {user_id, created, windows}
+
+            self.status_signal.emit(status)
+            
+            # Multiscope: update detection and push snapshot to the tab
+            try:
+                if hasattr(self, "ms") and self.ms:
+                    self.ms.tick(status)                 # feed current user/server state
+                    rows = self.ms.snapshot()            # [{server, users, biome/merchant…}]
+                    self.multiscope_signal.emit(rows)    # GUI will render it
+            except Exception as _e:
+                self._log(f"[Multiscope] tick error: {_e}")
+
+
+            # process table signal
             proc_info = {}
             for uid, pids in self.manager.process_tracker.user_processes.items():
                 for pid in pids:
                     if not self.process_mgr.verify_process_active(pid):
                         continue
-                    created = datetime.fromtimestamp(
-                        self.manager.process_tracker.creation_timestamps.get(pid, time.time())
-                    ).strftime("%H:%M:%S")
+                    created = datetime.fromtimestamp(self.manager.process_tracker.creation_timestamps.get(pid, time.time())).strftime("%H:%M:%S")
                     windows = self.process_mgr.count_windows_by_process().get(pid, 0)
-                    proc_info[pid] = {
-                        "user_id": uid,
-                        "created": created,
-                        "windows": windows,
-                    }
-
-            # 2️⃣  notify the GUI
+                    proc_info[pid] = {"user_id": uid, "created": created, "windows": windows}
             self.process_signal.emit(proc_info)
 
-            # auto-restart oldest candidate
+
+            # auto-restart queue (skip donors in handoff)
             restartables = [
                 u for u, s in self.user_states.items()
-                if s["requires_restart"] and not s["user_info"].get("bad", False)            
-]
-            if restartables and (now - self.timing_trackers['relaunch']) >= self.manager.timeouts["launch_delay"]:
-                uid   = restartables[0]
-                info  = self.user_states[uid]["user_info"]
-                cookie = info.get("cookie", "") if isinstance(info, dict) else info
-                self.launcher.start_game_session(uid, cookie, info)
-                self.user_states[uid]["inactive_since"] = None
-                self.user_states[uid]["requires_restart"] = False
-                self.user_states[uid]["status"] = "Restarting"
-                self.timing_trackers['relaunch'] = now
-                
-                            # ── strap.exe limiter (queue empty) ───────────────────────
-            if not restartables:
+                if s.get("requires_restart")
+                and not s["user_info"].get("bad", False)
+                and u not in self.handoff_for
+            ]
+
+            # Per-user gating: honor backoff and per-user launch_delay up front,
+            # so we don't keep picking the same blocked uid over and over.
+            now = time.time()
+            def _eligible_now(u: str) -> bool:
+                st = self.user_states.get(u, {})
+                info = st.get("user_info", {})
+                if now < self._skip_until_by_user.get(u, 0):
+                    return False
+                # per-user launch delay (prefer not to hammer)
+                if now - st.get("last_launch", 0) < self.manager.timeouts["launch_delay"]:
+                    return False
+                return True
+
+            restartables = [u for u in restartables if _eligible_now(u)]
+
+            # Prefer accounts expected in active_pool, then apply round-robin starting point
+            restartables.sort(key=lambda u: (u not in self.active_pool, u))
+            if restartables:
+                # advance cursor into the sorted list (wrap around)
+                self._restart_cursor = self._restart_cursor % len(restartables)
+                ordered = restartables[self._restart_cursor:] + restartables[:self._restart_cursor]
+            else:
+                ordered = []
+
+            # Only attempt one successful launch per launch_delay window (global pacing)
+            if ordered and (now - self.timing_trackers['relaunch']) >= self.manager.timeouts["launch_delay"]:
+                launched = False
+
+                for uid in ordered:
+                    st    = self.user_states.get(uid, {})
+                    info  = st.get("user_info", {})
+                    cookie = info.get("cookie", "")
+
+                    # If spares_mode and this is a spare, only launch to meet target count
+                    if self.spares_mode and uid in self.spare_pool:
+                        target_live = len(self.active_pool)
+                        live_now = sum(1 for row in status.values() if row["status"] == "Active")
+                        if live_now >= target_live:
+                            continue  # capacity satisfied; don't attempt, don't log
+
+                    # Final preflight: only when we're about to actually attempt a launch
+                    conflict, label, by_uid = self._normal_launch_conflict(uid, info)
+                    if conflict:
+                        # Back off this uid for a bit so it doesn't starve others
+                        self._skip_until_by_user[uid] = now + 20
+                        # Move the round-robin cursor past this uid for next time
+                        self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
+                        # Try the next candidate
+                        continue
+
+                    # Safe to try launching
+                    if self.launcher.start_game_session(uid, cookie, info):
+                        self.user_states[uid]["inactive_since"]   = None
+                        self.user_states[uid]["requires_restart"] = False
+                        self.user_states[uid]["status"]           = "Restarting"
+                        self.user_states[uid]["last_launch"]      = now
+                        self.timing_trackers['relaunch']          = now
+                        # Move round-robin forward from the *next* uid
+                        self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
+                        launched = True
+                        break
+                    else:
+                        # Launch failed for some other reason — short backoff on this uid
+                        self._skip_until_by_user[uid] = now + 10
+                        self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
+                        # keep trying next candidate in this tick
+
+                # If none launched, do not reset relaunch timer (we’ll retry next tick with new order)
+
+            if not ordered:
                 limit_strap_helpers(threshold=self.strap_threshold)
+
             time.sleep(self.manager.check_intervals['main_tick'])
+    
+    def _enforce_one_per_server(self):
+        p = self.manager.process_tracker
+
+        # Prune expired cooldowns
+        now = time.time()
+        rh = getattr(self, "_recent_handoffs", {})
+        for u, exp in list(rh.items()):
+            if exp <= now:
+                rh.pop(u, None)
+
+        # Group by real labels only (skip synthetic pools)
+        by_label = {}
+        for uid, raw in (p.user_server or {}).items():
+            if not raw:
+                continue
+            lbl = str(raw).strip()
+            up = lbl.upper()
+            if up.startswith("DISCONNECT") or up.startswith("UNKNOWN"):
+                continue  # never dedupe these pools
+            by_label.setdefault(lbl, []).append(uid)
+
+        # Build protection set:
+        #  - always protect donor+spare while mapping exists
+        #  - protect any uid within the recent-handoff cooldown window
+        protected = set()
+        for donor, spare in (self.handoff_for or {}).items():
+            protected.update([donor, spare])
+        protected.update([u for u, exp in rh.items() if exp > now])
+
+        # Helper: earliest PID start time for tie-break
+        def oldest_start(uid: str) -> float:
+            times = [p.creation_timestamps.get(pid, float('inf'))
+                    for pid in p.user_processes.get(uid, [])]
+            return min(times) if times else float('inf')
+
+        # Choose keeper per label by priority, then terminate extras
+        for label, uids in by_label.items():
+            if len(uids) <= 1:
+                continue
+
+            def prio(u: str):
+                return (
+                    0 if u in protected else 1,          # keep protected if present
+                    0 if u in self.active_pool else 1,   # else prefer active-pool user
+                    oldest_start(u)                      # else oldest start wins
+                )
+
+            keep = sorted(uids, key=prio)[0]
+
+            for uid in uids:
+                if uid == keep or uid in protected:
+                    continue
+                for pid in p.user_processes.get(uid, []):
+                    if self.process_mgr.verify_process_active(pid):
+                        self.process_mgr.terminate_process(pid, p)
+                        self._log(f"[DEDUP] Killed extra instance for {uid} on {label}")
+
+    def _reserve_server(self, label: str, uid: str, purpose: str = "handoff"):
+        """Mark a server label as reserved for a short window (prevents normal launches)."""
+        if not label or not hasattr(self.manager, "process_tracker"):
+            return
+        now = time.time()
+        rs = getattr(self.manager.process_tracker, "reserved_servers", None)
+        if rs is None:
+            self.manager.process_tracker.reserved_servers = rs = {}
+        rs[label] = {"by": uid, "type": purpose, "exp": now + self._reservations_ttl}
+
+    def _prune_reservations(self):
+        """Expire old reservations (called each loop)."""
+        if not hasattr(self.manager, "process_tracker"):
+            return
+        rs = getattr(self.manager.process_tracker, "reserved_servers", {})
+        if not rs:
+            return
+        now = time.time()
+        for lbl, meta in list(rs.items()):
+            if meta.get("exp", 0) <= now:
+                rs.pop(lbl, None)
 
     def stop(self):
         if self.manager and self.manager.timeout_monitor:
@@ -1624,7 +2405,10 @@ class RobloxManagerGUI(QMainWindow):
         self.process_data = {}
         self.config_manager = ConfigManager()
         self.setup_ui()
+        # NEW: add the Multiscope tab
+        self.setup_multiscope_tab()
         self.setup_timers()
+
 
     def setup_ui(self):
         self.setWindowTitle("Jirach1 + JARAM - Just Another Roblox Account Manager")
@@ -1683,6 +2467,7 @@ class RobloxManagerGUI(QMainWindow):
         self.setup_logs_tab()
         self.setup_settings_tab()
         self.setup_RAMEXPORT_tab()
+        setup_UTILITIES_tab(self)
         self.setup_credits_tab()
 
         self.setup_menu_bar()
@@ -1783,36 +2568,37 @@ class RobloxManagerGUI(QMainWindow):
         layout = QVBoxLayout(users_widget)
 
         self.users_table = QTableWidget()
-        self.users_table.setColumnCount(10)      # was 9
+        self.users_table.setColumnCount(11)
         self.users_table.setHorizontalHeaderLabels([
             "User ID","Username","Private Server","Place",
+            "Server",               # ← NEW
             "Status","PIDs","TTL(s)","Last Active",
             "Inactive For","Actions"
-])
-
+        ])
 
         header = self.users_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)  # Server
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)  
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)  
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)  
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
 
-        self.users_table.setColumnWidth(2, 200)  
-        self.users_table.setColumnWidth(3, 100)  
-        self.users_table.setColumnWidth(6, 100)  
-        self.users_table.setColumnWidth(8, 160)  
-        self.users_table.setColumnWidth(9, 170)
+        self.users_table.setColumnWidth(2, 200)
+        self.users_table.setColumnWidth(3, 100)
+        self.users_table.setColumnWidth(4, 120)
+        self.users_table.setColumnWidth(7, 100)
+        self.users_table.setColumnWidth(9, 160)
+        self.users_table.setColumnWidth(10, 170)
         self.users_table.verticalHeader().setDefaultSectionSize(60)
 
         layout.addWidget(self.users_table)
 
         controls_layout = QHBoxLayout()
-
         refresh_users_btn = QPushButton("Refresh")
         refresh_users_btn.clicked.connect(self.refresh_users)
         controls_layout.addWidget(refresh_users_btn)
@@ -1822,10 +2608,10 @@ class RobloxManagerGUI(QMainWindow):
         controls_layout.addWidget(add_user_btn)
 
         controls_layout.addStretch()
-
         layout.addLayout(controls_layout)
 
         self.tab_widget.addTab(users_widget, "Users")
+
 
     def setup_processes_tab(self):
         processes_widget = QWidget()
@@ -1888,6 +2674,10 @@ class RobloxManagerGUI(QMainWindow):
         controls_layout.addWidget(save_logs_btn)
 
         controls_layout.addStretch()
+        
+        self.watch_hit_chk = QCheckBox("Show WATCH-HIT messages", self)
+        self.watch_hit_chk.setChecked(False)  # hidden by default
+        controls_layout.addWidget(self.watch_hit_chk)
 
         self.scan_trace_chk = QCheckBox("Show SCAN-TRACE messages", self)
         self.scan_trace_chk.setChecked(False)      # default = ON
@@ -1905,104 +2695,251 @@ class RobloxManagerGUI(QMainWindow):
         settings_widget = QWidget()
         layout = QVBoxLayout(settings_widget)
 
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
+        scroll_area = QScrollArea(); scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        content_widget = QWidget()
-        content_layout = QVBoxLayout(content_widget)
+        content_widget = QWidget(); content_layout = QVBoxLayout(content_widget)
 
-        basic_group = QGroupBox("Basic Settings")
-        basic_layout = QFormLayout(basic_group)
-
-        self.settings_window_limit_input = QSpinBox()
-        self.settings_window_limit_input.setRange(1, 999)
+        # ── Basic ────────────────────────────────────────────────────────────────
+        basic_group = QGroupBox("Basic Settings"); basic_layout = QFormLayout(basic_group)
+        self.settings_window_limit_input = QSpinBox(); self.settings_window_limit_input.setRange(1, 999)
         self.settings_window_limit_input.setToolTip("Maximum windows per Roblox process")
         basic_layout.addRow("Window Limit:", self.settings_window_limit_input)
 
+        self.spares_mode_chk = QCheckBox("Use Spare Accounts (launch ~half)")
+        self.spares_mode_chk.setToolTip("When enabled, only ~half of good accounts are launched initially. Others act as spares for pre-join handoffs.")
+        basic_layout.addRow("Spares Mode:", self.spares_mode_chk)
+        
+        # NEW:
+        self.spares_split_cmb = QComboBox()
+        self.spares_split_cmb.addItems(["1/2", "3/4", "4/5"])
+        self.spares_split_cmb.setToolTip("When spare mode is ON: what fraction of good accounts to launch as active.")
+        self.spares_split_cmb.setEnabled(self.spares_mode_chk.isChecked())
+        self.spares_mode_chk.toggled.connect(self.spares_split_cmb.setEnabled)
+        basic_layout.addRow("Spare Mode Split:", self.spares_split_cmb)
         content_layout.addWidget(basic_group)
 
-        timing_group = QGroupBox("Timing Settings")
-        timing_layout = QFormLayout(timing_group)
-        
-        timeout_group = QGroupBox("Shutdown Settings")
-        timeout_layout = QFormLayout(timeout_group)
+        # ── Timing ───────────────────────────────────────────────────────────────
+        timing_group = QGroupBox("Timing Settings"); timing_layout = QFormLayout(timing_group)
+        self.settings_offline_threshold_input = QSpinBox(); self.settings_offline_threshold_input.setRange(10, 120); self.settings_offline_threshold_input.setSuffix(" s")
+        timing_layout.addRow("Restart Inactive After:", self.settings_offline_threshold_input)
 
-        self.settings_strap_threshold_input = QSpinBox()
-        self.settings_strap_threshold_input.setRange(1, 200)
+        self.settings_initial_delay_input = QSpinBox(); self.settings_initial_delay_input.setRange(5, 60); self.settings_initial_delay_input.setSuffix(" s")
+        timing_layout.addRow("Initial Launch Delay:", self.settings_initial_delay_input)
+
+        self.settings_launch_delay_input = QSpinBox(); self.settings_launch_delay_input.setRange(1, 120); self.settings_launch_delay_input.setSuffix(" s")
+        timing_layout.addRow("Launch Delay:", self.settings_launch_delay_input)
+
+        self.handoff_lead_input = QSpinBox(); self.handoff_lead_input.setRange(5, 300); self.handoff_lead_input.setSuffix(" s")
+        timing_layout.addRow("Handoff Lead (pre-join before kill):", self.handoff_lead_input)
+
+        self.early_join_window_input = QSpinBox(); self.early_join_window_input.setRange(10, 600); self.early_join_window_input.setSuffix(" s")
+        self.early_join_window_input.setToolTip("Assign spares early for sessions expiring within this window to avoid backlog spikes.")
+        timing_layout.addRow("Early-Join Window:", self.early_join_window_input)
+        content_layout.addWidget(timing_group)
+
+        # ── Shutdown / Timeout ───────────────────────────────────────────────────
+        timeout_group = QGroupBox("Shutdown Settings"); timeout_layout = QFormLayout(timeout_group)
+        self.settings_strap_threshold_input = QSpinBox(); self.settings_strap_threshold_input.setRange(1, 200)
         self.settings_strap_threshold_input.setToolTip("Max number of strap.exe helpers before trimming")
         timeout_layout.addRow("-Strap Limit:", self.settings_strap_threshold_input)
         
-        self.kill_timeout_input = QSpinBox()
-        self.kill_timeout_input.setRange(60, 7200)
-        self.kill_timeout_input.setSuffix(" s")
+        self.kill_after_enable_chk = QCheckBox("Enable Kill After (auto-close)")
+        self.kill_after_enable_chk.setChecked(True)
+        timeout_layout.addRow("Enable:", self.kill_after_enable_chk)
+
+        # Optional: gray out the timeout field when disabled
+        def _toggle_kill_inputs(checked: bool):
+            self.kill_timeout_input.setEnabled(checked)
+        self.kill_after_enable_chk.toggled.connect(_toggle_kill_inputs)
+
+        self.kill_timeout_input = QSpinBox(); self.kill_timeout_input.setRange(60, 7200); self.kill_timeout_input.setSuffix(" s")
         self.kill_timeout_input.setToolTip("Time until window auto-closes (≤ 1,740s recommended)")
         timeout_layout.addRow("Kill After:", self.kill_timeout_input)
 
-        self.poll_interval_input = QSpinBox()
-        self.poll_interval_input.setRange(1, 120)
-        self.poll_interval_input.setSuffix(" s")
+        self.poll_interval_input = QSpinBox(); self.poll_interval_input.setRange(1, 120); self.poll_interval_input.setSuffix(" s")
         self.poll_interval_input.setToolTip("Polling Interval + Kill After must stay under 1,800s")
         timeout_layout.addRow("Poll Interval:", self.poll_interval_input)
 
-        self.webhook_input = QLineEdit()
-        self.webhook_input.setPlaceholderText("Discord webhook URL")
-        self.webhook_input.setToolTip("Keep empty to disable")
+        self.webhook_input = QLineEdit(); self.webhook_input.setPlaceholderText("Discord webhook URL")
         timeout_layout.addRow("Webhook URL:", self.webhook_input)
 
-        self.ping_msg_input = QLineEdit()
-        self.ping_msg_input.setPlaceholderText("Ping message (optional)")
+        self.ping_msg_input = QLineEdit(); self.ping_msg_input.setPlaceholderText("Ping message (optional)")
         timeout_layout.addRow("Ping Message:", self.ping_msg_input)
-
         content_layout.addWidget(timeout_group)
 
-        self.settings_offline_threshold_input = QSpinBox()
-        self.settings_offline_threshold_input.setRange(10, 120)
-        self.settings_offline_threshold_input.setSuffix(" s")
-        self.settings_offline_threshold_input.setToolTip("How long to wait before restarting inactive users")
-        timing_layout.addRow("Restart Inactive After:", self.settings_offline_threshold_input)
-        
-        self.settings_initial_delay_input = QSpinBox()
-        self.settings_initial_delay_input.setRange(5, 60)
-        self.settings_initial_delay_input.setSuffix(" s")
-        self.settings_initial_delay_input.setToolTip("Seconds between first-run launches when staggering is ON")
-        timing_layout.addRow("Initial Launch Delay:", self.settings_initial_delay_input)
+        # ── Webhooks (Per-webhook biome filters) ─────────────────────────────────
+        webhooks_group = QGroupBox("Webhooks (Per-Webhook Biome Filters)")
+        webhooks_v = QVBoxLayout(webhooks_group)
 
-        self.settings_launch_delay_input = QSpinBox()
-        self.settings_launch_delay_input.setRange(1, 120)
-        self.settings_launch_delay_input.setSuffix(" s")
-        self.settings_launch_delay_input.setToolTip("Delay between launching sessions")
-        timing_layout.addRow("Launch Delay:", self.settings_launch_delay_input)
+        info_lbl = QLabel("Each row is a webhook. Choose how each biome should notify. "
+                        "No selection = None. Legacy readers still use the allowed list.")
+        info_lbl.setWordWrap(True)
+        webhooks_v.addWidget(info_lbl)
 
-        content_layout.addWidget(timing_group)
+        self.webhooks_table = QTableWidget()
+        self.webhooks_table.setColumnCount(1 + len(GUI_BIOME_NAMES))  # URL + biomes...
+        headers = ["Webhook URL"] + GUI_BIOME_NAMES
+        self.webhooks_table.setHorizontalHeaderLabels(headers)
+        self.webhooks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
 
+        header = self.webhooks_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # Make biome columns wide enough so the combobox text is visible when closed
+        header.setMinimumSectionSize(150)
+        vh = self.webhooks_table.verticalHeader()
+        vh.setDefaultSectionSize(30)   # good-looking row height
+        vh.setMinimumSectionSize(30)   # prevents squeeze below readable height
+
+        for c in range(1, 1 + len(GUI_BIOME_NAMES)):
+            header.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
+            self.webhooks_table.setColumnWidth(c, 150)
+        webhooks_v.addWidget(self.webhooks_table)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add Webhook")
+        rem_btn = QPushButton("Remove Selected")
+        btn_row.addWidget(add_btn); btn_row.addWidget(rem_btn); btn_row.addStretch()
+        webhooks_v.addLayout(btn_row)
+
+        MODE_ITEMS = ("None", "Message", "Everyone")  # tri-mode per biome cell
+
+        def _mk_mode_combo(default_text: str = "None") -> QComboBox:
+            cmb = QComboBox()
+            cmb.addItems(("None", "Message", "Everyone"))
+            if default_text in ("None", "Message", "Everyone"):
+                cmb.setCurrentText(default_text)
+            
+            # Make the CLOSED state readable and consistent
+            cmb.setMinimumContentsLength(9)
+            cmb.setMinimumWidth(120)
+
+            # Height: slightly taller so it clears gridlines and looks centered
+            cmb.setMinimumHeight(10)
+            cmb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+            cmb.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
+
+            # Tighten vertical padding a bit; keep arrow space
+            cmb.setStyleSheet(
+                "QComboBox{min-height:10px; padding:2px 8px;}"
+                "QComboBox::drop-down{width:22px;}"
+            )
+            return cmb
+
+        def _place_centered(table: QTableWidget, row: int, col: int, w: QWidget):
+            """
+            Wrap `w` in a container and center it both horizontally & vertically.
+            Also give the holder enough minimum height so the child never clips.
+            """
+            holder = QWidget()
+            v = QVBoxLayout(holder)
+            v.setContentsMargins(0, 1, 0, 1)   # tiny top/bottom breathing room
+            v.setSpacing(0)
+            v.addWidget(w, 1, Qt.AlignCenter)  # true H+V centering
+            # ensure the row will be at least the child height + a couple px
+            holder.setMinimumHeight(max(30, w.sizeHint().height() + 4))
+            table.setCellWidget(row, col, holder)
+            return holder
+
+
+        def add_webhook_row(url: str = "", allowed_biomes=None, biome_modes=None):
+            """
+            allowed_biomes: Optional[List[str]]  -> kept for backward compatibility
+            biome_modes:    Optional[Dict[str, str]] per-biome: "None"|"Message"|"Everyone"
+                            If provided, it overrides the mode derived from allowed_biomes.
+            """
+            row = self.webhooks_table.rowCount()
+            self.webhooks_table.insertRow(row)
+
+            url_item = QTableWidgetItem(url)
+            self.webhooks_table.setItem(row, 0, url_item)
+
+            allowed_set = {str(b).upper() for b in (allowed_biomes or [])}
+            biome_modes = biome_modes or {}
+
+            for idx, biome in enumerate(GUI_BIOME_NAMES):
+                bkey = str(biome).upper()
+                default_mode = "Message" if bkey in allowed_set else "None"
+                mode = biome_modes.get(bkey, default_mode)
+                combo = _mk_mode_combo(mode)
+                _place_centered(self.webhooks_table, row, 1 + idx, combo)
+
+            # Center + size the row based on the first combo’s height
+            first_holder = self.webhooks_table.cellWidget(row, 1)  # wrapper at first biome col
+            first_combo  = None
+            if first_holder:
+                first_combo = first_holder.findChild(QComboBox)
+
+            if first_combo:
+                need = first_combo.sizeHint().height() + 6  # 2–3 px above/below
+            else:
+                need = self.webhooks_table.verticalHeader().defaultSectionSize()
+
+            need = max(need, 34)  # don’t go below a comfortable default
+            self.webhooks_table.setRowHeight(row, need)
+
+
+        def remove_selected_rows():
+            rows = sorted({i.row() for i in self.webhooks_table.selectedIndexes()}, reverse=True)
+            for r in rows:
+                self.webhooks_table.removeRow(r)
+
+        add_btn.clicked.connect(lambda: add_webhook_row("", []))
+        rem_btn.clicked.connect(remove_selected_rows)
+
+        # expose helpers for load/save
+        self._add_webhook_row = add_webhook_row
+        self._clear_webhook_rows = lambda: self.webhooks_table.setRowCount(0)
+
+        content_layout.addWidget(webhooks_group)
+
+        # --- Multiscope — Merchant & Pings (simple, no custom helpers) ---
+        ms_box = QGroupBox("Multiscope — Merchant & Pings")
+        ms_form = QFormLayout(ms_box)
+
+        self.ms_merchant_webhook_input = QLineEdit()
+        self.ms_merchant_webhook_input.setEchoMode(QLineEdit.EchoMode.Password)
+
+        self.ms_enable_jester = QCheckBox("Enable Jester pings")
+        self.ms_enable_mari   = QCheckBox("Enable Mari pings")
+
+        type_opts = ["None", "User ID", "Role ID"]
+
+        self.ms_jester_type = QComboBox(); self.ms_jester_type.addItems(type_opts)
+        self.ms_jester_id   = QLineEdit();  self.ms_jester_id.setPlaceholderText("numeric ID or @everyone")
+        self.ms_mari_type   = QComboBox();  self.ms_mari_type.addItems(type_opts)
+        self.ms_mari_id     = QLineEdit();  self.ms_mari_id.setPlaceholderText("numeric ID or @everyone")
+
+        # tidy two-control rows without custom helpers:
+        jester_row = QWidget(); jester_h = QHBoxLayout(jester_row); jester_h.setContentsMargins(0,0,0,0)
+        jester_h.addWidget(self.ms_jester_type); jester_h.addWidget(self.ms_jester_id)
+
+        mari_row = QWidget(); mari_h = QHBoxLayout(mari_row); mari_h.setContentsMargins(0,0,0,0)
+        mari_h.addWidget(self.ms_mari_type); mari_h.addWidget(self.ms_mari_id)
+
+        ms_form.addRow("Merchant Webhook URL", self.ms_merchant_webhook_input)
+        ms_form.addRow(self.ms_enable_jester)
+        ms_form.addRow("Jester ping type / ID", jester_row)
+        ms_form.addRow(self.ms_enable_mari)
+        ms_form.addRow("Mari ping type / ID", mari_row)
+
+        content_layout.addWidget(ms_box)
+
+        # ── Save / Reset ─────────────────────────────────────────────────────────
         buttons_layout = QHBoxLayout()
+        save_settings_btn = QPushButton("Save Settings"); save_settings_btn.setProperty("class", "success"); save_settings_btn.clicked.connect(self.save_settings)
+        reset_settings_btn = QPushButton("Reset to Defaults"); reset_settings_btn.clicked.connect(self.reset_settings)
+        clear_bad_btn = QPushButton("Clear Bad Flags"); clear_bad_btn.clicked.connect(self._clear_bad_flags)
+        buttons_layout.addWidget(save_settings_btn); buttons_layout.addWidget(reset_settings_btn); buttons_layout.addWidget(clear_bad_btn); buttons_layout.addStretch()
+        content_layout.addLayout(buttons_layout); content_layout.addStretch()
 
-        save_settings_btn = QPushButton("Save Settings")
-        save_settings_btn.setProperty("class", "success")
-        save_settings_btn.clicked.connect(self.save_settings)
-        buttons_layout.addWidget(save_settings_btn)
-
-        reset_settings_btn = QPushButton("Reset to Defaults")
-        reset_settings_btn.clicked.connect(self.reset_settings)
-        buttons_layout.addWidget(reset_settings_btn)
-        
-        clear_bad_btn = QPushButton("Clear Bad Flags")
-        clear_bad_btn.clicked.connect(self._clear_bad_flags)
-        buttons_layout.addWidget(clear_bad_btn)
-
-        buttons_layout.addStretch()
-
-        content_layout.addLayout(buttons_layout)
-        content_layout.addStretch()
-
-        scroll_area.setWidget(content_widget)
-        layout.addWidget(scroll_area)
-
+        scroll_area.setWidget(content_widget); layout.addWidget(scroll_area)
         self.tab_widget.addTab(settings_widget, "Settings")
-
         self.load_settings_tab()
-        
+
+    def append_log(self, s: str):
+        self.add_log(s)
+
     def setup_RAMEXPORT_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -2107,6 +3044,7 @@ class RobloxManagerGUI(QMainWindow):
         layout.addWidget(lbl)
 
         return card
+    
 
     def setup_credits_tab(self):
         credits_widget = QWidget()
@@ -2326,7 +3264,7 @@ class RobloxManagerGUI(QMainWindow):
             config = self.config_manager.get_users_for_manager()
             if not config:
                 QMessageBox.warning(self, "No Users",
-                                  "No users found in configuration. Please add users first using File → Manage Users.")
+                                    "No users found in configuration. Please add users first using File → Manage Users.")
                 return
         except Exception as e:
             QMessageBox.critical(self, "Config Error", f"Error reading user configuration: {e}")
@@ -2336,6 +3274,9 @@ class RobloxManagerGUI(QMainWindow):
         self.worker_thread.log_signal.connect(self.add_log)
         self.worker_thread.status_signal.connect(self.update_user_status)
         self.worker_thread.process_signal.connect(self.update_process_data)
+        # NEW: Multiscope snapshot updates the tab
+        self.worker_thread.multiscope_signal.connect(self.update_multiscope)
+
         self.worker_thread.start()
 
         self.start_btn.setEnabled(False)
@@ -2343,6 +3284,7 @@ class RobloxManagerGUI(QMainWindow):
         self.status_label.setText("Status: Running")
         self.status_label.setStyleSheet(f"color: {ModernStyle.SECONDARY}; font-weight: bold;")
         self.start_time = time.time()
+
 
     def stop_manager(self):
         if self.worker_thread and self.worker_thread.isRunning():
@@ -2388,23 +3330,18 @@ class RobloxManagerGUI(QMainWindow):
 
     def refresh_users(self):
         self.users_table.setRowCount(len(self.user_data))
-
         users_cfg = self.config_manager.load_users()
 
-        # good first, bad last
-        ordered = sorted(
-            self.user_data.items(),
-            key=lambda kv: bool(users_cfg.get(kv[0], {}).get("bad", False))
-        )
+        ordered = sorted(self.user_data.items(), key=lambda kv: bool(users_cfg.get(kv[0], {}).get("bad", False)))
 
         for row, (user_id, runtime) in enumerate(ordered):
             u_conf   = users_cfg.get(user_id, {})
             bad_flag = bool(u_conf.get("bad", False))
 
-            # ── static columns ───────────────────────────────────────
             username  = u_conf.get("username", f"User_{user_id}")
             ps_link   = u_conf.get("private_server_link", "")
             place     = u_conf.get("place", "")
+            server    = runtime.get("server", "")
 
             self.users_table.setItem(row, 0, QTableWidgetItem(user_id))
             self.users_table.setItem(row, 1, QTableWidgetItem(username))
@@ -2412,8 +3349,9 @@ class RobloxManagerGUI(QMainWindow):
             trimmed_link = ps_link[:25] + "..." if len(ps_link) > 25 else ps_link
             self.users_table.setItem(row, 2, QTableWidgetItem(trimmed_link))
             self.users_table.setItem(row, 3, QTableWidgetItem(place))
+            self.users_table.setItem(row, 4, QTableWidgetItem(server))  # NEW
 
-            # ── status cell ──────────────────────────────────────────
+            # status cell
             if bad_flag:
                 status_text, colour = "Bad", QColor(ModernStyle.ERROR)
             else:
@@ -2427,79 +3365,42 @@ class RobloxManagerGUI(QMainWindow):
                 else:
                     colour = QColor(ModernStyle.ERROR)
                 status_text = raw
-
             status_item = QTableWidgetItem(status_text)
             status_item.setForeground(colour)
-            self.users_table.setItem(row, 4, status_item)
+            self.users_table.setItem(row, 5, status_item)
 
-            # ── runtime columns ─────────────────────────────────────
+            # runtime columns
             pids = runtime.get('pids', [])
-            self.users_table.setItem(row, 5,
-                                    QTableWidgetItem(', '.join(map(str, pids)) or 'None'))
+            self.users_table.setItem(row, 6, QTableWidgetItem(', '.join(map(str, pids)) or 'None'))
 
             ttl_list = runtime.get('ttl', [])
-            self.users_table.setItem(row, 6,
-                                    QTableWidgetItem(', '.join(f"{t}s" for t in ttl_list) or 'N/A'))
+            self.users_table.setItem(row, 7, QTableWidgetItem(', '.join(f"{t}s" for t in ttl_list) or 'N/A'))
 
             last_active = runtime.get('last_active', 0)
             last_active_str = datetime.fromtimestamp(last_active).strftime("%H:%M:%S") if last_active else "Never"
-            self.users_table.setItem(row, 7, QTableWidgetItem(last_active_str))
+            self.users_table.setItem(row, 8, QTableWidgetItem(last_active_str))
 
             inactive_since = runtime.get('inactive_since')
             dur = int(time.time() - inactive_since) if inactive_since else None
-            self.users_table.setItem(row, 8, QTableWidgetItem(f"{dur}s" if dur else "N/A"))
+            self.users_table.setItem(row, 9, QTableWidgetItem(f"{dur}s" if dur else "N/A"))
 
-            # ── action buttons ──────────────────────────────────────
+            # action buttons
             actions_widget  = QWidget()
             actions_layout  = QHBoxLayout(actions_widget)
             actions_layout.setContentsMargins(8, 5, 8, 5)
             actions_layout.setSpacing(12)
 
             restart_btn = QPushButton("Restart")
-            restart_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {ModernStyle.PRIMARY};
-                    color: {ModernStyle.TEXT_PRIMARY};
-                    border: none;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    font-weight: 500;
-                    font-size: 11px;
-                    min-width: 40px;
-                    max-width: 50px;
-                    min-height: 26px;
-                    max-height: 28px;
-                }}
-                QPushButton:hover {{
-                    background-color: {ModernStyle.ERROR};
-                }}
-            """)
+            restart_btn.setStyleSheet(self._get_action_button_style("primary"))
             restart_btn.clicked.connect(lambda _, uid=user_id: self.restart_user_session(uid))
             actions_layout.addWidget(restart_btn)
 
             kill_btn = QPushButton("Kill")
-            kill_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {ModernStyle.ERROR};
-                    color: {ModernStyle.TEXT_PRIMARY};
-                    border: none;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    font-weight: 500;
-                    font-size: 11px;
-                    min-width: 40px;
-                    max-width: 50px;
-                    min-height: 26px;
-                    max-height: 28px;
-                }}
-                QPushButton:hover {{
-                    background-color: {ModernStyle.ERROR};
-                }}
-            """)
+            kill_btn.setStyleSheet(self._get_action_button_style("danger"))
             kill_btn.clicked.connect(lambda _, uid=user_id: self.kill_user_processes(uid))
             actions_layout.addWidget(kill_btn)
 
-            self.users_table.setCellWidget(row, 9, actions_widget)
+            self.users_table.setCellWidget(row, 10, actions_widget)
 
 
     def refresh_processes(self):
@@ -2543,8 +3444,42 @@ class RobloxManagerGUI(QMainWindow):
             actions_layout.addWidget(kill_btn)
 
             self.processes_table.setCellWidget(row, 4, actions_widget)
+    
+    def _get_action_button_style(self, color_type="primary"):
+        if color_type == "danger":
+            bg_color = ModernStyle.ERROR
+            hover_color = "#dc2626"
+            pressed_color = "#b91c1c"
+        else:
+            bg_color = ModernStyle.PRIMARY
+            hover_color = ModernStyle.PRIMARY_VARIANT
+            pressed_color = "#3730a3"
+
+        return f"""
+            QPushButton {{
+                background-color: {bg_color};
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: 600;
+                font-size: 12px;
+                min-width: 70px;
+                max-width: 80px;
+                min-height: 30px;
+                max-height: 32px;
+            }}
+            QPushButton:hover {{
+                background-color: {hover_color};
+            }}
+            QPushButton:pressed {{
+                background-color: {pressed_color};
+            }}
+        """
 
     def add_log(self, message):
+        if message.startswith("[MultiScope] Watch hit") and not self.watch_hit_chk.isChecked():
+            return
         if message.startswith("[SCAN-TRACE]") and not self.scan_trace_chk.isChecked():
             return    
         print("add_log():", message)
@@ -2586,53 +3521,174 @@ class RobloxManagerGUI(QMainWindow):
         self.tab_widget.setCurrentIndex(4)
 
     def load_settings_tab(self):
-        cfg = self.config_manager.load_settings()
+        """Populate Settings UI from settings.json (timings + shutdown monitor + tri-mode webhooks + optional merchant/pings)."""
+        settings = self.config_manager.load_settings()
 
-        self.settings_window_limit_input.setValue(cfg.get("window_limit", 1))
+        # ---------- Basic ----------
+        self.settings_window_limit_input.setValue(settings.get("window_limit", 1))
+        self.spares_mode_chk.setChecked(bool(settings.get("spares_mode", False)))
+        self.spares_split_cmb.setCurrentText(settings.get("spares_fraction", "1/2"))
 
-        self.settings_initial_delay_input.setValue(
-                cfg.get("timeouts", {}).get("initial_delay", 4))
+        # ---------- Timing (timeouts) ----------
+        t = settings.get("timeouts", {}) or {}
+        self.settings_initial_delay_input.setValue(t.get("initial_delay", 10))
+        self.settings_offline_threshold_input.setValue(t.get("offline", 120))
+        self.settings_launch_delay_input.setValue(t.get("launch_delay", 10))
+        self.settings_strap_threshold_input.setValue(t.get("strap_threshold", 10))
+        self.handoff_lead_input.setValue(t.get("handoff_lead", 25))
+        self.early_join_window_input.setValue(t.get("early_join_window", 60))
 
-        self.settings_offline_threshold_input.setValue(
-                cfg.get("timeouts", {}).get("offline", 35))
-
-        self.settings_launch_delay_input.setValue(
-                cfg.get("timeouts", {}).get("launch_delay", 4))
-        
-        self.settings_strap_threshold_input.setValue(
-                cfg.get("timeouts", {}).get("strap_threshold", 50))
-
-        tm = cfg.get("timeout_monitor", {})
-        self.kill_timeout_input.setValue(tm.get("kill_timeout", 1740))
+        # ---------- Shutdown monitor (timeout_monitor) ----------
+        tm = settings.get("timeout_monitor", {}) or {}
+        self.kill_timeout_input.setValue(tm.get("kill_timeout", 850))
         self.poll_interval_input.setValue(tm.get("poll_interval", 10))
         self.webhook_input.setText(tm.get("webhook_url", ""))
-        self.ping_msg_input.setText(tm.get("ping_message", "<@YourPing> This message is sent whenever your active processes drop to 1 or 0, for debugging, leave webhook empty if not interested"))
+        self.ping_msg_input.setText(tm.get("ping_message", ""))
+        self.kill_after_enable_chk.setChecked(bool(tm.get("kill_enabled", True)))
+        self.kill_timeout_input.setEnabled(self.kill_after_enable_chk.isChecked())
+
+        # ---------- Webhooks table (tri-mode + legacy) ----------
+        self._clear_webhook_rows()
+        for wh in (settings.get("webhooks", []) or []):
+            url     = wh.get("url", "")
+            allowed = wh.get("biomes", []) or []      # legacy list your worker already uses
+            modes   = wh.get("biome_modes", {}) or {} # optional per-biome tri-state
+            if url:
+                try:
+                    self._add_webhook_row(url, allowed, modes)
+                except TypeError:
+                    self._add_webhook_row(url, allowed)
+
+        # ---------- Optional: Merchant + Pings (safe if widgets exist) ----------
+        ms = settings.get("multiscope", {}) or {}
+        if hasattr(self, "ms_merchant_webhook_input"):
+            self.ms_merchant_webhook_input.setText(ms.get("merchant_webhook", ""))
+
+        if hasattr(self, "ms_enable_jester"):
+            self.ms_enable_jester.setChecked(bool(ms.get("enable_jester", True)))
+        if hasattr(self, "ms_enable_mari"):
+            self.ms_enable_mari.setChecked(bool(ms.get("enable_mari", True)))
+
+        if hasattr(self, "ms_jester_type"):
+            self.ms_jester_type.setCurrentText(ms.get("jester_ping_type", "None"))
+        if hasattr(self, "ms_jester_id"):
+            self.ms_jester_id.setText(ms.get("jester_ping_id", ""))
+
+        if hasattr(self, "ms_mari_type"):
+            self.ms_mari_type.setCurrentText(ms.get("mari_ping_type", "None"))
+        if hasattr(self, "ms_mari_id"):
+            self.ms_mari_id.setText(ms.get("mari_ping_id", ""))
+
+
 
     def save_settings(self):
-        settings = {
-            "window_limit": self.settings_window_limit_input.value(),
-            "timeouts": {
-                "initial_delay": self.settings_initial_delay_input.value(),
-                "offline"      : self.settings_offline_threshold_input.value(),
-                "launch_delay" : self.settings_launch_delay_input.value(),
-                "strap_threshold": self.settings_strap_threshold_input.value(),
+        """Collect Settings UI and persist to settings.json, then live-apply."""
+        settings = self.config_manager.load_settings()
 
-            },
-            "timeout_monitor": {                              # NEW block
-            "kill_timeout" : self.kill_timeout_input.value(),
-            "poll_interval": self.poll_interval_input.value(),
-            "webhook_url"  : self.webhook_input.text().strip(),
-            "ping_message" : self.ping_msg_input.text().strip() or "<@YourPing> This message is sent whenever your active processes drop to 1 or 0, for debugging. Leave webhook empty if not interested"
-            }
-        }
+        # ---------- Basic ----------
+        settings["window_limit"] = self.settings_window_limit_input.value()
+        settings["spares_mode"]  = bool(self.spares_mode_chk.isChecked())
+        settings["spares_fraction"] = self.spares_split_cmb.currentText()
 
+        # ---------- Timing (timeouts) ----------
+        t = settings.get("timeouts", {}) or {}
+        t["initial_delay"]     = self.settings_initial_delay_input.value()
+        t["offline"]           = self.settings_offline_threshold_input.value()
+        t["launch_delay"]      = self.settings_launch_delay_input.value()
+        t["strap_threshold"]   = self.settings_strap_threshold_input.value()
+        t["handoff_lead"]      = self.handoff_lead_input.value()
+        t["early_join_window"] = self.early_join_window_input.value()
+        settings["timeouts"]   = t
+
+        # ---------- Shutdown monitor (timeout_monitor) ----------
+        tm = settings.get("timeout_monitor", {}) or {}
+        tm["kill_enabled"]  = bool(self.kill_after_enable_chk.isChecked())
+        tm["kill_timeout"]  = self.kill_timeout_input.value()
+        tm["poll_interval"] = self.poll_interval_input.value()
+        tm["webhook_url"]   = self.webhook_input.text().strip()
+        tm["ping_message"]  = self.ping_msg_input.text().strip()
+        settings["timeout_monitor"] = tm
+
+        # ---------- Webhooks table (tri-mode + legacy-compatible) ----------
+        webhooks = []
+        rows = self.webhooks_table.rowCount()
+        for r in range(rows):
+            url_item = self.webhooks_table.item(r, 0)
+            url = (url_item.text().strip() if url_item else "")
+            if not url:
+                continue
+
+            allowed = []        # legacy list your worker already uses today
+            biome_modes = {}    # new per-biome: "None"/"Message"/"Everyone"
+
+            # --- inside save_settings(), in the webhooks loop ---
+            for idx, biome_name in enumerate(GUI_BIOME_NAMES):
+                w = self.webhooks_table.cellWidget(r, 1 + idx)
+
+                # support wrapped combo (holder) and raw combo
+                cb = None
+                if isinstance(w, QComboBox):
+                    cb = w
+                elif hasattr(w, "findChild"):
+                    cb = w.findChild(QComboBox)
+
+                if cb is not None:
+                    mode = cb.currentText()
+                    biome_modes[str(biome_name).upper()] = mode
+                    if mode in ("Message", "Everyone"):
+                        allowed.append(str(biome_name).upper())
+                elif hasattr(w, "isChecked") and w.isChecked():  # legacy checkbox fallback
+                    allowed.append(str(biome_name).upper())
+
+            entry = {"url": url, "biomes": allowed}
+            if biome_modes:
+                entry["biome_modes"] = biome_modes
+            webhooks.append(entry)
+
+        settings["webhooks"] = webhooks
+
+        # ---------- Optional: Merchant + Pings (safe if widgets exist) ----------
+        ms = settings.get("multiscope", {}) or {}
+        if hasattr(self, "ms_merchant_webhook_input"):
+            ms["merchant_webhook"] = self.ms_merchant_webhook_input.text().strip()
+
+        if hasattr(self, "ms_enable_jester"):
+            ms["enable_jester"] = bool(self.ms_enable_jester.isChecked())
+        if hasattr(self, "ms_enable_mari"):
+            ms["enable_mari"]   = bool(self.ms_enable_mari.isChecked())
+
+        if hasattr(self, "ms_jester_type"):
+            ms["jester_ping_type"] = self.ms_jester_type.currentText()
+        if hasattr(self, "ms_jester_id"):
+            ms["jester_ping_id"]   = self.ms_jester_id.text().strip()
+        if hasattr(self, "ms_mari_type"):
+            ms["mari_ping_type"]   = self.ms_mari_type.currentText()
+        if hasattr(self, "ms_mari_id"):
+            ms["mari_ping_id"]     = self.ms_mari_id.text().strip()
+
+        # convenience: build mention strings the engine can use immediately (still optional)
+        def _mk_ping(typ: str, ident: str) -> str:
+            ident = (ident or "").strip()
+            if not ident:
+                return ""
+            if typ == "User ID":
+                return f"<@{ident}>"
+            if typ == "Role ID":
+                return f"<@&{ident}>"
+            return ident  # "None" or raw like "@everyone"
+
+        if ms:
+            ms["jester_ping"] = _mk_ping(ms.get("jester_ping_type", "None"), ms.get("jester_ping_id", ""))
+            ms["mari_ping"]   = _mk_ping(ms.get("mari_ping_type", "None"),   ms.get("mari_ping_id", ""))
+            settings["multiscope"] = ms
+
+        # ---------- Persist & live-apply ----------
         if self.config_manager.save_settings(settings):
             if self.worker_thread and self.worker_thread.isRunning():
                 self.worker_thread.apply_new_settings(settings)
             QMessageBox.information(self, "Success", "Settings saved and applied!")
         else:
             QMessageBox.critical(self, "Error", "Failed to save settings.")
-
 
 
     def reset_settings(self):
@@ -2802,7 +3858,108 @@ class RobloxManagerGUI(QMainWindow):
                 event.ignore()
         else:
             event.accept()
+    
+    def setup_multiscope_tab(self):
+        multiscope_widget = QWidget()
+        layout = QVBoxLayout(multiscope_widget)
+
+        self.multiscope_table = QTableWidget()
+        self.multiscope_table.setColumnCount(7)
+        self.multiscope_table.setHorizontalHeaderLabels([
+            "Server", "Users", "Last Biome", "Biome Age", "Last Merchant", "Merchant Age", "Events"
+        ])
+        header = self.multiscope_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.multiscope_table.verticalHeader().setDefaultSectionSize(44)
+
+        layout.addWidget(self.multiscope_table)
+
+        hint = QLabel(
+            "Multiscope groups accounts by the exact server they’re in.\n"
+            "Biome and merchant alerts persist across handoffs."
+        )
+        hint.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(hint)
+
+        self.tab_widget.addTab(multiscope_widget, "Multiscope")
+
+
+    def update_multiscope(self, rows: list):
+        # rows: [{server, users, last_biome|biome, biome_age, last_merchant|merchant, merchant_age, events}]
+        self.multiscope_table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            server = row.get("server", "—")
+            users_list = row.get("users", [])
+            users = ", ".join(users_list) if users_list else "—"
+
+            # accept both key styles
+            last_biome = row.get("last_biome", row.get("biome", "—"))
+            biome_age = row.get("biome_age")
+            last_merchant = row.get("last_merchant", row.get("merchant", "—"))
+            merchant_age = row.get("merchant_age")
+            events = str(row.get("events", 0))
+
+            self.multiscope_table.setItem(r, 0, QTableWidgetItem(server))
+            self.multiscope_table.setItem(r, 1, QTableWidgetItem(users))
+            self.multiscope_table.setItem(r, 2, QTableWidgetItem(last_biome))
+            self.multiscope_table.setItem(r, 3, QTableWidgetItem(f"{biome_age}s" if biome_age is not None else "—"))
+            self.multiscope_table.setItem(r, 4, QTableWidgetItem(last_merchant))
+            self.multiscope_table.setItem(r, 5, QTableWidgetItem(f"{merchant_age}s" if merchant_age is not None else "—"))
+            self.multiscope_table.setItem(r, 6, QTableWidgetItem(events))
+
             
+    def test_multiscope_webhooks(self):
+        try:
+            import requests
+        except Exception:
+            QMessageBox.warning(self, "Missing dependency", "The 'requests' library is required to send test webhooks.")
+            return
+
+        # Build fake embeds
+        biome_hooks_txt = self.ms_biome_webhooks_input.text().strip()
+        biome_hooks = [s.strip() for s in biome_hooks_txt.split(",") if s.strip()] if biome_hooks_txt else []
+        merchant_hook = self.ms_merchant_webhook_input.text().strip()
+        j_ping = self.ms_jester_ping_input.text().strip()
+        m_ping = self.ms_mari_ping_input.text().strip()
+
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+        biome_payload = {"content": "", "embeds": [{
+            "title": "🌍 Biome — TEST_BIOME",
+            "description": "**User:** `TestUser`\n**Server:** `PS:TEST…`",
+            "timestamp": now_iso, "color": 0x3BA55D
+        }]}
+
+        merch_payload_j = {"content": j_ping, "embeds": [{
+            "title": "🛒 Merchant — Jester",
+            "description": "**User:** `TestUser`\n**Server:** `PS:TEST…`",
+            "timestamp": now_iso, "color": 0x5865F2
+        }]}
+        merch_payload_m = {"content": m_ping, "embeds": [{
+            "title": "🛒 Merchant — Mari",
+            "description": "**User:** `TestUser`\n**Server:** `PS:TEST…`",
+            "timestamp": now_iso, "color": 0xE67E22
+        }]}
+
+        ok = 0; fail = 0
+        try:
+            for url in biome_hooks:
+                if not url: continue
+                r = requests.post(url, json=biome_payload, timeout=8)
+                (ok if r.ok else fail).__iadd__(1)
+            if merchant_hook:
+                r1 = requests.post(merchant_hook, json=merch_payload_j, timeout=8); (ok if r1.ok else fail).__iadd__(1)
+                r2 = requests.post(merchant_hook, json=merch_payload_m, timeout=8); (ok if r2.ok else fail).__iadd__(1)
+        except Exception:
+            fail += 1
+
+        QMessageBox.information(self, "Webhook Test", f"Sent: {ok}  •  Failed: {fail}")
 
 def main():
     app = QApplication(sys.argv)

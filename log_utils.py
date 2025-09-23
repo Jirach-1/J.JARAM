@@ -86,3 +86,11 @@ def find_log_for_username(
         return str(newest)
     except ValueError:
         return None
+
+def refresh_username_log_map() -> None:
+    """
+    Force-rebuild the strict username → newest-log mapping cache
+    so callers (e.g., MultiScopeEngine) see newly created/moved logs
+    immediately without waiting for the TTL.
+    """
+    _rebuild_cache()
