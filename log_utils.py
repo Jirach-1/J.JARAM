@@ -8,7 +8,7 @@ from typing import Optional
 ROBLOX_LOGS_DIR = os.path.join(os.getenv("LOCALAPPDATA"), "Roblox", "logs")
 
 # User-name marker ― exactly the same pattern detection.py relies on
-_PAT_LOAD_FAIL = re.compile(r"load failed in Players\.([^.]+)\.")
+_PAT_LOAD_FAIL = re.compile(r"Players\.([^.]+)\.")
 
 # Disconnect strings that trigger an immediate restart
 R_DISC_REASON  = re.compile(r"\[FLog::Network\]\s+Disconnect reason received:\s*(\d+)", re.I)
@@ -62,7 +62,7 @@ def find_log_for_username(
 ) -> Optional[str]:
     """
     Return the newest Roblox log that contains
-    “load failed in Players.<username>.”.
+    “Players.<username>.”.
 
     • If *allow_fallback* is False and no match is found, returns **None**.  
     • If *allow_fallback* is True, falls back to the newest log in the folder.

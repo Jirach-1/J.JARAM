@@ -34,6 +34,11 @@
         "thumbnail_url": "https://i.postimg.cc/ncZQ84Dh/image.png",
         "Timer": "660"
     },
+    "Cyberspace": {
+        "color": "0x011ab7",
+        "thumbnail_url": "https://at-cdn-s01.audiotool.com/2013/06/13/documents/zW2OHriFzthb06Ty5h9tUxEGgEw/0/cover256x256-f161eb9cd16c4786bbb3c78292e7131f.jpg",
+        "Timer": "150"
+    },
     "NULL": {
         "color": "0x838383",
         "thumbnail_url": "https://static.wikia.nocookie.net/sol-rng/images/f/fc/NULLLL.png",
@@ -47,7 +52,7 @@
     "DREAMSPACE": {
         "color": "0xea9dda",
         "thumbnail_url": "https://i.postimg.cc/rFjCcW3w/image.png",
-        "Timer": "128"
+        "Timer": "192"
     },
     "NORMAL": {
         "color": "0x00ff00",
@@ -57,5 +62,25 @@
         "color": "0XFF8900",
         "thumbnail_url": "https://static.wikia.nocookie.net/supermarioglitchy4/images/b/b5/Angry_Sun_SMB3.png/revision/latest?cb=20230512215153",
         "Timer": "150"
+    },
+    "Graveyard": {
+        "color": "0XFF8900",
+        "thumbnail_url": "https://images.vexels.com/media/users/3/136069/isolated/lists/399370e90f142aff65c2c3963134b11d-graveyard-tombstones.png",
+        "Timer": "150"
+    },
+    "Pumpkin Moon": {
+        "color": "0XFF8900",
+        "thumbnail_url": "https://cdn.shopify.com/s/files/1/0125/8261/7145/files/Pumpkin_Plushie-SV2-P-1_1000x.png.webp?v=1759503127",
+        "Timer": "150"
+    },
+    "Blood Rain": {
+        "color": "0XFF8900",
+        "thumbnail_url": "https://cdn-icons-png.flaticon.com/512/967/967119.png",
+        "Timer": "150"
+    },
+    "Heaven": {
+        "color": "0XFFDE5E",
+        "thumbnail_url": "https://static.myfigurecollection.net/upload/items/2/1356930-3ff0a.jpg",
+        "Timer": "240"
     }
 }

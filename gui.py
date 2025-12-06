@@ -6,20 +6,23 @@ import shutil
 import requests
 import psutil
 import re
-from typing import Dict, Set
+import threading
+from typing import Dict, Set, List, Tuple, Optional
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen
+from PIL import Image
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QGridLayout, QTabWidget, QTableWidget,
                             QTableWidgetItem, QPushButton, QLabel, QLineEdit,
-                            QSpinBox, QTextEdit, QGroupBox,QStackedLayout,
+                            QSpinBox, QDoubleSpinBox, QTextEdit, QGroupBox, QStackedLayout,
                             QProgressBar, QComboBox, QCheckBox, QSplitter,
                             QHeaderView, QMessageBox, QDialog, QDialogButtonBox,
                             QFormLayout, QScrollArea, QFrame, QSizePolicy,
-                            QAbstractItemView, QHeaderView, QScrollArea)
-from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt, QSize,  QBuffer, QByteArray, QIODevice, QRectF, QPointF
-from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QMovie, QRegion, QPainterPath
+                            QAbstractItemView, QHeaderView, QScrollArea, QRubberBand,
+                            QRadioButton, QListWidget, QListWidgetItem)
+from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt, QSize,  QBuffer, QByteArray, QIODevice, QRectF, QPointF, QRect, QPoint
+from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QMovie, QRegion, QPainterPath, QImage, QTextCursor
 # ---------- Qt6 enum shims (keep PyQt5-style constants working) ----------
 # Paste directly below your current PyQt6 imports.
 
@@ -53,13 +56,82 @@ from main import RobloxManager, ProcessManager, GameLauncher
 from cookie_extractor import CookieExtractor
 from RAM_export import transform         # re-use your parsing helper
 from main import limit_strap_helpers
-from log_utils import find_log_for_username, R_DISC_REASON, R_DISC_NOTIFY, R_DISC_SENDING, R_CONN_LOST
+from log_utils import find_log_for_username
 from biomes import biome_names
 from utilities_tab import setup_UTILITIES_tab
 # Exclude NORMAL from the Settings table (still exists internally, we just don't offer it as a toggle)
 GUI_BIOME_NAMES = [b for b in biome_names() if str(b).upper() != "NORMAL"]
 from multiscope import MultiScopeEngine
+from antiafk import AntiAFK
+from ocr_worker import (
+    OCRWorker,
+    enum_roblox_windows,
+    capture_window_image,
+    preprocess_for_ocr,
+    ColorFilter,
+    get_ocr_device_summary,
+)
 
+# --- minimal crash logging (EXE-safe, AV-friendly) ---
+import os, sys, atexit, logging, logging.handlers, threading, warnings
+from pathlib import Path
+
+# Put logs in Jaram folder
+_log_dir = Path(os.getenv("APPDATA", Path.home())) / "Jaram" / "logs"
+_log_dir.mkdir(parents=True, exist_ok=True)
+LOGFILE = _log_dir / "JARAM.log"
+
+_logger = logging.getLogger("jaram")
+_logger.setLevel(logging.INFO)
+
+# Rotate at ~1MB, keep 3 backups
+_handler = logging.handlers.RotatingFileHandler(
+    LOGFILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+)
+_formatter = logging.Formatter(
+    fmt="%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_handler.setFormatter(_formatter)
+_logger.addHandler(_handler)
+
+# Also capture warnings->logging (no consoles needed)
+warnings.simplefilter("default")
+logging.captureWarnings(True)
+
+def _log_unhandled(exc_type, exc_value, exc_traceback):
+    try:
+        _logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    except Exception:
+        pass
+
+# Main-thread uncaught exceptions
+sys.excepthook = _log_unhandled
+
+# Python 3.8+ thread exceptions
+def _thread_excepthook(args: threading.ExceptHookArgs):
+    _log_unhandled(args.exc_type, args.exc_value, args.exc_traceback)
+threading.excepthook = _thread_excepthook
+
+# Python "unraisable" (e.g., __del__ errors)
+def _unraisable_hook(unraisable):
+    try:
+        _logger.error("Unraisable exception: %r", unraisable.err_msg, exc_info=(unraisable.exc_type, unraisable.exc_value, unraisable.exc_traceback))
+    except Exception:
+        pass
+setattr(sys, "unraisablehook", _unraisable_hook)
+
+# Clean shutdown of handlers
+def _close_handlers():
+    for h in list(_logger.handlers):
+        try:
+            h.flush()
+            h.close()
+        except Exception:
+            pass
+        _logger.removeHandler(h)
+atexit.register(_close_handlers)
+# --- end minimal crash logging ---
 
 def _get_icon_path():
 
@@ -78,6 +150,33 @@ def _get_icon_path():
         return icon_path
 
     return None
+
+# Lockout
+def _bm_relaxed() -> bool:
+    try:
+        if os.environ.get("JARAM_UNLOCK", "").strip() == "1":
+            return True
+    except Exception:
+        pass
+    try:
+        # Check for the sentinel both in the current working directory and, if bundled,
+        # alongside the frozen executable (PyInstaller exposes sys._MEIPASS).
+        candidates = [Path("JARAM.biu")]
+        try:
+            import sys as _sys
+            if getattr(_sys, "_MEIPASS", None):
+                candidates.append(Path(getattr(_sys, "_MEIPASS")) / "JARAM.biu")
+        except Exception:
+            pass
+        for sentinel in candidates:
+            try:
+                if sentinel.exists():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
 
 class ConfigManager:
 
@@ -116,6 +215,30 @@ class ConfigManager:
                 "merchant_rate_limit": 15,   # seconds (global cooldown for merchant alerts)
                 "biome_min_interval": 2,     # seconds per server (dampen bursts)
             },
+            "ocr": {
+                "enabled": False,             # current desired state
+                "workers": 2,
+                "max_captures_per_second": 20,
+                "cooldown_seconds": 600,
+                "use_preprocess": True,
+                "roi": {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
+                "color_filters": [
+                    {"name": "white_text", "r": 255, "g": 255, "b": 255, "tol": 40, "enabled": True},
+                    {"name": "purple_text", "r": 145, "g": 67, "b": 255, "tol": 40, "enabled": True},
+                ],
+            },
+
+            "antiafk": {
+                "antiafk_enabled": False,
+                "multi_instance_enabled": False,
+                "antiafk_interval": 120,
+            "antiafk_action": "space",
+            "antiafk_user_safe": False,
+            "antiafk_dev_mode": False,
+            "antiafk_sequential_mode": False,
+            "antiafk_sequential_delay": 0.75,
+            "antiafk_menu_autoreconnect": False,
+            },
 
         }
 
@@ -125,7 +248,8 @@ class ConfigManager:
             "cookie": "",
             "private_server_link": "",
             "place": "",
-            "bad": False
+            "bad": False,
+            "disabled": False,
         }
         
 
@@ -294,7 +418,9 @@ class ConfigManager:
                     "username": f"User_{user_id}",
                     "cookie": user_info,
                     "private_server_link": "",
-                    "place": ""
+                    "place": "",
+                    "bad": False,
+                    "disabled": False,
                 }
             elif isinstance(user_info, dict):
 
@@ -303,7 +429,8 @@ class ConfigManager:
                     "cookie": user_info.get("cookie", ""),
                     "private_server_link": user_info.get("private_server_link", ""),
                     "place": user_info.get("place", ""),
-                    "bad":  user_info.get("bad", False)
+                    "bad":  user_info.get("bad", False),
+                    "disabled": user_info.get("disabled", False),
                 }
             else:
 
@@ -312,7 +439,8 @@ class ConfigManager:
                     "cookie": "",
                     "private_server_link": "",
                     "place": "",
-                    "bad":  ""
+                    "bad":  False,
+                    "disabled": False,
                 }
         return new_data
 
@@ -341,7 +469,8 @@ class ConfigManager:
                     "username": f"User_{user_id}",
                     "cookie": user_info,
                     "private_server_link": "",
-                    "place": ""
+                    "place": "",
+                    "disabled": False,
                 }
         return manager_format
 
@@ -579,6 +708,8 @@ class WorkerThread(QThread):
         self.manager          = None
         self.process_mgr      = None
         self.launcher         = None
+        self._ramp_thread     = None
+
 
         self.user_states      = {}
         self.log_pointers     = {}
@@ -616,11 +747,12 @@ class WorkerThread(QThread):
         # Multiscope
         self.ms = None  # ← NEW: MultiScopeEngine instance
         
-        self._last_good_set = set()  # tracks which users are currently 'good' (bad == False)
+        self._last_good_set = set()  # tracks which users are currently 'good' (bad/disabled == False)
         self._reservations_ttl = 60  # seconds a server is "held" by a handoff pre-join
         self.preconnect_grace = 120  # seconds to wait for username to show in logs on first connect
         self._waiting_usernames_since = {}  # uid -> epoch; cleaned up automatically
-
+        self._boot_phase = True  # use initial_delay for any launches during ramp
+        
     # -------------- utilities -----------------
     def _log(self, msg: str):
         self.log_signal.emit(msg)
@@ -637,7 +769,7 @@ class WorkerThread(QThread):
 
     # -------------- pools ---------------------
     def _recompute_pools(self):
-        # Prefer live user_states (reflects in-memory bad flips immediately)
+        # Prefer live user_states (reflects in-memory bad/disabled flips immediately)
         if getattr(self, "user_states", None):
             source_items = [
                 (uid, st.get("user_info", {}))
@@ -647,10 +779,15 @@ class WorkerThread(QThread):
             # Fallback during very early init
             source_items = list(self.manager.settings.items())
 
-        good = [uid for uid, info in source_items if not info.get("bad", False)]
-        good_sorted = sorted(good)
+        total_users = len(source_items)
+        bad_count = sum(1 for _uid, info in source_items if info.get("bad", False))
+        disabled_count = sum(1 for _uid, info in source_items if info.get("disabled", False))
 
-        # NEW:
+        good_sorted = sorted(
+            uid for uid, info in source_items
+            if not info.get("bad", False) and not info.get("disabled", False)
+        )
+
         if self.spares_mode:
             n = len(good_sorted)
             # ceil(n * num/den) without importing math
@@ -662,7 +799,8 @@ class WorkerThread(QThread):
         self.spare_pool  = set(good_sorted[target_active:])
 
         self._log(
-            f"Pools set — spares_mode={self.spares_mode} active={len(self.active_pool)} spare={len(self.spare_pool)}"
+            f"Pools set - spares_mode={self.spares_mode} active={len(self.active_pool)} "
+            f"spare={len(self.spare_pool)} total={total_users} bad={bad_count} disabled={disabled_count}"
         )
 
 
@@ -673,7 +811,9 @@ class WorkerThread(QThread):
             # Skip if bad in live state OR in settings (covers recent flips + reloads)
             is_bad_live = bool(st and st.get("user_info", {}).get("bad", False))
             is_bad_cfg  = bool(self.manager.settings.get(uid, {}).get("bad", False))
-            if is_bad_live or is_bad_cfg:
+            is_disabled_live = bool(st and st.get("user_info", {}).get("disabled", False))
+            is_disabled_cfg  = bool(self.manager.settings.get(uid, {}).get("disabled", False))
+            if is_bad_live or is_bad_cfg or is_disabled_live or is_disabled_cfg:
                 continue
 
             live = [
@@ -810,8 +950,6 @@ class WorkerThread(QThread):
 
         return False, server_label, ""
 
-
-
     # -------------- handoff -------------------
     def _launch_spare_into_donors_server(self, donor_uid: str, donor_info: dict) -> bool:
         """
@@ -881,8 +1019,6 @@ class WorkerThread(QThread):
         except Exception:
             pass
         return False
-
-
 
 
     def _complete_handoff(self, donor_uid: str, spare_uid: str):
@@ -1039,6 +1175,11 @@ class WorkerThread(QThread):
                 info = self.manager.settings.get(uid, {}) or {}
                 return str(info.get("cookie") or "")
 
+            # Expose helpers for other workers (OCR, etc.)
+            self.get_ps_link_for_user = _get_ps_link
+            self.get_owner_for_user = _get_owner_for_ms
+            self.get_username_for_user = _get_username
+
             self.ms = MultiScopeEngine(
                 get_username=_get_username,
                 get_server_label=lambda uid: self.manager.process_tracker.user_server.get(uid, ""),
@@ -1074,7 +1215,6 @@ class WorkerThread(QThread):
         except Exception as e:
             self.log_signal.emit(f"Manager init failed: {e}")
             return False
-
 
 
     def apply_new_settings(self, cfg: dict):
@@ -1140,6 +1280,58 @@ class WorkerThread(QThread):
 
         self._recompute_pools()
 
+    def _ramp_up_launches(self):
+        """Launch initial sessions in the background so the main loop (and ms.tick) stays active."""
+        try:
+            # mirror old 'initialization' behavior for any consumers
+            try:
+                self.manager.process_tracker.initialization_mode = True
+            except Exception:
+                pass
+
+            launch_list = sorted(self.active_pool) if self.spares_mode else [uid for uid, _ in self.manager.settings.items()]
+            total = len(launch_list)
+
+            for i, uid in enumerate(launch_list):
+                if not self.running:
+                    break
+
+                st = self.user_states.get(uid, {})
+                info = st.get("user_info", {})
+                if info.get("disabled", False):
+                    continue
+                if info.get("bad", False):
+                    continue
+
+                cookie = info.get("cookie", "")
+                # First user launches immediately; subsequent users spaced by initial_delay
+                self.launcher.start_game_session(uid, cookie, info, skip_cleanup=True)
+                self.user_states[uid]["last_launch"] = time.time()
+
+                # optional: a quick warm tick; main loop is already ticking continuously
+                try:
+                    self._ms_prelaunch_tick()
+                except Exception:
+                    pass
+
+                # Apply initial_delay only BETWEEN launches (i.e., after the first user)
+                if i < total - 1:
+                    ticks = max(0, int(self.initial_delay * 10))  # 0.1s steps for responsive stop()
+                    for _ in range(ticks):
+                        if not self.running:
+                            break
+                        time.sleep(0.1)
+                    if not self.running:
+                        break
+        except Exception as e:
+            self._log(f"[RampUp] error: {e}")
+        finally:
+            # end boot phase → subsequent launches use launch_delay
+            self._boot_phase = False
+            try:
+                self.manager.process_tracker.initialization_mode = False
+            except Exception:
+                pass
 
     # -------------- actions -------------------
     def restart_user_session(self, user_id):
@@ -1194,409 +1386,404 @@ class WorkerThread(QThread):
         if self.spares_mode and not self.active_pool:
             self._recompute_pools()
 
-        # first launch: either half (active_pool) or everyone
-        if self.spares_mode:
-            for i, uid in enumerate(sorted(self.active_pool)):
-                info = self.user_states[uid]["user_info"]
-                if info.get("bad", False):
-                    continue
-                cookie = info.get("cookie", "")
-                self.launcher.start_game_session(uid, cookie, info, skip_cleanup=True)
-                self.user_states[uid]["last_launch"] = time.time()
-                if i < len(self.active_pool) - 1:
-                    time.sleep(self.initial_delay)
-        else:
-            self.launcher.initialize_all_sessions(self.manager.settings)
-            now = time.time()
-            for uid in self.user_states:
-                self.user_states[uid]["last_launch"] = now
+        # Start launching in the background so ms.tick is fully active now
+        self._ramp_thread = threading.Thread(target=self._ramp_up_launches, name="JARAM-RampUp", daemon=True)
+        self._ramp_thread.start()
 
         while self.running:
-            now = time.time()
-            
-            # ---- Hot reload users.json (propagate "bad" flips etc.) ----
             try:
-                fresh_map = self.cfg_manager.get_users_for_manager() or {}
-            except Exception:
-                fresh_map = {}
-
-            # Only do work if something actually changed
-            if fresh_map and fresh_map != self.manager.settings:
-                old_ids = set(self.manager.settings.keys())
-                new_ids = set(fresh_map.keys())
-
-                # 1) Remove users that no longer exist
-                for uid in (old_ids - new_ids):
-                    # Optional: terminate any lingering processes
-                    for pid in self.manager.process_tracker.user_processes.get(uid, []).copy():
-                        if self.process_mgr.verify_process_active(pid):
-                            self.process_mgr.terminate_process(pid, self.manager.process_tracker)
-                    self.user_states.pop(uid, None)
-                    self.handoff_for.pop(uid, None)
-                    self.active_pool.discard(uid)
-                    self.spare_pool.discard(uid)
-
-                # 2) Add new users (if any)
-                now2 = time.time()
-                for uid in (new_ids - old_ids):
-                    info = fresh_map.get(uid, {})
-                    self.user_states[uid] = {
-                        "last_active": now2,
-                        "inactive_since": None,
-                        "user_info": info,
-                        "requires_restart": False,
-                        "status": "Initializing",
-                    }
-
-                # 3) Update info for existing users (this brings in new "bad" flags)
-                for uid in (new_ids & old_ids):
-                    self.user_states[uid]["user_info"] = fresh_map[uid]
-
-                # 4) Swap the snapshot and recompute pools
-                self.manager.settings = fresh_map
-                self._recompute_pools()           # pools depend on "bad" flags in settings
-                if self.ms:
-                    self.ms.update_users(list(self.user_states.keys()))
-            # ---- end hot reload ----
-
-
-            # housekeeping
-            if now - self.timing_trackers['cleanup'] >= self.manager.check_intervals['cleanup']:
-                self.process_mgr.cleanup_dead_processes(self.manager.process_tracker)
-                self.timing_trackers['cleanup'] = now
-            if now - self.timing_trackers['window'] >= self.manager.check_intervals['window']:
-                for pid, nwin in self.process_mgr.count_windows_by_process().items():
-                    if nwin > self.manager.window_limit and pid != self.manager.excluded_pid:
-                        self.process_mgr.terminate_process(pid, self.manager.process_tracker)
-                self.timing_trackers['window'] = now
-            
-            # After housekeeping, before relaunch logic
-            self._enforce_one_per_server()
-            self._prune_reservations()
-
-            # --- sync bad flags + evict from pools immediately ---
-            try:
-                changed = False
-                for uid, cfg_info in self.manager.settings.items():
-                    st = self.user_states.get(uid)
-                    if not st:
-                        continue
-                    bad_disk = bool(cfg_info.get("bad", False))
-                    if st["user_info"].get("bad", False) != bad_disk:
-                        st["user_info"]["bad"] = bad_disk
-                        changed = True
-
-                    # If bad, evict from both pools and cancel any in-flight handoff roles
-                    if bad_disk:
-                        if uid in self.active_pool or uid in self.spare_pool:
-                            self.active_pool.discard(uid)
-                            self.spare_pool.discard(uid)
-                            changed = True
-                        # If this bad user is being used as a spare for a donor, cancel it
-                        donors = [d for d, s in self.handoff_for.items() if s == uid]
-                        for d in donors:
-                            self.handoff_for.pop(d, None)
-            except Exception as _e:
-                self._log(f"[Sync] bad-flag sync error: {_e}")
-
-            # If the good-set changed, rebuild pools from the live state (keeps odd/even split correct)
-            try:
-                current_good = {
-                    u for u, s in self.user_states.items()
-                    if not s.get("user_info", {}).get("bad", False)
-                }
-                if current_good != getattr(self, "_last_good_set", set()):
-                    self._last_good_set = current_good
-                    self._recompute_pools()
-            except Exception as _e:
-                self._log(f"[Pools] good-set recompute error: {_e}")
-
-
-            # low-count watchdog
-            STUCK_TIMEOUT = 300
-            total_users = len([u for u, i in self.manager.settings.items() if not i.get("bad", False)])
-            active_processes = sum(
-                1 for p in psutil.process_iter(['name','pid'])
-                if p.info['name'] == 'RobloxPlayerBeta.exe' and p.info['pid'] != self.manager.excluded_pid
-            )
-            if active_processes > self._last_proc_count:
-                self._last_proc_count = active_processes
-                self._last_growth_ts = now
-            else:
-                self._last_proc_count = active_processes
-            if active_processes < total_users and (now - self._last_growth_ts) >= STUCK_TIMEOUT:
-                limit_strap_helpers(threshold=1, kill_all=False)
-                self._last_growth_ts = now
-
-            # per-user heartbeat
-            status = {}
-            kill_t = self.manager.timeout_monitor.kill_timeout
-
-            for uid, st in self.user_states.items():
-                info = st["user_info"]
-                # bad users
-                if info.get("bad", False):
-                    status[uid] = {
-                        "status": "Bad",
-                        "pids": [],
-                        "needs_restart": False,
-                        "last_active": st.get("last_active", 0),
-                        "inactive_since": st.get("inactive_since"),
-                        "ttl": [],
-                        "server": self.manager.process_tracker.user_server.get(uid, ""),
-                    }
-                    continue
-                
-                live = [pid for pid in self.manager.process_tracker.user_processes.get(uid, []) if self.process_mgr.verify_process_active(pid)]
-                
-                # --- NEW: pre-connect watchdog -------------------------------------------
-                # If this account has live processes but we still don't have a strict log
-                # match for its username within 2 minutes of launch, assume it failed to
-                # connect and recycle it.
                 now = time.time()
-                uname = str(info.get("username", "")).lower()
+                
+                # ---- Hot reload users.json (propagate "bad" flips etc.) ----
+                try:
+                    fresh_map = self.cfg_manager.get_users_for_manager() or {}
+                except Exception:
+                    fresh_map = {}
 
-                if live:
-                    # Strict lookup: only returns a path once the username actually appears in logs
-                    log_path = find_log_for_username(uname, allow_fallback=False)
+                # Only do work if something actually changed
+                if fresh_map and fresh_map != self.manager.settings:
+                    old_ids = set(self.manager.settings.keys())
+                    new_ids = set(fresh_map.keys())
 
-                    if not log_path:
-                        # oldest process start for this user
-                        oldest_ct = min(self.manager.process_tracker.creation_timestamps.get(pid, now) for pid in live)
-                        waited = now - oldest_ct
+                    # 1) Remove users that no longer exist
+                    for uid in (old_ids - new_ids):
+                        # Optional: terminate any lingering processes
+                        for pid in self.manager.process_tracker.user_processes.get(uid, []).copy():
+                            if self.process_mgr.verify_process_active(pid):
+                                self.process_mgr.terminate_process(pid, self.manager.process_tracker)
+                        self.user_states.pop(uid, None)
+                        self.handoff_for.pop(uid, None)
+                        self.active_pool.discard(uid)
+                        self.spare_pool.discard(uid)
 
-                        # (optional) remember we're waiting; handy for trace logs
-                        # self._waiting_usernames_since.setdefault(uid, oldest_ct)
+                    # 2) Add new users (if any)
+                    now2 = time.time()
+                    for uid in (new_ids - old_ids):
+                        info = fresh_map.get(uid, {})
+                        self.user_states[uid] = {
+                            "last_active": now2,
+                            "inactive_since": None,
+                            "requires_restart": False,
+                            "user_info": info.copy() if isinstance(info, dict) else {},
+                            "status": "Offline",
+                        }
 
-                        if waited >= self.preconnect_grace:
-                            self._log(f"⚠️  {uname} did not appear in logs within {self.preconnect_grace}s — terminating")
-                            self.kill_user_processes(uid)
-                            st["requires_restart"] = True
-                            # clean up a bit so next launch is fresh
-                            self.log_pointers.pop(uid, None)
-                            self.manager.process_tracker.user_server[uid] = "DISCONNECTED"
-                            # (optional) stop tracking the wait
-                            # self._waiting_usernames_since.pop(uid, None)
-                            # Skip the rest of the log-based disconnect checks for this uid this tick
-                            continue
-                    else:
-                        # (optional) we *did* see the username; stop tracking waits
-                        # self._waiting_usernames_since.pop(uid, None)
-                        pass
-                # --- END new watchdog -----------------------------------------------------
-
-
-                # disconnect via logs
-                uname = str(info.get("username", "")).lower()
-                log_path = find_log_for_username(uname, allow_fallback=False)
-                if live and log_path and os.path.isfile(log_path):
+                    # 3) Replace settings and re-compute pools
+                    self.manager.settings = fresh_map
                     try:
-                        last_pos   = self.log_pointers.get(uid, 0)
-                        cur_sz     = os.path.getsize(log_path)
-                        if cur_sz < last_pos:
-                            last_pos = cur_sz
-                        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-                            f.seek(last_pos)
-                            chunk = f.read()
-                        self.log_pointers[uid] = cur_sz
-                        if chunk:
-                            for line in chunk.splitlines():
-                                pos_net = line.lower().find("[flog::network]")
-                                pos_txt = line.lower().find("text:")
-                                if pos_txt != -1 and pos_txt < pos_net:
-                                    continue
-                                if (m := R_DISC_REASON.search(line)) or (m := R_DISC_NOTIFY.search(line)) or (m := R_DISC_SENDING.search(line)) or R_CONN_LOST.search(line):
-                                    self._log(f"⚠️  {uname} disconnect detected – terminating")
-                                    self.kill_user_processes(uid)
-                                    st["requires_restart"] = True
-                                    live = []
-                                    break
+                        self._recompute_pools()
+                    except Exception as _e:
+                        self._log(f"[Pools] recompute error: {_e}")
+
+                # housekeeping: clean dead processes
+                if 'cleanup' not in self.timing_trackers:
+                    self.timing_trackers['cleanup'] = 0
+                if 'window' not in self.timing_trackers:
+                    self.timing_trackers['window'] = 0
+                if 'relaunch' not in self.timing_trackers:
+                    self.timing_trackers['relaunch'] = 0
+
+                if now - self.timing_trackers['cleanup'] >= self.manager.check_intervals['cleanup']:
+                    try:
+                        self.process_mgr.cleanup_dead_processes(self.manager.process_tracker)
                     except Exception as e:
-                        self._trace(uid, f"log scan error: {e}")
+                        self._log(f"[Cleanup] error: {e!r}")
+                    self.timing_trackers['cleanup'] = now
 
-                # TTLs
-                ttl_list = []
-                min_ttl = None
-                for pid in live:
-                    ct  = self.manager.process_tracker.creation_timestamps.get(pid, now)
-                    ttl = max(0, int(kill_t - (now - ct)))
-                    ttl_list.append(ttl)
-                    if min_ttl is None or ttl < min_ttl:
-                        min_ttl = ttl
+                if now - self.timing_trackers['window'] >= self.manager.check_intervals['window']:
+                    try:
+                        # enforce window cap: kill helpers with too many windows
+                        win_counts = self.process_mgr.count_windows_by_process()
+                        for pid, nwin in win_counts.items():
+                            if nwin > self.manager.window_limit and pid != self.manager.excluded_pid:
+                                self.process_mgr.terminate_process(pid, self.manager.process_tracker)
+                    except Exception as e:
+                        self._log(f"[WindowCheck] error: {e!r}")
+                    self.timing_trackers['window'] = now
+                
+                # After housekeeping, before relaunch logic
+                self._enforce_one_per_server()
+                self._prune_reservations()
 
-                # donor standby
-                if self.spares_mode and uid in self.handoff_for:
-                    spare_uid = self.handoff_for[uid]
-                    spare_live = any(
-                        self.process_mgr.verify_process_active(pid)
-                        for pid in self.manager.process_tracker.user_processes.get(spare_uid, [])
-                    )
-                    if spare_live:
-                        st["status"] = "Standby (handoff)"
-                        st["requires_restart"] = False
-                        st["inactive_since"] = None
-                        if not live:
-                            self._complete_handoff(uid, spare_uid)
+                # --- sync bad flags + evict from pools immediately ---
+                try:
+                    changed = False
+                    for uid, cfg_info in list(self.manager.settings.items()):
+                        st = self.user_states.get(uid)
+                        if not st:
+                            continue
+                        bad_disk = bool(cfg_info.get("bad", False))
+                        if st["user_info"].get("bad", False) != bad_disk:
+                            st["user_info"]["bad"] = bad_disk
+                            changed = True
 
+                        # If bad, evict from both pools and cancel any in-flight handoff roles
+                        if bad_disk:
+                            if uid in self.active_pool or uid in self.spare_pool:
+                                self.active_pool.discard(uid)
+                                self.spare_pool.discard(uid)
+                                changed = True
+                            # If this bad user is being used as a spare for a donor, cancel it
+                            donors = [d for d, s in list(self.handoff_for.items()) if s == uid]
+                            for d in donors:
+                                self.handoff_for.pop(d, None)
+                    if changed and self.spares_mode:
+                        self._recompute_pools()
+                except Exception as _e:
+                    self._log(f"[Sync] bad-flag sync error: {_e}")
+
+                # Count live processes and guard against stalls
+                active_processes = sum(
+                    len([pid for pid in self.manager.process_tracker.user_processes.get(uid, [])
+                        if self.process_mgr.verify_process_active(pid)])
+                    for uid in list(self.manager.settings.keys())
+                )
+                total_users = len(self.manager.settings)
+                STUCK_TIMEOUT = self.manager.check_intervals.get('stuck_guard', 90)
+
+                if active_processes > self._last_proc_count:
+                    self._last_proc_count = active_processes
+                    self._last_growth_ts = now
+                else:
+                    self._last_proc_count = active_processes
+                if active_processes < total_users and (now - self._last_growth_ts) >= STUCK_TIMEOUT:
+                    limit_strap_helpers(threshold=1, kill_all=False)
+                    self._last_growth_ts = now
+
+                # per-user heartbeat
+                status = {}
+                kill_t = self.manager.timeout_monitor.kill_timeout
+
+                for uid, st in list(self.user_states.items()):
+                    info = st["user_info"]
+                    # bad users
+                    if info.get("bad", False):
                         status[uid] = {
-                            "status": st["status"],
-                            "pids": live,
+                            "status": "Bad",
+                            "pids": [],
                             "needs_restart": False,
                             "last_active": st.get("last_active", 0),
                             "inactive_since": st.get("inactive_since"),
-                            "ttl": ttl_list,
+                            "ttl": [],
                             "server": self.manager.process_tracker.user_server.get(uid, ""),
                         }
                         continue
-
-                # normal state
-                if live:
-                    st["last_active"] = now
-                    st["inactive_since"] = None
-                    st["requires_restart"] = False
-                    st["status"] = "Active"
-                else:
-                    if st["inactive_since"] is None:
-                        st["inactive_since"] = now
-                    idle = now - st["inactive_since"]
-                    st["status"] = f"Inactive ({int(idle)} s)"
-                    if idle >= self.restart_threshold:
-                        st["requires_restart"] = True
-
-                status[uid] = {
-                    "status": st["status"],
-                    "pids": live,
-                    "needs_restart": st["requires_restart"],
-                    "last_active": st.get("last_active", 0),
-                    "inactive_since": st.get("inactive_since"),
-                    "ttl": ttl_list,
-                    "server": self.manager.process_tracker.user_server.get(uid, ""),
-                }
-
-                # pre-join spare
-                if (self.spares_mode and uid in self.active_pool and min_ttl is not None
-                    and uid not in self.handoff_for and not info.get("bad", False)):
-                    if min_ttl <= self.handoff_lead or min_ttl <= self.early_join_window:
-                        self._launch_spare_into_donors_server(uid, info)
-            
-            # --- detect changes to the good-set and rebuild pools on-the-fly ---
-            try:
-                current_good = {
-                    u for u, s in self.user_states.items()
-                    if not s.get("user_info", {}).get("bad", False)
-                }
-                if current_good != getattr(self, "_last_good_set", set()):
-                    self._last_good_set = current_good
-                    self._recompute_pools()
-            except Exception as _e:
-                self._log(f"[Pools] good-set recompute error: {_e}")
-
-
-            self.status_signal.emit(status)
-            
-            # Multiscope: update detection and push snapshot to the tab
-            try:
-                if hasattr(self, "ms") and self.ms:
-                    self.ms.tick(status)                 # feed current user/server state
-                    rows = self.ms.snapshot()            # [{server, users, biome/merchant…}]
-                    self.multiscope_signal.emit(rows)    # GUI will render it
-            except Exception as _e:
-                self._log(f"[Multiscope] tick error: {_e}")
-
-
-            # process table signal
-            proc_info = {}
-            for uid, pids in self.manager.process_tracker.user_processes.items():
-                for pid in pids:
-                    if not self.process_mgr.verify_process_active(pid):
+                    # disabled users: do not launch/restart
+                    if info.get("disabled", False):
+                        status[uid] = {
+                            "status": "Disabled",
+                            "pids": [],
+                            "needs_restart": False,
+                            "last_active": st.get("last_active", 0),
+                            "inactive_since": st.get("inactive_since"),
+                            "ttl": [],
+                            "server": self.manager.process_tracker.user_server.get(uid, ""),
+                        }
+                        st["requires_restart"] = False
                         continue
-                    created = datetime.fromtimestamp(self.manager.process_tracker.creation_timestamps.get(pid, time.time())).strftime("%H:%M:%S")
-                    windows = self.process_mgr.count_windows_by_process().get(pid, 0)
-                    proc_info[pid] = {"user_id": uid, "created": created, "windows": windows}
-            self.process_signal.emit(proc_info)
+                    
+                    live = [pid for pid in self.manager.process_tracker.user_processes.get(uid, [])
+                            if self.process_mgr.verify_process_active(pid)]
+                    
+                    # --- NEW: pre-connect watchdog -------------------------------------------
+                    # If this account has live processes but we still don't have a strict log
+                    # match for its username within 2 minutes of launch, assume it failed to
+                    # connect and recycle it.
+                    now = time.time()
+                    uname = str(info.get("username", "")).lower()
 
+                    if live:
+                        # Strict lookup: only returns a path once the username actually appears in logs
+                        log_path = find_log_for_username(uname, allow_fallback=False)
 
-            # auto-restart queue (skip donors in handoff)
-            restartables = [
-                u for u, s in self.user_states.items()
-                if s.get("requires_restart")
-                and not s["user_info"].get("bad", False)
-                and u not in self.handoff_for
-            ]
+                        if not log_path:
+                            # oldest process start for this user
+                            oldest_ct = min(self.manager.process_tracker.creation_timestamps.get(pid, now) for pid in live)
+                            waited = now - oldest_ct
 
-            # Per-user gating: honor backoff and per-user launch_delay up front,
-            # so we don't keep picking the same blocked uid over and over.
-            now = time.time()
-            def _eligible_now(u: str) -> bool:
-                st = self.user_states.get(u, {})
-                info = st.get("user_info", {})
-                if now < self._skip_until_by_user.get(u, 0):
-                    return False
-                # per-user launch delay (prefer not to hammer)
-                if now - st.get("last_launch", 0) < self.manager.timeouts["launch_delay"]:
-                    return False
-                return True
+                            if waited >= self.preconnect_grace:
+                                self._log(f"⚠️  {uname} did not appear in logs within {self.preconnect_grace}s — terminating")
+                                self.kill_user_processes(uid)
+                                st["requires_restart"] = True
+                                # clean up a bit so next launch is fresh
+                                try:
+                                    self.manager.process_tracker.user_server.pop(uid, None)
+                                except Exception:
+                                    pass
+                                live = []
 
-            restartables = [u for u in restartables if _eligible_now(u)]
+                    # --- end pre-connect watchdog ---
 
-            # Prefer accounts expected in active_pool, then apply round-robin starting point
-            restartables.sort(key=lambda u: (u not in self.active_pool, u))
-            if restartables:
-                # advance cursor into the sorted list (wrap around)
-                self._restart_cursor = self._restart_cursor % len(restartables)
-                ordered = restartables[self._restart_cursor:] + restartables[:self._restart_cursor]
-            else:
-                ordered = []
+                    # status shape
+                    ttl_list = []
+                    min_ttl = None
+                    for pid in live:
+                        ct  = self.manager.process_tracker.creation_timestamps.get(pid, now)
+                        ttl = max(0, int(kill_t - (now - ct)))
+                        ttl_list.append(ttl)
+                        if min_ttl is None or ttl < min_ttl:
+                            min_ttl = ttl
 
-            # Only attempt one successful launch per launch_delay window (global pacing)
-            if ordered and (now - self.timing_trackers['relaunch']) >= self.manager.timeouts["launch_delay"]:
-                launched = False
+                    # donor standby
+                    if self.spares_mode and uid in self.handoff_for:
+                        spare_uid = self.handoff_for[uid]
+                        spare_live = any(
+                            self.process_mgr.verify_process_active(pid)
+                            for pid in self.manager.process_tracker.user_processes.get(spare_uid, [])
+                        )
+                        if spare_live:
+                            st["status"] = "Standby (handoff)"
+                            st["requires_restart"] = False
+                            st["inactive_since"] = None
+                            if not live:
+                                self._complete_handoff(uid, spare_uid)
 
-                for uid in ordered:
-                    st    = self.user_states.get(uid, {})
-                    info  = st.get("user_info", {})
-                    cookie = info.get("cookie", "")
+                            status[uid] = {
+                                "status": st["status"],
+                                "pids": live,
+                                "needs_restart": False,
+                                "last_active": st.get("last_active", 0),
+                                "inactive_since": st.get("inactive_since"),
+                                "ttl": ttl_list,
+                                "server": self.manager.process_tracker.user_server.get(uid, ""),
+                            }
+                            continue
 
-                    # If spares_mode and this is a spare, only launch to meet target count
-                    if self.spares_mode and uid in self.spare_pool:
-                        target_live = len(self.active_pool)
-                        live_now = sum(1 for row in status.values() if row["status"] == "Active")
-                        if live_now >= target_live:
-                            continue  # capacity satisfied; don't attempt, don't log
-
-                    # Final preflight: only when we're about to actually attempt a launch
-                    conflict, label, by_uid = self._normal_launch_conflict(uid, info)
-                    if conflict:
-                        # Back off this uid for a bit so it doesn't starve others
-                        self._skip_until_by_user[uid] = now + 20
-                        # Move the round-robin cursor past this uid for next time
-                        self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
-                        # Try the next candidate
-                        continue
-
-                    # Safe to try launching
-                    if self.launcher.start_game_session(uid, cookie, info):
-                        self.user_states[uid]["inactive_since"]   = None
-                        self.user_states[uid]["requires_restart"] = False
-                        self.user_states[uid]["status"]           = "Restarting"
-                        self.user_states[uid]["last_launch"]      = now
-                        self.timing_trackers['relaunch']          = now
-                        # Move round-robin forward from the *next* uid
-                        self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
-                        launched = True
-                        break
+                    # active
+                    if live:
+                        st["status"] = "Active"
+                        st["requires_restart"] = False
+                        st["inactive_since"] = None
+                        st["last_active"] = now
                     else:
-                        # Launch failed for some other reason — short backoff on this uid
-                        self._skip_until_by_user[uid] = now + 10
-                        self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
-                        # keep trying next candidate in this tick
+                        if st.get("inactive_since") is None:
+                            st["inactive_since"] = now
+                        if (now - st.get("last_active", 0)) > self.restart_threshold:
+                            st["requires_restart"] = True
+                        if st.get("status") != "Offline":
+                            st["status"] = "Offline"
 
-                # If none launched, do not reset relaunch timer (we’ll retry next tick with new order)
+                    status[uid] = {
+                        "status": st["status"],
+                        "pids": live,
+                        "needs_restart": st.get("requires_restart", False),
+                        "last_active": st.get("last_active", 0),
+                        "inactive_since": st.get("inactive_since"),
+                        "ttl": ttl_list,
+                        "server": self.manager.process_tracker.user_server.get(uid, ""),
+                    }
 
-            if not ordered:
-                limit_strap_helpers(threshold=self.strap_threshold)
+                # After building status, keep pools synced with 'good' users immediately
+                try:
+                    current_good = {
+                        u for u, s in self.user_states.items()
+                        if not s.get("user_info", {}).get("bad", False)
+                        and not s.get("user_info", {}).get("disabled", False)
+                    }
+                    if current_good != getattr(self, "_last_good_set", set()):
+                        self._last_good_set = current_good
+                        self._recompute_pools()
+                except Exception as _e:
+                    self._log(f"[Pools] good-set recompute error: {_e}")
 
-            time.sleep(self.manager.check_intervals['main_tick'])
+                self.status_signal.emit(status)
+                
+                # Multiscope: update detection and push snapshot to the tab
+                try:
+                    if hasattr(self, "ms") and self.ms:
+                        self.ms.tick(status)                 # feed current user/server state
+                        # Handle MultiScope signals (disconnects, etc.)
+                        for kind, uid, payload in self.ms.drain_events():
+                            if kind == "disconnect":
+                                uname = (self.manager.settings.get(uid, {}) or {}).get("username", uid)
+                                self._log(f"[Disconnect] {uname} — {payload}; restarting now.")
+                                try:
+                                    self.kill_user_processes(uid)
+                                except Exception:
+                                    pass
+                                st = self.user_states.get(uid, {})
+                                st["requires_restart"] = True
+                                st["inactive_since"]   = None
+                                st["status"]           = "Offline"
+                        rows = self.ms.snapshot()            # [{server, users, biome/merchant…}]
+                        self.multiscope_signal.emit(rows)    # GUI will render it
+                except Exception as _e:
+                    self._log(f"[Multiscope] tick error: {_e}")
+
+                # process table signal
+                proc_info = {}
+                for uid, pids in list(self.manager.process_tracker.user_processes.items()):
+                    for pid in list(pids):  # snapshot the list in case it changes
+                        if not self.process_mgr.verify_process_active(pid):
+                            continue
+                        created = datetime.fromtimestamp(
+                            self.manager.process_tracker.creation_timestamps.get(pid, time.time())
+                        ).strftime("%H:%M:%S")
+                        windows = self.process_mgr.count_windows_by_process().get(pid, 0)
+                        proc_info[pid] = {"user_id": uid, "created": created, "windows": windows}
+                self.process_signal.emit(proc_info)
+
+
+                # auto-restart queue (skip donors in handoff)
+                try:
+                    restartables = [
+                        u for u, s in list(self.user_states.items())
+                        if s.get("requires_restart")
+                        and not s["user_info"].get("bad", False)
+                        and not s["user_info"].get("disabled", False)
+                        and u not in self.handoff_for
+                    ]
+                    # Per-user gating: honor backoff and per-user launch_delay up front,
+                    # so we don't keep picking the same blocked uid over and over.
+                    now = time.time()
+                    def _eligible_now(u: str) -> bool:
+                        st = self.user_states.get(u, {})
+                        info = st.get("user_info", {})
+                        if now < self._skip_until_by_user.get(u, 0):
+                            return False
+                        # per-user launch delay (boot uses initial_delay)
+                        gate = self.initial_delay if self._boot_phase else self.manager.timeouts["launch_delay"]
+                        if now - st.get("last_launch", 0) < gate:
+                            return False
+                        return True 
+
+                    restartables = [u for u in restartables if _eligible_now(u)]
+
+                    # Prefer accounts expected in active_pool, then apply round-robin starting point
+                    restartables.sort(key=lambda u: (u not in self.active_pool, u))
+                    if restartables:
+                        # advance cursor into the sorted list (wrap around)
+                        self._restart_cursor = self._restart_cursor % len(restartables)
+                        ordered = restartables[self._restart_cursor:] + restartables[:self._restart_cursor]
+                    else:
+                        ordered = []
+
+                    # Only attempt one launch per window; disable relaunches during boot
+                    _global_gate = self.initial_delay if self._boot_phase else self.manager.timeouts["launch_delay"]
+
+                    # block the relaunch queue entirely until ramp finishes
+                    if self._boot_phase:
+                        ordered = []
+
+                    if ordered and (now - self.timing_trackers['relaunch']) >= _global_gate:
+                        launched = False
+
+                        for uid in ordered:
+                            st    = self.user_states.get(uid, {})
+                            info  = st.get("user_info", {})
+                            cookie = info.get("cookie", "")
+
+                            # If spares_mode and this is a spare, only launch to meet target count
+                            if self.spares_mode and uid in self.spare_pool:
+                                target_live = len(self.active_pool)
+                                live_now = sum(1 for row in status.values() if row["status"] == "Active")
+                                if live_now >= target_live:
+                                    continue  # capacity satisfied; don't attempt, don't log
+
+                            # Final preflight: only when we're about to actually attempt a launch
+                            conflict, label, by_uid = self._normal_launch_conflict(uid, info)
+                            if conflict:
+                                # Back off this uid for a bit so it doesn't starve others
+                                self._skip_until_by_user[uid] = now + 20
+                                # Move the round-robin cursor past this uid for next time
+                                self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
+                                # Try the next candidate
+                                continue
+
+                            # Safe to try launching
+                            if self.launcher.start_game_session(uid, cookie, info):
+                                self.user_states[uid]["inactive_since"]   = None
+                                self.user_states[uid]["requires_restart"] = False
+                                self.user_states[uid]["status"]           = "Restarting"
+                                self.user_states[uid]["last_launch"]      = now
+                                self.timing_trackers['relaunch']          = now
+                                # Move round-robin forward from the *next* uid
+                                self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
+                                launched = True
+                                break
+                            else:
+                                # Launch failed for some other reason — short backoff on this uid
+                                self._skip_until_by_user[uid] = now + 10
+                                self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
+                                # keep trying next candidate in this tick
+
+                        # If none launched, do not reset relaunch timer (we’ll retry next tick with new order)
+
+                    if not ordered:
+                        limit_strap_helpers(threshold=self.strap_threshold)
+                except Exception as e:
+                    self._log(f"[Relaunch] scheduler error: {e!r}")
+
+                time.sleep(self.manager.check_intervals['main_tick'])
+            except Exception as e:
+                try:
+                    self._log(f"[WorkerLoop] crash prevented: {e!r}")
+                    import traceback
+                    self._log(traceback.format_exc())
+                except Exception:
+                    pass
+                time.sleep(0.2)
+                continue
     
     def _enforce_one_per_server(self):
         p = self.manager.process_tracker
@@ -1678,9 +1865,25 @@ class WorkerThread(QThread):
                 rs.pop(lbl, None)
 
     def stop(self):
+        self.running = False  # make the loop exit ASAP
+        if getattr(self, "ms", None) and hasattr(self.ms, "shutdown"):
+            try:
+                self.ms.shutdown()
+            except Exception:
+                pass
         if self.manager and self.manager.timeout_monitor:
-            self.manager.timeout_monitor.stop()
-        self.running = False
+            try:
+                self.manager.timeout_monitor.stop()
+            except Exception:
+                pass
+        
+        # don’t block long on ramp thread
+        try:
+            t = getattr(self, "_ramp_thread", None)
+            if t and t.is_alive():
+                t.join(timeout=0.5)
+        except Exception:
+            pass
 
 class UserManagementDialog(QDialog):
 
@@ -2396,14 +2599,113 @@ class RoundMovieLabel(QLabel):
         self._inner_side = int(round(r * 2))   # 117 px
 
 
-        
+def pil_to_pixmap(img: Image.Image) -> QPixmap:
+    """Convert a PIL Image to a detached QPixmap."""
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    data = img.tobytes("raw", "RGB")
+    qimg = QImage(data, img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg.copy())
+
+
+class _SelectableLabel(QLabel):
+    """QLabel that exposes a drag-to-select ROI signal."""
+    roi_selected = pyqtSignal(tuple)
+
+    def __init__(self, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        self.setPixmap(pixmap)
+        self.setFixedSize(pixmap.size())
+        self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        self._origin: Optional[QPoint] = None
+
+    def mousePressEvent(self, event):
+        self._origin = event.position().toPoint()
+        self._rubber.setGeometry(QRect(self._origin, QSize()))
+        self._rubber.show()
+
+    def mouseMoveEvent(self, event):
+        if self._origin is None:
+            return
+        current = event.position().toPoint()
+        rect = QRect(self._origin, current).normalized()
+        self._rubber.setGeometry(rect)
+
+    def mouseReleaseEvent(self, event):
+        if self._origin is None:
+            return
+        current = event.position().toPoint()
+        rect = QRect(self._origin, current).normalized()
+        self._rubber.hide()
+        self._rubber.setGeometry(QRect())
+
+        origin = self._origin
+        self._origin = None
+        if rect.width() < 2 or rect.height() < 2:
+            return
+
+        pm = self.pixmap()
+        if not pm:
+            return
+        w = pm.width()
+        h = pm.height()
+        if w <= 0 or h <= 0:
+            return
+
+        roi = (rect.x() / w, rect.y() / h, rect.width() / w, rect.height() / h)
+        self.roi_selected.emit(roi)
+
+
+class ROICropDialog(QDialog):
+    """Modal dialog that lets the user pick a chat ROI."""
+    def __init__(self, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Chat Area")
+        self._roi: Optional[Tuple[float, float, float, float]] = None
+
+        layout = QVBoxLayout(self)
+        label = _SelectableLabel(pixmap, self)
+        label.roi_selected.connect(self._on_roi_selected)
+        layout.addWidget(label)
+
+        hint = QLabel("Drag to draw the chat box. Release to save.")
+        hint.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(hint)
+
+    def _on_roi_selected(self, roi: Tuple[float, float, float, float]):
+        self._roi = roi
+        self.accept()
+
+    def selected_roi(self) -> Optional[Tuple[float, float, float, float]]:
+        return self._roi
+
+
 class RobloxManagerGUI(QMainWindow):
+    # Bridge between AntiAFK worker threads and the Qt UI
+    antiafk_log_signal = pyqtSignal(str)
+    antiafk_state_signal = pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
         self.worker_thread = None
+        self.ocr_worker: Optional[OCRWorker] = None
+        self.ocr_roi: Optional[Tuple[float, float, float, float]] = None
+        self._last_ocr_log: Optional[str] = None
+        self.ocr_log_autoscroll: bool = True
+        self._loading_ocr_settings = False
+        self._loading_antiafk_settings = False
+        self.settings_tab_index: Optional[int] = None
         self.process_data = {}
         self.config_manager = ConfigManager()
+
+        # Anti-AFK engine instance (configured in setup_antiafk_tab)
+        self.antiafk: Optional[AntiAFK] = None
+        self.antiafk_status_box: Optional[QTextEdit] = None
+
+        # Connect Anti-AFK cross-thread signals
+        self.antiafk_log_signal.connect(self._on_antiafk_status)
+        self.antiafk_state_signal.connect(self._on_antiafk_state_changed)
+
         self.setup_ui()
         # NEW: add the Multiscope tab
         self.setup_multiscope_tab()
@@ -2412,7 +2714,7 @@ class RobloxManagerGUI(QMainWindow):
 
     def setup_ui(self):
         self.setWindowTitle("Jirach1 + JARAM - Just Another Roblox Account Manager")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1100, 720)
 
         icon_path = _get_icon_path()
         if icon_path and os.path.exists(icon_path):
@@ -2463,8 +2765,11 @@ class RobloxManagerGUI(QMainWindow):
 
         self.setup_dashboard_tab()
         self.setup_users_tab()
+        self.setup_accounts_tab()
         self.setup_processes_tab()
         self.setup_logs_tab()
+        self.setup_ocr_tab()
+        self.setup_antiafk_tab()
         self.setup_settings_tab()
         self.setup_RAMEXPORT_tab()
         setup_UTILITIES_tab(self)
@@ -2561,7 +2866,10 @@ class RobloxManagerGUI(QMainWindow):
 
         layout.addStretch()
 
-        self.tab_widget.addTab(dashboard_widget, "Dashboard")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(dashboard_widget)
+        self.tab_widget.addTab(scroll, "Dashboard")
 
     def setup_users_tab(self):
         users_widget = QWidget()
@@ -2584,9 +2892,10 @@ class RobloxManagerGUI(QMainWindow):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)  # Server
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(10, QHeaderView.ResizeMode.Fixed)
 
         self.users_table.setColumnWidth(2, 200)
         self.users_table.setColumnWidth(3, 100)
@@ -2610,8 +2919,120 @@ class RobloxManagerGUI(QMainWindow):
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
 
-        self.tab_widget.addTab(users_widget, "Users")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(users_widget)
+        self.tab_widget.addTab(scroll, "Users")
 
+    def setup_accounts_tab(self):
+        """Account management tab."""
+        accounts_widget = QWidget()
+        layout = QVBoxLayout(accounts_widget)
+
+        header_label = QLabel("Account Management")
+        header_label.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {ModernStyle.TEXT_PRIMARY}; padding: 10px 0;")
+        layout.addWidget(header_label)
+
+        main_layout = QHBoxLayout()
+
+        # Left form
+        form_widget = QWidget()
+        form_widget.setMaximumWidth(400)
+        form_layout = QVBoxLayout(form_widget)
+
+        form_title = QLabel("Add New Account")
+        form_title.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {ModernStyle.TEXT_PRIMARY}; padding: 5px 0;")
+        form_layout.addWidget(form_title)
+
+        self.account_user_id = QLineEdit()
+        self.account_user_id.setPlaceholderText("User ID (e.g., 123456789)")
+        form_layout.addWidget(QLabel("User ID:"))
+        form_layout.addWidget(self.account_user_id)
+
+        self.account_username = QLineEdit()
+        self.account_username.setPlaceholderText("Username (e.g., PlayerName)")
+        form_layout.addWidget(QLabel("Username:"))
+        form_layout.addWidget(self.account_username)
+
+        form_layout.addWidget(QLabel("Server Type:"))
+        server_layout = QHBoxLayout()
+        self.account_private_radio = QRadioButton("Private Server")
+        self.account_public_radio = QRadioButton("Public Server")
+        self.account_private_radio.setChecked(True)
+        server_layout.addWidget(self.account_private_radio)
+        server_layout.addWidget(self.account_public_radio)
+        form_layout.addLayout(server_layout)
+
+        self.account_private_link = QLineEdit()
+        self.account_private_link.setPlaceholderText("Private server link")
+        form_layout.addWidget(QLabel("Private Server Link:"))
+        form_layout.addWidget(self.account_private_link)
+
+        self.account_place_id = QLineEdit()
+        self.account_place_id.setPlaceholderText("Place ID")
+        self.account_place_id_label = QLabel("Place ID:")
+        form_layout.addWidget(self.account_place_id_label)
+        form_layout.addWidget(self.account_place_id)
+        self.account_place_id_label.hide()
+        self.account_place_id.hide()
+
+        self.account_cookie = QLineEdit()
+        self.account_cookie.setPlaceholderText("ROBLOSECURITY cookie")
+        form_layout.addWidget(QLabel("Cookie:"))
+        form_layout.addWidget(self.account_cookie)
+
+        self.account_disabled = QCheckBox("Disable this account")
+        form_layout.addWidget(self.account_disabled)
+
+        button_layout = QHBoxLayout()
+        self.add_account_btn = QPushButton("Add Account")
+        self.add_account_btn.setStyleSheet(f"background-color: {ModernStyle.PRIMARY}; color: white; border: none; padding: 8px 16px; border-radius: 4px; font-weight: bold;")
+        self.add_account_btn.clicked.connect(self.add_account)
+        button_layout.addWidget(self.add_account_btn)
+
+        self.clear_form_btn = QPushButton("Clear")
+        self.clear_form_btn.clicked.connect(self.clear_account_form)
+        button_layout.addWidget(self.clear_form_btn)
+
+        form_layout.addLayout(button_layout)
+        form_layout.addStretch()
+
+        self.account_private_radio.toggled.connect(self.on_account_server_type_changed)
+
+        main_layout.addWidget(form_widget)
+
+        # Right list
+        list_widget = QWidget()
+        list_layout = QVBoxLayout(list_widget)
+
+        list_title = QLabel("Existing Accounts")
+        list_title.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {ModernStyle.TEXT_PRIMARY}; padding: 5px 0;")
+        list_layout.addWidget(list_title)
+
+        self.accounts_list = QTableWidget()
+        self.accounts_list.setColumnCount(6)
+        self.accounts_list.setHorizontalHeaderLabels(["User ID", "Username", "Server Type", "Status", "Actions", "Delete"])
+        header = self.accounts_list.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.accounts_list.setColumnWidth(1, 120)
+        self.accounts_list.setColumnWidth(4, 90)
+        self.accounts_list.setColumnWidth(5, 80)
+        self.accounts_list.verticalHeader().setDefaultSectionSize(35)
+        list_layout.addWidget(self.accounts_list)
+
+        main_layout.addWidget(list_widget)
+        layout.addLayout(main_layout)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(accounts_widget)
+        self.tab_widget.addTab(scroll, "Accounts")
+        self.refresh_accounts_list()
 
     def setup_processes_tab(self):
         processes_widget = QWidget()
@@ -2652,7 +3073,10 @@ class RobloxManagerGUI(QMainWindow):
 
         layout.addLayout(controls_layout)
 
-        self.tab_widget.addTab(processes_widget, "Processes")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(processes_widget)
+        self.tab_widget.addTab(scroll, "Processes")
 
     def setup_logs_tab(self):
         logs_widget = QWidget()
@@ -2689,8 +3113,856 @@ class RobloxManagerGUI(QMainWindow):
 
         layout.addLayout(controls_layout)
 
-        self.tab_widget.addTab(logs_widget, "Logs")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(logs_widget)
+        self.tab_widget.addTab(scroll, "Logs")
 
+    def setup_ocr_tab(self):
+        ocr_widget = QWidget()
+        layout = QVBoxLayout(ocr_widget)
+
+        # Show whether OCR preprocessing is using CPU or GPU
+        self.ocr_device_label = QLabel()
+        self.ocr_device_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY}; font-weight: bold;")
+        layout.addWidget(self.ocr_device_label)
+        self._update_ocr_device_label()
+
+        toggles_row = QHBoxLayout()
+        self.ocr_enable_chk = QCheckBox("Enabled")
+        self.ocr_enable_chk.toggled.connect(self._on_ocr_enabled_toggled)
+        toggles_row.addWidget(self.ocr_enable_chk)
+        toggles_row.addStretch()
+        layout.addLayout(toggles_row)
+
+        controls_group = QGroupBox("Capture & OCR")
+        controls_form = QFormLayout(controls_group)
+
+        self.ocr_workers_spin = QSpinBox(); self.ocr_workers_spin.setRange(1, 16)
+        self.ocr_workers_spin.valueChanged.connect(self._on_ocr_settings_changed)
+        self.ocr_max_caps_spin = QSpinBox(); self.ocr_max_caps_spin.setRange(1, 60)
+        self.ocr_max_caps_spin.valueChanged.connect(self._on_ocr_settings_changed)
+        self.ocr_cooldown_spin = QSpinBox(); self.ocr_cooldown_spin.setRange(30, 7200); self.ocr_cooldown_spin.setSuffix(" s")
+        self.ocr_cooldown_spin.valueChanged.connect(self._on_ocr_settings_changed)
+        self.ocr_preprocess_chk = QCheckBox("Use preprocessing")
+        self.ocr_preprocess_chk.toggled.connect(self._on_ocr_settings_changed)
+
+        controls_form.addRow("OCR workers:", self.ocr_workers_spin)
+        controls_form.addRow("Max captures / sec:", self.ocr_max_caps_spin)
+        controls_form.addRow("Cooldown per PID:", self.ocr_cooldown_spin)
+        controls_form.addRow("Preprocess chat image:", self.ocr_preprocess_chk)
+
+        layout.addWidget(controls_group)
+
+        btn_row = QHBoxLayout()
+        calibrate_btn = QPushButton("Calibrate chat area")
+        calibrate_btn.clicked.connect(self.calibrate_ocr_roi)
+        preview_btn = QPushButton("Test preview")
+        preview_btn.clicked.connect(self.show_ocr_preview)
+        btn_row.addWidget(calibrate_btn)
+        btn_row.addWidget(preview_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.ocr_roi_label = QLabel("ROI: not calibrated")
+        layout.addWidget(self.ocr_roi_label)
+
+        filters_group = QGroupBox("Color Filters")
+        filters_layout = QVBoxLayout(filters_group)
+        self.ocr_filter_table = QTableWidget()
+        self.ocr_filter_table.setColumnCount(6)
+        self.ocr_filter_table.setHorizontalHeaderLabels(["Enabled", "Name", "R", "G", "B", "Tol"])
+        self.ocr_filter_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.ocr_filter_table.setMinimumHeight(180)
+        header = self.ocr_filter_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(1, 6):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            self.ocr_filter_table.setColumnWidth(col, 80)
+        self.ocr_filter_table.setColumnWidth(10, 150)
+        vh = self.ocr_filter_table.verticalHeader()
+        vh.setDefaultSectionSize(30)
+        vh.setMinimumSectionSize(30)
+        filters_layout.addWidget(self.ocr_filter_table)
+        # React immediately when filter cells change (name/colors/tolerance/enabled)
+        self.ocr_filter_table.itemChanged.connect(lambda _item: self._on_ocr_settings_changed())
+
+        filter_btns = QHBoxLayout()
+        add_filter_btn = QPushButton("Add Filter")
+        add_filter_btn.clicked.connect(lambda: (self._add_filter_row(), self._on_ocr_settings_changed()))
+        remove_filter_btn = QPushButton("Remove Selected")
+        remove_filter_btn.clicked.connect(lambda: (self._remove_selected_filter_rows(), self._on_ocr_settings_changed()))
+        filter_btns.addWidget(add_filter_btn)
+        filter_btns.addWidget(remove_filter_btn)
+        filter_btns.addStretch()
+        filters_layout.addLayout(filter_btns)
+        layout.addWidget(filters_group)
+
+        self.ocr_status_label = QLabel("Status: Stopped")
+        self.ocr_status_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY}; font-weight: bold;")
+        layout.addWidget(self.ocr_status_label)
+
+        log_group = QGroupBox("OCR Log")
+        log_layout = QVBoxLayout(log_group)
+        self.ocr_log_box = QTextEdit()
+        self.ocr_log_box.setReadOnly(True)
+        self.ocr_log_box.setFont(QFont("Consolas", 10))
+        self.ocr_log_box.setMinimumHeight(260)
+        self.ocr_auto_scroll_chk = QCheckBox("Auto-scroll")
+        self.ocr_auto_scroll_chk.setChecked(True)
+        self.ocr_auto_scroll_chk.toggled.connect(lambda checked: setattr(self, "ocr_log_autoscroll", bool(checked)))
+        clear_log_btn = QPushButton("Clear OCR Log")
+        clear_log_btn.clicked.connect(self.ocr_log_box.clear)
+        log_layout.addWidget(self.ocr_log_box)
+        controls_row = QHBoxLayout()
+        controls_row.addWidget(self.ocr_auto_scroll_chk)
+        controls_row.addStretch()
+        controls_row.addWidget(clear_log_btn)
+        log_layout.addLayout(controls_row)
+        layout.addWidget(log_group)
+
+        # Footer: reset OCR settings to defaults
+        footer = QHBoxLayout()
+        footer.addStretch()
+        reset_ocr_btn = QPushButton("Restore OCR Defaults")
+        reset_ocr_btn.clicked.connect(self._reset_ocr_to_defaults)
+        footer.addWidget(reset_ocr_btn)
+        layout.addLayout(footer)
+
+        layout.addStretch()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(ocr_widget)
+        self.tab_widget.addTab(scroll, "OCR")
+
+    def setup_antiafk_tab(self):
+        antiafk_widget = QWidget()
+        layout = QVBoxLayout(antiafk_widget)
+
+        info_group = QGroupBox("Roblox Anti-AFK")
+        info_layout = QVBoxLayout(info_group)
+        desc = QLabel(
+            "Anti-AFK keeps your Roblox sessions active by periodically sending key presses.\n"
+            "This works on all Roblox windows and may require administrator privileges."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        info_layout.addWidget(desc)
+        layout.addWidget(info_group)
+
+        settings_group = QGroupBox("Settings")
+        settings_layout = QGridLayout(settings_group)
+
+        # Interval + quick presets
+        settings_layout.addWidget(QLabel("Action Interval (seconds):"), 0, 0)
+        interval_row_widget = QWidget()
+        interval_row = QHBoxLayout(interval_row_widget)
+        interval_row.setContentsMargins(0, 0, 0, 0)
+        self.antiafk_interval_spin = QSpinBox()
+        self.antiafk_interval_spin.setRange(5, 3600)
+        self.antiafk_interval_spin.setValue(120)
+        interval_row.addWidget(self.antiafk_interval_spin)
+        for seconds, label in ((120, "2m"), (300, "5m"), (600, "10m")):
+            btn = QPushButton(label)
+            btn.setFixedWidth(40)
+            btn.clicked.connect(lambda _, s=seconds: self.antiafk_interval_spin.setValue(s))
+            interval_row.addWidget(btn)
+        interval_row.addStretch()
+        settings_layout.addWidget(interval_row_widget, 0, 1)
+
+        # Action type
+        settings_layout.addWidget(QLabel("Action Type:"), 1, 0)
+        self.antiafk_action_combo = QComboBox()
+        self.antiafk_action_combo.addItems(["space", "ws", "zoom", "AutoReconnect"])
+        settings_layout.addWidget(self.antiafk_action_combo, 1, 1)
+
+        # True-AFK mode
+        self.antiafk_user_safe_chk = QCheckBox("True-AFK Mode (only act when you're inactive)")
+        settings_layout.addWidget(self.antiafk_user_safe_chk, 2, 0, 1, 2)
+
+        # Sequential mode + delay
+        self.antiafk_sequential_chk = QCheckBox("Sequential Mode (better for 5+ windows)")
+        settings_layout.addWidget(self.antiafk_sequential_chk, 3, 0, 1, 2)
+
+        settings_layout.addWidget(QLabel("Delay between actions (seconds):"), 4, 0)
+        self.antiafk_seq_delay_spin = QDoubleSpinBox()
+        self.antiafk_seq_delay_spin.setRange(0.1, 5.0)
+        self.antiafk_seq_delay_spin.setSingleStep(0.05)
+        self.antiafk_seq_delay_spin.setDecimals(2)
+        self.antiafk_seq_delay_spin.setValue(0.75)
+        settings_layout.addWidget(self.antiafk_seq_delay_spin, 4, 1)
+
+        # Use AutoReconnect in main menu
+        self.antiafk_menu_autoreconnect_chk = QCheckBox("Use AutoReconnect when in main menu")
+        settings_layout.addWidget(self.antiafk_menu_autoreconnect_chk, 5, 0, 1, 2)
+
+        layout.addWidget(settings_group)
+
+        # Status/log view specific to Anti-AFK
+        status_group = QGroupBox("Anti-AFK Log")
+        status_layout = QVBoxLayout(status_group)
+        self.antiafk_status_box = QTextEdit()
+        self.antiafk_status_box.setReadOnly(True)
+        self.antiafk_status_box.setFont(QFont("Consolas", 10))
+        status_layout.addWidget(self.antiafk_status_box)
+        layout.addWidget(status_group)
+
+        # Control row: enable toggle + actions + defaults
+        btn_row = QHBoxLayout()
+        self.antiafk_enable_chk = QCheckBox("Enable Anti-AFK (while manager is running)")
+        btn_row.addWidget(self.antiafk_enable_chk)
+        btn_row.addStretch()
+        self.antiafk_test_btn = QPushButton("Test Action")
+        self.antiafk_test_btn.clicked.connect(self._on_antiafk_test)
+        self.antiafk_show_btn = QPushButton("Show Roblox")
+        self.antiafk_show_btn.clicked.connect(self._on_antiafk_show)
+        self.antiafk_hide_btn = QPushButton("Hide Roblox")
+        self.antiafk_hide_btn.clicked.connect(self._on_antiafk_hide)
+        reset_btn = QPushButton("Restore Anti-AFK Defaults")
+        reset_btn.clicked.connect(self._reset_antiafk_to_defaults)
+        btn_row.addWidget(self.antiafk_test_btn)
+        btn_row.addWidget(self.antiafk_show_btn)
+        btn_row.addWidget(self.antiafk_hide_btn)
+        btn_row.addWidget(reset_btn)
+        layout.addLayout(btn_row)
+
+        layout.addStretch()
+
+        # Wire up engine + config
+        settings_data = self.config_manager.load_settings() or {}
+        antiafk_cfg = settings_data.get("antiafk", {}) or {}
+        self.antiafk = AntiAFK(parent=self, config=antiafk_cfg)
+
+        # Connect callbacks so worker threads report via Qt signals
+        self.antiafk.status_callback = self._emit_antiafk_status
+        self.antiafk.button_state_callback = self._emit_antiafk_state
+        self.antiafk.is_pid_in_menu_callback = self._is_pid_in_menu
+
+        # Apply config to UI without triggering change handlers
+        self._loading_antiafk_settings = True
+        try:
+            cfg = self.antiafk.config or {}
+            self.antiafk_interval_spin.setValue(int(cfg.get("antiafk_interval", 120)))
+            self.antiafk_action_combo.setCurrentText(cfg.get("antiafk_action", "space"))
+            self.antiafk_user_safe_chk.setChecked(bool(cfg.get("antiafk_user_safe", False)))
+            self.antiafk_sequential_chk.setChecked(bool(cfg.get("antiafk_sequential_mode", False)))
+            self.antiafk_seq_delay_spin.setValue(float(cfg.get("antiafk_sequential_delay", 0.75)))
+            self.antiafk_menu_autoreconnect_chk.setChecked(bool(cfg.get("antiafk_menu_autoreconnect", False)))
+            self.antiafk_enable_chk.setChecked(bool(cfg.get("antiafk_enabled", False)))
+        finally:
+            self._loading_antiafk_settings = False
+
+        # React to UI changes
+        self.antiafk_interval_spin.valueChanged.connect(self._on_antiafk_ui_changed)
+        self.antiafk_action_combo.currentTextChanged.connect(self._on_antiafk_ui_changed)
+        self.antiafk_user_safe_chk.toggled.connect(self._on_antiafk_ui_changed)
+        self.antiafk_sequential_chk.toggled.connect(self._on_antiafk_ui_changed)
+        self.antiafk_seq_delay_spin.valueChanged.connect(self._on_antiafk_ui_changed)
+        self.antiafk_menu_autoreconnect_chk.toggled.connect(self._on_antiafk_ui_changed)
+        self.antiafk_enable_chk.toggled.connect(self._on_antiafk_ui_changed)
+
+        # Ensure initial engine config (including multi-instance) is applied
+        self._on_antiafk_ui_changed()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(antiafk_widget)
+        self.tab_widget.addTab(scroll, "Anti AFK")
+
+    def _emit_antiafk_status(self, message: str):
+        """Called from AntiAFK worker threads to forward status messages."""
+        self.antiafk_log_signal.emit(message)
+
+    def _emit_antiafk_state(self, running: bool):
+        """Called from AntiAFK worker threads to mirror running state."""
+        self.antiafk_state_signal.emit(bool(running))
+
+    def _on_antiafk_status(self, message: str):
+        """Qt slot: update Anti-AFK tab and main log safely on the GUI thread."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] {message}"
+
+        if self.antiafk_status_box is not None:
+            try:
+                self.antiafk_status_box.append(line)
+            except Exception:
+                pass
+
+        # Also forward to the global log view
+        try:
+            self.add_log(f"[Anti-AFK] {message}")
+        except Exception:
+            pass
+
+    def _on_antiafk_state_changed(self, enabled: bool):
+        """Qt slot: keep Anti-AFK buttons and inputs in sync with worker state."""
+        enabled = bool(enabled)
+        for w in (
+            getattr(self, "antiafk_interval_spin", None),
+            getattr(self, "antiafk_action_combo", None),
+            getattr(self, "antiafk_user_safe_chk", None),
+            getattr(self, "antiafk_sequential_chk", None),
+            getattr(self, "antiafk_seq_delay_spin", None),
+        ):
+            if w is not None:
+                try:
+                    w.setEnabled(not enabled)
+                except Exception:
+                    pass
+
+    def _on_antiafk_ui_changed(self):
+        """Apply current Anti-AFK UI values to the engine and persist them."""
+        if self._loading_antiafk_settings or not self.antiafk:
+            return
+
+        try:
+            interval = int(self.antiafk_interval_spin.value())
+            action = self.antiafk_action_combo.currentText()
+            user_safe = bool(self.antiafk_user_safe_chk.isChecked())
+            sequential_mode = bool(self.antiafk_sequential_chk.isChecked())
+            sequential_delay = float(self.antiafk_seq_delay_spin.value())
+            menu_autoreconnect = bool(self.antiafk_menu_autoreconnect_chk.isChecked())
+            enabled_flag = bool(self.antiafk_enable_chk.isChecked())
+
+            # Push new settings into the AntiAFK engine so behavior changes immediately.
+            self.antiafk.apply_host_config(
+                interval=interval,
+                action=action,
+                user_safe=user_safe,
+                sequential_mode=sequential_mode,
+                sequential_delay=sequential_delay,
+                menu_autoreconnect=menu_autoreconnect,
+            )
+
+            # If the manager is running, keep Anti-AFK running state in sync with the toggle.
+            if self._is_manager_running():
+                self.antiafk.toggle_antiafk(enabled_flag)
+
+            # Persist Anti-AFK settings to disk so they survive relaunch.
+            self._save_antiafk_settings()
+        except Exception:
+            # AntiAFK will log detailed errors via its own log_error method.
+            pass
+
+    def _save_antiafk_settings(self):
+        """Persist Anti-AFK-related settings into settings.json."""
+        try:
+            settings = self.config_manager.load_settings()
+        except Exception:
+            settings = self.config_manager.default_settings.copy()
+
+        antiafk_cfg = settings.get("antiafk", {}) or {}
+        try:
+            antiafk_cfg["antiafk_interval"] = int(self.antiafk_interval_spin.value())
+            antiafk_cfg["antiafk_action"] = self.antiafk_action_combo.currentText()
+            antiafk_cfg["antiafk_user_safe"] = bool(self.antiafk_user_safe_chk.isChecked())
+            antiafk_cfg["antiafk_sequential_mode"] = bool(self.antiafk_sequential_chk.isChecked())
+            antiafk_cfg["antiafk_sequential_delay"] = float(self.antiafk_seq_delay_spin.value())
+            antiafk_cfg["antiafk_menu_autoreconnect"] = bool(self.antiafk_menu_autoreconnect_chk.isChecked())
+            antiafk_cfg["antiafk_enabled"] = bool(self.antiafk_enable_chk.isChecked())
+        except Exception:
+            # If widgets are missing or invalid, keep whatever was already stored.
+            pass
+
+        settings["antiafk"] = antiafk_cfg
+        try:
+            self.config_manager.save_settings(settings)
+        except Exception:
+            pass
+
+    def _reset_antiafk_to_defaults(self):
+        """Reset only the Anti-AFK tab to its default config and live-apply."""
+        defaults = self.config_manager.default_settings.get("antiafk", {}) or {}
+        self._loading_antiafk_settings = True
+        try:
+            self.antiafk_interval_spin.setValue(int(defaults.get("antiafk_interval", 120)))
+            self.antiafk_action_combo.setCurrentText(defaults.get("antiafk_action", "space"))
+            self.antiafk_user_safe_chk.setChecked(bool(defaults.get("antiafk_user_safe", False)))
+            self.antiafk_sequential_chk.setChecked(bool(defaults.get("antiafk_sequential_mode", False)))
+            self.antiafk_seq_delay_spin.setValue(float(defaults.get("antiafk_sequential_delay", 0.75)))
+            self.antiafk_menu_autoreconnect_chk.setChecked(bool(defaults.get("antiafk_menu_autoreconnect", False)))
+            self.antiafk_enable_chk.setChecked(bool(defaults.get("antiafk_enabled", False)))
+        finally:
+            self._loading_antiafk_settings = False
+
+        # Apply + persist + sync running state
+        self._on_antiafk_ui_changed()
+
+    def _on_antiafk_start(self):
+        """Start the Anti-AFK loop with current settings."""
+        if not self.antiafk:
+            return
+        # Ensure engine has latest values and they are saved
+        self._on_antiafk_ui_changed()
+        self.antiafk.toggle_antiafk(True)
+
+    def _on_antiafk_stop(self):
+        """Stop the Anti-AFK loop."""
+        if not self.antiafk:
+            return
+        self.antiafk.toggle_antiafk(False)
+        self._save_antiafk_settings()
+
+    def _is_pid_in_menu(self, pid: int):
+        """
+        Best-effort check: return True if the Roblox PID appears to be in the main menu
+        according to MultiScope's last known state, False if explicitly not, or None
+        if unknown.
+        """
+        try:
+            pid = int(pid)
+        except Exception:
+            return None
+
+        # Need a running worker + multiscope engine
+        wt = getattr(self, "worker_thread", None)
+        if not wt or not wt.isRunning():
+            return None
+
+        try:
+            manager = wt.manager
+            tracker = manager.process_tracker
+        except Exception:
+            return None
+
+        uid = tracker.process_owners.get(pid)
+        if not uid:
+            return None
+
+        server_label = tracker.user_server.get(uid, "")
+        if not server_label:
+            return None
+
+        ms = getattr(wt, "ms", None)
+        if not ms:
+            return None
+
+        try:
+            rows = ms.snapshot()
+        except Exception:
+            return None
+
+        for row in rows:
+            if row.get("server", "") == server_label:
+                val = row.get("in_menu")
+                # snapshot already normalizes None -> True, but keep the intent:
+                if val is None:
+                    return True
+                return bool(val)
+
+        return None
+
+    def _on_antiafk_show(self):
+        """Show all Roblox windows detected by the Anti-AFK engine."""
+        if self.antiafk:
+            self.antiafk.show_roblox_windows()
+
+    def _on_antiafk_hide(self):
+        """Hide all visible Roblox windows detected by the Anti-AFK engine."""
+        if self.antiafk:
+            self.antiafk.hide_roblox_windows()
+
+    def _on_antiafk_test(self):
+        """Run the built-in AntiAFK test_action_with_delay helper."""
+        if not self.antiafk:
+            return
+        # Delegate completely to AntiAFK's own test helper.
+        self.antiafk.test_action_with_delay()
+
+    def _add_filter_row(self, name: str = "white_text", r: int = 255, g: int = 255, b: int = 255, tol: int = 40, enabled: bool = True):
+        row = self.ocr_filter_table.rowCount()
+        self.ocr_filter_table.insertRow(row)
+
+        enabled_item = QTableWidgetItem()
+        enabled_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        enabled_item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+        self.ocr_filter_table.setItem(row, 0, enabled_item)
+
+        self.ocr_filter_table.setItem(row, 1, QTableWidgetItem(str(name)))
+        self.ocr_filter_table.setItem(row, 2, QTableWidgetItem(str(r)))
+        self.ocr_filter_table.setItem(row, 3, QTableWidgetItem(str(g)))
+        self.ocr_filter_table.setItem(row, 4, QTableWidgetItem(str(b)))
+        self.ocr_filter_table.setItem(row, 5, QTableWidgetItem(str(tol)))
+
+    def _remove_selected_filter_rows(self):
+        rows = sorted({idx.row() for idx in self.ocr_filter_table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.ocr_filter_table.removeRow(r)
+
+    def _load_color_filters_table(self, filters: List[dict]):
+        self.ocr_filter_table.setRowCount(0)
+        defaults = (self.config_manager.default_settings.get("ocr", {}) or {}).get("color_filters", [])
+        for f in filters or defaults:
+            self._add_filter_row(
+                f.get("name", ""),
+                int(f.get("r", 0)),
+                int(f.get("g", 0)),
+                int(f.get("b", 0)),
+                int(f.get("tol", 0)),
+                bool(f.get("enabled", True)),
+            )
+
+    def _current_color_filters(self, as_dataclass: bool = False):
+        filters = []
+        rows = self.ocr_filter_table.rowCount()
+
+        def _get_int(item: QTableWidgetItem, default: int = 0) -> int:
+            try:
+                return int(item.text())
+            except Exception:
+                return default
+
+        for r in range(rows):
+            enabled_item = self.ocr_filter_table.item(r, 0)
+            name_item = self.ocr_filter_table.item(r, 1)
+            r_item = self.ocr_filter_table.item(r, 2)
+            g_item = self.ocr_filter_table.item(r, 3)
+            b_item = self.ocr_filter_table.item(r, 4)
+            tol_item = self.ocr_filter_table.item(r, 5)
+
+            enabled = enabled_item.checkState() == Qt.CheckState.Checked if enabled_item else True
+            name = name_item.text().strip() if name_item else ""
+            rv = _get_int(r_item, 0) if r_item else 0
+            gv = _get_int(g_item, 0) if g_item else 0
+            bv = _get_int(b_item, 0) if b_item else 0
+            tol = _get_int(tol_item, 0) if tol_item else 0
+
+            if as_dataclass:
+                filters.append(ColorFilter(name, rv, gv, bv, tol, enabled))
+            else:
+                filters.append({"name": name, "r": rv, "g": gv, "b": bv, "tol": tol, "enabled": enabled})
+        return filters
+
+    def _get_ocr_settings_from_ui(self) -> dict:
+        roi = self.ocr_roi or (0.0, 0.0, 0.0, 0.0)
+        return {
+            "enabled": bool(self.ocr_enable_chk.isChecked()),
+            "workers": self.ocr_workers_spin.value(),
+            "max_captures_per_second": self.ocr_max_caps_spin.value(),
+            "cooldown_seconds": self.ocr_cooldown_spin.value(),
+            "use_preprocess": bool(self.ocr_preprocess_chk.isChecked()),
+            "roi": {"x": roi[0], "y": roi[1], "w": roi[2], "h": roi[3]},
+            "color_filters": self._current_color_filters(as_dataclass=False),
+        }
+
+    def _apply_ocr_settings_to_ui(self, cfg: dict):
+        defaults = self.config_manager.default_settings.get("ocr", {}) or {}
+        cfg = cfg or defaults
+        self._loading_ocr_settings = True
+        try:
+            target_enabled = bool(cfg.get("enabled", False))
+            self.ocr_enable_chk.setChecked(target_enabled)
+
+            self.ocr_workers_spin.setValue(int(cfg.get("workers", defaults.get("workers", 2))))
+            self.ocr_max_caps_spin.setValue(int(cfg.get("max_captures_per_second", defaults.get("max_captures_per_second", 20))))
+            self.ocr_cooldown_spin.setValue(int(cfg.get("cooldown_seconds", defaults.get("cooldown_seconds", 600))))
+            self.ocr_preprocess_chk.setChecked(bool(cfg.get("use_preprocess", defaults.get("use_preprocess", True))))
+
+            roi_cfg = cfg.get("roi") or {}
+            rx, ry, rw, rh = roi_cfg.get("x", 0.0), roi_cfg.get("y", 0.0), roi_cfg.get("w", 0.0), roi_cfg.get("h", 0.0)
+            try:
+                fx, fy, fw, fh = float(rx), float(ry), float(rw), float(rh)
+            except Exception:
+                fx = fy = fw = fh = 0.0
+            self.ocr_roi = (fx, fy, fw, fh) if fw > 0 and fh > 0 else None
+            self._update_ocr_roi_label()
+
+            self._load_color_filters_table(cfg.get("color_filters") or defaults.get("color_filters", []))
+        finally:
+            self._loading_ocr_settings = False
+
+        # Reflect current CPU/GPU preprocessing device in the OCR tab
+        self._update_ocr_device_label()
+
+        if self._is_manager_running() and self.ocr_enable_chk.isChecked():
+            self._start_ocr_worker()
+
+    def _update_ocr_roi_label(self):
+        if self.ocr_roi:
+            x, y, w, h = self.ocr_roi
+            self.ocr_roi_label.setText(f"ROI: x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}")
+        else:
+            self.ocr_roi_label.setText("ROI: not calibrated")
+
+    def _update_ocr_device_label(self):
+        """Update the OCR device label with current CPU/GPU status."""
+        try:
+            summary = get_ocr_device_summary()
+        except Exception:
+            summary = "Unknown (error checking Torch/Kornia)"
+        self.ocr_device_label.setText(f"OCR Preprocessing Device: {summary}")
+
+    def _on_ocr_enabled_toggled(self, checked: bool):
+        if self._loading_ocr_settings:
+            return
+        if checked:
+            if not self._is_manager_running():
+                QMessageBox.information(self, "Manager not running", "OCR will start once the manager is running.")
+                return
+            self._start_ocr_worker()
+        else:
+            self._stop_ocr_worker()
+
+        # Persist the new enabled state and settings immediately
+        try:
+            settings = self.config_manager.load_settings()
+        except Exception:
+            settings = self.config_manager.default_settings.copy()
+        settings["ocr"] = self._get_ocr_settings_from_ui()
+        try:
+            self.config_manager.save_settings(settings)
+        except Exception:
+            pass
+
+    def _sync_ocr_worker_settings(self):
+        if self.ocr_worker and self.ocr_worker.isRunning():
+            self.ocr_worker.update_settings(self._get_ocr_settings_from_ui(), self._ms_settings_from_ui())
+
+    def _on_ocr_settings_changed(self):
+        """Apply OCR tab settings immediately and persist them."""
+        if self._loading_ocr_settings:
+            return
+        # Save settings
+        try:
+            settings = self.config_manager.load_settings()
+        except Exception:
+            settings = self.config_manager.default_settings.copy()
+        settings["ocr"] = self._get_ocr_settings_from_ui()
+        try:
+            self.config_manager.save_settings(settings)
+        except Exception:
+            pass
+        # Live-apply to worker if running
+        self._sync_ocr_worker_settings()
+
+    def _reset_ocr_to_defaults(self):
+        """Reset only the OCR tab to its default config and live-apply."""
+        defaults = self.config_manager.default_settings.get("ocr", {}) or {}
+        self._loading_ocr_settings = True
+        try:
+            self.ocr_enable_chk.setChecked(bool(defaults.get("enabled", False)))
+            self.ocr_workers_spin.setValue(int(defaults.get("workers", 2)))
+            self.ocr_max_caps_spin.setValue(int(defaults.get("max_captures_per_second", 20)))
+            self.ocr_cooldown_spin.setValue(int(defaults.get("cooldown_seconds", 600)))
+            self.ocr_preprocess_chk.setChecked(bool(defaults.get("use_preprocess", True)))
+            roi_cfg = defaults.get("roi") or {}
+            rx, ry, rw, rh = roi_cfg.get("x", 0.0), roi_cfg.get("y", 0.0), roi_cfg.get("w", 0.0), roi_cfg.get("h", 0.0)
+            try:
+                fx, fy, fw, fh = float(rx), float(ry), float(rw), float(rh)
+            except Exception:
+                fx = fy = fw = fh = 0.0
+            self.ocr_roi = (fx, fy, fw, fh) if fw > 0 and fh > 0 else None
+            self._update_ocr_roi_label()
+            self._load_color_filters_table(defaults.get("color_filters", []))
+        finally:
+            self._loading_ocr_settings = False
+
+        # Persist + apply to worker
+        self._on_ocr_settings_changed()
+        # Device availability may have changed between runs (e.g., driver update)
+        self._update_ocr_device_label()
+
+    def _start_ocr_worker(self):
+        if not self._is_manager_running():
+            return
+        if self.ocr_worker and self.ocr_worker.isRunning():
+            return
+        if not self.ocr_roi:
+            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the chat area before enabling OCR.")
+            self.ocr_enable_chk.setChecked(False)
+            return
+
+        ocr_cfg = self._get_ocr_settings_from_ui()
+        ms_cfg = self._ms_settings_from_ui()
+
+        self.ocr_worker = OCRWorker(
+            ocr_settings=ocr_cfg,
+            ms_settings=ms_cfg,
+            context_provider=self._resolve_pid_context,
+        )
+        self.ocr_worker.log_signal.connect(self._handle_ocr_log)
+        self.ocr_worker.status_signal.connect(self._handle_ocr_status)
+        self.ocr_worker.start()
+        self._handle_ocr_status("running")
+
+    def _stop_ocr_worker(self):
+        if self.ocr_worker:
+            self.ocr_worker.stop()
+            # wait up to 3s for a clean stop; force terminate if hung
+            if not self.ocr_worker.wait(3000):
+                self.add_log("[OCR] stop timed out; forcing terminate()")
+                try:
+                    self.ocr_worker.terminate()
+                except Exception:
+                    pass
+                self.ocr_worker.wait(1000)
+            self.ocr_worker = None
+        self._handle_ocr_status("stopped")
+
+    def _is_manager_running(self) -> bool:
+        return bool(self.worker_thread and self.worker_thread.isRunning())
+
+    def _ms_settings_from_ui(self) -> dict:
+        ms = {}
+        try:
+            settings = self.config_manager.load_settings() or {}
+            ms = settings.get("multiscope", {}) or {}
+        except Exception:
+            ms = {}
+
+        if hasattr(self, "ms_merchant_webhook_input"):
+            ms["merchant_webhook"] = self.ms_merchant_webhook_input.text().strip()
+        if hasattr(self, "ms_enable_jester"):
+            ms["enable_jester"] = bool(self.ms_enable_jester.isChecked())
+        if hasattr(self, "ms_enable_mari"):
+            ms["enable_mari"] = bool(self.ms_enable_mari.isChecked())
+        if hasattr(self, "ms_jester_type") and hasattr(self, "ms_jester_id"):
+            ms["jester_ping_type"] = self.ms_jester_type.currentText()
+            ms["jester_ping_id"] = self.ms_jester_id.text().strip()
+        if hasattr(self, "ms_mari_type") and hasattr(self, "ms_mari_id"):
+            ms["mari_ping_type"] = self.ms_mari_type.currentText()
+            ms["mari_ping_id"] = self.ms_mari_id.text().strip()
+
+        def _mk_ping(typ: str, ident: str) -> str:
+            ident = (ident or "").strip()
+            if not ident:
+                return ""
+            if typ == "User ID":
+                return f"<@{ident}>"
+            if typ == "Role ID":
+                return f"<@&{ident}>"
+            return ident
+
+        ms["jester_ping"] = _mk_ping(ms.get("jester_ping_type", "None"), ms.get("jester_ping_id", ""))
+        ms["mari_ping"] = _mk_ping(ms.get("mari_ping_type", "None"), ms.get("mari_ping_id", ""))
+        return ms
+
+    def calibrate_ocr_roi(self):
+        windows = enum_roblox_windows()
+        if not windows:
+            QMessageBox.warning(self, "No Roblox windows", "No visible Roblox windows were found.")
+            return
+        ref_win = windows[0]
+        img = capture_window_image(ref_win.hwnd)
+        if img is None:
+            QMessageBox.warning(self, "Capture failed", f"Could not capture window '{ref_win.title}'.")
+            return
+
+        pixmap = pil_to_pixmap(img)
+        dlg = ROICropDialog(pixmap, self)
+        if dlg.exec():
+            roi = dlg.selected_roi()
+            if roi:
+                self.ocr_roi = roi
+                self._update_ocr_roi_label()
+                # Persist new ROI + live-apply
+                self._on_ocr_settings_changed()
+
+    def show_ocr_preview(self):
+        """
+        Capture the calibrated chat area from a Roblox window and show what the
+        OCR engine would see. Any unexpected errors are logged to the OCR log
+        panel so users can debug missing dependencies or GPU issues.
+        """
+        if not self.ocr_roi:
+            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the chat area first.")
+            return
+        windows = enum_roblox_windows()
+        if not windows:
+            QMessageBox.warning(self, "No Roblox windows", "No visible Roblox windows were found.")
+            return
+
+        try:
+            win = windows[0]
+            img = capture_window_image(win.hwnd, self.ocr_roi)
+            if img is None:
+                QMessageBox.warning(self, "Capture failed", f"Could not capture window '{win.title}'.")
+                return
+
+            if self.ocr_preprocess_chk.isChecked():
+                img_to_show = preprocess_for_ocr(
+                    img,
+                    self._current_color_filters(as_dataclass=True),
+                )
+            else:
+                img_to_show = img
+
+            pm = pil_to_pixmap(img_to_show)
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("OCR Preview")
+            v = QVBoxLayout(dlg)
+            lbl = QLabel()
+            lbl.setPixmap(pm)
+            v.addWidget(lbl)
+            dlg.resize(pm.width(), pm.height())
+            dlg.exec()
+        except Exception as e:
+            # Mirror OCR worker logging so users see why preview failed
+            msg = f"[OCR Preview] Error: {e}"
+            try:
+                self._handle_ocr_log(msg)
+            except Exception:
+                # Fallback in case the log widget is not available yet
+                try:
+                    print(msg)
+                except Exception:
+                    pass
+            QMessageBox.critical(
+                self,
+                "OCR Preview Error",
+                f"An unexpected error occurred while generating the OCR preview:\n{e}",
+            )
+
+    def _resolve_pid_context(self, pid: int) -> Dict[str, str]:
+        ctx = {"user_id": "", "username": "", "server_label": "", "ps_link": "", "owner": ""}
+        wt = self.worker_thread
+        if wt and wt.manager:
+            tracker = wt.manager.process_tracker
+            uid = tracker.process_owners.get(pid)
+            if uid:
+                ctx["user_id"] = uid
+                info = wt.manager.settings.get(uid, {}) or {}
+                ctx["username"] = info.get("username", uid)
+                ctx["server_label"] = tracker.user_server.get(uid, "")
+                if hasattr(wt, "get_ps_link_for_user"):
+                    try:
+                        ctx["ps_link"] = wt.get_ps_link_for_user(uid) or ""
+                    except Exception:
+                        ctx["ps_link"] = ""
+                if hasattr(wt, "get_owner_for_user"):
+                    try:
+                        ctx["owner"] = wt.get_owner_for_user(uid) or ctx["username"]
+                    except Exception:
+                        ctx["owner"] = ctx["username"]
+
+        if (not ctx.get("username")) and pid in self.process_data:
+            data = self.process_data.get(pid, {})
+            uid = data.get("user_id", "")
+            ctx["user_id"] = uid
+            users_cfg = self.config_manager.load_users()
+            info = users_cfg.get(uid, {}) if isinstance(users_cfg, dict) else {}
+            ctx["username"] = info.get("username", uid)
+            ctx["ps_link"] = info.get("private_server_link", "")
+
+        return ctx
+
+    def _handle_ocr_log(self, msg: str):
+        if msg == self._last_ocr_log:
+            return
+        self._last_ocr_log = msg
+        self.ocr_log_box.append(msg)
+        if self.ocr_log_autoscroll:
+            self.ocr_log_box.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _handle_ocr_status(self, status: str):
+        status_upper = (status or "").strip().lower()
+        if status_upper == "running":
+            self.ocr_status_label.setText("Status: Running")
+            self.ocr_status_label.setStyleSheet(f"color:{ModernStyle.SECONDARY}; font-weight: bold;")
+        else:
+            self.ocr_status_label.setText("Status: Stopped")
+            self.ocr_status_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY}; font-weight: bold;")
     def setup_settings_tab(self):
         settings_widget = QWidget()
         layout = QVBoxLayout(settings_widget)
@@ -2778,20 +4050,21 @@ class RobloxManagerGUI(QMainWindow):
         webhooks_v.addWidget(info_lbl)
 
         self.webhooks_table = QTableWidget()
-        self.webhooks_table.setColumnCount(1 + len(GUI_BIOME_NAMES))  # URL + biomes...
-        headers = ["Webhook URL"] + GUI_BIOME_NAMES
+        self.webhooks_table.setColumnCount(2 + len(GUI_BIOME_NAMES))  # Name + URL + biomes...
+        headers = ["Name", "Webhook URL"] + GUI_BIOME_NAMES
         self.webhooks_table.setHorizontalHeaderLabels(headers)
         self.webhooks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
 
         header = self.webhooks_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         # Make biome columns wide enough so the combobox text is visible when closed
         header.setMinimumSectionSize(150)
         vh = self.webhooks_table.verticalHeader()
         vh.setDefaultSectionSize(30)   # good-looking row height
         vh.setMinimumSectionSize(30)   # prevents squeeze below readable height
 
-        for c in range(1, 1 + len(GUI_BIOME_NAMES)):
+        for c in range(2, 2 + len(GUI_BIOME_NAMES)):
             header.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
             self.webhooks_table.setColumnWidth(c, 150)
         webhooks_v.addWidget(self.webhooks_table)
@@ -2799,10 +4072,55 @@ class RobloxManagerGUI(QMainWindow):
         btn_row = QHBoxLayout()
         add_btn = QPushButton("Add Webhook")
         rem_btn = QPushButton("Remove Selected")
-        btn_row.addWidget(add_btn); btn_row.addWidget(rem_btn); btn_row.addStretch()
+        route_btn = QPushButton("Assign Users...")
+        btn_row.addWidget(add_btn); btn_row.addWidget(rem_btn); btn_row.addWidget(route_btn); btn_row.addStretch()
         webhooks_v.addLayout(btn_row)
 
         MODE_ITEMS = ("None", "Message", "Everyone")  # tri-mode per biome cell
+
+        def _apply_user_filter_to_row(row: int, user_ids=None, user_map: Optional[dict] = None, all_user_ids=None):
+            """Persist the selected users and surface a quick tooltip."""
+            name_item = self.webhooks_table.item(row, 0)
+            url_item  = self.webhooks_table.item(row, 1)
+            target_item = name_item or url_item
+            if not target_item:
+                return
+
+            tip = "Sends events for all users."
+            cleaned = None
+            if user_ids is None:
+                target_item.setData(Qt.ItemDataRole.UserRole, None)
+            else:
+                cleaned = [str(u).strip() for u in (user_ids or []) if str(u).strip()]
+                # If caller passes the full universe, treat it as no filter for clarity.
+                if all_user_ids and set(cleaned) == set(all_user_ids):
+                    cleaned = None
+                    target_item.setData(Qt.ItemDataRole.UserRole, None)
+                else:
+                    target_item.setData(Qt.ItemDataRole.UserRole, cleaned)
+
+            # Keep the tooltip useful (preview a handful of names)
+            if cleaned is not None:
+                if user_map is None:
+                    try:
+                        user_map = self.config_manager.load_users() or {}
+                    except Exception:
+                        user_map = {}
+                if cleaned:
+                    names = []
+                    for uid in cleaned:
+                        info = user_map.get(uid, {}) if isinstance(user_map, dict) else {}
+                        names.append(info.get("username") or uid)
+                    preview = ", ".join(names[:4])
+                    suffix = "..." if len(names) > 4 else ""
+                    tip = f"Users: {preview}{suffix}"
+                else:
+                    tip = "No users selected. This webhook will be skipped until users are assigned."
+
+            if name_item:
+                name_item.setToolTip(tip)
+            if url_item:
+                url_item.setToolTip(tip)
 
         def _mk_mode_combo(default_text: str = "None") -> QComboBox:
             cmb = QComboBox()
@@ -2842,7 +4160,7 @@ class RobloxManagerGUI(QMainWindow):
             return holder
 
 
-        def add_webhook_row(url: str = "", allowed_biomes=None, biome_modes=None):
+        def add_webhook_row(name: str = "", url: str = "", allowed_biomes=None, biome_modes=None, user_ids=None):
             """
             allowed_biomes: Optional[List[str]]  -> kept for backward compatibility
             biome_modes:    Optional[Dict[str, str]] per-biome: "None"|"Message"|"Everyone"
@@ -2851,8 +4169,11 @@ class RobloxManagerGUI(QMainWindow):
             row = self.webhooks_table.rowCount()
             self.webhooks_table.insertRow(row)
 
+            name_item = QTableWidgetItem(name or "")
             url_item = QTableWidgetItem(url)
-            self.webhooks_table.setItem(row, 0, url_item)
+            self.webhooks_table.setItem(row, 0, name_item)
+            self.webhooks_table.setItem(row, 1, url_item)
+            _apply_user_filter_to_row(row, user_ids)
 
             allowed_set = {str(b).upper() for b in (allowed_biomes or [])}
             biome_modes = biome_modes or {}
@@ -2862,10 +4183,13 @@ class RobloxManagerGUI(QMainWindow):
                 default_mode = "Message" if bkey in allowed_set else "None"
                 mode = biome_modes.get(bkey, default_mode)
                 combo = _mk_mode_combo(mode)
-                _place_centered(self.webhooks_table, row, 1 + idx, combo)
+                if bkey in ("GLITCHED", "DREAMSPACE") and not _bm_relaxed():
+                    combo.setCurrentText("Everyone")
+                    combo.setEnabled(False)
+                _place_centered(self.webhooks_table, row, 2 + idx, combo)
 
             # Center + size the row based on the first combo’s height
-            first_holder = self.webhooks_table.cellWidget(row, 1)  # wrapper at first biome col
+            first_holder = self.webhooks_table.cellWidget(row, 2)  # wrapper at first biome col
             first_combo  = None
             if first_holder:
                 first_combo = first_holder.findChild(QComboBox)
@@ -2884,8 +4208,287 @@ class RobloxManagerGUI(QMainWindow):
             for r in rows:
                 self.webhooks_table.removeRow(r)
 
-        add_btn.clicked.connect(lambda: add_webhook_row("", []))
+        def _open_webhook_user_dialog():
+            rows = self.webhooks_table.rowCount()
+            if rows == 0:
+                QMessageBox.information(self, "No webhooks", "Add a webhook before assigning users.")
+                return
+
+            try:
+                users_cfg = self.config_manager.load_users() or {}
+            except Exception:
+                users_cfg = {}
+
+            user_choices = [
+                {
+                    "id": str(uid).strip(),
+                    "username": str(info.get("username", uid)).strip(),
+                }
+                for uid, info in (users_cfg.items() if isinstance(users_cfg, dict) else [])
+            ]
+            user_choices.sort(key=lambda u: u["username"].lower())
+            # Deduplicate by canonicalized id (strip spaces) in case upstream data has duplicates/whitespace
+            uniq = []
+            seen_ids = set()
+            for u in user_choices:
+                cid = u["id"].strip()
+                if cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                uniq.append({"id": cid, "username": u["username"]})
+            user_choices = uniq
+            choice_ids = [u["id"] for u in user_choices]
+            choice_set = set(choice_ids)
+            name_to_id = {u["username"].strip().lower(): u["id"] for u in user_choices if u["username"]}
+
+            entries = []
+            for r in range(rows):
+                name_item = self.webhooks_table.item(r, 0)
+                url_item  = self.webhooks_table.item(r, 1)
+                data_item = name_item or url_item
+                selected_raw = data_item.data(Qt.ItemDataRole.UserRole) if data_item else None
+                # None  -> no explicit filter yet (default: all users)
+                # []    -> explicit "no users"
+                # [ids] -> explicit subset
+                selected_set = set()
+                if isinstance(selected_raw, (list, tuple, set)):
+                    selected_set = {str(u).strip() for u in selected_raw if str(u).strip()}
+                if selected_raw is None and choice_ids:
+                    selected_set = set(choice_ids)  # default: all users enabled
+                name_txt = (name_item.text().strip() if name_item else "")
+                url_txt = (url_item.text().strip() if url_item else "")
+                display = name_txt or url_txt or f"Webhook {r + 1}"
+                entries.append({"row": r, "name": name_txt, "url": url_txt, "display": display, "selected": selected_set})
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Webhook User Routing")
+            dlg.resize(720, 520)
+
+            h = QHBoxLayout(dlg)
+            left_col = QVBoxLayout()
+            webhook_list = QListWidget()
+            webhook_list.setMinimumWidth(240)
+            for entry in entries:
+                webhook_list.addItem(QListWidgetItem(entry["display"]))
+            left_col.addWidget(webhook_list)
+
+            distribute_btn = QPushButton("Distribute Evenly")
+            left_col.addWidget(distribute_btn)
+            left_col.addStretch()
+            h.addLayout(left_col)
+
+            right = QVBoxLayout()
+            h.addLayout(right)
+
+            right.addWidget(QLabel("Choose which users can send events to the selected webhook:"))
+
+            btn_row = QHBoxLayout()
+            select_all_btn = QPushButton("Select All")
+            deselect_all_btn = QPushButton("Deselect All")
+            stagger_btn = QPushButton("Stagger")
+            invert_btn = QPushButton("Invert")
+            btn_row.addWidget(select_all_btn)
+            btn_row.addWidget(deselect_all_btn)
+            btn_row.addWidget(stagger_btn)
+            btn_row.addWidget(invert_btn)
+            btn_row.addStretch()
+            right.addLayout(btn_row)
+
+            user_scroll = QScrollArea()
+            user_scroll.setWidgetResizable(True)
+            user_container = QWidget()
+            user_layout = QVBoxLayout(user_container)
+            user_layout.setContentsMargins(6, 6, 6, 6)
+            user_scroll.setWidget(user_container)
+            right.addWidget(user_scroll)
+
+            btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            right.addWidget(btn_box)
+
+            current_checks: list[QCheckBox] = []
+
+            def _clear_user_layout():
+                while user_layout.count():
+                    item = user_layout.takeAt(0)
+                    if item.widget():
+                        w = item.widget()
+                        w.setParent(None)
+                        w.deleteLater()
+                current_checks.clear()
+
+            def _build_user_checks(idx: int):
+                _clear_user_layout()
+                if idx < 0 or idx >= len(entries):
+                    user_layout.addWidget(QLabel("Select a webhook to edit."))
+                    user_layout.addStretch()
+                    return
+
+                entry = entries[idx]
+                # Normalize any legacy selections (usernames, mixed casing) to IDs where possible
+                def _resolve_to_id(val: str) -> str:
+                    val_clean = (val or "").strip()
+                    if not val_clean:
+                        return ""
+                    if val_clean in choice_set:
+                        return val_clean
+                    m = re.search(r"(\\d+)", val_clean)
+                    if m:
+                        cand = m.group(1)
+                        if cand in choice_set:
+                            return cand
+                    mapped = name_to_id.get(val_clean.lower())
+                    if mapped:
+                        return mapped
+                    return ""
+
+                normalized = set()
+                missing_raw = set()
+                for val in entry["selected"]:
+                    uid_resolved = _resolve_to_id(str(val))
+                    if uid_resolved:
+                        normalized.add(uid_resolved)
+                    else:
+                        missing_raw.add(str(val).strip())
+                entry["selected"] = normalized
+
+                if not user_choices and not entry["selected"]:
+                    user_layout.addWidget(QLabel("No users found. Add accounts first."))
+                    user_layout.addStretch()
+                    return
+
+                for u in user_choices:
+                    uid = u["id"]
+                    label = f"{u['username']} ({uid})" if u["username"] else uid
+                    cb = QCheckBox(label)
+                    cb.setChecked(uid in entry["selected"])
+                    cb.toggled.connect(lambda state, uid=uid, entry=entry:
+                                       entry["selected"].add(uid) if state else entry["selected"].discard(uid))
+                    user_layout.addWidget(cb)
+                    current_checks.append(cb)
+
+                extras = sorted(
+                    v for v in missing_raw
+                    if not _resolve_to_id(v)  # skip anything that actually matches a known user
+                )
+                if extras:
+                    user_layout.addWidget(QLabel("Missing / legacy users:"))
+                    for uid in extras:
+                        cb = QCheckBox(f"{uid} (not in users.json)")
+                        cb.setChecked(True)
+                        cb.toggled.connect(lambda state, uid=uid, entry=entry:
+                                           entry["selected"].add(uid) if state else entry["selected"].discard(uid))
+                        user_layout.addWidget(cb)
+                        current_checks.append(cb)
+
+                user_layout.addStretch()
+                user_scroll.verticalScrollBar().setValue(0)
+
+            def _set_checks(val: bool):
+                for cb in current_checks:
+                    cb.setChecked(val)
+
+            def _stagger_checks():
+                for idx, cb in enumerate(current_checks):
+                    cb.setChecked(idx % 2 == 0)
+
+            def _invert_checks():
+                for cb in current_checks:
+                    cb.setChecked(not cb.isChecked())
+
+            def _distribute_evenly():
+                if not entries or not choice_ids:
+                    return
+                extras_map = {e["row"]: {uid for uid in e["selected"] if uid not in choice_set} for e in entries}
+                for e in entries:
+                    e["selected"] = set(extras_map.get(e["row"], set()))
+                for i, uid in enumerate(choice_ids):
+                    entries[i % len(entries)]["selected"].add(uid)
+                _build_user_checks(webhook_list.currentRow())
+
+            select_all_btn.clicked.connect(lambda: _set_checks(True))
+            deselect_all_btn.clicked.connect(lambda: _set_checks(False))
+            stagger_btn.clicked.connect(_stagger_checks)
+            invert_btn.clicked.connect(_invert_checks)
+            distribute_btn.clicked.connect(_distribute_evenly)
+
+            webhook_list.currentRowChanged.connect(_build_user_checks)
+            webhook_list.setCurrentRow(0 if entries else -1)
+
+            btn_box.rejected.connect(dlg.reject)
+
+            def _persist_webhook_users_only():
+                settings = self.config_manager.load_settings()
+                webhooks = []
+                for entry in entries:
+                    row_idx = entry["row"]
+                    name_item = self.webhooks_table.item(row_idx, 0)
+                    url_item  = self.webhooks_table.item(row_idx, 1)
+                    name = (name_item.text().strip() if name_item else "")
+                    url = (url_item.text().strip() if url_item else "")
+                    if not url:
+                        continue
+
+                    allowed = []
+                    biome_modes = {}
+                    data_item = name_item or url_item
+                    user_filter = data_item.data(Qt.ItemDataRole.UserRole) if data_item else None
+                    selected_users: list[str] = []
+                    explicit_users = False
+                    if isinstance(user_filter, (list, tuple, set)):
+                        explicit_users = True
+                        selected_users = [str(u).strip() for u in user_filter if str(u).strip()]
+                        selected_users = sorted({u for u in selected_users})
+                        # If the explicit selection equals "all users", treat it as no filter
+                        # and omit the users list entirely.
+                        if choice_ids and set(selected_users) == set(choice_ids):
+                            explicit_users = False
+                            selected_users = []
+
+                    for idx, biome_name in enumerate(GUI_BIOME_NAMES):
+                        w = self.webhooks_table.cellWidget(row_idx, 2 + idx)
+                        cb = None
+                        if isinstance(w, QComboBox):
+                            cb = w
+                        elif hasattr(w, "findChild"):
+                            cb = w.findChild(QComboBox)
+                        if cb is not None:
+                            mode = cb.currentText()
+                            if str(biome_name).upper() in ("GLITCHED", "DREAMSPACE") and not _bm_relaxed():
+                                mode = "Everyone"
+                            biome_modes[str(biome_name).upper()] = mode
+                            if mode in ("Message", "Everyone"):
+                                allowed.append(str(biome_name).upper())
+
+                    entry_dict = {"name": name, "url": url, "biomes": allowed}
+                    if biome_modes:
+                        entry_dict["biome_modes"] = biome_modes
+                    if explicit_users:
+                        entry_dict["users"] = selected_users
+                        entry_dict["users_explicit"] = True
+                    webhooks.append(entry_dict)
+
+                settings["webhooks"] = webhooks
+                if self.config_manager.save_settings(settings):
+                    try:
+                        if self.worker_thread and self.worker_thread.isRunning():
+                            self.worker_thread.apply_new_settings(settings)
+                    except Exception:
+                        pass
+
+            def _apply_selections_and_close():
+                for entry in entries:
+                    _apply_user_filter_to_row(entry["row"], sorted(entry["selected"]), user_map=users_cfg, all_user_ids=choice_ids)
+                _persist_webhook_users_only()
+                dlg.accept()
+
+            btn_box.accepted.connect(_apply_selections_and_close)
+
+            _build_user_checks(0 if entries else -1)
+            dlg.exec()
+
+        add_btn.clicked.connect(lambda: add_webhook_row("", ""))
         rem_btn.clicked.connect(remove_selected_rows)
+        route_btn.clicked.connect(_open_webhook_user_dialog)
 
         # expose helpers for load/save
         self._add_webhook_row = add_webhook_row
@@ -2934,7 +4537,7 @@ class RobloxManagerGUI(QMainWindow):
         content_layout.addLayout(buttons_layout); content_layout.addStretch()
 
         scroll_area.setWidget(content_widget); layout.addWidget(scroll_area)
-        self.tab_widget.addTab(settings_widget, "Settings")
+        self.settings_tab_index = self.tab_widget.addTab(settings_widget, "Settings")
         self.load_settings_tab()
 
     def append_log(self, s: str):
@@ -2984,7 +4587,10 @@ class RobloxManagerGUI(QMainWindow):
         layout.addWidget(run_btn)
 
         layout.addStretch()
-        self.tab_widget.addTab(tab, "RAM Export")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(tab)
+        self.tab_widget.addTab(scroll, "RAM Export")
         
     @staticmethod
     def _make_dev_card(name: str,
@@ -3010,28 +4616,34 @@ class RobloxManagerGUI(QMainWindow):
         holder.setFixedSize(inner_d, inner_d)
         holder.move(ring_px, ring_px)       # gap = ring thickness
         
-        try:
-            buf = QBuffer()
-            buf.setData(QByteArray(movie_bytes))
-            buf.open(QIODevice.OpenModeFlag.ReadOnly)
-
-            mv = QMovie()
-            mv.setDevice(buf)
-            mv.setCacheMode(QMovie.CacheMode.CacheAll)
-            mv.setScaledSize(QSize(150, False))      # == holder size
-
-            buf.setParent(mv)
-            mv.setParent(holder)
-            holder.setMovie(mv)
-            mv.start()
-
-        except Exception:
+        def _show_fallback() -> None:
             holder.setText(fallback)
             holder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             holder.setStyleSheet(
                 f"color:{ModernStyle.TEXT_SECONDARY};"
                 f"border:1px dashed {ModernStyle.PRIMARY};"
             )
+
+        if not movie_bytes:
+            _show_fallback()
+        else:
+            try:
+                buf = QBuffer()
+                buf.setData(QByteArray(movie_bytes))
+                buf.open(QIODevice.OpenModeFlag.ReadOnly)
+
+                mv = QMovie()
+                mv.setDevice(buf)
+                mv.setCacheMode(QMovie.CacheMode.CacheAll)
+                mv.setScaledSize(QSize(150, False))      # == holder size
+
+                buf.setParent(mv)
+                mv.setParent(holder)
+                holder.setMovie(mv)
+                mv.start()
+
+            except Exception:
+                _show_fallback()
 
         layout.addWidget(outer)
 
@@ -3075,18 +4687,26 @@ class RobloxManagerGUI(QMainWindow):
         developer_layout.setSpacing(40)
 
         # — Jirach1 —
+        bytes_j = b""
         try:
             bytes_j = Path(__file__).with_name("jirachi.gif").read_bytes()
-        except FileNotFoundError:
-            bytes_j = urlopen("https://kyl.neocities.org/jirachi.gif").read()
+        except Exception:
+            try:
+                bytes_j = urlopen("https://kyl.neocities.org/jirachi.gif").read()
+            except Exception:
+                bytes_j = b""
 
         developer_layout.addWidget(self._make_dev_card("Jirach1", bytes_j))
 
         # — cresqnt —
+        bytes_c = b""
         try:
             bytes_c = Path(__file__).with_name("cresqnt.gif").read_bytes()
-        except FileNotFoundError:
-            bytes_c = urlopen("https://media1.tenor.com/m/CNBGgG2DU10AAAAd/nyan-cat-poptart.gif").read()
+        except Exception:
+            try:
+                bytes_c = urlopen("https://media1.tenor.com/m/CNBGgG2DU10AAAAd/nyan-cat-poptart.gif").read()
+            except Exception:
+                bytes_c = b""
 
         developer_layout.addWidget(self._make_dev_card("cresqnt",  bytes_c))
 
@@ -3279,6 +4899,16 @@ class RobloxManagerGUI(QMainWindow):
 
         self.worker_thread.start()
 
+        if self.ocr_enable_chk.isChecked():
+            self._start_ocr_worker()
+
+        # Auto-start Anti-AFK if enabled in the UI
+        if getattr(self, "antiafk", None) and bool(self.antiafk_enable_chk.isChecked()):
+            try:
+                self.antiafk.toggle_antiafk(True)
+            except Exception:
+                pass
+
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_label.setText("Status: Running")
@@ -3289,7 +4919,22 @@ class RobloxManagerGUI(QMainWindow):
     def stop_manager(self):
         if self.worker_thread and self.worker_thread.isRunning():
             self.worker_thread.stop()
-            self.worker_thread.wait()
+            # wait a few seconds for a clean shutdown; force-stop if hung
+            if not self.worker_thread.wait(5000):
+                self.add_log("[UI] Worker stop timed out; forcing terminate()")
+                try:
+                    self.worker_thread.terminate()
+                except Exception:
+                    pass
+                self.worker_thread.wait(1000)
+        self._stop_ocr_worker()
+
+        # Always stop Anti-AFK when the manager stops
+        if getattr(self, "antiafk", None):
+            try:
+                self.antiafk.toggle_antiafk(False)
+            except Exception:
+                pass
 
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -3313,7 +4958,7 @@ class RobloxManagerGUI(QMainWindow):
         total_processes = sum(len(data.get('pids', [])) for data in self.user_data.values())
         pending_restarts = sum(1 for data in self.user_data.values() if data.get('needs_restart', False))
         users_cfg = self.config_manager.load_users()
-        good = [u for u, i in users_cfg.items() if not i.get("bad")]
+        good = [u for u, i in users_cfg.items() if not i.get("bad") and not i.get("disabled")]
 
         self.total_users_label.setText(f"{len(good)}")
         self.active_users_label.setText(str(active_users))
@@ -3332,11 +4977,18 @@ class RobloxManagerGUI(QMainWindow):
         self.users_table.setRowCount(len(self.user_data))
         users_cfg = self.config_manager.load_users()
 
-        ordered = sorted(self.user_data.items(), key=lambda kv: bool(users_cfg.get(kv[0], {}).get("bad", False)))
+        ordered = sorted(
+            self.user_data.items(),
+            key=lambda kv: (
+                bool(users_cfg.get(kv[0], {}).get("bad", False)),
+                bool(users_cfg.get(kv[0], {}).get("disabled", False))
+            )
+        )
 
         for row, (user_id, runtime) in enumerate(ordered):
             u_conf   = users_cfg.get(user_id, {})
             bad_flag = bool(u_conf.get("bad", False))
+            disabled_flag = bool(u_conf.get("disabled", False))
 
             username  = u_conf.get("username", f"User_{user_id}")
             ps_link   = u_conf.get("private_server_link", "")
@@ -3354,6 +5006,8 @@ class RobloxManagerGUI(QMainWindow):
             # status cell
             if bad_flag:
                 status_text, colour = "Bad", QColor(ModernStyle.ERROR)
+            elif disabled_flag:
+                status_text, colour = "Disabled", QColor(ModernStyle.TEXT_SECONDARY)
             else:
                 raw = runtime.get("status", "Unknown")
                 if "Active" in raw:
@@ -3477,6 +5131,10 @@ class RobloxManagerGUI(QMainWindow):
             }}
         """
 
+    def append_log(self, message: str):
+        """Compatibility wrapper so helpers can call parent.append_log()."""
+        self.add_log(message)
+
     def add_log(self, message):
         if message.startswith("[MultiScope] Watch hit") and not self.watch_hit_chk.isChecked():
             return
@@ -3518,7 +5176,8 @@ class RobloxManagerGUI(QMainWindow):
         dialog.exec()
 
     def open_settings(self):
-        self.tab_widget.setCurrentIndex(4)
+        idx = self.settings_tab_index if self.settings_tab_index is not None else 5
+        self.tab_widget.setCurrentIndex(idx)
 
     def load_settings_tab(self):
         """Populate Settings UI from settings.json (timings + shutdown monitor + tri-mode webhooks + optional merchant/pings)."""
@@ -3550,14 +5209,18 @@ class RobloxManagerGUI(QMainWindow):
         # ---------- Webhooks table (tri-mode + legacy) ----------
         self._clear_webhook_rows()
         for wh in (settings.get("webhooks", []) or []):
+            name    = wh.get("name", "")
             url     = wh.get("url", "")
             allowed = wh.get("biomes", []) or []      # legacy list your worker already uses
             modes   = wh.get("biome_modes", {}) or {} # optional per-biome tri-state
+            raw_users = wh.get("users", None)
+            users_explicit = bool(wh.get("users_explicit", raw_users is not None))
+            users   = raw_users if users_explicit else None  # optional per-user routing
             if url:
                 try:
-                    self._add_webhook_row(url, allowed, modes)
+                    self._add_webhook_row(name, url, allowed, modes, users)
                 except TypeError:
-                    self._add_webhook_row(url, allowed)
+                    self._add_webhook_row(name, url, allowed)
 
         # ---------- Optional: Merchant + Pings (safe if widgets exist) ----------
         ms = settings.get("multiscope", {}) or {}
@@ -3579,7 +5242,8 @@ class RobloxManagerGUI(QMainWindow):
         if hasattr(self, "ms_mari_id"):
             self.ms_mari_id.setText(ms.get("mari_ping_id", ""))
 
-
+        # ---------- OCR tab ----------
+        self._apply_ocr_settings_to_ui(settings.get("ocr", {}))
 
     def save_settings(self):
         """Collect Settings UI and persist to settings.json, then live-apply."""
@@ -3610,20 +5274,39 @@ class RobloxManagerGUI(QMainWindow):
         settings["timeout_monitor"] = tm
 
         # ---------- Webhooks table (tri-mode + legacy-compatible) ----------
+        try:
+            _users_cfg = self.config_manager.load_users() or {}
+        except Exception:
+            _users_cfg = {}
+        all_user_ids = {str(uid) for uid in _users_cfg.keys()} if isinstance(_users_cfg, dict) else set()
         webhooks = []
         rows = self.webhooks_table.rowCount()
         for r in range(rows):
-            url_item = self.webhooks_table.item(r, 0)
+            name_item = self.webhooks_table.item(r, 0)
+            url_item  = self.webhooks_table.item(r, 1)
+            name = (name_item.text().strip() if name_item else "")
             url = (url_item.text().strip() if url_item else "")
             if not url:
                 continue
 
             allowed = []        # legacy list your worker already uses today
             biome_modes = {}    # new per-biome: "None"/"Message"/"Everyone"
+            data_item = name_item or url_item
+            user_filter = data_item.data(Qt.ItemDataRole.UserRole) if data_item else None
+            selected_users: list[str] = []
+            explicit_users = False
+            if isinstance(user_filter, (list, tuple, set)):
+                explicit_users = True
+                selected_users = [str(u).strip() for u in user_filter if str(u).strip()]
+                selected_users = sorted({u for u in selected_users})
+                # If this explicit selection equals "all users", treat as no filter.
+                if all_user_ids and set(selected_users) == all_user_ids:
+                    explicit_users = False
+                    selected_users = []
 
             # --- inside save_settings(), in the webhooks loop ---
             for idx, biome_name in enumerate(GUI_BIOME_NAMES):
-                w = self.webhooks_table.cellWidget(r, 1 + idx)
+                w = self.webhooks_table.cellWidget(r, 2 + idx)
 
                 # support wrapped combo (holder) and raw combo
                 cb = None
@@ -3634,15 +5317,20 @@ class RobloxManagerGUI(QMainWindow):
 
                 if cb is not None:
                     mode = cb.currentText()
+                    if str(biome_name).upper() in ("GLITCHED", "DREAMSPACE") and not _bm_relaxed():
+                        mode = "Everyone"
                     biome_modes[str(biome_name).upper()] = mode
                     if mode in ("Message", "Everyone"):
                         allowed.append(str(biome_name).upper())
                 elif hasattr(w, "isChecked") and w.isChecked():  # legacy checkbox fallback
                     allowed.append(str(biome_name).upper())
 
-            entry = {"url": url, "biomes": allowed}
+            entry = {"name": name, "url": url, "biomes": allowed}
             if biome_modes:
                 entry["biome_modes"] = biome_modes
+            if explicit_users:
+                entry["users"] = selected_users
+                entry["users_explicit"] = True
             webhooks.append(entry)
 
         settings["webhooks"] = webhooks
@@ -3666,6 +5354,9 @@ class RobloxManagerGUI(QMainWindow):
         if hasattr(self, "ms_mari_id"):
             ms["mari_ping_id"]     = self.ms_mari_id.text().strip()
 
+        # ---------- OCR settings ----------
+        settings["ocr"] = self._get_ocr_settings_from_ui()
+
         # convenience: build mention strings the engine can use immediately (still optional)
         def _mk_ping(typ: str, ident: str) -> str:
             ident = (ident or "").strip()
@@ -3686,6 +5377,8 @@ class RobloxManagerGUI(QMainWindow):
         if self.config_manager.save_settings(settings):
             if self.worker_thread and self.worker_thread.isRunning():
                 self.worker_thread.apply_new_settings(settings)
+            if self.ocr_worker and self.ocr_worker.isRunning():
+                self.ocr_worker.update_settings(settings.get("ocr", {}), settings.get("multiscope", {}))
             QMessageBox.information(self, "Success", "Settings saved and applied!")
         else:
             QMessageBox.critical(self, "Error", "Failed to save settings.")
@@ -3712,6 +5405,11 @@ class RobloxManagerGUI(QMainWindow):
         self.poll_interval_input.setValue(t["poll_interval"])
         self.webhook_input.setText(t["webhook_url"])
         self.ping_msg_input.setText(t["ping_message"])
+
+        # -- OCR --
+        self._apply_ocr_settings_to_ui(defaults.get("ocr", {}))
+        if self.ocr_worker and self.ocr_worker.isRunning():
+            self._stop_ocr_worker()
 
         QMessageBox.information(
             self,
@@ -3813,6 +5511,263 @@ class RobloxManagerGUI(QMainWindow):
 
         self.worker_thread.restart_user_session(user_id)
 
+    # ---------------- Accounts tab helpers ----------------
+    def on_account_server_type_changed(self):
+        if self.account_private_radio.isChecked():
+            self.account_place_id_label.hide()
+            self.account_place_id.hide()
+        else:
+            self.account_place_id_label.show()
+            self.account_place_id.show()
+
+    def clear_account_form(self):
+        self.account_user_id.clear()
+        self.account_username.clear()
+        self.account_private_link.clear()
+        self.account_place_id.clear()
+        self.account_cookie.clear()
+        self.account_disabled.setChecked(False)
+        self.account_private_radio.setChecked(True)
+        self.on_account_server_type_changed()
+
+    def add_account(self):
+        user_id = self.account_user_id.text().strip()
+        username = self.account_username.text().strip()
+        private_link = self.account_private_link.text().strip()
+        place_id = self.account_place_id.text().strip()
+        cookie = self.account_cookie.text().strip()
+        disabled = self.account_disabled.isChecked()
+        server_type = "private" if self.account_private_radio.isChecked() else "public"
+
+        if not user_id:
+            QMessageBox.warning(self, "Error", "User ID is required!")
+            return
+        if not username:
+            username = f"User_{user_id}"
+        if not cookie:
+            QMessageBox.warning(self, "Error", "Cookie is required!")
+            return
+        if server_type == "private" and not private_link:
+            QMessageBox.warning(self, "Error", "Private server link is required for private servers!")
+            return
+        if server_type == "public" and not place_id:
+            QMessageBox.warning(self, "Error", "Place ID is required for public servers!")
+            return
+
+        users_config = self.config_manager.load_users()
+        if user_id in users_config:
+            QMessageBox.warning(self, "Error", f"User {user_id} already exists!")
+            return
+
+        account_data = {
+            "username": username,
+            "server_type": server_type,
+            "private_server_link": private_link if server_type == "private" else "",
+            "place_id": place_id if server_type == "public" else "",
+            "cookie": cookie,
+            "disabled": disabled,
+        }
+        users_config[user_id] = account_data
+        if self.config_manager.save_users(users_config):
+            QMessageBox.information(self, "Success", f"Account {user_id} ({username}) added successfully!")
+            self.clear_account_form()
+            self.refresh_accounts_list()
+            self.refresh_users()
+        else:
+            QMessageBox.critical(self, "Error", "Failed to save account!")
+
+    def refresh_accounts_list(self):
+        users_config = self.config_manager.load_users()
+        self.accounts_list.setRowCount(len(users_config))
+        for row, (user_id, user_info) in enumerate(users_config.items()):
+            if isinstance(user_info, dict):
+                username = user_info.get("username", f"User_{user_id}")
+                server_type = user_info.get("server_type", "private")
+                disabled = user_info.get("disabled", False)
+                bad_flag = user_info.get("bad", False)
+            else:
+                username = f"User_{user_id}"
+                server_type = "private"
+                disabled = False
+                bad_flag = False
+
+            self.accounts_list.setItem(row, 0, QTableWidgetItem(user_id))
+            self.accounts_list.setItem(row, 1, QTableWidgetItem(username))
+            self.accounts_list.setItem(row, 2, QTableWidgetItem(server_type.title()))
+
+            status_text = "Disabled" if disabled else "Enabled"
+            if bad_flag:
+                status_text = f"{status_text} (bad)"
+            status_item = QTableWidgetItem(status_text)
+            if disabled:
+                status_item.setForeground(QColor("#FF6666"))
+            elif bad_flag:
+                status_item.setForeground(QColor(ModernStyle.ERROR))
+            else:
+                status_item.setForeground(QColor("#66FF66"))
+            self.accounts_list.setItem(row, 3, status_item)
+
+            action_cell = QWidget()
+            action_layout = QHBoxLayout(action_cell)
+            action_layout.setContentsMargins(0, 0, 0, 0)
+            action_layout.setSpacing(4)
+
+            edit_btn = QPushButton("Edit")
+            edit_btn.setStyleSheet(
+                "QPushButton {background-color:%s; color:white; border:none; padding:2px 4px; border-radius:3px; font-size:8px; font-weight:bold; min-width:50px; max-width:80px; min-height:18px; max-height:22px;} QPushButton:hover {background-color:%s;}"
+                % (ModernStyle.PRIMARY, ModernStyle.PRIMARY_VARIANT)
+            )
+            edit_btn.clicked.connect(lambda _, uid=user_id: self.edit_account(uid))
+            action_layout.addWidget(edit_btn)
+
+            action_layout.addStretch()
+            self.accounts_list.setCellWidget(row, 4, action_cell)
+
+            delete_btn = QPushButton("Del")
+            delete_btn.setStyleSheet(
+                "QPushButton {background-color:#f44336; color:white; border:none; padding:2px 4px; border-radius:3px; font-size:8px; font-weight:bold; min-width:40px; max-width:70px; min-height:18px; max-height:22px;} QPushButton:hover {background-color:#da190b;}"
+            )
+            delete_btn.clicked.connect(lambda _, uid=user_id: self.delete_account(uid))
+            self.accounts_list.setCellWidget(row, 5, delete_btn)
+
+    def edit_account(self, user_id):
+        users_config = self.config_manager.load_users()
+        user_info = users_config.get(user_id, {})
+        if not isinstance(user_info, dict):
+            return
+        self.account_user_id.setText(user_id)
+        self.account_user_id.setEnabled(False)
+        self.account_username.setText(user_info.get("username", f"User_{user_id}"))
+        self.account_private_link.setText(user_info.get("private_server_link", ""))
+        self.account_place_id.setText(user_info.get("place_id", ""))
+        self.account_cookie.setText(user_info.get("cookie", ""))
+        self.account_disabled.setChecked(user_info.get("disabled", False))
+        server_type = user_info.get("server_type", "private")
+        if server_type == "public":
+            self.account_public_radio.setChecked(True)
+        else:
+            self.account_private_radio.setChecked(True)
+        self.on_account_server_type_changed()
+        self.add_account_btn.setText("Update Account")
+        try:
+            self.add_account_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.add_account_btn.clicked.connect(lambda: self.update_account(user_id))
+
+    def update_account(self, user_id):
+        username = self.account_username.text().strip() or f"User_{user_id}"
+        private_link = self.account_private_link.text().strip()
+        place_id = self.account_place_id.text().strip()
+        cookie = self.account_cookie.text().strip()
+        disabled = self.account_disabled.isChecked()
+        server_type = "private" if self.account_private_radio.isChecked() else "public"
+
+        if not cookie:
+            QMessageBox.warning(self, "Error", "Cookie is required!")
+            return
+        if server_type == "private" and not private_link:
+            QMessageBox.warning(self, "Error", "Private server link is required for private servers!")
+            return
+        if server_type == "public" and not place_id:
+            QMessageBox.warning(self, "Error", "Place ID is required for public servers!")
+            return
+
+        users_config = self.config_manager.load_users()
+        existing = users_config.get(user_id, {})
+        account_data = {
+            "username": username,
+            "server_type": server_type,
+            "private_server_link": private_link if server_type == "private" else "",
+            "place_id": place_id if server_type == "public" else "",
+            "cookie": cookie,
+            "disabled": disabled,
+            "bad": existing.get("bad", False),
+        }
+        users_config[user_id] = account_data
+        if self.config_manager.save_users(users_config):
+            QMessageBox.information(self, "Success", f"Account {user_id} ({username}) updated successfully!")
+            self.clear_account_form()
+            self.account_user_id.setEnabled(True)
+            self.add_account_btn.setText("Add Account")
+            try:
+                self.add_account_btn.clicked.disconnect()
+            except Exception:
+                pass
+            self.add_account_btn.clicked.connect(self.add_account)
+            self.refresh_accounts_list()
+            self.refresh_users()
+        else:
+            QMessageBox.critical(self, "Error", "Failed to update account!")
+
+    def delete_account(self, user_id):
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Are you sure you want to delete account {user_id}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        users_config = self.config_manager.load_users()
+        if user_id in users_config:
+            users_config.pop(user_id, None)
+            if self.config_manager.save_users(users_config):
+                QMessageBox.information(self, "Success", f"Account {user_id} deleted successfully!")
+                self.refresh_accounts_list()
+                self.refresh_users()
+            else:
+                QMessageBox.critical(self, "Error", "Failed to delete account!")
+
+    def toggle_user_enabled(self, user_id):
+        """Toggle the disabled flag for an account and refresh UI."""
+        try:
+            users_config = self.config_manager.load_users()
+            if user_id not in users_config:
+                QMessageBox.warning(self, "Error", f"Account {user_id} not found.")
+                return False
+            info = users_config[user_id]
+            if not isinstance(info, dict):
+                QMessageBox.warning(self, "Error", "Cannot modify legacy account format. Please update account configuration.")
+                return False
+            info["disabled"] = not info.get("disabled", False)
+            if self.config_manager.save_users(users_config):
+                if info["disabled"] and self.worker_thread and self.worker_thread.isRunning():
+                    self.worker_thread.kill_user_processes(user_id)
+                self.refresh_users()
+                status = "disabled" if info["disabled"] else "enabled"
+                QMessageBox.information(self, "Account Status Changed", f"Account {user_id} has been {status}.")
+                return True
+            QMessageBox.critical(self, "Error", "Failed to save account configuration.")
+            return False
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to toggle account status: {e}")
+            return False
+
+    def toggle_user_enabled(self, user_id):
+        try:
+            users_config = self.config_manager.load_users()
+            if user_id not in users_config:
+                QMessageBox.warning(self, "Error", f"Account {user_id} not found.")
+                return False
+            user_info = users_config[user_id]
+            if not isinstance(user_info, dict):
+                QMessageBox.warning(self, "Error", "Cannot modify legacy account format. Please update account configuration.")
+                return False
+            user_info["disabled"] = not user_info.get("disabled", False)
+            if self.config_manager.save_users(users_config):
+                if user_info["disabled"] and self.worker_thread and self.worker_thread.isRunning():
+                    self.worker_thread.kill_user_processes(user_id)
+                self.refresh_users()
+                status = "disabled" if user_info["disabled"] else "enabled"
+                QMessageBox.information(self, "Account Status Changed", f"Account {user_id} has been {status}.")
+                return True
+            QMessageBox.critical(self, "Error", "Failed to save account configuration.")
+            return False
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to toggle account status: {e}")
+            return False
+
     def kill_user_processes(self, user_id):
         if not self.worker_thread or not self.worker_thread.isRunning():
             QMessageBox.warning(self, "Manager Not Running", "Please start the manager first.")
@@ -3853,10 +5808,24 @@ class RobloxManagerGUI(QMainWindow):
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
                 self.stop_manager()
+                if self.ocr_worker and self.ocr_worker.isRunning():
+                    self._stop_ocr_worker()
+                if getattr(self, "antiafk", None):
+                    try:
+                        self.antiafk.shutdown()
+                    except Exception:
+                        pass
                 event.accept()
             else:
                 event.ignore()
         else:
+            if self.ocr_worker and self.ocr_worker.isRunning():
+                self._stop_ocr_worker()
+            if getattr(self, "antiafk", None):
+                try:
+                    self.antiafk.shutdown()
+                except Exception:
+                    pass
             event.accept()
     
     def setup_multiscope_tab(self):
@@ -3864,9 +5833,9 @@ class RobloxManagerGUI(QMainWindow):
         layout = QVBoxLayout(multiscope_widget)
 
         self.multiscope_table = QTableWidget()
-        self.multiscope_table.setColumnCount(7)
+        self.multiscope_table.setColumnCount(8)
         self.multiscope_table.setHorizontalHeaderLabels([
-            "Server", "Users", "Last Biome", "Biome Age", "Last Merchant", "Merchant Age", "Events"
+            "Server", "Users", "In-Menu", "Last Biome", "Biome Age", "Last Merchant", "Merchant Age", "Events"
         ])
         header = self.multiscope_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -3876,6 +5845,7 @@ class RobloxManagerGUI(QMainWindow):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         self.multiscope_table.verticalHeader().setDefaultSectionSize(44)
 
         layout.addWidget(self.multiscope_table)
@@ -3891,29 +5861,31 @@ class RobloxManagerGUI(QMainWindow):
 
 
     def update_multiscope(self, rows: list):
-        # rows: [{server, users, last_biome|biome, biome_age, last_merchant|merchant, merchant_age, events}]
+        # rows: [{server, users, in_menu, last_biome|biome, biome_age, last_merchant|merchant, merchant_age, events}]
         self.multiscope_table.setRowCount(len(rows))
         for r, row in enumerate(rows):
-            server = row.get("server", "—")
+            server = row.get("server", "")
             users_list = row.get("users", [])
-            users = ", ".join(users_list) if users_list else "—"
+            users = ", ".join(users_list) if users_list else ""
+            in_menu_val = row.get("in_menu")
+            in_menu_txt = "True" if in_menu_val is None else ("True" if in_menu_val else "False")
 
             # accept both key styles
-            last_biome = row.get("last_biome", row.get("biome", "—"))
+            last_biome = row.get("last_biome", row.get("biome", ""))
             biome_age = row.get("biome_age")
-            last_merchant = row.get("last_merchant", row.get("merchant", "—"))
+            last_merchant = row.get("last_merchant", row.get("merchant", ""))
             merchant_age = row.get("merchant_age")
             events = str(row.get("events", 0))
 
             self.multiscope_table.setItem(r, 0, QTableWidgetItem(server))
             self.multiscope_table.setItem(r, 1, QTableWidgetItem(users))
-            self.multiscope_table.setItem(r, 2, QTableWidgetItem(last_biome))
-            self.multiscope_table.setItem(r, 3, QTableWidgetItem(f"{biome_age}s" if biome_age is not None else "—"))
-            self.multiscope_table.setItem(r, 4, QTableWidgetItem(last_merchant))
-            self.multiscope_table.setItem(r, 5, QTableWidgetItem(f"{merchant_age}s" if merchant_age is not None else "—"))
-            self.multiscope_table.setItem(r, 6, QTableWidgetItem(events))
+            self.multiscope_table.setItem(r, 2, QTableWidgetItem(in_menu_txt))
+            self.multiscope_table.setItem(r, 3, QTableWidgetItem(last_biome))
+            self.multiscope_table.setItem(r, 4, QTableWidgetItem(f"{biome_age}s" if biome_age is not None else ""))
+            self.multiscope_table.setItem(r, 5, QTableWidgetItem(last_merchant))
+            self.multiscope_table.setItem(r, 6, QTableWidgetItem(f"{merchant_age}s" if merchant_age is not None else ""))
+            self.multiscope_table.setItem(r, 7, QTableWidgetItem(events))
 
-            
     def test_multiscope_webhooks(self):
         try:
             import requests

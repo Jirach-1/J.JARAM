@@ -276,74 +276,136 @@ class ProcessManager:
         return False
 
     def terminate_process(self, pid=None, tracker=None):
-        if pid:
+        """
+        Kill RobloxPlayerBeta.exe processes without calling taskkill.exe.
+
+        • If pid is given: kill that PID only.
+        • If pid is None: kill all matching processes (except excluded_pid).
+        """
+        def _cleanup_tracker(_pid: int):
+            if not tracker:
+                return
+            # Remove from per-user lists
+            user_id = tracker.process_owners.get(_pid)
+            if user_id:
+                lst = tracker.user_processes.get(user_id, [])
+                if _pid in lst:
+                    lst.remove(_pid)
+            tracker.process_owners.pop(_pid, None)
+            tracker.creation_timestamps.pop(_pid, None)
+
+        def _kill_one(_pid: int) -> bool:
+            if _pid == self.excluded_pid:
+                return False
             try:
-                process = psutil.Process(pid)
-                # (optional) protect the launcher itself
-                if pid == self.excluded_pid:
-                    return False
-                # primary method
-                rc = os.system(f"taskkill /F /PID {pid}")
-                if rc != 0:              # taskkill failed – try psutil
-                    process.kill()
-                # … tracker-cleanup exactly as before …
-                    if tracker and pid in tracker.process_owners:
-                        user_id = tracker.process_owners[pid]
-                        if pid in tracker.user_processes[user_id]:
-                            tracker.user_processes[user_id].remove(pid)
-                        del tracker.process_owners[pid]
-                    if tracker and pid in tracker.creation_timestamps:
-                        del tracker.creation_timestamps[pid]
-                    return True
+                proc = psutil.Process(_pid)
             except psutil.NoSuchProcess:
-                if tracker and pid in tracker.process_owners:
-                    user_id = tracker.process_owners[pid]
-                    if pid in tracker.user_processes[user_id]:
-                        tracker.user_processes[user_id].remove(pid)
-                    del tracker.process_owners[pid]
-                if tracker and pid in tracker.creation_timestamps:
-                    del tracker.creation_timestamps[pid]
-            return False
-        else:
-            terminated = False
+                _cleanup_tracker(_pid)
+                return False
+
+            try:
+                # Try a graceful terminate first
+                proc.terminate()
+                try:
+                    proc.wait(5)
+                except psutil.TimeoutExpired:
+                    # Force kill if it doesn't die in 5s
+                    proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                # Nothing more we can do
+                pass
+
+            _cleanup_tracker(_pid)
+            return True
+
+        # --- Single PID branch ---------------------------------------------
+        if pid is not None:
+            return _kill_one(pid)
+
+        # --- Kill all RobloxPlayerBeta.exe processes -----------------------
+        terminated_any = False
+        try:
             for process in psutil.process_iter(['pid', 'name']):
-                if process.info['name'] == self.process_name and process.info['pid'] != self.excluded_pid:
-                    pid = process.info['pid']
-                    os.system(f"taskkill /F /PID {pid}")
+                try:
+                    name = process.info.get('name')
+                    _pid = process.info.get('pid')
+                except (psutil.NoSuchProcess,
+                        psutil.AccessDenied,
+                        psutil.ZombieProcess):
+                    continue
 
-                    if tracker and pid in tracker.process_owners:
-                        user_id = tracker.process_owners[pid]
-                        if pid in tracker.user_processes[user_id]:
-                            tracker.user_processes[user_id].remove(pid)
-                        del tracker.process_owners[pid]
-                    if tracker and pid in tracker.creation_timestamps:
-                        del tracker.creation_timestamps[pid]
-                    terminated = True
-            return terminated
+                if name == self.process_name and _pid != self.excluded_pid:
+                    if _kill_one(_pid):
+                        terminated_any = True
+        except (OSError, psutil.Error):
+            # If the system is under resource pressure, just bail out gracefully.
+            pass
 
+        return terminated_any
+    
     def count_windows_by_process(self):
-        active_pids = []
-        for process in psutil.process_iter(['pid', 'name']):
-            if process.info['name'] == self.process_name and process.info['pid'] != self.excluded_pid:
-                active_pids.append(process.info['pid'])
+        """
+        Count visible top-level windows belonging to RobloxPlayerBeta.exe PIDs.
+
+        Hardened so that:
+          • psutil.process_iter() OSError/WinError 8 is swallowed gracefully
+          • per-process info errors (AccessDenied, disappeared PIDs) are ignored
+          • EnumWindows failures don't crash the worker loop
+        """
+        from collections import defaultdict
 
         window_counts = defaultdict(int)
+        active_pids = []
 
+        # --- Safely collect Roblox PIDs ------------------------------------
+        try:
+            for process in psutil.process_iter(['pid', 'name']):
+                try:
+                    name = process.info.get('name')
+                    pid  = process.info.get('pid')
+                except (psutil.NoSuchProcess,
+                        psutil.AccessDenied,
+                        psutil.ZombieProcess):
+                    continue
+
+                if name == self.process_name and pid != self.excluded_pid:
+                    active_pids.append(pid)
+        except (OSError, psutil.Error):
+            # WinError 8 / resource issues → just skip this pass
+            return window_counts
+
+        if not active_pids:
+            return window_counts
+
+        # --- Count windows for those PIDs ----------------------------------
         def window_callback(hwnd, extra):
-            if win32gui.IsWindowVisible(hwnd):
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                if pid in active_pids:
-                    window_counts[pid] += 1
+            try:
+                if win32gui.IsWindowVisible(hwnd):
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    if pid in active_pids:
+                        window_counts[pid] += 1
+            except Exception:
+                # Never let a bad window handle kill the loop
+                pass
 
-        win32gui.EnumWindows(window_callback, None)
+        try:
+            win32gui.EnumWindows(window_callback, None)
+        except Exception:
+            # If EnumWindows itself fails, just return what we have
+            pass
+
         return window_counts
 
     def verify_process_active(self, pid):
-        try:
-            process = psutil.Process(pid)
-            return process.name() == self.process_name and pid != self.excluded_pid
-        except psutil.NoSuchProcess:
-            return False
+            try:
+                process = psutil.Process(pid)
+                return process.name() == self.process_name and pid != self.excluded_pid
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                return False
+            except Exception:
+                # Any unexpected psutil error => treat as inactive so the loop doesn't die
+                return False
+
 
     def await_new_process(self, user_id, launch_timestamp, timeout, tracker):
         start_time = time.time()
