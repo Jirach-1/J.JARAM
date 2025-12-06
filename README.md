@@ -106,7 +106,6 @@ C:\Users\[USERNAME]\AppData\Roaming\JARAM\
 ### Setting Up Accounts
 
 #### 1. Launch JARAM
-- **Executable**: Double-click `JARAM.exe`
 - **Source**: Run `python gui.py`
 
 #### 2. Add User Accounts
@@ -143,7 +142,6 @@ Share links are automatically converted to direct links using the Roblox API for
 ## Usage Guide
 
 ### Starting the Application
-- **Executable**: Double-click `JARAM.exe`
 - **Source**: Run `python gui.py`
 
 ### Interface Overview
