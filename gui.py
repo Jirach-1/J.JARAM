@@ -217,7 +217,7 @@ class ConfigManager:
             },
             "ocr": {
                 "enabled": False,             # current desired state
-                "workers": 2,
+                "workers": 1,
                 "max_captures_per_second": 20,
                 "cooldown_seconds": 600,
                 "use_preprocess": True,
@@ -3653,7 +3653,7 @@ class RobloxManagerGUI(QMainWindow):
             target_enabled = bool(cfg.get("enabled", False))
             self.ocr_enable_chk.setChecked(target_enabled)
 
-            self.ocr_workers_spin.setValue(int(cfg.get("workers", defaults.get("workers", 2))))
+            self.ocr_workers_spin.setValue(int(cfg.get("workers", defaults.get("workers", 1))))
             self.ocr_max_caps_spin.setValue(int(cfg.get("max_captures_per_second", defaults.get("max_captures_per_second", 20))))
             self.ocr_cooldown_spin.setValue(int(cfg.get("cooldown_seconds", defaults.get("cooldown_seconds", 600))))
             self.ocr_preprocess_chk.setChecked(bool(cfg.get("use_preprocess", defaults.get("use_preprocess", True))))
@@ -3741,7 +3741,7 @@ class RobloxManagerGUI(QMainWindow):
         self._loading_ocr_settings = True
         try:
             self.ocr_enable_chk.setChecked(bool(defaults.get("enabled", False)))
-            self.ocr_workers_spin.setValue(int(defaults.get("workers", 2)))
+            self.ocr_workers_spin.setValue(int(defaults.get("workers", 1)))
             self.ocr_max_caps_spin.setValue(int(defaults.get("max_captures_per_second", 20)))
             self.ocr_cooldown_spin.setValue(int(defaults.get("cooldown_seconds", 600)))
             self.ocr_preprocess_chk.setChecked(bool(defaults.get("use_preprocess", True)))

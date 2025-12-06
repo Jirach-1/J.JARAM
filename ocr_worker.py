@@ -310,12 +310,20 @@ def capture_window_image(hwnd: int, roi: Optional[Tuple[float, float, float, flo
 
 
 def preprocess_for_ocr(image: Image.Image, color_filters: List[ColorFilter]) -> Image.Image:
-    if not color_filters:
-        gray = image.convert("L")
-        gray = ImageOps.autocontrast(gray)
-        w0, h0 = gray.size
+    def _finalize_gray(gray_img: Image.Image) -> Image.Image:
+        """Apply contrast, scale, and invert to prepare for OCR."""
+        if gray_img.mode != "L":
+            gray_img = gray_img.convert("L")
+        gray_img = ImageOps.autocontrast(gray_img)
+        w0, h0 = gray_img.size
+        if w0 == 0 or h0 == 0:
+            return ImageOps.invert(gray_img)
         scale = 3 if w0 < 400 else 2
-        return gray.resize((w0 * scale, h0 * scale), Image.LANCZOS)
+        resized = gray_img.resize((w0 * scale, h0 * scale), Image.LANCZOS)
+        return ImageOps.invert(resized)
+
+    if not color_filters:
+        return _finalize_gray(image.convert("L"))
 
     if _torch is None or _kornia is None:
         raise RuntimeError("Torch + Kornia are required for OCR color-filter preprocessing.")
@@ -325,11 +333,7 @@ def preprocess_for_ocr(image: Image.Image, color_filters: List[ColorFilter]) -> 
 
     h, w = arr.shape[0], arr.shape[1]
     if h == 0 or w == 0:
-        gray = rgb.convert("L")
-        gray = ImageOps.autocontrast(gray)
-        w0, h0 = gray.size
-        scale = 3 if w0 < 400 else 2
-        return gray.resize((w0 * scale, h0 * scale), Image.LANCZOS)
+        return _finalize_gray(rgb.convert("L"))
 
     # Strict GPU-only: do not silently fall back to CPU
     if not _torch.cuda.is_available():
@@ -349,11 +353,7 @@ def preprocess_for_ocr(image: Image.Image, color_filters: List[ColorFilter]) -> 
             filt_rgb.append([float(cf.r) / 255.0, float(cf.g) / 255.0, float(cf.b) / 255.0])
             filt_tol.append(float(cf.tol) / 255.0)
         if not filt_rgb:
-            gray = rgb.convert("L")
-            gray = ImageOps.autocontrast(gray)
-            w0, h0 = gray.size
-            scale = 3 if w0 < 400 else 2
-            return gray.resize((w0 * scale, h0 * scale), Image.LANCZOS)
+            return _finalize_gray(rgb.convert("L"))
 
         filt_rgb_t = _torch.tensor(filt_rgb, device=device, dtype=_torch.float16).view(-1, 3, 1, 1)
         filt_tol_t = _torch.tensor(filt_tol, device=device, dtype=_torch.float16).view(-1, 1, 1, 1)
@@ -369,10 +369,8 @@ def preprocess_for_ocr(image: Image.Image, color_filters: List[ColorFilter]) -> 
         mask_img = np.clip(mask_img * 255.0, 0, 255).astype(np.uint8)
         text_only = Image.fromarray(mask_img, mode="RGB")
 
-        gray = ImageOps.autocontrast(text_only.convert("L"))
-        w0, h0 = gray.size
-        scale = 3 if w0 < 400 else 2
-        return gray.resize((w0 * scale, h0 * scale), Image.LANCZOS)
+        gray = text_only.convert("L")
+        return _finalize_gray(gray)
 
 
 
@@ -485,7 +483,7 @@ class OCRWorker(QThread):
             if not windows:
                 self._log("No Roblox windows found.")
                 self._log(f"[Loop {loop_idx}] Sleeping 1.00s (no windows).")
-                time.sleep(1.0)
+                time.sleep(2.0)
                 continue
 
             work_list = self._select_windows(windows)
@@ -523,8 +521,8 @@ class OCRWorker(QThread):
                 self._log(f"[Loop {loop_idx}] No windows eligible for capture this cycle.")
 
             elapsed = time.time() - start
-            if elapsed < 1.0:
-                sleep_for = max(0.0, 1.0 - elapsed)
+            if elapsed < 2.0:
+                sleep_for = max(0.0, 2.0 - elapsed)
                 self._log(f"[Loop {loop_idx}] Sleeping {sleep_for:.2f}s to throttle loop.")
                 time.sleep(sleep_for)
 
@@ -797,7 +795,7 @@ class OCRWorker(QThread):
 
         self._filters = _filters_from_cfg(self._ocr_cfg.get("color_filters") or [])
         self._roi = _roi_from_cfg(self._ocr_cfg.get("roi") or {})
-        self._workers = max(1, int(self._ocr_cfg.get("workers", 2) or 1))
+        self._workers = max(1, int(self._ocr_cfg.get("workers", 1) or 1))
         self._max_captures_per_second = max(1, int(self._ocr_cfg.get("max_captures_per_second", 20) or 1))
         self._cooldown_seconds = float(self._ocr_cfg.get("cooldown_seconds", 600) or 600)
         self._use_preprocess = bool(self._ocr_cfg.get("use_preprocess", True))
