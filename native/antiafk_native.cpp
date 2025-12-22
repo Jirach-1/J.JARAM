@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -35,7 +36,6 @@ constexpr int kNoWindowsStatusEveryS = 10;
 constexpr int kLoopIdleWaitS = 1;
 constexpr int kNoWindowsWaitS = 5;
 constexpr int kUserInactivityWaitS = 5;
-constexpr DWORD kWindowTextTimeoutMs = 100;
 
 using Clock = std::chrono::steady_clock;
 
@@ -45,6 +45,35 @@ std::int64_t mono_ms() {
 
 bool contains(std::wstring_view haystack, std::wstring_view needle) {
   return haystack.find(needle) != std::wstring_view::npos;
+}
+
+inline wchar_t lower_ascii(wchar_t c) {
+  if (c >= L'A' && c <= L'Z') {
+    return static_cast<wchar_t>(c - L'A' + L'a');
+  }
+  return c;
+}
+
+bool icontains_ascii(std::wstring_view haystack, std::wstring_view needle) {
+  if (needle.empty()) {
+    return true;
+  }
+  if (haystack.size() < needle.size()) {
+    return false;
+  }
+  for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+    bool match = true;
+    for (size_t j = 0; j < needle.size(); ++j) {
+      if (lower_ascii(haystack[i + j]) != lower_ascii(needle[j])) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::string wide_to_utf8(std::wstring_view w) {
@@ -64,73 +93,49 @@ std::string wide_to_utf8(std::wstring_view w) {
 }
 
 std::wstring window_text(HWND hwnd, bool* timed_out = nullptr) {
-  if (timed_out) {
-    *timed_out = false;
-  }
   if (!hwnd || !::IsWindow(hwnd)) {
     return {};
   }
-
-  const UINT flags = SMTO_ABORTIFHUNG | SMTO_BLOCK;
-  bool timeout_hit = false;
-  const auto log_timeout = [&](const wchar_t* stage) {
-    std::wostringstream oss;
-    oss << L"[AntiAFK] window title read timed out (" << stage << L") for hwnd=" << hwnd << L"\n";
-    ::OutputDebugStringW(oss.str().c_str());
-  };
-
-  DWORD_PTR len = 0;
-  const LRESULT len_res =
-      ::SendMessageTimeoutW(hwnd, WM_GETTEXTLENGTH, 0, 0, flags, kWindowTextTimeoutMs, &len);
-  if (len_res == 0) {
-    timeout_hit = (::GetLastError() == ERROR_TIMEOUT);
-    if (timeout_hit) {
-      log_timeout(L"WM_GETTEXTLENGTH");
-    }
-    if (timed_out) {
-      *timed_out = timeout_hit;
-    }
+  if (timed_out) {
+    *timed_out = false;
+  }
+  const int len = ::GetWindowTextLengthW(hwnd);
+  if (len <= 0) {
     return {};
   }
-  if (len == 0) {
-    return {};
-  }
-
   std::wstring out;
   out.resize(static_cast<size_t>(len) + 1);
-
-  DWORD_PTR written = 0;
-  const LRESULT text_res = ::SendMessageTimeoutW(hwnd,
-                                                 WM_GETTEXT,
-                                                 static_cast<WPARAM>(out.size()),
-                                                 reinterpret_cast<LPARAM>(out.data()),
-                                                 flags,
-                                                 kWindowTextTimeoutMs,
-                                                 &written);
-  if (text_res == 0) {
-    timeout_hit = timeout_hit || (::GetLastError() == ERROR_TIMEOUT);
-    if (timeout_hit) {
-      log_timeout(L"WM_GETTEXT");
-    }
-    if (timed_out) {
-      *timed_out = timeout_hit;
-    }
-    return {};
-  }
-
-  const size_t actual = std::min(static_cast<size_t>(written), out.size());
-  if (actual == 0) {
-    return {};
-  }
-
-  out.resize(actual);
-
-  if (timeout_hit) {
-    log_timeout(L"WM_GETTEXT");
-  }
   if (timed_out) {
-    *timed_out = timeout_hit;
+    DWORD_PTR message_result = 0;
+    ::SetLastError(ERROR_SUCCESS);
+    const int timeout_ms = 150;
+    const BOOL sent = ::SendMessageTimeoutW(
+        hwnd,
+        WM_GETTEXT,
+        static_cast<WPARAM>(out.size()),
+        reinterpret_cast<LPARAM>(out.data()),
+        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        timeout_ms,
+        &message_result);
+    if (!sent) {
+      if (::GetLastError() == ERROR_TIMEOUT) {
+        *timed_out = true;
+      }
+      return {};
+    }
+    const int copied = static_cast<int>(message_result);
+    if (copied <= 0) {
+      return {};
+    }
+    out.resize(static_cast<size_t>(copied));
+    return out;
   }
+
+  const int written = ::GetWindowTextW(hwnd, out.data(), static_cast<int>(out.size()));
+  if (written <= 0) {
+    return {};
+  }
+  out.resize(static_cast<size_t>(written));
   return out;
 }
 
@@ -205,14 +210,17 @@ bool is_roblox_process(DWORD pid) {
 }
 
 bool is_valid_roblox_title_for_action(std::wstring_view title) {
+  // Title checks are best-effort only. IME windows can appear as top-level windows
+  // inside the Roblox process and should be excluded.
   if (title.empty()) {
-    // Fail-open on unknown titles to avoid excluding valid Roblox windows.
-    return true;
-  }
-  if (!contains(title, L"Roblox")) {
     return false;
   }
-  if (contains(title, L"MSCTFIME") || contains(title, L"Default IME")) {
+
+  // Case-insensitive match: users have reported "default ime" / "msctfime" in lowercase.
+  if (!icontains_ascii(title, L"roblox")) {
+    return false;
+  }
+  if (icontains_ascii(title, L"msctfime") || icontains_ascii(title, L"default ime")) {
     return false;
   }
   return true;
@@ -222,11 +230,14 @@ bool is_valid_roblox_title_for_find(std::wstring_view title) {
   if (!is_valid_roblox_title_for_action(title)) {
     return false;
   }
-  if (contains(title, L"NVIDIA")) {
+  if (icontains_ascii(title, L"nvidia")) {
     return false;
   }
   return true;
 }
+
+// Forward-declared: implementation near the window enumeration helpers.
+bool is_probably_ime_window(std::wstring_view title, std::wstring_view cls);
 
 void clear_notopmost(HWND hwnd) {
   if (!hwnd || !::IsWindow(hwnd)) {
@@ -420,21 +431,17 @@ ActionResult action_task_impl(HWND hwnd,
 
   DWORD window_pid = 0;
   const DWORD window_tid = ::GetWindowThreadProcessId(hwnd, &window_pid);
-
-  bool title_timed_out = false;
-  const std::wstring wtitle = window_text(hwnd, &title_timed_out);
-  (void)title_timed_out;
-  const std::string utf8_title = wtitle.empty() ? std::string("<unknown>") : wide_to_utf8(wtitle);
-  const bool process_ok = is_roblox_process(window_pid);
-  if (!process_ok) {
+  if (window_pid == 0 || !is_roblox_process(window_pid)) {
     out.ok = false;
-    out.message = "Window '" + utf8_title + "' is not a Roblox process";
+    out.message = "Window '" + wide_to_utf8(window_text(hwnd)) + "' is not a Roblox window";
     return out;
   }
 
-  if (!is_valid_roblox_title_for_action(wtitle)) {
+  const std::wstring cls = window_class_name(hwnd);
+  const std::wstring wtitle = window_text(hwnd);
+  if (is_probably_ime_window(wtitle, cls)) {
     out.ok = false;
-    out.message = "Window '" + utf8_title + "' is not a valid Roblox window";
+    out.message = "Window '" + wide_to_utf8(wtitle) + "' is not a valid Roblox game window";
     return out;
   }
 
@@ -564,7 +571,7 @@ ActionResult action_task_impl(HWND hwnd,
     }
 
     out.ok = true;
-    out.message = "Performed " + effective_action + " action on '" + utf8_title + "'";
+    out.message = "Performed " + effective_action + " action on '" + wide_to_utf8(wtitle) + "'";
     return out;
   } catch (const std::exception& e) {
     if (was_minimized) {
@@ -574,8 +581,8 @@ ActionResult action_task_impl(HWND hwnd,
       (void)::SetForegroundWindow(old_hwnd);
     }
     out.ok = false;
-    out.message =
-        "Error performing anti-AFK action on '" + utf8_title + "': " + std::string(e.what());
+    out.message = "Error performing anti-AFK action on '" + wide_to_utf8(wtitle) + "': " +
+                  std::string(e.what());
     return out;
   } catch (...) {
     if (was_minimized) {
@@ -585,7 +592,7 @@ ActionResult action_task_impl(HWND hwnd,
       (void)::SetForegroundWindow(old_hwnd);
     }
     out.ok = false;
-    out.message = "Error performing anti-AFK action on '" + utf8_title + "': unknown error";
+    out.message = "Error performing anti-AFK action on '" + wide_to_utf8(wtitle) + "': unknown error";
     return out;
   }
 }
@@ -604,13 +611,92 @@ py::tuple action_task(std::uint64_t hwnd_int,
 }
 
 struct FindEnumData {
+  struct Best {
+    HWND hwnd{nullptr};
+    int score{0};
+  };
+
   bool include_hidden{true};
-  std::vector<std::uint64_t>* out{nullptr};
+  std::unordered_map<DWORD, bool> roblox_pid_cache;
+  std::unordered_map<DWORD, Best> best_by_pid;
 };
+
+bool is_probably_ime_window(std::wstring_view title, std::wstring_view cls) {
+  // Filter IME helper windows that sometimes live in the Roblox process and show up as
+  // top-level windows in EnumWindows().
+  if (icontains_ascii(title, L"msctfime") || icontains_ascii(cls, L"msctfime")) {
+    return true;
+  }
+  if (icontains_ascii(title, L"default ime") || icontains_ascii(cls, L"default ime")) {
+    return true;
+  }
+  // Some IME windows use a very short class name.
+  if (iequals_ascii(cls, L"IME")) {
+    return true;
+  }
+  return false;
+}
+
+int score_roblox_window_candidate(HWND hwnd,
+                                 bool include_hidden,
+                                 std::wstring_view title,
+                                 std::wstring_view cls,
+                                 bool title_timed_out) {
+  // Higher score = more likely the main Roblox game window.
+  int score = 0;
+  if (::IsWindowVisible(hwnd)) {
+    score += 200;
+  } else if (!include_hidden) {
+    // Should have been filtered out, but keep it low just in case.
+    score -= 200;
+  }
+  if (!::IsIconic(hwnd)) {
+    score += 50;
+  }
+
+  LONG_PTR exstyle = ::GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+  if (exstyle & WS_EX_APPWINDOW) {
+    score += 25;
+  }
+  if (exstyle & WS_EX_TOOLWINDOW) {
+    score -= 250;
+  }
+  if (exstyle & WS_EX_NOACTIVATE) {
+    score -= 400;
+  }
+
+  RECT r{};
+  if (::GetWindowRect(hwnd, &r)) {
+    const int w = std::max(0, static_cast<int>(r.right - r.left));
+    const int h = std::max(0, static_cast<int>(r.bottom - r.top));
+    const int area = w * h;
+    // Scale area influence but cap it.
+    score += std::min(area / 10000, 350);
+  }
+
+  if (!title.empty()) {
+    if (is_valid_roblox_title_for_find(title)) {
+      score += 500;
+    } else {
+      score -= 30;
+    }
+  }
+  if (title_timed_out) {
+    score -= 100;
+  }
+  if (!cls.empty() && icontains_ascii(cls, L"windowsclient")) {
+    // Common Roblox player class name on Windows.
+    score += 150;
+  }
+  return score;
+}
 
 BOOL CALLBACK enum_find_roblox_windows(HWND hwnd, LPARAM lparam) {
   auto* data = reinterpret_cast<FindEnumData*>(lparam);
-  if (!data || !data->out) {
+  if (!data) {
+    return TRUE;
+  }
+  if (!hwnd || !::IsWindow(hwnd)) {
     return TRUE;
   }
   if (!data->include_hidden && !::IsWindowVisible(hwnd)) {
@@ -619,25 +705,84 @@ BOOL CALLBACK enum_find_roblox_windows(HWND hwnd, LPARAM lparam) {
 
   DWORD pid = 0;
   (void)::GetWindowThreadProcessId(hwnd, &pid);
-  if (!is_roblox_process(pid)) {
+  if (pid == 0) {
+    return TRUE;
+  }
+  auto cache_it = data->roblox_pid_cache.find(pid);
+  bool is_rbx = false;
+  if (cache_it != data->roblox_pid_cache.end()) {
+    is_rbx = cache_it->second;
+  } else {
+    is_rbx = is_roblox_process(pid);
+    data->roblox_pid_cache.emplace(pid, is_rbx);
+  }
+  if (!is_rbx) {
     return TRUE;
   }
 
-  std::wstring title = window_text(hwnd);
-  if (!is_valid_roblox_title_for_find(title)) {
+  // Skip obvious non-game windows that can live in the Roblox process.
+  const LONG_PTR exstyle = ::GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+  if (exstyle & WS_EX_NOACTIVATE) {
+    return TRUE;
+  }
+  if (exstyle & WS_EX_TOOLWINDOW) {
+    return TRUE;
+  }
+  if (::GetWindow(hwnd, GW_OWNER) != nullptr) {
+    // Owned windows are often helper/overlay windows.
     return TRUE;
   }
 
-  data->out->push_back(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(hwnd)));
+  const std::wstring cls = window_class_name(hwnd);
+  bool title_timed_out = false;
+  const std::wstring title = window_text(hwnd, &title_timed_out);
+
+  if (is_probably_ime_window(title, cls)) {
+    return TRUE;
+  }
+
+  // Filter out tiny helper windows (IME, overlays, etc.). Keep minimized windows.
+  RECT r{};
+  if (::GetWindowRect(hwnd, &r) && !::IsIconic(hwnd)) {
+    const int w = std::max(0, static_cast<int>(r.right - r.left));
+    const int h = std::max(0, static_cast<int>(r.bottom - r.top));
+    // Very small windows are almost never the actual game client window.
+    // Keep the threshold low because many users run Roblox in tiny tiled windows.
+    if (w < 120 || h < 80) {
+      return TRUE;
+    }
+  }
+
+  // If title matches the expected pattern we heavily prefer it, but don't require it.
+  const int score = score_roblox_window_candidate(hwnd, data->include_hidden, title, cls, title_timed_out);
+  auto it = data->best_by_pid.find(pid);
+  if (it == data->best_by_pid.end() || score > it->second.score) {
+    data->best_by_pid[pid] = FindEnumData::Best{hwnd, score};
+  }
   return TRUE;
 }
 
 std::vector<std::uint64_t> find_roblox_windows_impl(bool include_hidden) {
-  std::vector<std::uint64_t> out;
   FindEnumData data;
   data.include_hidden = include_hidden;
-  data.out = &out;
   ::EnumWindows(enum_find_roblox_windows, reinterpret_cast<LPARAM>(&data));
+
+  // Return at most one hwnd per Roblox PID (the best-scoring candidate).
+  std::vector<std::pair<DWORD, FindEnumData::Best>> entries;
+  entries.reserve(data.best_by_pid.size());
+  for (const auto& kv : data.best_by_pid) {
+    entries.emplace_back(kv.first, kv.second);
+  }
+  std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  std::vector<std::uint64_t> out;
+  out.reserve(entries.size());
+  for (const auto& kv : entries) {
+    const HWND hwnd = kv.second.hwnd;
+    if (hwnd && ::IsWindow(hwnd)) {
+      out.push_back(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(hwnd)));
+    }
+  }
   return out;
 }
 
@@ -646,29 +791,19 @@ std::vector<std::uint64_t> find_roblox_windows(bool include_hidden) {
   return find_roblox_windows_impl(include_hidden);
 }
 
-struct ClearEnumData {
-  int count{0};
-};
-
-BOOL CALLBACK enum_clear_notopmost(HWND hwnd, LPARAM lparam) {
-  auto* data = reinterpret_cast<ClearEnumData*>(lparam);
-  if (!data) {
-    return TRUE;
-  }
-  DWORD pid = 0;
-  (void)::GetWindowThreadProcessId(hwnd, &pid);
-  if (!is_roblox_process(pid)) {
-    return TRUE;
-  }
-  clear_notopmost(hwnd);
-  data->count += 1;
-  return TRUE;
-}
-
 int clear_notopmost_all_roblox_windows_impl() {
-  ClearEnumData data;
-  ::EnumWindows(enum_clear_notopmost, reinterpret_cast<LPARAM>(&data));
-  return data.count;
+  // Only operate on the main/primary Roblox window per PID.
+  const std::vector<std::uint64_t> windows = find_roblox_windows_impl(true);
+  int count = 0;
+  for (std::uint64_t w : windows) {
+    const HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w));
+    if (!hwnd || !::IsWindow(hwnd)) {
+      continue;
+    }
+    clear_notopmost(hwnd);
+    count += 1;
+  }
+  return count;
 }
 
 int clear_notopmost_all_roblox_windows() {
@@ -1345,21 +1480,13 @@ void AntiAFK::test_action_with_delay() {
           if (!vec || !::IsWindow(hwnd)) {
             return TRUE;
           }
+          std::wstring title = window_text(hwnd);
+          if (title.empty() || title.find(L"Roblox") == std::wstring::npos) {
+            return TRUE;
+          }
           DWORD pid = 0;
           (void)::GetWindowThreadProcessId(hwnd, &pid);
           std::wstring pname = process_basename(pid).value_or(L"unknown");
-
-          bool title_timeout = false;
-          std::wstring title = window_text(hwnd, &title_timeout);
-
-          const bool is_roblox_proc = iequals_ascii(pname, L"RobloxPlayerBeta.exe");
-          const bool title_mentions_roblox =
-              (!title.empty() && title.find(L"Roblox") != std::wstring::npos);
-
-          if (!is_roblox_proc && !title_mentions_roblox) {
-            return TRUE;
-          }
-
           vec->push_back(WinInfo{hwnd, std::move(title), pid, std::move(pname)});
           return TRUE;
         },
@@ -1367,15 +1494,14 @@ void AntiAFK::test_action_with_delay() {
   }
 
   if (all.empty()) {
-    emit_status("No Roblox windows found for testing!");
+    emit_status("No windows with 'Roblox' in the title found!");
     return;
   }
 
-  emit_status("Found " + std::to_string(all.size()) + " Roblox window(s) (title read best-effort):");
+  emit_status("Found " + std::to_string(all.size()) + " windows with 'Roblox' in title:");
   for (const auto& w : all) {
-    const std::string utf8_title = w.title.empty() ? std::string("<unknown>") : wide_to_utf8(w.title);
     std::ostringstream oss;
-    oss << "Window: '" << utf8_title << "' (handle: "
+    oss << "Window: '" << wide_to_utf8(w.title) << "' (handle: "
         << reinterpret_cast<std::uintptr_t>(w.hwnd) << ", process: " << wide_to_utf8(w.pname)
         << ", PID: " << w.pid << ")";
     emit_status(oss.str());
