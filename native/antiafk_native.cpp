@@ -35,6 +35,7 @@ constexpr int kNoWindowsStatusEveryS = 10;
 constexpr int kLoopIdleWaitS = 1;
 constexpr int kNoWindowsWaitS = 5;
 constexpr int kUserInactivityWaitS = 5;
+constexpr DWORD kWindowTextTimeoutMs = 100;
 
 using Clock = std::chrono::steady_clock;
 
@@ -62,21 +63,74 @@ std::string wide_to_utf8(std::wstring_view w) {
   return out;
 }
 
-std::wstring window_text(HWND hwnd) {
+std::wstring window_text(HWND hwnd, bool* timed_out = nullptr) {
+  if (timed_out) {
+    *timed_out = false;
+  }
   if (!hwnd || !::IsWindow(hwnd)) {
     return {};
   }
-  const int len = ::GetWindowTextLengthW(hwnd);
-  if (len <= 0) {
+
+  const UINT flags = SMTO_ABORTIFHUNG | SMTO_BLOCK;
+  bool timeout_hit = false;
+  const auto log_timeout = [&](const wchar_t* stage) {
+    std::wostringstream oss;
+    oss << L"[AntiAFK] window title read timed out (" << stage << L") for hwnd=" << hwnd << L"\n";
+    ::OutputDebugStringW(oss.str().c_str());
+  };
+
+  DWORD_PTR len = 0;
+  const LRESULT len_res =
+      ::SendMessageTimeoutW(hwnd, WM_GETTEXTLENGTH, 0, 0, flags, kWindowTextTimeoutMs, &len);
+  if (len_res == 0) {
+    timeout_hit = (::GetLastError() == ERROR_TIMEOUT);
+    if (timeout_hit) {
+      log_timeout(L"WM_GETTEXTLENGTH");
+    }
+    if (timed_out) {
+      *timed_out = timeout_hit;
+    }
     return {};
   }
+  if (len == 0) {
+    return {};
+  }
+
   std::wstring out;
   out.resize(static_cast<size_t>(len) + 1);
-  const int written = ::GetWindowTextW(hwnd, out.data(), static_cast<int>(out.size()));
-  if (written <= 0) {
+
+  DWORD_PTR written = 0;
+  const LRESULT text_res = ::SendMessageTimeoutW(hwnd,
+                                                 WM_GETTEXT,
+                                                 static_cast<WPARAM>(out.size()),
+                                                 reinterpret_cast<LPARAM>(out.data()),
+                                                 flags,
+                                                 kWindowTextTimeoutMs,
+                                                 &written);
+  if (text_res == 0) {
+    timeout_hit = timeout_hit || (::GetLastError() == ERROR_TIMEOUT);
+    if (timeout_hit) {
+      log_timeout(L"WM_GETTEXT");
+    }
+    if (timed_out) {
+      *timed_out = timeout_hit;
+    }
     return {};
   }
-  out.resize(static_cast<size_t>(written));
+
+  const size_t actual = std::min(static_cast<size_t>(written), out.size());
+  if (actual == 0) {
+    return {};
+  }
+
+  out.resize(actual);
+
+  if (timeout_hit) {
+    log_timeout(L"WM_GETTEXT");
+  }
+  if (timed_out) {
+    *timed_out = timeout_hit;
+  }
   return out;
 }
 
@@ -152,7 +206,8 @@ bool is_roblox_process(DWORD pid) {
 
 bool is_valid_roblox_title_for_action(std::wstring_view title) {
   if (title.empty()) {
-    return false;
+    // Fail-open on unknown titles to avoid excluding valid Roblox windows.
+    return true;
   }
   if (!contains(title, L"Roblox")) {
     return false;
@@ -363,10 +418,23 @@ ActionResult action_task_impl(HWND hwnd,
     return out;
   }
 
-  const std::wstring wtitle = window_text(hwnd);
+  DWORD window_pid = 0;
+  const DWORD window_tid = ::GetWindowThreadProcessId(hwnd, &window_pid);
+
+  bool title_timed_out = false;
+  const std::wstring wtitle = window_text(hwnd, &title_timed_out);
+  (void)title_timed_out;
+  const std::string utf8_title = wtitle.empty() ? std::string("<unknown>") : wide_to_utf8(wtitle);
+  const bool process_ok = is_roblox_process(window_pid);
+  if (!process_ok) {
+    out.ok = false;
+    out.message = "Window '" + utf8_title + "' is not a Roblox process";
+    return out;
+  }
+
   if (!is_valid_roblox_title_for_action(wtitle)) {
     out.ok = false;
-    out.message = "Window '" + wide_to_utf8(wtitle) + "' is not a valid Roblox window";
+    out.message = "Window '" + utf8_title + "' is not a valid Roblox window";
     return out;
   }
 
@@ -380,8 +448,6 @@ ActionResult action_task_impl(HWND hwnd,
       ::ShowWindow(hwnd, SW_RESTORE);
     }
 
-    DWORD window_pid = 0;
-    const DWORD window_tid = ::GetWindowThreadProcessId(hwnd, &window_pid);
     if (!ensure_foreground(hwnd, window_tid, /*attempts=*/10, /*sleep_ms=*/20, stop_requested, shutdown_requested)) {
       out.ok = false;
       out.message = "Failed to focus target window for Anti-AFK action";
@@ -498,7 +564,7 @@ ActionResult action_task_impl(HWND hwnd,
     }
 
     out.ok = true;
-    out.message = "Performed " + effective_action + " action on '" + wide_to_utf8(wtitle) + "'";
+    out.message = "Performed " + effective_action + " action on '" + utf8_title + "'";
     return out;
   } catch (const std::exception& e) {
     if (was_minimized) {
@@ -508,8 +574,8 @@ ActionResult action_task_impl(HWND hwnd,
       (void)::SetForegroundWindow(old_hwnd);
     }
     out.ok = false;
-    out.message = "Error performing anti-AFK action on '" + wide_to_utf8(wtitle) + "': " +
-                  std::string(e.what());
+    out.message =
+        "Error performing anti-AFK action on '" + utf8_title + "': " + std::string(e.what());
     return out;
   } catch (...) {
     if (was_minimized) {
@@ -519,7 +585,7 @@ ActionResult action_task_impl(HWND hwnd,
       (void)::SetForegroundWindow(old_hwnd);
     }
     out.ok = false;
-    out.message = "Error performing anti-AFK action on '" + wide_to_utf8(wtitle) + "': unknown error";
+    out.message = "Error performing anti-AFK action on '" + utf8_title + "': unknown error";
     return out;
   }
 }
@@ -1279,13 +1345,21 @@ void AntiAFK::test_action_with_delay() {
           if (!vec || !::IsWindow(hwnd)) {
             return TRUE;
           }
-          std::wstring title = window_text(hwnd);
-          if (title.empty() || title.find(L"Roblox") == std::wstring::npos) {
-            return TRUE;
-          }
           DWORD pid = 0;
           (void)::GetWindowThreadProcessId(hwnd, &pid);
           std::wstring pname = process_basename(pid).value_or(L"unknown");
+
+          bool title_timeout = false;
+          std::wstring title = window_text(hwnd, &title_timeout);
+
+          const bool is_roblox_proc = iequals_ascii(pname, L"RobloxPlayerBeta.exe");
+          const bool title_mentions_roblox =
+              (!title.empty() && title.find(L"Roblox") != std::wstring::npos);
+
+          if (!is_roblox_proc && !title_mentions_roblox) {
+            return TRUE;
+          }
+
           vec->push_back(WinInfo{hwnd, std::move(title), pid, std::move(pname)});
           return TRUE;
         },
@@ -1293,14 +1367,15 @@ void AntiAFK::test_action_with_delay() {
   }
 
   if (all.empty()) {
-    emit_status("No windows with 'Roblox' in the title found!");
+    emit_status("No Roblox windows found for testing!");
     return;
   }
 
-  emit_status("Found " + std::to_string(all.size()) + " windows with 'Roblox' in title:");
+  emit_status("Found " + std::to_string(all.size()) + " Roblox window(s) (title read best-effort):");
   for (const auto& w : all) {
+    const std::string utf8_title = w.title.empty() ? std::string("<unknown>") : wide_to_utf8(w.title);
     std::ostringstream oss;
-    oss << "Window: '" << wide_to_utf8(w.title) << "' (handle: "
+    oss << "Window: '" << utf8_title << "' (handle: "
         << reinterpret_cast<std::uintptr_t>(w.hwnd) << ", process: " << wide_to_utf8(w.pname)
         << ", PID: " << w.pid << ")";
     emit_status(oss.str());
