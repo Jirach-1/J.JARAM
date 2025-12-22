@@ -24,6 +24,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import (
     QTimer,
     QThread,
+    QRunnable,
+    QThreadPool,
     pyqtSignal,
     Qt,
     QSize,
@@ -105,6 +107,23 @@ class _WinHotkeyFilter(QAbstractNativeEventFilter):
         except Exception:
             pass
         return False, 0
+
+
+class _FunctionRunnable(QRunnable):
+    """Tiny QRunnable wrapper to execute a callable off the GUI thread."""
+
+    def __init__(self, func, *args, **kwargs):
+        super().__init__()
+        self._func = func
+        self._args = args
+        self._kwargs = kwargs
+
+    def run(self):
+        try:
+            self._func(*self._args, **self._kwargs)
+        except Exception:
+            pass
+
 
 from main import RobloxManager, ProcessManager, GameLauncher
 from cookie_extractor import CookieExtractor
@@ -2986,6 +3005,11 @@ class RobloxManagerGUI(QMainWindow):
         # Anti-AFK engine instance (configured in setup_antiafk_tab)
         self.antiafk: Optional[AntiAFK] = None
         self.antiafk_status_box: Optional[QTextEdit] = None
+        self._antiafk_thread_pool = QThreadPool.globalInstance()
+        self._antiafk_save_timer = QTimer(self)
+        self._antiafk_save_timer.setSingleShot(True)
+        self._antiafk_save_timer.setInterval(300)
+        self._antiafk_save_timer.timeout.connect(self._save_antiafk_settings)
 
         # Auto-Item engine + log view (configured in setup_auto_item_tab)
         self.auto_item_engine = None
@@ -3803,6 +3827,34 @@ class RobloxManagerGUI(QMainWindow):
                 except Exception:
                     pass
 
+    def _run_antiafk_async(self, func_name: str, *args, **kwargs):
+        antiafk = getattr(self, "antiafk", None)
+        if not antiafk:
+            return
+
+        def _call():
+            try:
+                fn = getattr(antiafk, func_name, None)
+                if callable(fn):
+                    fn(*args, **kwargs)
+            except Exception:
+                pass
+
+        try:
+            runnable = _FunctionRunnable(_call)
+            self._antiafk_thread_pool.start(runnable)
+        except Exception:
+            threading.Thread(target=_call, daemon=True).start()
+
+    def _schedule_antiafk_save(self):
+        try:
+            self._antiafk_save_timer.start()
+        except Exception:
+            try:
+                self._save_antiafk_settings()
+            except Exception:
+                pass
+
     def _on_antiafk_ui_changed(self):
         """Apply current Anti-AFK UI values to the engine and persist them."""
         if self._loading_antiafk_settings or not self.antiafk:
@@ -3829,10 +3881,10 @@ class RobloxManagerGUI(QMainWindow):
 
             # If the manager is running, keep Anti-AFK running state in sync with the toggle.
             if self._is_manager_running():
-                self.antiafk.toggle_antiafk(enabled_flag)
+                self._run_antiafk_async("toggle_antiafk", enabled_flag)
 
             # Persist Anti-AFK settings to disk so they survive relaunch.
-            self._save_antiafk_settings()
+            self._schedule_antiafk_save()
         except Exception:
             # AntiAFK will log detailed errors via its own log_error method.
             pass
@@ -3887,14 +3939,14 @@ class RobloxManagerGUI(QMainWindow):
             return
         # Ensure engine has latest values and they are saved
         self._on_antiafk_ui_changed()
-        self.antiafk.toggle_antiafk(True)
+        self._run_antiafk_async("toggle_antiafk", True)
 
     def _on_antiafk_stop(self):
         """Stop the Anti-AFK loop."""
         if not self.antiafk:
             return
-        self.antiafk.toggle_antiafk(False)
-        self._save_antiafk_settings()
+        self._run_antiafk_async("toggle_antiafk", False)
+        self._schedule_antiafk_save()
 
     def _is_pid_in_menu(self, pid: int):
         """
@@ -7855,10 +7907,7 @@ class RobloxManagerGUI(QMainWindow):
 
         # Auto-start Anti-AFK if enabled in the UI
         if getattr(self, "antiafk", None) and bool(self.antiafk_enable_chk.isChecked()):
-            try:
-                self.antiafk.toggle_antiafk(True)
-            except Exception:
-                pass
+            self._run_antiafk_async("toggle_antiafk", True)
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -7882,10 +7931,7 @@ class RobloxManagerGUI(QMainWindow):
 
         # Always stop Anti-AFK when the manager stops
         if getattr(self, "antiafk", None):
-            try:
-                self.antiafk.toggle_antiafk(False)
-            except Exception:
-                pass
+            self._run_antiafk_async("toggle_antiafk", False)
 
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
