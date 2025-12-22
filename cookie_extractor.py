@@ -1,9 +1,9 @@
 import time
-import threading
 from typing import Optional, Callable
 from PyQt6.QtCore import QThread, pyqtSignal, QObject
-from PyQt6.QtWidgets import QMessageBox, QProgressDialog, QApplication
-import undetected_chromedriver as uc
+from PyQt6.QtWidgets import QMessageBox, QProgressDialog
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -49,23 +49,20 @@ class CookieExtractionThread(QThread):
 
     def _setup_browser(self):
         try:
-
-            options = uc.ChromeOptions()
-
+            options = Options()
             options.add_argument("--no-first-run")
             options.add_argument("--no-default-browser-check")
             options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_argument("--disable-extensions")
             options.add_argument("--disable-plugins-discovery")
             options.add_argument("--disable-dev-shm-usage")
-
             options.add_argument("--window-size=1200,800")
 
-            self.driver = uc.Chrome(options=options, version_main=None)
+            # Let Selenium Manager pick the correct ChromeDriver for your Chrome 142
+            self.driver = webdriver.Chrome(options=options)
 
             self.driver.implicitly_wait(10)
             self.driver.set_page_load_timeout(30)
-
         except Exception as e:
             raise Exception(f"Failed to initialize browser: {str(e)}")
 

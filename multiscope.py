@@ -55,7 +55,7 @@ except Exception:
     WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
 
 
-APP_FOOTER = "J1's JARAM v2"
+APP_FOOTER = "J.JARAM JX 2x10"
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
 # Helpers
@@ -731,9 +731,18 @@ class MultiScopeEngine:
         self._watch_cooldown_sec = 2.0     # ignore hits closer than this
         
         self._normpath_by_uid: Dict[str, str] = {}
+        self._menu_unknown_log_by_uid: Dict[str, str] = {}
         
         # NEW: per-biome notifier modes (biome -> "None" | "Message" | "Everyone")
         self._biome_modes: Dict[str, str] = {}
+        # Raw user-provided biome modes (without enforced overrides).
+        self._biome_modes_user: Dict[str, str] = {}
+        # Latch relaxed state once found; avoid flapping back to locked.
+        self._bm_relaxed: bool = False
+        # Require confirmation before forcing locked mode.
+        self._bm_lock_confirmed: bool = False
+        # Track which biomes were forced to Everyone due to lock enforcement.
+        self._lock_forced_biomes: Set[str] = set()
 
         self._temp_block_sessions = {}  # uid -> expiry epoch (simple gate)
         self._temp_block_disabled: bool = False
@@ -766,11 +775,15 @@ class MultiScopeEngine:
         # NEW:
         biome_modes: Optional[Dict[str, str]] = None,
     ) -> None:
-        lock_disabled = self._is_bm_relaxed()
-        base_modes: Dict[str, str] = {str(k).upper(): str(v) for k, v in (biome_modes or {}).items()}
-        if not lock_disabled:
-            for hard in ("GLITCHED", "DREAMSPACE"):
+        lock_enforced = self._is_bm_lock_enforced()
+        lock_disabled = not lock_enforced
+        base_modes_raw: Dict[str, str] = {str(k).upper(): str(v) for k, v in (biome_modes or {}).items()}
+        base_modes: Dict[str, str] = dict(base_modes_raw)
+        forced_biomes: Set[str] = set()
+        if lock_enforced:
+            for hard in ("GLITCHED", "DREAMSPACE", "CYBERSPACE"):
                 base_modes[hard] = "Everyone"
+                forced_biomes.add(hard)
 
         normalized_hooks: List[dict] = []
         for wh in (biome_webhooks or []):
@@ -786,7 +799,7 @@ class MultiScopeEngine:
             if not allowed_biomes and modes:
                 allowed_biomes = [k for k, v in modes.items() if str(v).lower() in ("message", "everyone")]
             if not lock_disabled:
-                for hard in ("GLITCHED", "DREAMSPACE"):
+                for hard in ("GLITCHED", "DREAMSPACE", "CYBERSPACE"):
                     if modes.get(hard) != "Everyone":
                         modes[hard] = "Everyone"
             # NEW: user routing
@@ -817,7 +830,10 @@ class MultiScopeEngine:
         # --- ignore merchant_rate_limit entirely (no cooldown)
         self._biome_min_interval = float(biome_min_interval or 2.0)
         self._biome_modes = base_modes
+        self._biome_modes_user = base_modes_raw
         self._bm_relaxed = lock_disabled
+        self._bm_lock_confirmed = not lock_disabled
+        self._lock_forced_biomes = forced_biomes
 
 
     # -- Watcher plumbing ------------------------------------------------------
@@ -1130,6 +1146,7 @@ class MultiScopeEngine:
         if latest_state is not None:
             scope.in_menu = latest_state
             scope.last_menu_ts = now_t
+            self._clear_menu_unknown(uid)
         else:
             scope.in_menu = scope.in_menu if scope.in_menu is not None else True
         if latest_biome:
@@ -1147,15 +1164,40 @@ class MultiScopeEngine:
             self._events.clear()
         return ev
 
-    def _scan_disconnect_in_chunk(self, uid: str, chunk: str) -> None:
+    def _mark_menu_unknown(self, uid: str) -> None:
+        try:
+            key = self._server_key_for(uid)
+            scope = self._scope(key)
+            scope.in_menu = None
+            scope.users.add(uid)
+        except Exception:
+            pass
+
+        try:
+            cur = self._cur.get(uid)
+            if cur and cur.path:
+                self._menu_unknown_log_by_uid[str(uid)] = os.path.abspath(cur.path)
+        except Exception:
+            pass
+
+    def _clear_menu_unknown(self, uid: str) -> None:
+        try:
+            self._menu_unknown_log_by_uid.pop(str(uid), None)
+        except Exception:
+            pass
+
+    def _scan_disconnect_in_chunk(self, uid: str, chunk: str) -> bool:
         """Check a just-read log chunk for Roblox disconnect signals."""
         if not chunk:
-            return
+            return False
         if (R_DISC_REASON.search(chunk) or
             R_DISC_NOTIFY.search(chunk) or
             R_DISC_SENDING.search(chunk) or
             R_CONN_LOST.search(chunk)):
             self._emit_event("disconnect", uid, "detected in log")
+            self._mark_menu_unknown(uid)
+            return True
+        return False
 
     def begin_handoff(self, donor_uid: str, spare_uid: str) -> None:
         with self._lock:
@@ -1263,12 +1305,55 @@ class MultiScopeEngine:
                 return True
             if os.environ.get("JARAM_UNLOCK", "").strip() == "1":
                 return True
-            from pathlib import Path
-            if Path("JARAM.biu").exists():
-                return True
+
+            candidates = [Path("JARAM.biu")]
+            try:
+                candidates.append(Path(__file__).resolve().with_name("JARAM.biu"))
+            except Exception:
+                pass
+            try:
+                import sys as _sys
+                meipass = getattr(_sys, "_MEIPASS", None)
+                if meipass:
+                    candidates.append(Path(meipass) / "JARAM.biu")
+            except Exception:
+                pass
+
+            for p in candidates:
+                try:
+                    if p.exists():
+                        return True
+                except Exception:
+                    continue
         except Exception:
             pass
         return False
+
+    def _is_bm_lock_enforced(self) -> bool:
+        """
+        Returns True when the biome lock should be enforced (force Everyone on hard biomes).
+        We double-check before locking to avoid accidental flips when the sentinel exists.
+        """
+        try:
+            if self._is_bm_relaxed():
+                # If we were previously locked, clear the confirmation so we can relax.
+                if getattr(self, "_bm_lock_confirmed", False):
+                    self._bm_lock_confirmed = False
+                return False
+
+            if getattr(self, "_bm_lock_confirmed", False):
+                return True
+
+            # Second pass before enforcing lock to avoid flapping on transient misses.
+            if self._is_bm_relaxed():
+                self._bm_lock_confirmed = False
+                return False
+
+            self._bm_lock_confirmed = True
+            return True
+        except Exception:
+            # Fail closed if anything unexpected happens.
+            return True
 
 
     def _emit_biome_event(self, uid: str, server_key: str, biome: str, *, event_type: str, ts_epoch: Optional[float] = None) -> None:
@@ -1280,7 +1365,9 @@ class MultiScopeEngine:
 
         b = (biome or "").upper()
         base_modes = getattr(self, "_biome_modes", {}) or {}
-        lock_disabled = self._is_bm_relaxed()
+        base_modes_user = getattr(self, "_biome_modes_user", {}) or {}
+        lock_disabled = not self._is_bm_lock_enforced()
+        forced_biomes = getattr(self, "_lock_forced_biomes", set())
 
         def _mode_for_hook(hook_modes: Optional[Dict[str, str]]) -> str:
             mode = None
@@ -1288,10 +1375,14 @@ class MultiScopeEngine:
                 mode = hook_modes.get(b)
             if mode is None:
                 mode = base_modes.get(b)
-            if not lock_disabled and b in ("GLITCHED", "DREAMSPACE"):
+            # If we previously forced Everyone due to lock, drop it once relaxed.
+            if lock_disabled and b in forced_biomes:
+                if mode is None or str(mode).lower() == "everyone":
+                    mode = base_modes_user.get(b)
+            if not lock_disabled and b in ("GLITCHED", "DREAMSPACE", "CYBERSPACE"):
                 return "Everyone"
             if mode is None:
-                if lock_disabled and b in ("GLITCHED", "DREAMSPACE"):
+                if lock_disabled and b in ("GLITCHED", "DREAMSPACE", "CYBERSPACE"):
                     return "None"
                 if b == "NORMAL":
                     return "None"
@@ -1489,6 +1580,7 @@ class MultiScopeEngine:
             if not cur or not cur.path or not os.path.isfile(cur.path):
                 return
 
+        disconnect_hit = False
         try:
             read_start = _t.perf_counter()
             chunks = []
@@ -1515,7 +1607,7 @@ class MultiScopeEngine:
                 return
 
             chunk = "".join(chunks)
-            self._scan_disconnect_in_chunk(uid, chunk)
+            disconnect_hit = self._scan_disconnect_in_chunk(uid, chunk)
 
         except Exception:
             return
@@ -1626,14 +1718,19 @@ class MultiScopeEngine:
                                 latest_ts = now_f
                                 latest_biome = str(b).upper()
 
-            if latest_menu_ts is not None:
-                if latest_menu_ts >= getattr(scope, "last_menu_ts", 0.0):
-                    scope.in_menu = latest_menu_flag
-                    scope.last_menu_ts = latest_menu_ts
-                scope.users.add(uid)
+            if not disconnect_hit:
+                if latest_menu_ts is not None:
+                    if latest_menu_ts >= getattr(scope, "last_menu_ts", 0.0):
+                        scope.in_menu = latest_menu_flag
+                        scope.last_menu_ts = latest_menu_ts
+                    scope.users.add(uid)
+                    self._clear_menu_unknown(uid)
+                else:
+                    # keep default True when no RPC state parsed yet
+                    scope.in_menu = scope.in_menu if scope.in_menu is not None else True
+                    scope.users.add(uid)
             else:
-                # keep default True when no RPC state parsed yet
-                scope.in_menu = scope.in_menu if scope.in_menu is not None else True
+                scope.users.add(uid)
 
             if (latest_ts is not None) and latest_biome:
                 event_ts: float = latest_ts
@@ -1666,7 +1763,7 @@ class MultiScopeEngine:
 
                         if biome != "NORMAL":
                             self._emit_biome_event(uid, server_key, biome, event_type="start", ts_epoch=event_ts)
-                            if biome in ("DREAMSPACE", "GLITCHED"):
+                            if biome in ("DREAMSPACE", "GLITCHED", "CYBERSPACE"):
                                 self._maybe_start_temp_block(uid, f"Biome:{biome}")
                         else:
                             self._log(f"[MultiScope] + NORMAL (start suppressed) | user={self._get_username(uid)} | server={server_key}")
@@ -1703,12 +1800,21 @@ class MultiScopeEngine:
                     # try any member we have a log for
                     for uid in list(scope.users):
                         cur = self._cur.get(uid)
-                        if cur and cur.path:
+                        if not cur or not cur.path:
+                            continue
+                        blocked = self._menu_unknown_log_by_uid.get(str(uid))
+                        if blocked:
                             try:
-                                self._seed_last_rpc_state(uid, cur.path)
+                                if os.path.abspath(blocked) == os.path.abspath(cur.path):
+                                    continue
                             except Exception:
-                                pass
-                            break
+                                if blocked == cur.path:
+                                    continue
+                        try:
+                            self._seed_last_rpc_state(uid, cur.path)
+                        except Exception:
+                            pass
+                        break
 
             # ---- SCHEDULER: poll by scope, not by user -----------------------
             import time
@@ -1752,7 +1858,7 @@ class MultiScopeEngine:
             out.append({
                 "server": key,
                 "users": sorted(list(s.users)),
-                "in_menu": True if s.in_menu is None else bool(s.in_menu),
+                "in_menu": s.in_menu,
                 "last_biome": s.last_biome or "",
                 "biome_age": int(now_t - s.last_biome_ts) if s.last_biome_ts else None,
                 "last_merchant": s.last_merchant or "",

@@ -29,20 +29,25 @@
         "thumbnail_url": "https://i.postimg.cc/1t0dY4J8/image.png",
         "Timer": "600"
     },
+    "Heaven": {
+        "color": "0XFFDE5E",
+        "thumbnail_url": "https://media.discordapp.net/stickers/1447481739240018010.webp?size=240&quality=lossless",
+        "Timer": "240"
+    },
     "CORRUPTION": {
         "color": "0x6d32a8",
         "thumbnail_url": "https://i.postimg.cc/ncZQ84Dh/image.png",
         "Timer": "660"
     },
-    "Cyberspace": {
-        "color": "0x011ab7",
-        "thumbnail_url": "https://at-cdn-s01.audiotool.com/2013/06/13/documents/zW2OHriFzthb06Ty5h9tUxEGgEw/0/cover256x256-f161eb9cd16c4786bbb3c78292e7131f.jpg",
-        "Timer": "150"
-    },
     "NULL": {
         "color": "0x838383",
         "thumbnail_url": "https://static.wikia.nocookie.net/sol-rng/images/f/fc/NULLLL.png",
         "Timer": "99"
+    },
+    "Cyberspace": {
+        "color": "0x011ab7",
+        "thumbnail_url": "https://at-cdn-s01.audiotool.com/2013/06/13/documents/zW2OHriFzthb06Ty5h9tUxEGgEw/0/cover256x256-f161eb9cd16c4786bbb3c78292e7131f.jpg",
+        "Timer": "150"
     },
     "GLITCHED": {
         "color": "0xbfff00",
@@ -64,23 +69,24 @@
         "Timer": "150"
     },
     "Graveyard": {
-        "color": "0XFF8900",
+        "color": "0X696761",
         "thumbnail_url": "https://images.vexels.com/media/users/3/136069/isolated/lists/399370e90f142aff65c2c3963134b11d-graveyard-tombstones.png",
         "Timer": "150"
     },
     "Pumpkin Moon": {
-        "color": "0XFF8900",
+        "color": "0Xba7600",
         "thumbnail_url": "https://cdn.shopify.com/s/files/1/0125/8261/7145/files/Pumpkin_Plushie-SV2-P-1_1000x.png.webp?v=1759503127",
         "Timer": "150"
     },
     "Blood Rain": {
-        "color": "0XFF8900",
+        "color": "0X701f03",
         "thumbnail_url": "https://cdn-icons-png.flaticon.com/512/967/967119.png",
         "Timer": "150"
     },
-    "Heaven": {
-        "color": "0XFFDE5E",
-        "thumbnail_url": "https://static.myfigurecollection.net/upload/items/2/1356930-3ff0a.jpg",
-        "Timer": "240"
+    "Aurora": {
+        "color": "0X3299a8",
+        "thumbnail_url": "https://images.stockcake.com/public/b/d/3/bd3769ca-18e5-4d66-9722-6f9dc8aa64de_medium/aurora-over-mountains-stockcake.jpg",
+        "Timer": "600"
     }
+
 }

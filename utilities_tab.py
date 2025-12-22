@@ -857,7 +857,6 @@ def setup_UTILITIES_tab(self):
     run_block_btn = QPushButton("Start Blocking")
     row.addWidget(save_block_btn); row.addStretch(); row.addWidget(run_block_btn)
     block_form.addLayout(row)
-    content_v.addWidget(block_grp)
 
     # Unblocking group
     un_grp = QGroupBox("Unblocking")
@@ -871,7 +870,6 @@ def setup_UTILITIES_tab(self):
 
     run_unblock_btn = QPushButton("Start Unblocking")
     un_form.addWidget(run_unblock_btn, alignment=Qt.AlignmentFlag.AlignRight)
-    content_v.addWidget(un_grp)
 
     # PSL Grabber group
     psl_grp = QGroupBox("Private Server Link Grabber")
@@ -888,6 +886,8 @@ def setup_UTILITIES_tab(self):
     run_psl_btn = QPushButton("Run PSL Grabber")
     psl_form.addRow("", run_psl_btn)
     content_v.addWidget(psl_grp)
+    content_v.addWidget(block_grp)
+    content_v.addWidget(un_grp)
 
     content_v.addStretch()
 

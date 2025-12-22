@@ -4,7 +4,6 @@ import time
 import os
 import shutil
 import requests
-import psutil
 import re
 import threading
 from typing import Dict, Set, List, Tuple, Optional
@@ -15,14 +14,28 @@ from PIL import Image
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QGridLayout, QTabWidget, QTableWidget,
                             QTableWidgetItem, QPushButton, QLabel, QLineEdit,
-                            QSpinBox, QDoubleSpinBox, QTextEdit, QGroupBox, QStackedLayout,
-                            QProgressBar, QComboBox, QCheckBox, QSplitter,
+                            QSpinBox, QDoubleSpinBox, QSlider, QTextEdit, QGroupBox,
+                            QComboBox, QCheckBox, QSplitter,
+                            QAbstractSpinBox, QStyle, QStyleOptionSpinBox,
                             QHeaderView, QMessageBox, QDialog, QDialogButtonBox,
-                            QFormLayout, QScrollArea, QFrame, QSizePolicy,
+                            QFormLayout, QScrollArea, QSizePolicy,
                             QAbstractItemView, QHeaderView, QScrollArea, QRubberBand,
-                            QRadioButton, QListWidget, QListWidgetItem)
-from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt, QSize,  QBuffer, QByteArray, QIODevice, QRectF, QPointF, QRect, QPoint
-from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QMovie, QRegion, QPainterPath, QImage, QTextCursor
+                            QRadioButton, QListWidget, QListWidgetItem, QKeySequenceEdit)
+from PyQt6.QtCore import (
+    QTimer,
+    QThread,
+    pyqtSignal,
+    Qt,
+    QSize,
+    QBuffer,
+    QByteArray,
+    QIODevice,
+    QPointF,
+    QRect,
+    QPoint,
+    QAbstractNativeEventFilter,
+)
+from PyQt6.QtGui import QFont, QIcon, QColor, QPixmap, QMovie, QRegion, QPainter, QPainterPath, QImage, QTextCursor, QKeySequence
 # ---------- Qt6 enum shims (keep PyQt5-style constants working) ----------
 # Paste directly below your current PyQt6 imports.
 
@@ -52,6 +65,47 @@ if not hasattr(QHeaderView, "Stretch"):
     QHeaderView.ResizeToContents = QHeaderView.ResizeMode.ResizeToContents
     QHeaderView.Interactive      = QHeaderView.ResizeMode.Interactive
     
+
+class _WinHotkeyFilter(QAbstractNativeEventFilter):
+    """
+    Minimal WM_HOTKEY bridge for Windows (RegisterHotKey -> Qt callback).
+    """
+
+    WM_HOTKEY = 0x0312
+
+    def __init__(self, on_hotkey):
+        super().__init__()
+        self._on_hotkey = on_hotkey
+
+    def nativeEventFilter(self, eventType, message):
+        try:
+            et = eventType
+            try:
+                # PyQt6 can pass a QByteArray-like here.
+                if isinstance(et, (bytes, bytearray)):
+                    et_str = bytes(et).decode(errors="ignore")
+                else:
+                    et_str = str(et)
+            except Exception:
+                et_str = ""
+
+            if "windows" not in et_str.lower():
+                return False, 0
+
+            import ctypes
+            from ctypes import wintypes
+
+            msg = ctypes.cast(int(message), ctypes.POINTER(wintypes.MSG)).contents
+            if int(msg.message) == self.WM_HOTKEY:
+                try:
+                    self._on_hotkey(int(msg.wParam))
+                except Exception:
+                    pass
+                return True, 0
+        except Exception:
+            pass
+        return False, 0
+
 from main import RobloxManager, ProcessManager, GameLauncher
 from cookie_extractor import CookieExtractor
 from RAM_export import transform         # re-use your parsing helper
@@ -70,7 +124,22 @@ from ocr_worker import (
     preprocess_for_ocr,
     ColorFilter,
     get_ocr_device_summary,
+    get_ocr_available_devices,
+    compute_frame_hash,
+    frame_hash_diff_percent,
 )
+
+# --- Auto Item engine (local module) ---
+try:
+    from auto_item_automation import AutoItemEngine  # type: ignore
+except Exception:  # pragma: no cover
+    AutoItemEngine = None  # type: ignore
+
+# --- BES limiter (local module) ---
+try:
+    from bes_limiter import BESMultiProcessController  # type: ignore
+except Exception:  # pragma: no cover
+    BESMultiProcessController = None  # type: ignore
 
 # --- minimal crash logging (EXE-safe, AV-friendly) ---
 import os, sys, atexit, logging, logging.handlers, threading, warnings
@@ -152,16 +221,29 @@ def _get_icon_path():
     return None
 
 # Lockout
+_BM_RELAXED = False          # latched once sentinel/env found
+_BM_LOCK_CONFIRMED = False   # latched once lock is enforced
+
 def _bm_relaxed() -> bool:
+    global _BM_RELAXED
+    if _BM_RELAXED:
+        return True
     try:
         if os.environ.get("JARAM_UNLOCK", "").strip() == "1":
+            _BM_RELAXED = True
             return True
     except Exception:
         pass
     try:
-        # Check for the sentinel both in the current working directory and, if bundled,
-        # alongside the frozen executable (PyInstaller exposes sys._MEIPASS).
+        # Check for the sentinel in common launch locations:
+        # - current working directory (when run from source)
+        # - next to this file (when launched from another cwd)
+        # - PyInstaller's temp extraction dir (onefile)
         candidates = [Path("JARAM.biu")]
+        try:
+            candidates.append(Path(__file__).resolve().with_name("JARAM.biu"))
+        except Exception:
+            pass
         try:
             import sys as _sys
             if getattr(_sys, "_MEIPASS", None):
@@ -171,12 +253,40 @@ def _bm_relaxed() -> bool:
         for sentinel in candidates:
             try:
                 if sentinel.exists():
+                    _BM_RELAXED = True
                     return True
             except Exception:
                 continue
     except Exception:
         pass
     return False
+
+
+def _bm_lock_enforced() -> bool:
+    """
+    True when biome lock should be enforced (force Everyone on hard biomes).
+    Uses a double-check to avoid accidental flips when the sentinel exists.
+    """
+    global _BM_LOCK_CONFIRMED
+    try:
+        if _bm_relaxed():
+            if _BM_LOCK_CONFIRMED:
+                _BM_LOCK_CONFIRMED = False
+            return False
+
+        if _BM_LOCK_CONFIRMED:
+            return True
+
+        # Second pass before enforcing lock to avoid flapping on transient misses.
+        if _bm_relaxed():
+            _BM_LOCK_CONFIRMED = False
+            return False
+
+        _BM_LOCK_CONFIRMED = True
+        return True
+    except Exception:
+        # Fail closed if anything unexpected happens.
+        return True
 
 class ConfigManager:
 
@@ -221,10 +331,14 @@ class ConfigManager:
                 "max_captures_per_second": 20,
                 "cooldown_seconds": 600,
                 "use_preprocess": True,
+                "frame_diff_tolerance": 2,    # percent (skip OCR if frame changes <= this)
+                "log_ocr_text": False,        # debug: include OCR text in OCR log
+                "log_loop": True,             # include per-loop "[Loop N]" logs in OCR log
+                "device_id": None,            # None => auto/default
                 "roi": {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
                 "color_filters": [
-                    {"name": "white_text", "r": 255, "g": 255, "b": 255, "tol": 40, "enabled": True},
-                    {"name": "purple_text", "r": 145, "g": 67, "b": 255, "tol": 40, "enabled": True},
+                    {"name": "white_text", "r": 255, "g": 255, "b": 255, "tol": 60, "enabled": True},
+                    {"name": "purple_text", "r": 145, "g": 67, "b": 255, "tol": 60, "enabled": True},
                 ],
             },
 
@@ -238,6 +352,37 @@ class ConfigManager:
             "antiafk_sequential_mode": False,
             "antiafk_sequential_delay": 0.75,
             "antiafk_menu_autoreconnect": False,
+            },
+
+              "auto_item": {
+                   "enabled": False,
+                   "tick_interval": 1.0,
+                   "click_delay": 0.2,
+                   "toggle_hotkey": "Ctrl+Alt+Space",
+                   "users": [],
+                  "coords": {
+                     # Required coords are populated by the Auto Item tab (kept empty by default).
+                     "conditional": {
+                        "enabled": False,
+                        "point": {"x": 0.0, "y": 0.0},
+                        "color": "#FFFFFF",
+                        "tolerance": 10,
+                     }
+                 },
+                  "items": [],
+              },
+
+            "bes": {
+                "enabled": False,
+                "cycle_ms": 50,
+                "menu_throttle_percent": 85,
+                "game_throttle_percent": 50,
+                # Exactly 3 slots (strings). Empty/None => unused.
+                "exempt_users": ["", "", ""],
+                # Auto Item integration: unthrottle lead seconds before actions.
+                "auto_item_lead_s": 3.0,
+                # Keep unthrottled briefly after actions (small grace).
+                "auto_item_grace_s": 1.0,
             },
 
         }
@@ -694,6 +839,75 @@ class ModernStyle:
             background-color: {ModernStyle.BORDER};
         }}
         """
+
+
+class _AutoItemSpinBox(QSpinBox):
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        try:
+            opt = QStyleOptionSpinBox()
+            self.initStyleOption(opt)
+
+            up_rect = self.style().subControlRect(
+                QStyle.ComplexControl.CC_SpinBox,
+                opt,
+                QStyle.SubControl.SC_SpinBoxUp,
+                self,
+            )
+            down_rect = self.style().subControlRect(
+                QStyle.ComplexControl.CC_SpinBox,
+                opt,
+                QStyle.SubControl.SC_SpinBoxDown,
+                self,
+            )
+
+            enabled = self.isEnabled()
+            try:
+                step_enabled = self.stepEnabled()
+            except Exception:
+                step_enabled = QAbstractSpinBox.StepEnabledFlag.StepUpEnabled | QAbstractSpinBox.StepEnabledFlag.StepDownEnabled
+
+            up_enabled = enabled and bool(step_enabled & QAbstractSpinBox.StepEnabledFlag.StepUpEnabled)
+            down_enabled = enabled and bool(step_enabled & QAbstractSpinBox.StepEnabledFlag.StepDownEnabled)
+
+            def _draw_triangle(rect: QRect, direction: str):
+                r = rect.adjusted(7, 5, -7, -5)
+                if r.width() <= 1 or r.height() <= 1:
+                    r = rect.adjusted(4, 4, -4, -4)
+                if r.width() <= 1 or r.height() <= 1:
+                    return
+
+                cx = float(r.center().x())
+                top = float(r.top())
+                bottom = float(r.bottom())
+                left = float(r.left())
+                right = float(r.right())
+
+                path = QPainterPath()
+                if direction == "up":
+                    path.moveTo(cx, top)
+                    path.lineTo(right, bottom)
+                    path.lineTo(left, bottom)
+                else:
+                    path.moveTo(left, top)
+                    path.lineTo(right, top)
+                    path.lineTo(cx, bottom)
+                path.closeSubpath()
+                painter.drawPath(path)
+
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+
+            painter.setBrush(QColor(ModernStyle.TEXT_PRIMARY if up_enabled else ModernStyle.TEXT_SECONDARY))
+            _draw_triangle(up_rect, "up")
+
+            painter.setBrush(QColor(ModernStyle.TEXT_PRIMARY if down_enabled else ModernStyle.TEXT_SECONDARY))
+            _draw_triangle(down_rect, "down")
+
+            painter.end()
+        except Exception:
+            return None
 
 class WorkerThread(QThread):
     log_signal     = pyqtSignal(str)
@@ -2608,6 +2822,70 @@ def pil_to_pixmap(img: Image.Image) -> QPixmap:
     return QPixmap.fromImage(qimg.copy())
 
 
+class _PointPickLabel(QLabel):
+    """QLabel that emits a point when clicked (normalized to pixmap size)."""
+    point_selected = pyqtSignal(tuple)
+
+    def __init__(self, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        self.setPixmap(pixmap)
+        self.setFixedSize(pixmap.size())
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def mousePressEvent(self, event):
+        pm = self.pixmap()
+        if not pm:
+            return
+        w = pm.width()
+        h = pm.height()
+        if w <= 0 or h <= 0:
+            return
+
+        pt = event.position().toPoint()
+        x = max(0, min(w - 1, pt.x()))
+        y = max(0, min(h - 1, pt.y()))
+        self.point_selected.emit((x / w, y / h, x, y))
+
+
+class PointPickDialog(QDialog):
+    """Modal dialog that lets the user pick a single point on a screenshot."""
+
+    def __init__(self, pixmap: QPixmap, title: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self._point: Optional[Tuple[float, float, int, int]] = None
+
+        layout = QVBoxLayout(self)
+
+        hint = QLabel("Click on the screenshot to select the coordinate.")
+        hint.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(hint)
+
+        self._label = _PointPickLabel(pixmap, self)
+        self._label.point_selected.connect(self._on_point_selected)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self._label)
+        layout.addWidget(scroll)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_point_selected(self, point: tuple):
+        try:
+            xf, yf, px, py = point
+            self._point = (float(xf), float(yf), int(px), int(py))
+        except Exception:
+            self._point = None
+        if self._point is not None:
+            self.accept()
+
+    def selected_point(self) -> Optional[Tuple[float, float, int, int]]:
+        return self._point
+
+
 class _SelectableLabel(QLabel):
     """QLabel that exposes a drag-to-select ROI signal."""
     roi_selected = pyqtSignal(tuple)
@@ -2684,6 +2962,8 @@ class RobloxManagerGUI(QMainWindow):
     # Bridge between AntiAFK worker threads and the Qt UI
     antiafk_log_signal = pyqtSignal(str)
     antiafk_state_signal = pyqtSignal(bool)
+    autoitem_log_signal = pyqtSignal(str)
+    bes_log_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -2691,20 +2971,62 @@ class RobloxManagerGUI(QMainWindow):
         self.ocr_worker: Optional[OCRWorker] = None
         self.ocr_roi: Optional[Tuple[float, float, float, float]] = None
         self._last_ocr_log: Optional[str] = None
+        self._ocr_test_last_hash: Optional[int] = None
         self.ocr_log_autoscroll: bool = True
+        self._last_ocr_device_id = None
         self._loading_ocr_settings = False
         self._loading_antiafk_settings = False
+        self._loading_autoitem_settings = False
         self.settings_tab_index: Optional[int] = None
         self.process_data = {}
+        self.user_data = {}
         self.config_manager = ConfigManager()
+        self.cookie_extractor = CookieExtractor(self)
 
         # Anti-AFK engine instance (configured in setup_antiafk_tab)
         self.antiafk: Optional[AntiAFK] = None
         self.antiafk_status_box: Optional[QTextEdit] = None
 
+        # Auto-Item engine + log view (configured in setup_auto_item_tab)
+        self.auto_item_engine = None
+        self.autoitem_status_box: Optional[QTextEdit] = None
+        self._auto_item_hwnd_cache: Dict[int, int] = {}
+        self._auto_item_hwnd_cache_ts: float = 0.0
+        self._auto_item_hwnd_cache_lock = threading.Lock()
+        self._ms_biome_by_server: Dict[str, str] = {}
+        self._ms_in_menu_by_server: Dict[str, Optional[bool]] = {}
+        self._ms_biome_lock = threading.Lock()
+        self._auto_item_antiafk_was_running: bool = False
+
+        # BES limiter controller (optional; Windows-only)
+        self._loading_bes_settings = False
+        self.bes_controller = (
+            BESMultiProcessController(log=self.bes_log_signal.emit) if BESMultiProcessController is not None else None
+        )
+        self.bes_log_box: Optional[QTextEdit] = None
+        self._bes_cfg_lock = threading.Lock()
+        self._bes_cfg_cache: Dict = dict(self.config_manager.default_settings.get("bes", {}) or {})
+        try:
+            _settings = self.config_manager.load_settings() or {}
+            _bes_cfg = _settings.get("bes", None)
+            if isinstance(_bes_cfg, dict):
+                self._bes_cfg_cache.update(dict(_bes_cfg))
+        except Exception:
+            pass
+        self._bes_save_timer: Optional[QTimer] = None
+        self._bes_tick_timer: Optional[QTimer] = None
+
+        # Global hotkeys (Windows RegisterHotKey -> WM_HOTKEY)
+        self._win_hotkey_filter: Optional[_WinHotkeyFilter] = None
+        self._auto_item_hotkey_id: int = 0xA117
+        self._auto_item_hotkey_hwnd: int = 0
+        self._auto_item_hotkey_registered: bool = False
+
         # Connect Anti-AFK cross-thread signals
         self.antiafk_log_signal.connect(self._on_antiafk_status)
         self.antiafk_state_signal.connect(self._on_antiafk_state_changed)
+        self.autoitem_log_signal.connect(self._on_autoitem_status)
+        self.bes_log_signal.connect(self._on_bes_log)
 
         self.setup_ui()
         # NEW: add the Multiscope tab
@@ -2713,7 +3035,7 @@ class RobloxManagerGUI(QMainWindow):
 
 
     def setup_ui(self):
-        self.setWindowTitle("Jirach1 + JARAM - Just Another Roblox Account Manager")
+        self.setWindowTitle("J.JARAM - Jirach1's Just Another Roblox Account Manager")
         self.setGeometry(100, 100, 1100, 720)
 
         icon_path = _get_icon_path()
@@ -2726,7 +3048,7 @@ class RobloxManagerGUI(QMainWindow):
 
         header_layout = QHBoxLayout()
 
-        title_label = QLabel("Jirach1 + JARAM - Just Another Roblox Account Manager")
+        title_label = QLabel("J.JARAM - Jirach1's Just Another Roblox Account Manager")
         title_font = QFont()
         title_font.setPointSize(18)
         title_font.setBold(True)
@@ -2766,10 +3088,11 @@ class RobloxManagerGUI(QMainWindow):
         self.setup_dashboard_tab()
         self.setup_users_tab()
         self.setup_accounts_tab()
-        self.setup_processes_tab()
         self.setup_logs_tab()
         self.setup_ocr_tab()
         self.setup_antiafk_tab()
+        self.setup_auto_item_tab()
+        self.setup_bes_tab()
         self.setup_settings_tab()
         self.setup_RAMEXPORT_tab()
         setup_UTILITIES_tab(self)
@@ -2876,11 +3199,11 @@ class RobloxManagerGUI(QMainWindow):
         layout = QVBoxLayout(users_widget)
 
         self.users_table = QTableWidget()
-        self.users_table.setColumnCount(11)
+        self.users_table.setColumnCount(12)
         self.users_table.setHorizontalHeaderLabels([
             "User ID","Username","Private Server","Place",
             "Server",               # ← NEW
-            "Status","PIDs","TTL(s)","Last Active",
+            "Status","PIDs","TTL(s)","Created","Last Active",
             "Inactive For","Actions"
         ])
 
@@ -2893,17 +3216,25 @@ class RobloxManagerGUI(QMainWindow):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(10, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)  # Created
+        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)           # Last Active
+        header.setSectionResizeMode(10, QHeaderView.ResizeMode.Fixed)            # Inactive For
+        header.setSectionResizeMode(11, QHeaderView.ResizeMode.Fixed)            # Actions
 
         self.users_table.setColumnWidth(2, 200)
         self.users_table.setColumnWidth(3, 100)
         self.users_table.setColumnWidth(4, 120)
-        self.users_table.setColumnWidth(7, 100)
-        self.users_table.setColumnWidth(9, 160)
-        self.users_table.setColumnWidth(10, 170)
+        self.users_table.setColumnWidth(7, 100)   # TTL(s)
+        self.users_table.setColumnWidth(8, 100)   # Created
+        self.users_table.setColumnWidth(10, 160)  # Inactive For
+        self.users_table.setColumnWidth(11, 260)  # Actions
         self.users_table.verticalHeader().setDefaultSectionSize(60)
+
+        try:
+            self.users_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.users_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        except Exception:
+            pass
 
         layout.addWidget(self.users_table)
 
@@ -2915,6 +3246,11 @@ class RobloxManagerGUI(QMainWindow):
         add_user_btn = QPushButton("Modify Users")
         add_user_btn.clicked.connect(self.open_user_management)
         controls_layout.addWidget(add_user_btn)
+
+        kill_selected_btn = QPushButton("Kill Selected")
+        kill_selected_btn.setProperty("class", "danger")
+        kill_selected_btn.clicked.connect(self.kill_selected_user)
+        controls_layout.addWidget(kill_selected_btn)
 
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
@@ -2979,7 +3315,32 @@ class RobloxManagerGUI(QMainWindow):
         self.account_cookie = QLineEdit()
         self.account_cookie.setPlaceholderText("ROBLOSECURITY cookie")
         form_layout.addWidget(QLabel("Cookie:"))
-        form_layout.addWidget(self.account_cookie)
+        cookie_layout = QHBoxLayout()
+        cookie_layout.addWidget(self.account_cookie)
+
+        self.account_browser_login_btn = QPushButton("Login with Browser")
+        self.account_browser_login_btn.setToolTip("Open browser to login and automatically extract cookie")
+        self.account_browser_login_btn.clicked.connect(self.extract_account_cookie_from_browser)
+        self.account_browser_login_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+                border: 1px solid {ModernStyle.BORDER};
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-weight: 500;
+                font-size: 13px;
+                min-height: 28px;
+                min-width: 160px;
+            }}
+            QPushButton:hover {{
+                background-color: {ModernStyle.BORDER};
+            }}
+            """
+        )
+        cookie_layout.addWidget(self.account_browser_login_btn)
+        form_layout.addLayout(cookie_layout)
 
         self.account_disabled = QCheckBox("Disable this account")
         form_layout.addWidget(self.account_disabled)
@@ -3034,50 +3395,6 @@ class RobloxManagerGUI(QMainWindow):
         self.tab_widget.addTab(scroll, "Accounts")
         self.refresh_accounts_list()
 
-    def setup_processes_tab(self):
-        processes_widget = QWidget()
-        layout = QVBoxLayout(processes_widget)
-
-        self.processes_table = QTableWidget()
-        self.processes_table.setColumnCount(5)
-        self.processes_table.setHorizontalHeaderLabels([
-            "PID", "User ID", "Created", "Windows", "Actions"
-        ])
-
-        header = self.processes_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)  
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  
-
-        self.processes_table.setColumnWidth(2, 100)  
-        self.processes_table.setColumnWidth(4, 110)  
-
-        self.processes_table.verticalHeader().setDefaultSectionSize(60)
-
-        layout.addWidget(self.processes_table)
-
-        controls_layout = QHBoxLayout()
-
-        refresh_processes_btn = QPushButton("Refresh")
-        refresh_processes_btn.clicked.connect(self.refresh_processes)
-        controls_layout.addWidget(refresh_processes_btn)
-
-        kill_selected_btn = QPushButton("Kill Selected")
-        kill_selected_btn.setProperty("class", "danger")
-        kill_selected_btn.clicked.connect(self.kill_selected_process)
-        controls_layout.addWidget(kill_selected_btn)
-
-        controls_layout.addStretch()
-
-        layout.addLayout(controls_layout)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(processes_widget)
-        self.tab_widget.addTab(scroll, "Processes")
-
     def setup_logs_tab(self):
         logs_widget = QWidget()
         layout = QVBoxLayout(logs_widget)
@@ -3122,7 +3439,7 @@ class RobloxManagerGUI(QMainWindow):
         ocr_widget = QWidget()
         layout = QVBoxLayout(ocr_widget)
 
-        # Show whether OCR preprocessing is using CPU or GPU
+        # Show the OCR runtime device
         self.ocr_device_label = QLabel()
         self.ocr_device_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY}; font-weight: bold;")
         layout.addWidget(self.ocr_device_label)
@@ -3135,7 +3452,7 @@ class RobloxManagerGUI(QMainWindow):
         toggles_row.addStretch()
         layout.addLayout(toggles_row)
 
-        controls_group = QGroupBox("Capture & OCR")
+        controls_group = QGroupBox("Capture | OCR")
         controls_form = QFormLayout(controls_group)
 
         self.ocr_workers_spin = QSpinBox(); self.ocr_workers_spin.setRange(1, 16)
@@ -3146,11 +3463,19 @@ class RobloxManagerGUI(QMainWindow):
         self.ocr_cooldown_spin.valueChanged.connect(self._on_ocr_settings_changed)
         self.ocr_preprocess_chk = QCheckBox("Use preprocessing")
         self.ocr_preprocess_chk.toggled.connect(self._on_ocr_settings_changed)
+        self.ocr_frame_diff_tol_spin = QSpinBox(); self.ocr_frame_diff_tol_spin.setRange(0, 100); self.ocr_frame_diff_tol_spin.setSuffix(" %")
+        self.ocr_frame_diff_tol_spin.setToolTip("Skip OCR when the chat frame changes by at most this amount compared to the previous frame.")
+        self.ocr_frame_diff_tol_spin.valueChanged.connect(self._on_ocr_settings_changed)
+        self.ocr_device_combo = QComboBox()
+        self.ocr_device_combo.currentIndexChanged.connect(self._on_ocr_settings_changed)
+        self._load_ocr_device_choices()
 
         controls_form.addRow("OCR workers:", self.ocr_workers_spin)
         controls_form.addRow("Max captures / sec:", self.ocr_max_caps_spin)
         controls_form.addRow("Cooldown per PID:", self.ocr_cooldown_spin)
         controls_form.addRow("Preprocess chat image:", self.ocr_preprocess_chk)
+        controls_form.addRow("Processor:", self.ocr_device_combo)
+        controls_form.addRow("Skip OCR if frame change ≤:", self.ocr_frame_diff_tol_spin)
 
         layout.addWidget(controls_group)
 
@@ -3159,8 +3484,11 @@ class RobloxManagerGUI(QMainWindow):
         calibrate_btn.clicked.connect(self.calibrate_ocr_roi)
         preview_btn = QPushButton("Test preview")
         preview_btn.clicked.connect(self.show_ocr_preview)
+        compare_btn = QPushButton("Test frame compare")
+        compare_btn.clicked.connect(self.test_ocr_frame_compare)
         btn_row.addWidget(calibrate_btn)
         btn_row.addWidget(preview_btn)
+        btn_row.addWidget(compare_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -3174,18 +3502,77 @@ class RobloxManagerGUI(QMainWindow):
         self.ocr_filter_table.setHorizontalHeaderLabels(["Enabled", "Name", "R", "G", "B", "Tol"])
         self.ocr_filter_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.ocr_filter_table.setMinimumHeight(180)
+        self.ocr_filter_table.setShowGrid(False)
+        self.ocr_filter_table.setAlternatingRowColors(False)
         header = self.ocr_filter_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        for col in range(1, 6):
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.ocr_filter_table.setColumnWidth(0, 90)
+        for col in range(2, 6):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
-            self.ocr_filter_table.setColumnWidth(col, 80)
-        self.ocr_filter_table.setColumnWidth(10, 150)
+            self.ocr_filter_table.setColumnWidth(col, 95)
         vh = self.ocr_filter_table.verticalHeader()
-        vh.setDefaultSectionSize(30)
-        vh.setMinimumSectionSize(30)
+        vh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        vh.setDefaultSectionSize(62)
+        vh.setMinimumSectionSize(62)
+        # Match the Auto Item "Items" table styling for a consistent look.
+        self.ocr_filter_table.setStyleSheet(
+            f"""
+            QTableWidget {{
+                background-color: {ModernStyle.SURFACE};
+                gridline-color: transparent;
+            }}
+
+            QTableWidget::item {{
+                border: none;
+                padding: 0px;
+            }}
+
+            QTableWidget QLineEdit {{
+                background-color: {ModernStyle.SURFACE};
+                border: 2px solid {ModernStyle.BORDER};
+                border-radius: 6px;
+                padding: 6px 10px;
+                min-height: 36px;
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+
+            QTableWidget QSpinBox {{
+                background-color: {ModernStyle.SURFACE};
+                border: 2px solid {ModernStyle.BORDER};
+                border-radius: 6px;
+                padding: 6px 30px 6px 10px; /* reserve space for arrows */
+                min-height: 36px;
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+
+            QTableWidget QSpinBox::up-button, QTableWidget QSpinBox::down-button {{
+                subcontrol-origin: border;
+                width: 22px;
+                border-left: 1px solid {ModernStyle.BORDER};
+                background-color: {ModernStyle.SURFACE_VARIANT};
+            }}
+            QTableWidget QSpinBox::up-button {{
+                subcontrol-position: top right;
+                border-top-right-radius: 6px;
+            }}
+            QTableWidget QSpinBox::down-button {{
+                subcontrol-position: bottom right;
+                border-bottom-right-radius: 6px;
+            }}
+            QTableWidget QSpinBox::up-button:hover, QTableWidget QSpinBox::down-button:hover {{
+                background-color: {ModernStyle.BORDER};
+            }}
+
+            QTableWidget QCheckBox {{
+                padding: 0px;
+                margin: 0px;
+                background: transparent;
+            }}
+            """
+        )
         filters_layout.addWidget(self.ocr_filter_table)
-        # React immediately when filter cells change (name/colors/tolerance/enabled)
-        self.ocr_filter_table.itemChanged.connect(lambda _item: self._on_ocr_settings_changed())
+        # Changes are wired from per-cell widgets (see _add_filter_row).
 
         filter_btns = QHBoxLayout()
         add_filter_btn = QPushButton("Add Filter")
@@ -3202,8 +3589,17 @@ class RobloxManagerGUI(QMainWindow):
         self.ocr_status_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY}; font-weight: bold;")
         layout.addWidget(self.ocr_status_label)
 
+        self.ocr_log_text_chk = QCheckBox("OCR text (debug)")
+        self.ocr_log_text_chk.setToolTip("Logs the raw OCR output text to the OCR log (can be spammy).")
+        self.ocr_log_text_chk.toggled.connect(self._on_ocr_settings_changed)
+
+        self.ocr_loop_logs_chk = QCheckBox("Show loop logs")
+        self.ocr_loop_logs_chk.setToolTip("Show per-loop capture stats (messages like [Loop N] ...).")
+        self.ocr_loop_logs_chk.toggled.connect(self._on_ocr_settings_changed)
+
         log_group = QGroupBox("OCR Log")
         log_layout = QVBoxLayout(log_group)
+        log_layout.setSpacing(4)
         self.ocr_log_box = QTextEdit()
         self.ocr_log_box.setReadOnly(True)
         self.ocr_log_box.setFont(QFont("Consolas", 10))
@@ -3214,11 +3610,14 @@ class RobloxManagerGUI(QMainWindow):
         clear_log_btn = QPushButton("Clear OCR Log")
         clear_log_btn.clicked.connect(self.ocr_log_box.clear)
         log_layout.addWidget(self.ocr_log_box)
-        controls_row = QHBoxLayout()
-        controls_row.addWidget(self.ocr_auto_scroll_chk)
-        controls_row.addStretch()
-        controls_row.addWidget(clear_log_btn)
-        log_layout.addLayout(controls_row)
+        log_options_row = QHBoxLayout()
+        log_options_row.setSpacing(8)
+        log_options_row.addWidget(self.ocr_log_text_chk)
+        log_options_row.addWidget(self.ocr_loop_logs_chk)
+        log_options_row.addWidget(self.ocr_auto_scroll_chk)
+        log_options_row.addStretch()
+        log_options_row.addWidget(clear_log_btn)
+        log_layout.addLayout(log_options_row)
         layout.addWidget(log_group)
 
         # Footer: reset OCR settings to defaults
@@ -3388,12 +3787,6 @@ class RobloxManagerGUI(QMainWindow):
             except Exception:
                 pass
 
-        # Also forward to the global log view
-        try:
-            self.add_log(f"[Anti-AFK] {message}")
-        except Exception:
-            pass
-
     def _on_antiafk_state_changed(self, enabled: bool):
         """Qt slot: keep Anti-AFK buttons and inputs in sync with worker state."""
         enabled = bool(enabled)
@@ -3545,7 +3938,7 @@ class RobloxManagerGUI(QMainWindow):
         for row in rows:
             if row.get("server", "") == server_label:
                 val = row.get("in_menu")
-                # snapshot already normalizes None -> True, but keep the intent:
+                # Treat unknown as in-menu to avoid misclassification.
                 if val is None:
                     return True
                 return bool(val)
@@ -3569,63 +3962,2370 @@ class RobloxManagerGUI(QMainWindow):
         # Delegate completely to AntiAFK's own test helper.
         self.antiafk.test_action_with_delay()
 
-    def _add_filter_row(self, name: str = "white_text", r: int = 255, g: int = 255, b: int = 255, tol: int = 40, enabled: bool = True):
+    # ------------------------
+    # Auto Item tab + engine
+    # ------------------------
+
+    def setup_auto_item_tab(self):
+        auto_widget = QWidget()
+        layout = QVBoxLayout(auto_widget)
+
+        info_group = QGroupBox("Auto Item")
+        info_layout = QVBoxLayout(info_group)
+        desc = QLabel(
+            "Automatically uses configured items for selected users.\n"
+            "Coordinates are stored relative to each Roblox window (client area)."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        info_layout.addWidget(desc)
+        layout.addWidget(info_group)
+
+        settings_group = QGroupBox("Settings")
+        settings_layout = QGridLayout(settings_group)
+
+        self.auto_item_enable_chk = QCheckBox("Enable Auto-Item (while manager is running)")
+        settings_layout.addWidget(self.auto_item_enable_chk, 0, 0, 1, 2)
+
+        settings_layout.addWidget(QLabel("Tick interval (seconds):"), 1, 0)
+        self.auto_item_tick_spin = QDoubleSpinBox()
+        self.auto_item_tick_spin.setRange(0.2, 60.0)
+        self.auto_item_tick_spin.setDecimals(2)
+        self.auto_item_tick_spin.setSingleStep(0.1)
+        self.auto_item_tick_spin.setValue(1.0)
+        settings_layout.addWidget(self.auto_item_tick_spin, 1, 1)
+
+        settings_layout.addWidget(QLabel("Click/typing delay (seconds):"), 2, 0)
+        self.auto_item_delay_spin = QDoubleSpinBox()
+        self.auto_item_delay_spin.setRange(0.01, 2.0)
+        self.auto_item_delay_spin.setDecimals(2)
+        self.auto_item_delay_spin.setSingleStep(0.05)
+        self.auto_item_delay_spin.setValue(0.2)
+        settings_layout.addWidget(self.auto_item_delay_spin, 2, 1)
+
+        settings_layout.addWidget(QLabel("Toggle hotkey:"), 3, 0)
+        self.auto_item_hotkey_edit = QKeySequenceEdit()
+        self.auto_item_hotkey_edit.setToolTip("Global hotkey to toggle Auto-Item enable/disable (default: Ctrl+Alt+Space).")
+        try:
+            self.auto_item_hotkey_edit.setKeySequence(QKeySequence("Ctrl+Alt+Space"))
+        except Exception:
+            pass
+        settings_layout.addWidget(self.auto_item_hotkey_edit, 3, 1)
+
+        self.auto_item_test_btn = QPushButton("Test Auto-Item (first selected user)")
+        self.auto_item_test_btn.setToolTip("Runs the configured automation once on the first selected user window.")
+        self.auto_item_test_btn.clicked.connect(self._auto_item_test_once)
+        settings_layout.addWidget(self.auto_item_test_btn, 4, 0, 1, 2)
+
+        layout.addWidget(settings_group)
+
+        coords_group = QGroupBox("Coordinates")
+        coords_layout = QGridLayout(coords_group)
+
+        self._auto_item_coord_edits = {}
+        self._auto_item_coords = {}
+
+        def _add_coord_row(row: int, key: str, label: str):
+            coords_layout.addWidget(QLabel(label + ":"), row, 0)
+            le = QLineEdit()
+            le.setReadOnly(True)
+            le.setPlaceholderText("not set")
+            coords_layout.addWidget(le, row, 1)
+            btn = QPushButton("Capture")
+            btn.clicked.connect(lambda _, k=key: self._auto_item_capture_coord(k))
+            coords_layout.addWidget(btn, row, 2)
+            self._auto_item_coord_edits[key] = le
+
+        _add_coord_row(0, "inv_button", "Inventory button")
+        _add_coord_row(1, "items_tab", "Items tab")
+        _add_coord_row(2, "search_box", "Search box")
+        _add_coord_row(3, "query_pos", "Query/result click")
+        _add_coord_row(4, "amount_box", "Amount box")
+        _add_coord_row(5, "use_button", "Use button")
+        _add_coord_row(6, "close_button", "Close button")
+
+        # Conditional click
+        self.auto_item_cond_enable_chk = QCheckBox("Enable conditional click (pixel color match)")
+        coords_layout.addWidget(self.auto_item_cond_enable_chk, 7, 0, 1, 3)
+
+        coords_layout.addWidget(QLabel("Conditional point:"), 8, 0)
+        self.auto_item_cond_point_le = QLineEdit()
+        self.auto_item_cond_point_le.setReadOnly(True)
+        self.auto_item_cond_point_le.setPlaceholderText("not set")
+        coords_layout.addWidget(self.auto_item_cond_point_le, 8, 1)
+        self.auto_item_cond_capture_btn = QPushButton("Capture + Sample Color")
+        self.auto_item_cond_capture_btn.clicked.connect(lambda: self._auto_item_capture_coord("conditional_point", sample_color=True))
+        coords_layout.addWidget(self.auto_item_cond_capture_btn, 8, 2)
+
+        coords_layout.addWidget(QLabel("Expected color (#RRGGBB):"), 9, 0)
+        self.auto_item_cond_color_le = QLineEdit("#FFFFFF")
+        coords_layout.addWidget(self.auto_item_cond_color_le, 9, 1)
+        coords_layout.addWidget(QLabel("Tolerance:"), 9, 2)
+        self.auto_item_cond_tol_spin = QSpinBox()
+        self.auto_item_cond_tol_spin.setRange(0, 255)
+        self.auto_item_cond_tol_spin.setValue(10)
+        coords_layout.addWidget(self.auto_item_cond_tol_spin, 9, 3)
+
+        hint = QLabel("Capture takes a screenshot of a Roblox window; click the screenshot to set the coordinate.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        coords_layout.addWidget(hint, 10, 0, 1, 4)
+
+        layout.addWidget(coords_group)
+
+        items_group = QGroupBox("Items (order matters)")
+        items_layout = QVBoxLayout(items_group)
+
+        self.auto_item_table = QTableWidget()
+        self.auto_item_table.setColumnCount(6)
+        self.auto_item_table.setHorizontalHeaderLabels(["Enabled", "Item", "Amount", "Cooldown (s)", "Biomes", "Users"])
+        self.auto_item_table.setShowGrid(False)
+        self.auto_item_table.setAlternatingRowColors(False)
+        header = self.auto_item_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        vh = self.auto_item_table.verticalHeader()
+        vh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        vh.setDefaultSectionSize(62)
+        self.auto_item_table.setColumnWidth(0, 80)
+        self.auto_item_table.setColumnWidth(2, 95)
+        self.auto_item_table.setColumnWidth(3, 120)
+        self.auto_item_table.setColumnWidth(4, 120)
+        self.auto_item_table.setColumnWidth(5, 140)
+        # Compact + consistent controls inside the table (avoid clipped borders inside cells).
+        self.auto_item_table.setStyleSheet(
+            f"""
+            QTableWidget {{
+                background-color: {ModernStyle.SURFACE};
+                gridline-color: transparent;
+            }}
+
+            QTableWidget::item {{
+                border: none;
+                padding: 0px;
+            }}
+
+            QTableWidget QLineEdit {{
+                background-color: {ModernStyle.SURFACE};
+                border: 2px solid {ModernStyle.BORDER};
+                border-radius: 6px;
+                padding: 6px 10px;
+                min-height: 36px;
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+
+            QTableWidget QSpinBox {{
+                background-color: {ModernStyle.SURFACE};
+                border: 2px solid {ModernStyle.BORDER};
+                border-radius: 6px;
+                padding: 6px 30px 6px 10px; /* reserve space for arrows */
+                min-height: 36px;
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+
+            QTableWidget QSpinBox::up-button, QTableWidget QSpinBox::down-button {{
+                subcontrol-origin: border;
+                width: 22px;
+                border-left: 1px solid {ModernStyle.BORDER};
+                background-color: {ModernStyle.SURFACE_VARIANT};
+            }}
+            QTableWidget QSpinBox::up-button {{
+                subcontrol-position: top right;
+                border-top-right-radius: 6px;
+            }}
+            QTableWidget QSpinBox::down-button {{
+                subcontrol-position: bottom right;
+                border-bottom-right-radius: 6px;
+            }}
+            QTableWidget QSpinBox::up-button:hover, QTableWidget QSpinBox::down-button:hover {{
+                background-color: {ModernStyle.BORDER};
+            }}
+
+            QTableWidget QPushButton {{
+                background-color: {ModernStyle.PRIMARY};
+                color: {ModernStyle.TEXT_PRIMARY};
+                border: 1px solid {ModernStyle.PRIMARY_VARIANT};
+                border-bottom: 3px solid {ModernStyle.PRIMARY_VARIANT};
+                padding: 6px 12px;
+                border-radius: 6px;
+                min-height: 36px;
+                min-width: 0px;
+                font-weight: 600;
+                text-align: left;
+            }}
+
+            QTableWidget QPushButton:hover {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+            }}
+
+            QTableWidget QPushButton:pressed {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+                border-bottom: 1px solid {ModernStyle.PRIMARY_VARIANT};
+                padding-top: 7px;
+                padding-bottom: 5px;
+            }}
+
+            QTableWidget QCheckBox {{
+                padding: 0px;
+                margin: 0px;
+                background: transparent;
+            }}
+            """
+        )
+        items_layout.addWidget(self.auto_item_table)
+
+        items_btn_row = QHBoxLayout()
+        add_item_btn = QPushButton("Add Item")
+        add_item_btn.clicked.connect(self._auto_item_add_item)
+        remove_item_btn = QPushButton("Remove Selected")
+        remove_item_btn.clicked.connect(self._auto_item_remove_selected_items)
+        up_btn = QPushButton("Move Up")
+        up_btn.clicked.connect(lambda: self._auto_item_move_selected(-1))
+        down_btn = QPushButton("Move Down")
+        down_btn.clicked.connect(lambda: self._auto_item_move_selected(1))
+        items_btn_row.addWidget(add_item_btn)
+        items_btn_row.addWidget(remove_item_btn)
+        items_btn_row.addWidget(up_btn)
+        items_btn_row.addWidget(down_btn)
+        items_btn_row.addStretch()
+        items_layout.addLayout(items_btn_row)
+
+        layout.addWidget(items_group)
+
+        users_group = QGroupBox("Users")
+        users_layout = QVBoxLayout(users_group)
+
+        users_btn_row = QHBoxLayout()
+        refresh_users_btn = QPushButton("Refresh List")
+        refresh_users_btn.clicked.connect(self._auto_item_refresh_users)
+        sel_all_btn = QPushButton("Select All")
+        sel_all_btn.clicked.connect(lambda: self._auto_item_set_all_users(True))
+        sel_none_btn = QPushButton("Select None")
+        sel_none_btn.clicked.connect(lambda: self._auto_item_set_all_users(False))
+        users_btn_row.addWidget(refresh_users_btn)
+        users_btn_row.addWidget(sel_all_btn)
+        users_btn_row.addWidget(sel_none_btn)
+        users_btn_row.addStretch()
+        users_layout.addLayout(users_btn_row)
+
+        self.auto_item_users_container = QWidget()
+        self.auto_item_users_vbox = QVBoxLayout(self.auto_item_users_container)
+        self.auto_item_users_vbox.setContentsMargins(0, 0, 0, 0)
+        self.auto_item_users_vbox.setSpacing(4)
+        self.auto_item_user_checks = {}
+
+        users_scroll = QScrollArea()
+        users_scroll.setWidgetResizable(True)
+        users_scroll.setWidget(self.auto_item_users_container)
+        users_scroll.setMinimumHeight(180)
+        users_layout.addWidget(users_scroll)
+
+        layout.addWidget(users_group)
+
+        log_group = QGroupBox("Auto-Item Log")
+        log_layout = QVBoxLayout(log_group)
+        self.autoitem_status_box = QTextEdit()
+        self.autoitem_status_box.setReadOnly(True)
+        self.autoitem_status_box.setFont(QFont("Consolas", 10))
+        log_layout.addWidget(self.autoitem_status_box)
+        layout.addWidget(log_group)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        reset_btn = QPushButton("Restore Auto-Item Defaults")
+        reset_btn.clicked.connect(self._reset_auto_item_to_defaults)
+        footer.addWidget(reset_btn)
+        layout.addLayout(footer)
+
+        layout.addStretch()
+
+        # Debounced persistence (avoid writing settings.json every keystroke)
+        self._auto_item_save_timer = QTimer(self)
+        self._auto_item_save_timer.setSingleShot(True)
+        self._auto_item_save_timer.timeout.connect(self._save_auto_item_settings)
+
+        # Wire change events
+        self.auto_item_enable_chk.toggled.connect(self._on_auto_item_ui_changed)
+        self.auto_item_tick_spin.valueChanged.connect(self._on_auto_item_ui_changed)
+        self.auto_item_delay_spin.valueChanged.connect(self._on_auto_item_ui_changed)
+        self.auto_item_hotkey_edit.keySequenceChanged.connect(self._on_auto_item_hotkey_changed)
+        self.auto_item_cond_enable_chk.toggled.connect(self._on_auto_item_ui_changed)
+        self.auto_item_cond_color_le.textChanged.connect(self._on_auto_item_ui_changed)
+        self.auto_item_cond_tol_spin.valueChanged.connect(self._on_auto_item_ui_changed)
+
+        # Load persisted config + populate user list and table
+        self._auto_item_refresh_users()
+        self._load_auto_item_settings()
+
+        # Ensure engine exists (but it will idle until enabled + fully configured)
+        self._ensure_auto_item_engine()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(auto_widget)
+        self.tab_widget.addTab(scroll, "Auto Item")
+
+    def _on_autoitem_status(self, message: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] {message}"
+        if self.autoitem_status_box is not None:
+            try:
+                self.autoitem_status_box.append(line)
+            except Exception:
+                pass
+        try:
+            self.add_log(message)
+        except Exception:
+            pass
+
+    def _ensure_auto_item_engine(self):
+        if self.auto_item_engine is not None or AutoItemEngine is None:
+            return
+
+        def _pid_provider(uid: str) -> Optional[int]:
+            try:
+                if not self._is_manager_running():
+                    return None
+                runtime = (self.user_data or {}).get(uid, {}) or {}
+                pids = runtime.get("pids", []) or []
+                if not isinstance(pids, (list, tuple)):
+                    pids = [pids]
+                if not pids:
+                    return None
+                return int(pids[0])
+            except Exception:
+                return None
+
+        def _hwnd_provider(pid: int) -> Optional[int]:
+            try:
+                now = time.time()
+                with self._auto_item_hwnd_cache_lock:
+                    if (now - float(self._auto_item_hwnd_cache_ts)) > 1.0 or not self._auto_item_hwnd_cache:
+                        self._auto_item_hwnd_cache = {int(w.pid): int(w.hwnd) for w in enum_roblox_windows()}
+                        self._auto_item_hwnd_cache_ts = now
+                    return self._auto_item_hwnd_cache.get(int(pid))
+            except Exception:
+                return None
+
+        def _biome_provider(uid: str) -> str:
+            try:
+                runtime = (self.user_data or {}).get(uid, {}) or {}
+                server = str(runtime.get("server", "") or "").strip()
+                if not server:
+                    return ""
+                with self._ms_biome_lock:
+                    return str(self._ms_biome_by_server.get(server, "") or "")
+            except Exception:
+                return ""
+
+        def _in_menu_provider(uid: str) -> Optional[bool]:
+            try:
+                runtime = (self.user_data or {}).get(uid, {}) or {}
+                server = str(runtime.get("server", "") or "").strip()
+                if not server:
+                    return None
+                with self._ms_biome_lock:
+                    if server not in (self._ms_in_menu_by_server or {}):
+                        return None
+                    val = self._ms_in_menu_by_server.get(server, None)
+                    if val is None:
+                        return None
+                    return bool(val)
+            except Exception:
+                return None
+
+        self.auto_item_engine = AutoItemEngine(
+            pid_provider=_pid_provider,
+            hwnd_provider=_hwnd_provider,
+            biome_provider=_biome_provider,
+            in_menu_provider=_in_menu_provider,
+            log=self.autoitem_log_signal.emit,
+            pause_antiafk=self._auto_item_pause_antiafk,
+            resume_antiafk=self._auto_item_resume_antiafk,
+            pre_action_hook=self._auto_item_pre_action_hook,
+            post_action_hook=self._auto_item_post_action_hook,
+        )
+        try:
+            self.auto_item_engine.start()
+        except Exception:
+            pass
+
+        # Push initial config snapshot
+        try:
+            self.auto_item_engine.update_config(self._get_auto_item_settings_from_ui())
+        except Exception:
+            pass
+
+    def _auto_item_pause_antiafk(self):
+        self._auto_item_antiafk_was_running = False
+        if getattr(self, "antiafk", None) and getattr(self.antiafk, "antiafk_running", False):
+            try:
+                self._auto_item_antiafk_was_running = True
+                if hasattr(self.antiafk, "pause_antiafk"):
+                    self.antiafk.pause_antiafk(wait=True)
+                else:
+                    # Fallback for legacy hosts: fully stop before Auto-Item interactions.
+                    t = getattr(self.antiafk, "antiafk_thread", None)
+                    self.antiafk.stop_antiafk()
+                    try:
+                        if t is not None and getattr(t, "is_alive", None) and t.is_alive():
+                            t.join()
+                    except Exception:
+                        pass
+            except Exception:
+                self._auto_item_antiafk_was_running = False
+
+    def _auto_item_resume_antiafk(self):
+        try:
+            if (
+                self._auto_item_antiafk_was_running
+                and getattr(self, "antiafk", None)
+                and self._is_manager_running()
+                and bool(getattr(self, "antiafk_enable_chk", None) and self.antiafk_enable_chk.isChecked())
+            ):
+                # Prefer resume when the engine is still running; otherwise restart.
+                if bool(getattr(self.antiafk, "antiafk_running", False)) and hasattr(self.antiafk, "resume_antiafk"):
+                    self.antiafk.resume_antiafk()
+                else:
+                    self.antiafk.start_antiafk()
+        except Exception:
+            pass
+        finally:
+            self._auto_item_antiafk_was_running = False
+
+    def _auto_item_pre_action_hook(self, uid: str, pid: int) -> float:
+        """
+        Auto Item hook: temporarily disable BES throttling a few seconds before actions.
+        Returns the requested lead time (seconds) so the engine can wait before clicking.
+        """
+        ctl = getattr(self, "bes_controller", None)
+        if ctl is None:
+            return 0.0
+
+        try:
+            with self._bes_cfg_lock:
+                cfg = dict(self._bes_cfg_cache or {})
+        except Exception:
+            cfg = {}
+
+        if not bool(cfg.get("enabled", False)):
+            return 0.0
+
+        try:
+            lead_s = float(cfg.get("auto_item_lead_s", 0.0) or 0.0)
+        except Exception:
+            lead_s = 0.0
+
+        # Hold long enough to cover the full click/type sequence; post-action hook will release early.
+        try:
+            ctl.hold_unthrottled(int(pid), max(0.0, lead_s) + 120.0)
+        except Exception:
+            pass
+
+        return max(0.0, float(lead_s))
+
+    def _auto_item_post_action_hook(self, uid: str, pid: int) -> None:
+        """Auto Item hook: release BES unthrottle hold after actions (with small grace)."""
+        ctl = getattr(self, "bes_controller", None)
+        if ctl is None:
+            return
+
+        try:
+            with self._bes_cfg_lock:
+                cfg = dict(self._bes_cfg_cache or {})
+        except Exception:
+            cfg = {}
+
+        if not bool(cfg.get("enabled", False)):
+            return
+
+        try:
+            grace_s = float(cfg.get("auto_item_grace_s", 0.0) or 0.0)
+        except Exception:
+            grace_s = 0.0
+
+        try:
+            ctl.release_hold(int(pid))
+        except Exception:
+            pass
+
+        if grace_s > 0.0:
+            try:
+                ctl.hold_unthrottled(int(pid), float(grace_s))
+            except Exception:
+                pass
+
+    # ------------------------
+    # Auto Item global hotkey
+    # ------------------------
+
+    def _ensure_win_hotkey_filter(self) -> None:
+        if os.name != "nt":
+            return
+        if getattr(self, "_win_hotkey_filter", None) is not None:
+            return
+        try:
+            app = QApplication.instance()
+            if app is None:
+                return
+            self._win_hotkey_filter = _WinHotkeyFilter(self._on_win_hotkey)
+            app.installNativeEventFilter(self._win_hotkey_filter)
+        except Exception:
+            self._win_hotkey_filter = None
+
+    def _parse_hotkey_to_win32(self, seq: str) -> Optional[Tuple[int, int]]:
+        """
+        Convert a single hotkey combo like "Ctrl+Alt+Space" -> (MOD_*, VK_*).
+        Returns None if unsupported/empty.
+        """
+        s = str(seq or "").strip()
+        if not s:
+            return None
+
+        MOD_ALT = 0x0001
+        MOD_CONTROL = 0x0002
+        MOD_SHIFT = 0x0004
+        MOD_WIN = 0x0008
+
+        def _vk_from_token(token: str) -> Optional[int]:
+            t = str(token or "").strip()
+            if not t:
+                return None
+            up = t.upper()
+            if len(up) == 1 and (("A" <= up <= "Z") or ("0" <= up <= "9")):
+                return ord(up)
+
+            mapping = {
+                "SPACE": 0x20,
+                "TAB": 0x09,
+                "ENTER": 0x0D,
+                "RETURN": 0x0D,
+                "ESC": 0x1B,
+                "ESCAPE": 0x1B,
+                "UP": 0x26,
+                "DOWN": 0x28,
+                "LEFT": 0x25,
+                "RIGHT": 0x27,
+                "PGUP": 0x21,
+                "PAGEUP": 0x21,
+                "PGDN": 0x22,
+                "PAGEDOWN": 0x22,
+                "HOME": 0x24,
+                "END": 0x23,
+                "INSERT": 0x2D,
+                "DEL": 0x2E,
+                "DELETE": 0x2E,
+                "BACKSPACE": 0x08,
+                "BKSP": 0x08,
+            }
+            if up in mapping:
+                return int(mapping[up])
+
+            if up.startswith("F") and up[1:].isdigit():
+                n = int(up[1:])
+                if 1 <= n <= 24:
+                    return 0x70 + (n - 1)
+
+            return None
+
+        parts = [p.strip() for p in s.replace("-", "+").split("+") if p.strip()]
+        mods = 0
+        vk: Optional[int] = None
+        for p in parts:
+            up = p.upper()
+            if up in ("CTRL", "CONTROL"):
+                mods |= MOD_CONTROL
+            elif up == "ALT":
+                mods |= MOD_ALT
+            elif up == "SHIFT":
+                mods |= MOD_SHIFT
+            elif up in ("WIN", "META", "CMD", "COMMAND"):
+                mods |= MOD_WIN
+            else:
+                vk = _vk_from_token(p)
+
+        if vk is None:
+            return None
+        return int(mods), int(vk)
+
+    def _unregister_auto_item_hotkey(self) -> None:
+        if os.name != "nt":
+            return
+        if not getattr(self, "_auto_item_hotkey_registered", False):
+            return
+        try:
+            import ctypes
+
+            ctypes.windll.user32.UnregisterHotKey(int(self._auto_item_hotkey_hwnd), int(self._auto_item_hotkey_id))
+        except Exception:
+            pass
+        self._auto_item_hotkey_registered = False
+        self._auto_item_hotkey_hwnd = 0
+
+    def _apply_auto_item_hotkey(self, seq: str, *, quiet: bool = False) -> None:
+        if os.name != "nt":
+            return
+        self._ensure_win_hotkey_filter()
+
+        s = str(seq or "").strip()
+        if not s:
+            self._unregister_auto_item_hotkey()
+            if not quiet:
+                self.autoitem_log_signal.emit("[Auto-Item] Toggle hotkey cleared (disabled).")
+            return
+
+        parsed = self._parse_hotkey_to_win32(s)
+        if not parsed:
+            if not quiet:
+                QMessageBox.warning(
+                    self,
+                    "Auto-Item Hotkey",
+                    "Unsupported hotkey.\n\nUse a single combo like: Ctrl+Alt+Space",
+                )
+            return
+        mods, vk = parsed
+
+        self._unregister_auto_item_hotkey()
+
+        try:
+            import ctypes
+
+            hwnd = 0
+            try:
+                hwnd = int(self.winId())
+            except Exception:
+                hwnd = 0
+
+            ok = int(ctypes.windll.user32.RegisterHotKey(int(hwnd), int(self._auto_item_hotkey_id), int(mods), int(vk)))
+            if not ok:
+                ok = int(ctypes.windll.user32.RegisterHotKey(0, int(self._auto_item_hotkey_id), int(mods), int(vk)))
+                if ok:
+                    hwnd = 0
+
+            if ok:
+                self._auto_item_hotkey_registered = True
+                self._auto_item_hotkey_hwnd = int(hwnd)
+                if not quiet:
+                    self.autoitem_log_signal.emit(f"[Auto-Item] Toggle hotkey registered: {s}")
+            else:
+                self._auto_item_hotkey_registered = False
+                self._auto_item_hotkey_hwnd = 0
+                msg = f"Could not register hotkey '{s}'. It may be in use by another app."
+                self.autoitem_log_signal.emit(f"[Auto-Item] {msg}")
+                if not quiet:
+                    QMessageBox.warning(self, "Auto-Item Hotkey", msg)
+        except Exception as e:
+            self._auto_item_hotkey_registered = False
+            self._auto_item_hotkey_hwnd = 0
+            if not quiet:
+                QMessageBox.warning(self, "Auto-Item Hotkey", f"Failed to register hotkey:\n{e}")
+
+    def _on_win_hotkey(self, hotkey_id: int) -> None:
+        try:
+            if int(hotkey_id) == int(self._auto_item_hotkey_id):
+                self._toggle_auto_item_enabled()
+        except Exception:
+            pass
+
+    def _toggle_auto_item_enabled(self) -> None:
+        try:
+            chk = getattr(self, "auto_item_enable_chk", None)
+            if chk is None:
+                return
+            chk.setChecked(not bool(chk.isChecked()))
+        except Exception:
+            pass
+
+    def _on_auto_item_hotkey_changed(self, *_):
+        if self._loading_autoitem_settings:
+            return
+        try:
+            seq = self.auto_item_hotkey_edit.keySequence().toString().strip()
+        except Exception:
+            seq = ""
+        self._apply_auto_item_hotkey(seq, quiet=False)
+        self._on_auto_item_ui_changed()
+
+    def _auto_item_refresh_users(self):
+        try:
+            users = self.config_manager.load_users() or {}
+        except Exception:
+            users = {}
+
+        # Preserve current in-UI selection when possible (fallback to disk on first load)
+        selected = [uid for uid, cb in (getattr(self, "auto_item_user_checks", {}) or {}).items() if cb.isChecked()]
+        if not selected:
+            try:
+                selected = list(self._get_auto_item_cfg_from_disk().get("users", []) or [])
+            except Exception:
+                selected = []
+
+        # Clear existing
+        try:
+            while self.auto_item_users_vbox.count():
+                item = self.auto_item_users_vbox.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.setParent(None)
+        except Exception:
+            pass
+
+        self.auto_item_user_checks = {}
+        for uid in sorted(users.keys(), key=lambda u: (users.get(u, {}) or {}).get("username", str(u))):
+            info = users.get(uid, {}) or {}
+            uname = info.get("username", uid)
+            cb = QCheckBox(f"{uname} ({uid})")
+            cb.toggled.connect(self._on_auto_item_ui_changed)
+            self.auto_item_users_vbox.addWidget(cb)
+            self.auto_item_user_checks[str(uid)] = cb
+
+        self.auto_item_users_vbox.addStretch()
+
+        # Apply selection without triggering persistence churn
+        prev = bool(getattr(self, "_loading_autoitem_settings", False))
+        self._loading_autoitem_settings = True
+        try:
+            self._apply_auto_item_users_to_ui(selected)
+        finally:
+            self._loading_autoitem_settings = prev
+
+    def _auto_item_set_all_users(self, enabled: bool):
+        for cb in (self.auto_item_user_checks or {}).values():
+            try:
+                cb.setChecked(bool(enabled))
+            except Exception:
+                pass
+        self._on_auto_item_ui_changed()
+
+    def _auto_item_add_item(self):
+        items = self._current_auto_item_items()
+        items.append({"enabled": True, "name": "", "amount": 1, "cooldown": 0, "biomes": []})
+        self._load_auto_item_items_table(items)
+        self._on_auto_item_ui_changed()
+
+    def _auto_item_remove_selected_items(self):
+        rows = sorted({idx.row() for idx in self.auto_item_table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        items = self._current_auto_item_items()
+        for r in rows:
+            if 0 <= r < len(items):
+                items.pop(r)
+        self._load_auto_item_items_table(items)
+        self._on_auto_item_ui_changed()
+
+    def _auto_item_move_selected(self, delta: int):
+        row = self.auto_item_table.currentRow()
+        if row < 0:
+            return
+        items = self._current_auto_item_items()
+        new_row = row + int(delta)
+        if new_row < 0 or new_row >= len(items):
+            return
+        items[row], items[new_row] = items[new_row], items[row]
+        self._load_auto_item_items_table(items)
+        try:
+            self.auto_item_table.setCurrentCell(new_row, 1)
+        except Exception:
+            pass
+        self._on_auto_item_ui_changed()
+
+    def _auto_item_test_once(self):
+        self._ensure_auto_item_engine()
+        if not getattr(self, "auto_item_engine", None):
+            QMessageBox.warning(self, "Auto-Item", "Auto-Item engine is not available.")
+            return
+
+        if not self._is_manager_running():
+            QMessageBox.information(self, "Auto-Item Test", "Start the manager first so a user window can be resolved.")
+            return
+
+        uid = None
+        for k, cb in (getattr(self, "auto_item_user_checks", {}) or {}).items():
+            try:
+                if cb.isChecked():
+                    uid = str(k)
+                    break
+            except Exception:
+                continue
+
+        if not uid:
+            QMessageBox.information(self, "Auto-Item Test", "Select at least one user in the Users list first.")
+            return
+
+        uname = uid
+        try:
+            users = self.config_manager.load_users() or {}
+            info = users.get(uid, {}) or {}
+            uname = info.get("username") or uid
+        except Exception:
+            uname = uid
+
+        confirm = QMessageBox.question(
+            self,
+            "Auto-Item Test",
+            f"Run Auto-Item once on:\n{uname} ({uid})\n\nThis will interact with Roblox and may use items.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        # Ensure the engine uses the latest UI config (without waiting for debounce).
+        try:
+            self.auto_item_engine.update_config(self._get_auto_item_settings_from_ui())
+        except Exception:
+            pass
+
+        try:
+            ok = bool(self.auto_item_engine.test_once(uid))
+        except Exception as e:
+            self.autoitem_log_signal.emit(f"[Auto-Item] Test: error: {e}")
+            ok = False
+
+        if ok:
+            QMessageBox.information(self, "Auto-Item Test", "Test run complete. Check the Auto-Item log for details.")
+        else:
+            QMessageBox.warning(self, "Auto-Item Test", "Test run did not complete. Check the Auto-Item log for details.")
+
+    def _update_biomes_btn_text(self, btn: QPushButton):
+        biomes = btn.property("biomes") or []
+        biomes = [str(b).strip().upper() for b in (biomes or []) if str(b).strip()]
+        btn.setProperty("biomes", biomes)
+        label = "Any" if not biomes else f"{len(biomes)} selected"
+        btn.setText(f"{label} v")
+
+    def _update_users_btn_text(self, btn: QPushButton):
+        raw = btn.property("users")
+        # Semantics:
+        # - None / missing => All users
+        # - []            => No users
+        # - [uids...]     => Only those users
+        if raw is None:
+            btn.setProperty("users", None)
+            btn.setText("All v")
+            return
+        if not isinstance(raw, (list, tuple)):
+            btn.setProperty("users", None)
+            btn.setText("All v")
+            return
+
+        users = [str(u).strip() for u in raw if str(u).strip()]
+        btn.setProperty("users", users)
+        label = "None" if not users else f"{len(users)} selected"
+        btn.setText(f"{label} v")
+
+    def _edit_item_biomes(self, btn: QPushButton):
+        try:
+            current = btn.property("biomes") or []
+            current = [str(b).strip().upper() for b in (current or []) if str(b).strip()]
+        except Exception:
+            current = []
+
+        # Dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select Allowed Biomes")
+        v = QVBoxLayout(dlg)
+
+        btn_row = QHBoxLayout()
+        sel_all_btn = QPushButton("Select All")
+        sel_none_btn = QPushButton("Select None")
+        btn_row.addWidget(sel_all_btn)
+        btn_row.addWidget(sel_none_btn)
+        btn_row.addStretch()
+        v.addLayout(btn_row)
+
+        lst = QListWidget()
+        lst.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        # Make selected highlight consistent regardless of focus (Select All button vs manual clicks)
+        lst.setStyleSheet(
+            """
+            QListWidget::item:selected {
+                background-color: palette(highlight);
+                color: palette(highlighted-text);
+            }
+            QListWidget::item:selected:!active {
+                background-color: palette(highlight);
+                color: palette(highlighted-text);
+            }
+            """
+        )
+        try:
+            all_biomes = list(biome_names())
+        except Exception:
+            all_biomes = []
+        sel = set(current)
+        for b in all_biomes:
+            it = QListWidgetItem(str(b).upper())
+            lst.addItem(it)
+            if it.text() in sel:
+                it.setSelected(True)
+
+        sel_all_btn.clicked.connect(lambda: (lst.selectAll(), lst.setFocus()))
+        sel_none_btn.clicked.connect(lambda: (lst.clearSelection(), lst.setFocus()))
+        v.addWidget(lst)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            chosen = [i.text() for i in lst.selectedItems()]
+            btn.setProperty("biomes", chosen)
+            self._update_biomes_btn_text(btn)
+            self._on_auto_item_ui_changed()
+
+    def _edit_item_users(self, btn: QPushButton):
+        try:
+            raw_current = btn.property("users")
+        except Exception:
+            raw_current = None
+        current: Optional[List[str]] = None
+        if raw_current is None:
+            current = None  # All
+        elif isinstance(raw_current, (list, tuple)):
+            current = [str(u).strip() for u in raw_current if str(u).strip()]
+        else:
+            current = None  # All
+
+        try:
+            users = self.config_manager.load_users() or {}
+        except Exception:
+            users = {}
+
+        all_uids: List[str] = [str(uid) for uid in sorted(users.keys())]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select Users For This Item")
+        v = QVBoxLayout(dlg)
+
+        btn_row = QHBoxLayout()
+        sel_all_btn = QPushButton("Select All")
+        sel_none_btn = QPushButton("Select None")
+        btn_row.addWidget(sel_all_btn)
+        btn_row.addWidget(sel_none_btn)
+        btn_row.addStretch()
+        v.addLayout(btn_row)
+
+        lst = QListWidget()
+        lst.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        # Make selected highlight consistent regardless of focus (Select All button vs manual clicks)
+        lst.setStyleSheet(
+            """
+            QListWidget::item:selected {
+                background-color: palette(highlight);
+                color: palette(highlighted-text);
+            }
+            QListWidget::item:selected:!active {
+                background-color: palette(highlight);
+                color: palette(highlighted-text);
+            }
+            """
+        )
+
+        # Semantics:
+        # - current is None => All users selected in UI
+        # - current is []   => None selected in UI
+        # - current list    => that subset selected
+        sel = set(all_uids) if current is None else set(current or [])
+
+        for uid in sorted(users.keys(), key=lambda u: (users.get(u, {}) or {}).get("username", str(u))):
+            info = users.get(uid, {}) or {}
+            uname = info.get("username", uid)
+            it = QListWidgetItem(f"{uname} ({uid})")
+            it.setData(Qt.ItemDataRole.UserRole, str(uid))
+            lst.addItem(it)
+            if str(uid) in sel:
+                it.setSelected(True)
+
+        sel_all_btn.clicked.connect(lambda: (lst.selectAll(), lst.setFocus()))
+        sel_none_btn.clicked.connect(lambda: (lst.clearSelection(), lst.setFocus()))
+
+        v.addWidget(lst)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            chosen: List[str] = []
+            for i in lst.selectedItems():
+                try:
+                    uid = str(i.data(Qt.ItemDataRole.UserRole) or "").strip()
+                except Exception:
+                    uid = ""
+                if uid:
+                    chosen.append(uid)
+
+            chosen_set = set(chosen)
+            if all_uids and len(chosen_set) >= len(set(all_uids)):
+                # All selected => store None (meaning all users)
+                btn.setProperty("users", None)
+            else:
+                # None selected => store [] (meaning no users)
+                btn.setProperty("users", chosen)
+            self._update_users_btn_text(btn)
+            self._on_auto_item_ui_changed()
+
+    def _load_auto_item_items_table(self, items: List[dict]):
+        self.auto_item_table.setRowCount(0)
+
+        def _wrap_cell(w: QWidget, *, center: bool = False, margins: Tuple[int, int, int, int] = (0, 6, 0, 6)) -> QWidget:
+            holder = QWidget()
+            holder.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            holder.setStyleSheet("background: transparent;")
+            lay = QHBoxLayout(holder)
+            lay.setContentsMargins(*margins)
+            lay.setSpacing(0)
+            if center:
+                lay.addStretch(1)
+                lay.addWidget(w, 0, Qt.AlignmentFlag.AlignCenter)
+                lay.addStretch(1)
+            else:
+                lay.addWidget(w, 1, Qt.AlignmentFlag.AlignVCenter)
+            try:
+                w.raise_()
+            except Exception:
+                pass
+            try:
+                holder.raise_()
+            except Exception:
+                pass
+            return holder
+
+        for it in (items or []):
+            row = self.auto_item_table.rowCount()
+            self.auto_item_table.insertRow(row)
+            try:
+                self.auto_item_table.setRowHeight(row, 62)
+            except Exception:
+                pass
+
+            en = QCheckBox()
+            en.setChecked(bool(it.get("enabled", True)))
+            en.setStyleSheet("background: transparent;")
+            en.toggled.connect(self._on_auto_item_ui_changed)
+            self.auto_item_table.setCellWidget(row, 0, _wrap_cell(en, center=True))
+
+            name = QLineEdit(str(it.get("name", "") or ""))
+            name.setPlaceholderText("Item name")
+            name.textChanged.connect(self._on_auto_item_ui_changed)
+            name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self.auto_item_table.setCellWidget(row, 1, _wrap_cell(name, center=False, margins=(6, 6, 6, 6)))
+
+            amt = _AutoItemSpinBox()
+            amt.setRange(1, 999)
+            amt.setValue(max(1, int(it.get("amount", 1) or 1)))
+            amt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            try:
+                amt.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+            except Exception:
+                pass
+            amt.setMinimumWidth(80)
+            amt.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            amt.valueChanged.connect(self._on_auto_item_ui_changed)
+            self.auto_item_table.setCellWidget(row, 2, _wrap_cell(amt, center=True, margins=(0, 6, 0, 6)))
+
+            cd = _AutoItemSpinBox()
+            cd.setRange(0, 86400)
+            cd.setValue(max(0, int(it.get("cooldown", 0) or 0)))
+            cd.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            try:
+                cd.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+            except Exception:
+                pass
+            cd.setMinimumWidth(95)
+            cd.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            cd.valueChanged.connect(self._on_auto_item_ui_changed)
+            self.auto_item_table.setCellWidget(row, 3, _wrap_cell(cd, center=True, margins=(0, 6, 0, 6)))
+
+            bbtn = QPushButton()
+            bbtn.setProperty("biomes", it.get("biomes", []) or [])
+            self._update_biomes_btn_text(bbtn)
+            try:
+                bbtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            except Exception:
+                pass
+            bbtn.clicked.connect(lambda _, b=bbtn: self._edit_item_biomes(b))
+            bbtn.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
+            self.auto_item_table.setCellWidget(row, 4, _wrap_cell(bbtn, center=False, margins=(6, 6, 6, 6)))
+
+            ubtn = QPushButton()
+            raw_users = it.get("users", None)
+            users_explicit = bool(it.get("users_explicit", False))
+            users_prop = None
+            if raw_users is None:
+                users_prop = None
+            elif isinstance(raw_users, (list, tuple, set)):
+                users_list = [str(u).strip() for u in raw_users if str(u).strip()]
+                if not users_list:
+                    users_prop = [] if users_explicit else None
+                else:
+                    users_prop = users_list
+            ubtn.setProperty("users", users_prop)
+            self._update_users_btn_text(ubtn)
+            try:
+                ubtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            except Exception:
+                pass
+            ubtn.clicked.connect(lambda _, b=ubtn: self._edit_item_users(b))
+            ubtn.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
+            self.auto_item_table.setCellWidget(row, 5, _wrap_cell(ubtn, center=False, margins=(6, 6, 6, 6)))
+
+    def _current_auto_item_items(self) -> List[dict]:
+        items: List[dict] = []
+        rows = self.auto_item_table.rowCount()
+
+        def _unwrap(col_widget: QWidget, typ):
+            if col_widget is None:
+                return None
+            if isinstance(col_widget, typ):
+                return col_widget
+            try:
+                return col_widget.findChild(typ)
+            except Exception:
+                return None
+
+        for r in range(rows):
+            try:
+                en = _unwrap(self.auto_item_table.cellWidget(r, 0), QCheckBox)
+                name = _unwrap(self.auto_item_table.cellWidget(r, 1), QLineEdit)
+                amt = _unwrap(self.auto_item_table.cellWidget(r, 2), QSpinBox)
+                cd = _unwrap(self.auto_item_table.cellWidget(r, 3), QSpinBox)
+                bbtn = _unwrap(self.auto_item_table.cellWidget(r, 4), QPushButton)
+                ubtn = _unwrap(self.auto_item_table.cellWidget(r, 5), QPushButton)
+
+                item = {
+                    "enabled": bool(en.isChecked()) if isinstance(en, QCheckBox) else True,
+                    "name": name.text().strip() if isinstance(name, QLineEdit) else "",
+                    "amount": int(amt.value()) if isinstance(amt, QSpinBox) else 1,
+                    "cooldown": int(cd.value()) if isinstance(cd, QSpinBox) else 0,
+                    "biomes": (bbtn.property("biomes") or []) if isinstance(bbtn, QPushButton) else [],
+                }
+                if isinstance(ubtn, QPushButton):
+                    raw_users = ubtn.property("users")
+                    if isinstance(raw_users, (list, tuple, set)):
+                        users_list = [str(u).strip() for u in raw_users if str(u).strip()]
+                        item["users"] = users_list
+                        item["users_explicit"] = True
+                items.append(item)
+            except Exception:
+                continue
+        return items
+
+    def _auto_item_capture_coord(self, key: str, sample_color: bool = False):
+        """
+        Capture a coordinate by screenshotting a Roblox window and letting the user click the point.
+        """
+        try:
+            import ctypes
+            import psutil
+            import win32api as _wapi
+            import win32con as _wcon
+            import win32gui as _wgui
+            import win32process as _wproc
+        except Exception as e:
+            self.autoitem_log_signal.emit(f"[Auto-Item] Missing dependencies for capture: {e}")
+            return
+
+        def _is_roblox_hwnd(hwnd: int) -> bool:
+            try:
+                if not hwnd or not _wgui.IsWindow(hwnd):
+                    return False
+                _, pid = _wproc.GetWindowThreadProcessId(hwnd)
+                if not pid:
+                    return False
+                return str(psutil.Process(int(pid)).name()).lower() == "robloxplayerbeta.exe"
+            except Exception:
+                return False
+
+        def _pick_hwnd() -> Optional[int]:
+            try:
+                fg = _wgui.GetForegroundWindow()
+                if _is_roblox_hwnd(fg):
+                    return int(fg)
+            except Exception:
+                pass
+            try:
+                wins = enum_roblox_windows()
+                if wins:
+                    return int(wins[0].hwnd)
+            except Exception:
+                pass
+            return None
+
+        def _bring_foreground(hwnd: int) -> None:
+            try:
+                if _wgui.IsIconic(hwnd):
+                    _wgui.ShowWindow(hwnd, _wcon.SW_RESTORE)
+                try:
+                    cur_tid = _wapi.GetCurrentThreadId()
+                    win_tid = _wproc.GetWindowThreadProcessId(hwnd)[0]
+                    ctypes.windll.user32.AttachThreadInput(cur_tid, win_tid, True)
+                    _wgui.BringWindowToTop(hwnd)
+                    _wgui.SetForegroundWindow(hwnd)
+                finally:
+                    try:
+                        ctypes.windll.user32.AttachThreadInput(cur_tid, win_tid, False)
+                    except Exception:
+                        pass
+            except Exception:
+                try:
+                    _wgui.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+
+        try:
+            hwnd = _pick_hwnd()
+            if not hwnd:
+                self.autoitem_log_signal.emit("[Auto-Item] No Roblox window found to capture from.")
+                return
+
+            _bring_foreground(hwnd)
+            time.sleep(0.12)
+
+            # Capture client area only (so ratios match the engine's client-relative math)
+            _l, _t, cr, cb = _wgui.GetClientRect(hwnd)
+            client_w = int(cr - _l)
+            client_h = int(cb - _t)
+            if client_w <= 0 or client_h <= 0:
+                raise RuntimeError("Invalid Roblox client size.")
+
+            full = capture_window_image(hwnd)
+            if full is None:
+                raise RuntimeError("Failed to capture Roblox window.")
+
+            def _is_blackish(im: Image.Image) -> bool:
+                try:
+                    _lo, _hi = im.convert("L").getextrema()
+                    return int(_hi) <= 5
+                except Exception:
+                    return False
+
+            # If the primary capture is black (PrintWindow can "succeed" but return black),
+            # try a direct screen grab as a fallback.
+            if _is_blackish(full):
+                try:
+                    from PIL import ImageGrab as _ig
+
+                    wl, wt, wr, wb = _wgui.GetWindowRect(hwnd)
+                    alt = _ig.grab(bbox=(wl, wt, wr, wb))
+                    if alt is not None and not _is_blackish(alt):
+                        full = alt
+                except Exception:
+                    pass
+
+            # If still black, try alternate PrintWindow flags (some windows only render with certain flags).
+            if _is_blackish(full):
+                try:
+                    import win32ui as _wui
+                    from ctypes import windll as _windll
+
+                    def _try_printwindow(flag: int) -> Optional[Image.Image]:
+                        try:
+                            left, top, right, bottom = _wgui.GetWindowRect(hwnd)
+                            width = int(right - left)
+                            height = int(bottom - top)
+                            if width <= 0 or height <= 0:
+                                return None
+
+                            hwnd_dc = _wgui.GetWindowDC(hwnd)
+                            if not hwnd_dc:
+                                return None
+                            try:
+                                mfc_dc = _wui.CreateDCFromHandle(hwnd_dc)
+                                save_dc = mfc_dc.CreateCompatibleDC()
+                                bmp = _wui.CreateBitmap()
+                                bmp.CreateCompatibleBitmap(mfc_dc, width, height)
+                                save_dc.SelectObject(bmp)
+
+                                ok = _windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), int(flag))
+                                if int(ok) != 1:
+                                    try:
+                                        _wgui.DeleteObject(bmp.GetHandle())
+                                    except Exception:
+                                        pass
+                                    try:
+                                        save_dc.DeleteDC()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        mfc_dc.DeleteDC()
+                                    except Exception:
+                                        pass
+                                    return None
+
+                                bmpinfo = bmp.GetInfo()
+                                bmpstr = bmp.GetBitmapBits(True)
+                                img2 = Image.frombuffer(
+                                    "RGB",
+                                    (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
+                                    bmpstr,
+                                    "raw",
+                                    "BGRX",
+                                    0,
+                                    1,
+                                )
+                                try:
+                                    _wgui.DeleteObject(bmp.GetHandle())
+                                except Exception:
+                                    pass
+                                try:
+                                    save_dc.DeleteDC()
+                                except Exception:
+                                    pass
+                                try:
+                                    mfc_dc.DeleteDC()
+                                except Exception:
+                                    pass
+                                return img2
+                            finally:
+                                try:
+                                    _wgui.ReleaseDC(hwnd, hwnd_dc)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            return None
+
+                    for fl in (0x00000000, 0x00000001, 0x00000003):
+                        alt2 = _try_printwindow(fl)
+                        if alt2 is not None and not _is_blackish(alt2):
+                            full = alt2
+                            break
+                except Exception:
+                    pass
+
+            # Compute client crop rect in the captured image coordinate space.
+            wl, wt, wr, wb = _wgui.GetWindowRect(hwnd)
+            win_w = max(1, int(wr - wl))
+            win_h = max(1, int(wb - wt))
+            scale_x = float(full.width) / float(win_w) if win_w else 1.0
+            scale_y = float(full.height) / float(win_h) if win_h else 1.0
+
+            client_left, client_top = _wgui.ClientToScreen(hwnd, (0, 0))
+            crop_left = int((client_left - wl) * scale_x)
+            crop_top = int((client_top - wt) * scale_y)
+            crop_right = int(crop_left + (client_w * scale_x))
+            crop_bottom = int(crop_top + (client_h * scale_y))
+
+            crop_left = max(0, min(full.width - 1, crop_left))
+            crop_top = max(0, min(full.height - 1, crop_top))
+            crop_right = max(crop_left + 1, min(full.width, crop_right))
+            crop_bottom = max(crop_top + 1, min(full.height, crop_bottom))
+
+            client_crop_w = max(1, crop_right - crop_left)
+            client_crop_h = max(1, crop_bottom - crop_top)
+
+            client_img = full.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+            # Prefer showing the client crop; if it's black but the full window isn't, show full
+            # and convert clicks back into client-relative coordinates.
+            show_img = client_img
+            offset_x = 0
+            offset_y = 0
+            if _is_blackish(client_img) and not _is_blackish(full):
+                show_img = full
+                offset_x = crop_left
+                offset_y = crop_top
+
+            # If the screenshot is still black, give a clearer hint (common with fullscreen / protected surfaces)
+            if _is_blackish(show_img):
+                # Final fallback: try Qt's grabWindow which can behave differently than PIL/PrintWindow.
+                try:
+                    screen = QApplication.primaryScreen()
+                    pm_full = screen.grabWindow(hwnd) if screen else QPixmap()
+
+                    def _pm_blackish(pm: QPixmap) -> bool:
+                        try:
+                            if pm.isNull():
+                                return True
+                            qimg = pm.toImage()
+                            w = qimg.width()
+                            h = qimg.height()
+                            if w <= 0 or h <= 0:
+                                return True
+                            pts = [
+                                (w // 2, h // 2),
+                                (w // 4, h // 4),
+                                (3 * w // 4, h // 4),
+                                (w // 4, 3 * h // 4),
+                                (3 * w // 4, 3 * h // 4),
+                            ]
+                            mx = 0
+                            for x, y in pts:
+                                c = qimg.pixelColor(int(x), int(y))
+                                mx = max(mx, int(c.red()), int(c.green()), int(c.blue()))
+                            return mx <= 5
+                        except Exception:
+                            return True
+
+                    if not _pm_blackish(pm_full):
+                        # Crop client area from the Qt pixmap using the same scale approach.
+                        sx = float(pm_full.width()) / float(win_w) if win_w else 1.0
+                        sy = float(pm_full.height()) / float(win_h) if win_h else 1.0
+                        q_crop_left = int((client_left - wl) * sx)
+                        q_crop_top = int((client_top - wt) * sy)
+                        q_crop_right = int(q_crop_left + (client_w * sx))
+                        q_crop_bottom = int(q_crop_top + (client_h * sy))
+                        q_crop_left = max(0, min(pm_full.width() - 1, q_crop_left))
+                        q_crop_top = max(0, min(pm_full.height() - 1, q_crop_top))
+                        q_crop_right = max(q_crop_left + 1, min(pm_full.width(), q_crop_right))
+                        q_crop_bottom = max(q_crop_top + 1, min(pm_full.height(), q_crop_bottom))
+
+                        pm_client = pm_full.copy(QRect(q_crop_left, q_crop_top, q_crop_right - q_crop_left, q_crop_bottom - q_crop_top))
+                        pm_show = pm_client if not _pm_blackish(pm_client) else pm_full
+
+                        # Convert to PIL for reuse of the existing click->relative math + color sampling.
+                        try:
+                            qimg = pm_show.toImage().convertToFormat(QImage.Format.Format_RGB888)
+                            ptr = qimg.bits()
+                            ptr.setsize(qimg.width() * qimg.height() * 3)
+                            show_img = Image.frombytes("RGB", (qimg.width(), qimg.height()), bytes(ptr))
+
+                            if pm_show.cacheKey() == pm_full.cacheKey():
+                                offset_x = q_crop_left
+                                offset_y = q_crop_top
+                                client_crop_w = max(1, q_crop_right - q_crop_left)
+                                client_crop_h = max(1, q_crop_bottom - q_crop_top)
+                            else:
+                                offset_x = 0
+                                offset_y = 0
+                                client_crop_w = max(1, pm_show.width())
+                                client_crop_h = max(1, pm_show.height())
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            if _is_blackish(show_img):
+                self.autoitem_log_signal.emit(
+                    "[Auto-Item] Screenshot is still black. Roblox may be blocking capture (common in exclusive fullscreen / MS Store builds). "
+                    "Try windowed/borderless and re-capture."
+                )
+                resp = QMessageBox.question(
+                    self,
+                    "Capture Failed",
+                    "Roblox screenshot capture returned a black image.\n\n"
+                    "Try:\n"
+                    "- Windowed/borderless mode (avoid exclusive fullscreen)\n"
+                    "- Ensure the window is not minimized\n"
+                    "- Try running J.JARAM as Administrator\n\n"
+                    "Use hover-based capture instead?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if resp == QMessageBox.StandardButton.Yes:
+                    self.autoitem_log_signal.emit(f"[Auto-Item] Hover capture for '{key}' in 3 seconds...")
+
+                    def _hover_capture():
+                        try:
+                            cx, cy = _wapi.GetCursorPos()
+                            ox, oy = _wgui.ClientToScreen(hwnd, (0, 0))
+                            _cl, _ct, _cr, _cb = _wgui.GetClientRect(hwnd)
+                            ww = int(_cr - _cl)
+                            hh = int(_cb - _ct)
+                            if ww <= 0 or hh <= 0:
+                                raise RuntimeError("Invalid Roblox client size.")
+
+                            rx2 = max(0.0, min(1.0, (cx - ox) / float(ww)))
+                            ry2 = max(0.0, min(1.0, (cy - oy) / float(hh)))
+
+                            if key == "conditional_point":
+                                self._auto_item_coords["conditional_point"] = {"x": rx2, "y": ry2}
+                                self.auto_item_cond_point_le.setText(f"{rx2:.4f}, {ry2:.4f}")
+                                if sample_color:
+                                    try:
+                                        from PIL import ImageGrab as _ig2
+
+                                        px_img = _ig2.grab(bbox=(int(cx), int(cy), int(cx) + 1, int(cy) + 1))
+                                        r, g, b = tuple(px_img.getpixel((0, 0))[:3])
+                                        self.auto_item_cond_color_le.setText(f"#{int(r):02X}{int(g):02X}{int(b):02X}")
+                                    except Exception:
+                                        pass
+                            else:
+                                self._auto_item_coords[key] = {"x": rx2, "y": ry2}
+                                le2 = self._auto_item_coord_edits.get(key)
+                                if le2:
+                                    le2.setText(f"{rx2:.4f}, {ry2:.4f}")
+
+                            self.autoitem_log_signal.emit(f"[Auto-Item] Set '{key}' to ({rx2:.4f}, {ry2:.4f}) via hover.")
+                            self._on_auto_item_ui_changed()
+                        except Exception as e:
+                            self.autoitem_log_signal.emit(f"[Auto-Item] Hover capture failed for '{key}': {e}")
+
+                    QTimer.singleShot(3000, _hover_capture)
+                return
+
+            title_map = {
+                "inv_button": "Inventory Button",
+                "items_tab": "Items Tab",
+                "search_box": "Search Box",
+                "query_pos": "Query / Result Click",
+                "amount_box": "Amount Box",
+                "use_button": "Use Button",
+                "close_button": "Close Button",
+                "conditional_point": "Conditional Point",
+            }
+            title = f"Select {title_map.get(key, key)}"
+
+            pm = pil_to_pixmap(show_img)
+            dlg = PointPickDialog(pm, title, parent=self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+
+            picked = dlg.selected_point()
+            if not picked:
+                return
+            _xf, _yf, px, py = picked
+
+            # Convert the click back into client-relative coordinates (0..1)
+            rx = (float(px) - float(offset_x)) / float(client_crop_w)
+            ry = (float(py) - float(offset_y)) / float(client_crop_h)
+            if rx < 0.0 or rx > 1.0 or ry < 0.0 or ry > 1.0:
+                QMessageBox.warning(self, "Invalid Selection", "Please click inside the Roblox client area.")
+                return
+
+            if key == "conditional_point":
+                self._auto_item_coords["conditional_point"] = {"x": float(rx), "y": float(ry)}
+                self.auto_item_cond_point_le.setText(f"{float(rx):.4f}, {float(ry):.4f}")
+
+                if sample_color:
+                    try:
+                        rgb_img = show_img.convert("RGB")
+                        r, g, b = rgb_img.getpixel((int(px), int(py)))[:3]
+                        self.auto_item_cond_color_le.setText(f"#{int(r):02X}{int(g):02X}{int(b):02X}")
+                    except Exception:
+                        pass
+            else:
+                self._auto_item_coords[key] = {"x": float(rx), "y": float(ry)}
+                le = self._auto_item_coord_edits.get(key)
+                if le:
+                    le.setText(f"{float(rx):.4f}, {float(ry):.4f}")
+
+            self.autoitem_log_signal.emit(f"[Auto-Item] Set '{key}' to ({float(rx):.4f}, {float(ry):.4f}).")
+            self._on_auto_item_ui_changed()
+        except Exception as e:
+            self.autoitem_log_signal.emit(f"[Auto-Item] Capture failed for '{key}': {e}")
+
+    def _get_auto_item_settings_from_ui(self) -> dict:
+        # Selected users
+        users = [uid for uid, cb in (self.auto_item_user_checks or {}).items() if cb.isChecked()]
+
+        coords = {}
+        for k in ("inv_button", "items_tab", "search_box", "query_pos", "amount_box", "use_button", "close_button"):
+            if k in (self._auto_item_coords or {}):
+                coords[k] = dict(self._auto_item_coords[k])
+
+        # Conditional click lives under coords.conditional
+        cond_pt = (self._auto_item_coords or {}).get("conditional_point")
+        coords["conditional"] = {
+            "enabled": bool(self.auto_item_cond_enable_chk.isChecked()),
+            "point": dict(cond_pt) if isinstance(cond_pt, dict) else {"x": 0.0, "y": 0.0},
+            "color": self.auto_item_cond_color_le.text().strip() or "#FFFFFF",
+            "tolerance": int(self.auto_item_cond_tol_spin.value()),
+        }
+
+        return {
+            "enabled": bool(self.auto_item_enable_chk.isChecked()),
+            "tick_interval": float(self.auto_item_tick_spin.value()),
+            "click_delay": float(self.auto_item_delay_spin.value()),
+            "toggle_hotkey": (self.auto_item_hotkey_edit.keySequence().toString().strip() if getattr(self, "auto_item_hotkey_edit", None) else ""),
+            "users": users,
+            "coords": coords,
+            "items": self._current_auto_item_items(),
+        }
+
+    def _get_auto_item_cfg_from_disk(self) -> dict:
+        try:
+            settings = self.config_manager.load_settings() or {}
+            return settings.get("auto_item", {}) or {}
+        except Exception:
+            return {}
+
+    def _apply_auto_item_users_to_ui(self, users: List[str]):
+        selected = {str(u) for u in (users or []) if str(u).strip()}
+        for uid, cb in (self.auto_item_user_checks or {}).items():
+            try:
+                cb.setChecked(uid in selected)
+            except Exception:
+                pass
+
+    def _load_auto_item_settings(self):
+        cfg = self._get_auto_item_cfg_from_disk()
+        defaults = self.config_manager.default_settings.get("auto_item", {}) or {}
+        cfg = {**defaults, **(cfg or {})}
+        hk = str(cfg.get("toggle_hotkey", "Ctrl+Alt+Space") or "Ctrl+Alt+Space").strip()
+
+        self._loading_autoitem_settings = True
+        try:
+            self.auto_item_enable_chk.setChecked(bool(cfg.get("enabled", False)))
+            self.auto_item_tick_spin.setValue(float(cfg.get("tick_interval", 1.0) or 1.0))
+            self.auto_item_delay_spin.setValue(float(cfg.get("click_delay", 0.2) or 0.2))
+            try:
+                self.auto_item_hotkey_edit.setKeySequence(QKeySequence(hk))
+            except Exception:
+                pass
+
+            # Coords
+            self._auto_item_coords = {}
+            coords = cfg.get("coords", {}) or {}
+            for k in ("inv_button", "items_tab", "search_box", "query_pos", "amount_box", "use_button", "close_button"):
+                if isinstance(coords.get(k), dict):
+                    self._auto_item_coords[k] = {"x": float(coords[k].get("x", 0.0)), "y": float(coords[k].get("y", 0.0))}
+                    le = self._auto_item_coord_edits.get(k)
+                    if le:
+                        le.setText(f"{self._auto_item_coords[k]['x']:.4f}, {self._auto_item_coords[k]['y']:.4f}")
+                else:
+                    le = self._auto_item_coord_edits.get(k)
+                    if le:
+                        le.clear()
+
+            cond = coords.get("conditional", {}) or {}
+            self.auto_item_cond_enable_chk.setChecked(bool(cond.get("enabled", False)))
+            self.auto_item_cond_color_le.setText(str(cond.get("color", "#FFFFFF") or "#FFFFFF"))
+            self.auto_item_cond_tol_spin.setValue(int(cond.get("tolerance", 10) or 10))
+            pt = cond.get("point") or {}
+            if isinstance(pt, dict):
+                self._auto_item_coords["conditional_point"] = {"x": float(pt.get("x", 0.0)), "y": float(pt.get("y", 0.0))}
+                self.auto_item_cond_point_le.setText(f"{self._auto_item_coords['conditional_point']['x']:.4f}, {self._auto_item_coords['conditional_point']['y']:.4f}")
+            else:
+                self.auto_item_cond_point_le.clear()
+
+            # Items + users
+            self._load_auto_item_items_table(cfg.get("items", []) or [])
+            self._apply_auto_item_users_to_ui(cfg.get("users", []) or [])
+        finally:
+            self._loading_autoitem_settings = False
+
+        # Register hotkey (quiet on load)
+        try:
+            self._apply_auto_item_hotkey(hk, quiet=True)
+        except Exception:
+            pass
+
+        # Push config into engine after load
+        try:
+            if self.auto_item_engine is not None:
+                self.auto_item_engine.update_config(self._get_auto_item_settings_from_ui())
+        except Exception:
+            pass
+
+    def _save_auto_item_settings(self):
+        if self._loading_autoitem_settings:
+            return
+        try:
+            settings = self.config_manager.load_settings() or {}
+        except Exception:
+            settings = self.config_manager.default_settings.copy()
+
+        cfg = self._get_auto_item_settings_from_ui()
+        settings["auto_item"] = cfg
+        try:
+            self.config_manager.save_settings(settings)
+        except Exception:
+            pass
+
+        # Live-apply to engine
+        try:
+            if self.auto_item_engine is not None:
+                self.auto_item_engine.update_config(cfg)
+        except Exception:
+            pass
+
+    def _on_auto_item_ui_changed(self):
+        if self._loading_autoitem_settings:
+            return
+        # Debounce writes (and engine updates)
+        try:
+            self._auto_item_save_timer.start(300)
+        except Exception:
+            self._save_auto_item_settings()
+
+    def _reset_auto_item_to_defaults(self):
+        defaults = self.config_manager.default_settings.get("auto_item", {}) or {}
+        hk = str(defaults.get("toggle_hotkey", "Ctrl+Alt+Space") or "Ctrl+Alt+Space").strip()
+        self._loading_autoitem_settings = True
+        try:
+            self.auto_item_enable_chk.setChecked(bool(defaults.get("enabled", False)))
+            self.auto_item_tick_spin.setValue(float(defaults.get("tick_interval", 1.0) or 1.0))
+            self.auto_item_delay_spin.setValue(float(defaults.get("click_delay", 0.2) or 0.2))
+            try:
+                self.auto_item_hotkey_edit.setKeySequence(QKeySequence(hk))
+            except Exception:
+                pass
+            self.auto_item_cond_enable_chk.setChecked(False)
+            self.auto_item_cond_color_le.setText("#FFFFFF")
+            self.auto_item_cond_tol_spin.setValue(10)
+            self.auto_item_cond_point_le.clear()
+            self._auto_item_coords = {}
+            for le in (self._auto_item_coord_edits or {}).values():
+                try:
+                    le.clear()
+                except Exception:
+                    pass
+            self._load_auto_item_items_table([])
+            self._auto_item_set_all_users(False)
+        finally:
+            self._loading_autoitem_settings = False
+
+        try:
+            self._apply_auto_item_hotkey(hk, quiet=True)
+        except Exception:
+            pass
+
+        self._on_auto_item_ui_changed()
+
+    # ------------------------
+    # BES tab + controller
+    # ------------------------
+
+    def setup_bes_tab(self):
+        bes_widget = QWidget()
+        layout = QVBoxLayout(bes_widget)
+
+        if self.bes_controller is None:
+            msg = QLabel("BES throttling is unavailable on this system/build.")
+            msg.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
+            layout.addWidget(msg)
+            layout.addStretch(1)
+            self.tab_widget.addTab(bes_widget, "BES")
+            return
+
+        top_group = QGroupBox("BES - Battle Encoder Shirasé")
+        top_layout = QGridLayout(top_group)
+
+        self.bes_enable_chk = QCheckBox("Enable throttling for all Roblox processes")
+        top_layout.addWidget(self.bes_enable_chk, 0, 0, 1, 3)
+
+        top_layout.addWidget(QLabel("Cycle (ms):"), 1, 0)
+        self.bes_cycle_spin = QSpinBox()
+        self.bes_cycle_spin.setRange(10, 500)
+        self.bes_cycle_spin.setSingleStep(5)
+        self.bes_cycle_spin.setValue(50)
+        top_layout.addWidget(self.bes_cycle_spin, 1, 1)
+
+        self.bes_status_label = QLabel("Status: Disabled")
+        self.bes_status_label.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
+        top_layout.addWidget(self.bes_status_label, 1, 2)
+
+        layout.addWidget(top_group)
+
+        levels_group = QGroupBox("Throttle Levels")
+        levels_layout = QGridLayout(levels_group)
+
+        levels_layout.addWidget(QLabel("Main menu:"), 0, 0)
+        self.bes_menu_slider = QSlider(Qt.Orientation.Horizontal)
+        self.bes_menu_slider.setRange(0, 99)
+        self.bes_menu_slider.setValue(85)
+        self.bes_menu_val = QLabel("85%")
+        levels_layout.addWidget(self.bes_menu_slider, 0, 1)
+        levels_layout.addWidget(self.bes_menu_val, 0, 2)
+
+        levels_layout.addWidget(QLabel("Outside main menu:"), 1, 0)
+        self.bes_game_slider = QSlider(Qt.Orientation.Horizontal)
+        self.bes_game_slider.setRange(0, 99)
+        self.bes_game_slider.setValue(50)
+        self.bes_game_val = QLabel("50%")
+        levels_layout.addWidget(self.bes_game_slider, 1, 1)
+        levels_layout.addWidget(self.bes_game_val, 1, 2)
+
+        layout.addWidget(levels_group)
+
+        exempt_group = QGroupBox("Exempt Users")
+        exempt_layout = QGridLayout(exempt_group)
+
+        self.bes_exempt_combos: List[QComboBox] = []
+        for i in range(3):
+            exempt_layout.addWidget(QLabel(f"Slot {i + 1}:"), i, 0)
+            combo = QComboBox()
+            combo.setMinimumWidth(280)
+            self.bes_exempt_combos.append(combo)
+            exempt_layout.addWidget(combo, i, 1, 1, 2)
+
+        refresh_btn = QPushButton("Refresh User List")
+        refresh_btn.clicked.connect(self._bes_refresh_user_list)
+        exempt_layout.addWidget(refresh_btn, 3, 0, 1, 3)
+
+        layout.addWidget(exempt_group)
+
+        auto_group = QGroupBox("Auto Item Pacify")
+        auto_layout = QGridLayout(auto_group)
+
+        auto_layout.addWidget(QLabel("Unthrottle lead time (seconds):"), 0, 0)
+        self.bes_auto_lead_spin = QDoubleSpinBox()
+        self.bes_auto_lead_spin.setRange(0.0, 15.0)
+        self.bes_auto_lead_spin.setSingleStep(0.5)
+        self.bes_auto_lead_spin.setDecimals(1)
+        self.bes_auto_lead_spin.setValue(3.0)
+        auto_layout.addWidget(self.bes_auto_lead_spin, 0, 1)
+
+        auto_layout.addWidget(QLabel("Post-action grace (seconds):"), 1, 0)
+        self.bes_auto_grace_spin = QDoubleSpinBox()
+        self.bes_auto_grace_spin.setRange(0.0, 10.0)
+        self.bes_auto_grace_spin.setSingleStep(0.25)
+        self.bes_auto_grace_spin.setDecimals(2)
+        self.bes_auto_grace_spin.setValue(1.0)
+        auto_layout.addWidget(self.bes_auto_grace_spin, 1, 1)
+
+        hint = QLabel("Auto Item temporarily disables throttling before it starts clicking/typing.")
+        hint.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
+        auto_layout.addWidget(hint, 2, 0, 1, 2)
+
+        layout.addWidget(auto_group)
+
+        log_group = QGroupBox("BES Log")
+        log_layout = QVBoxLayout(log_group)
+        self.bes_log_box = QTextEdit()
+        self.bes_log_box.setReadOnly(True)
+        self.bes_log_box.setFont(QFont("Consolas", 10))
+        self.bes_log_box.setMinimumHeight(180)
+        log_layout.addWidget(self.bes_log_box)
+        layout.addWidget(log_group)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        reset_btn = QPushButton("Restore BES Defaults")
+        reset_btn.clicked.connect(self._reset_bes_to_defaults)
+        footer.addWidget(reset_btn)
+        layout.addLayout(footer)
+
+        layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(bes_widget)
+        self.tab_widget.addTab(scroll, "BES")
+
+        # Debounced persistence (avoid writing settings.json on slider drag)
+        self._bes_save_timer = QTimer(self)
+        self._bes_save_timer.setSingleShot(True)
+        self._bes_save_timer.timeout.connect(self._save_bes_settings)
+
+        # Periodic enforcement loop
+        self._bes_tick_timer = QTimer(self)
+        self._bes_tick_timer.timeout.connect(self._bes_tick)
+        self._bes_tick_timer.setInterval(1000)
+
+        # Wire change events
+        self.bes_enable_chk.toggled.connect(self._on_bes_enabled_toggled)
+        self.bes_cycle_spin.valueChanged.connect(self._on_bes_ui_changed)
+        self.bes_menu_slider.valueChanged.connect(self._on_bes_slider_changed)
+        self.bes_game_slider.valueChanged.connect(self._on_bes_slider_changed)
+        self.bes_auto_lead_spin.valueChanged.connect(self._on_bes_ui_changed)
+        self.bes_auto_grace_spin.valueChanged.connect(self._on_bes_ui_changed)
+        for combo in self.bes_exempt_combos:
+            combo.currentIndexChanged.connect(self._on_bes_ui_changed)
+
+        # Populate + load persisted settings
+        self._bes_refresh_user_list()
+        self._load_bes_settings()
+
+    def _on_bes_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] {str(message)}"
+        box = getattr(self, "bes_log_box", None)
+        if box is not None:
+            try:
+                box.append(line)
+            except Exception:
+                pass
+
+    def _bes_refresh_user_list(self) -> None:
+        combos = getattr(self, "bes_exempt_combos", None) or []
+        try:
+            users_cfg = self.config_manager.load_users() or {}
+        except Exception:
+            users_cfg = {}
+
+        # Preserve current selections (userData values)
+        prev: List[str] = []
+        for c in combos:
+            try:
+                prev.append(str(c.currentData() or ""))
+            except Exception:
+                prev.append("")
+
+        items: List[tuple[str, str]] = []
+        for uid, info in (users_cfg or {}).items():
+            try:
+                uid_s = str(uid).strip()
+                if not uid_s:
+                    continue
+                name = str((info or {}).get("username", "") or "").strip() or uid_s
+                items.append((uid_s, name))
+            except Exception:
+                continue
+        items.sort(key=lambda t: (t[1].lower(), t[0]))
+
+        for idx, combo in enumerate(combos):
+            try:
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItem("None", "")
+                for uid_s, name in items:
+                    combo.addItem(f"{name} ({uid_s})", uid_s)
+
+                sel = prev[idx] if idx < len(prev) else ""
+                if sel and combo.findData(sel) < 0:
+                    combo.insertItem(1, f"Unknown ({sel})", sel)
+                if sel:
+                    combo.setCurrentIndex(max(0, combo.findData(sel)))
+                else:
+                    combo.setCurrentIndex(0)
+            except Exception:
+                pass
+            finally:
+                try:
+                    combo.blockSignals(False)
+                except Exception:
+                    pass
+
+    def _bes_update_status(self, text: str, *, warning: bool = False) -> None:
+        lbl = getattr(self, "bes_status_label", None)
+        if lbl is None:
+            return
+        try:
+            lbl.setText(str(text))
+            if warning:
+                lbl.setStyleSheet(f"color: {ModernStyle.WARNING};")
+            else:
+                lbl.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
+        except Exception:
+            pass
+
+    def _on_bes_slider_changed(self, _v: int) -> None:
+        try:
+            self.bes_menu_val.setText(f"{int(self.bes_menu_slider.value())}%")
+            self.bes_game_val.setText(f"{int(self.bes_game_slider.value())}%")
+        except Exception:
+            pass
+        self._on_bes_ui_changed()
+
+    def _on_bes_enabled_toggled(self, enabled: bool) -> None:
+        if self.bes_controller is None:
+            self._bes_update_status("Status: Unsupported", warning=True)
+            return
+
+        enabled = bool(enabled)
+        try:
+            self.bes_controller.set_enabled(enabled)
+        except Exception:
+            pass
+
+        if enabled:
+            try:
+                if self._bes_tick_timer is not None:
+                    self._bes_tick_timer.start()
+            except Exception:
+                pass
+            self._bes_tick()
+        else:
+            try:
+                if self._bes_tick_timer is not None:
+                    self._bes_tick_timer.stop()
+            except Exception:
+                pass
+            self._bes_update_status("Status: Disabled")
+
+        try:
+            with self._bes_cfg_lock:
+                self._bes_cfg_cache = self._get_bes_settings_from_ui()
+        except Exception:
+            pass
+
+        self._on_bes_ui_changed()
+
+    def _get_bes_settings_from_ui(self) -> Dict:
+        exempt: List[str] = []
+        for c in getattr(self, "bes_exempt_combos", None) or []:
+            try:
+                exempt.append(str(c.currentData() or "").strip())
+            except Exception:
+                exempt.append("")
+        while len(exempt) < 3:
+            exempt.append("")
+        exempt = exempt[:3]
+
+        return {
+            "enabled": bool(getattr(self, "bes_enable_chk", None) and self.bes_enable_chk.isChecked()),
+            "cycle_ms": int(getattr(self, "bes_cycle_spin", None) and self.bes_cycle_spin.value() or 50),
+            "menu_throttle_percent": int(getattr(self, "bes_menu_slider", None) and self.bes_menu_slider.value() or 0),
+            "game_throttle_percent": int(getattr(self, "bes_game_slider", None) and self.bes_game_slider.value() or 0),
+            "exempt_users": exempt,
+            "auto_item_lead_s": float(getattr(self, "bes_auto_lead_spin", None) and self.bes_auto_lead_spin.value() or 0.0),
+            "auto_item_grace_s": float(getattr(self, "bes_auto_grace_spin", None) and self.bes_auto_grace_spin.value() or 0.0),
+        }
+
+    def _load_bes_settings(self) -> None:
+        try:
+            settings = self.config_manager.load_settings() or {}
+        except Exception:
+            settings = dict(self.config_manager.default_settings or {})
+
+        cfg = settings.get("bes", {}) or {}
+        defaults = self.config_manager.default_settings.get("bes", {}) or {}
+
+        self._loading_bes_settings = True
+        try:
+            self.bes_enable_chk.setChecked(bool(cfg.get("enabled", defaults.get("enabled", False))))
+            self.bes_cycle_spin.setValue(int(cfg.get("cycle_ms", defaults.get("cycle_ms", 50))))
+
+            menu_pct = int(cfg.get("menu_throttle_percent", defaults.get("menu_throttle_percent", 85)))
+            game_pct = int(cfg.get("game_throttle_percent", defaults.get("game_throttle_percent", 50)))
+            self.bes_menu_slider.setValue(max(0, min(99, menu_pct)))
+            self.bes_game_slider.setValue(max(0, min(99, game_pct)))
+            self.bes_menu_val.setText(f"{int(self.bes_menu_slider.value())}%")
+            self.bes_game_val.setText(f"{int(self.bes_game_slider.value())}%")
+
+            self.bes_auto_lead_spin.setValue(float(cfg.get("auto_item_lead_s", defaults.get("auto_item_lead_s", 3.0))))
+            self.bes_auto_grace_spin.setValue(float(cfg.get("auto_item_grace_s", defaults.get("auto_item_grace_s", 1.0))))
+
+            exempt = cfg.get("exempt_users", defaults.get("exempt_users", ["", "", ""])) or ["", "", ""]
+            if not isinstance(exempt, list):
+                exempt = ["", "", ""]
+            while len(exempt) < 3:
+                exempt.append("")
+            for i, combo in enumerate(getattr(self, "bes_exempt_combos", None) or []):
+                uid = str(exempt[i] or "").strip()
+                if uid and combo.findData(uid) < 0:
+                    combo.insertItem(1, f"Unknown ({uid})", uid)
+                combo.setCurrentIndex(max(0, combo.findData(uid) if uid else 0))
+        finally:
+            self._loading_bes_settings = False
+
+        # Cache snapshot for cross-thread consumers (Auto Item hook)
+        try:
+            with self._bes_cfg_lock:
+                self._bes_cfg_cache = self._get_bes_settings_from_ui()
+        except Exception:
+            pass
+
+        # Apply enabled state on load (starts/stops controller/timer)
+        try:
+            self._on_bes_enabled_toggled(bool(self.bes_enable_chk.isChecked()))
+        except Exception:
+            pass
+
+    def _save_bes_settings(self) -> None:
+        if self._loading_bes_settings:
+            return
+
+        try:
+            settings = self.config_manager.load_settings() or {}
+        except Exception:
+            settings = dict(self.config_manager.default_settings or {})
+
+        cfg = self._get_bes_settings_from_ui()
+        settings["bes"] = cfg
+        try:
+            self.config_manager.save_settings(settings)
+        except Exception:
+            pass
+
+        try:
+            with self._bes_cfg_lock:
+                self._bes_cfg_cache = dict(cfg or {})
+        except Exception:
+            pass
+
+        # Live-apply cycle changes
+        if self.bes_controller is not None:
+            try:
+                self.bes_controller.set_cycle_ms(int(cfg.get("cycle_ms", 50)))
+            except Exception:
+                pass
+
+        if bool(cfg.get("enabled", False)):
+            self._bes_tick()
+
+    def _on_bes_ui_changed(self) -> None:
+        if self._loading_bes_settings:
+            return
+        try:
+            with self._bes_cfg_lock:
+                self._bes_cfg_cache = self._get_bes_settings_from_ui()
+        except Exception:
+            pass
+        try:
+            if self._bes_save_timer is not None:
+                self._bes_save_timer.start(300)
+        except Exception:
+            self._save_bes_settings()
+
+    def _reset_bes_to_defaults(self) -> None:
+        defaults = self.config_manager.default_settings.get("bes", {}) or {}
+        self._loading_bes_settings = True
+        try:
+            self.bes_enable_chk.setChecked(bool(defaults.get("enabled", False)))
+            self.bes_cycle_spin.setValue(int(defaults.get("cycle_ms", 50)))
+            self.bes_menu_slider.setValue(int(defaults.get("menu_throttle_percent", 85)))
+            self.bes_game_slider.setValue(int(defaults.get("game_throttle_percent", 50)))
+            self.bes_menu_val.setText(f"{int(self.bes_menu_slider.value())}%")
+            self.bes_game_val.setText(f"{int(self.bes_game_slider.value())}%")
+            self.bes_auto_lead_spin.setValue(float(defaults.get("auto_item_lead_s", 3.0)))
+            self.bes_auto_grace_spin.setValue(float(defaults.get("auto_item_grace_s", 1.0)))
+            for combo in getattr(self, "bes_exempt_combos", None) or []:
+                try:
+                    combo.setCurrentIndex(0)
+                except Exception:
+                    pass
+        finally:
+            self._loading_bes_settings = False
+        self._on_bes_enabled_toggled(bool(self.bes_enable_chk.isChecked()))
+        self._on_bes_ui_changed()
+
+    def _bes_tick(self) -> None:
+        """
+        Enforce per-process throttling:
+          - Only Roblox processes tracked per-user by the manager get a limiter worker.
+          - Exempt users get 0% (no throttling).
+          - In-menu vs outside-menu uses separate slider values.
+          - Active Auto Item holds force 0% temporarily (handled inside controller).
+        """
+        ctl = self.bes_controller
+        if ctl is None:
+            return
+        if not (getattr(self, "bes_enable_chk", None) and self.bes_enable_chk.isChecked()):
+            return
+
+        try:
+            import psutil  # local import to keep GUI import surface small
+        except Exception:
+            self._bes_update_status("Status: Missing psutil", warning=True)
+            return
+
+        cfg = self._get_bes_settings_from_ui()
+        cycle_ms = int(cfg.get("cycle_ms", 50) or 50)
+        menu_pct = int(cfg.get("menu_throttle_percent", 0) or 0)
+        game_pct = int(cfg.get("game_throttle_percent", 0) or 0)
+        exempt = {str(u).strip() for u in (cfg.get("exempt_users") or []) if str(u).strip()}
+
+        try:
+            ctl.set_cycle_ms(cycle_ms)
+        except Exception:
+            pass
+
+        # Map pid -> uid and uid -> server from last UI snapshot.
+        # Untracked Roblox processes are intentionally untouched.
+        pid_to_uid: Dict[int, str] = {}
+        uid_to_server: Dict[str, str] = {}
+        try:
+            for uid, runtime in (self.user_data or {}).items():
+                uid_s = str(uid)
+                uid_to_server[uid_s] = str((runtime or {}).get("server", "") or "").strip()
+                for pid in (runtime or {}).get("pids", []) or []:
+                    try:
+                        pid_i = int(pid)
+                        if pid_i > 0:
+                            pid_to_uid[pid_i] = uid_s
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        tracked_pids = sorted(pid_to_uid.keys())
+
+        try:
+            with self._ms_biome_lock:
+                in_menu_by_server = dict(self._ms_in_menu_by_server or {})
+        except Exception:
+            in_menu_by_server = {}
+
+        targets: Dict[int, int] = {}
+        names: Dict[int, str] = {}
+        throttled = 0
+
+        for pid in tracked_pids:
+            uid = pid_to_uid.get(int(pid), "")
+            # Best-effort: skip dead PIDs, but do not scan unrelated processes.
+            try:
+                proc = psutil.Process(int(pid))
+            except Exception:
+                continue
+            try:
+                if proc.name() != "RobloxPlayerBeta.exe":
+                    continue
+            except Exception:
+                continue
+            if uid and uid in exempt:
+                pct = 0
+            else:
+                server = uid_to_server.get(uid, "") if uid else ""
+                in_menu = True
+                if server and server in in_menu_by_server:
+                    val = in_menu_by_server.get(server, None)
+                    in_menu = True if val is None else bool(val)
+                pct = int(menu_pct if in_menu else game_pct)
+                if pct > 0:
+                    throttled += 1
+
+            targets[int(pid)] = max(0, min(99, pct))
+            names[int(pid)] = f"{uid} (PID {pid})" if uid else f"PID {pid}"
+
+        try:
+            ctl.apply(targets, names=names)
+            snap = ctl.snapshot()
+            self._bes_update_status(
+                f"Status: Running • Tracked={len(tracked_pids)} • Live={len(targets)} • Throttled={throttled} • Holds={int(snap.get('holds', 0))}"
+            )
+        except Exception:
+            self._bes_update_status("Status: Error", warning=True)
+
+    def _add_filter_row(self, name: str = "Blank", r: int = 255, g: int = 255, b: int = 255, tol: int = 40, enabled: bool = True, locked_name: bool = False):
         row = self.ocr_filter_table.rowCount()
         self.ocr_filter_table.insertRow(row)
+        try:
+            self.ocr_filter_table.setRowHeight(row, 62)
+        except Exception:
+            pass
 
-        enabled_item = QTableWidgetItem()
-        enabled_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-        enabled_item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
-        self.ocr_filter_table.setItem(row, 0, enabled_item)
+        def _wrap_cell(w: QWidget, *, center: bool = False, margins: Tuple[int, int, int, int] = (0, 6, 0, 6)) -> QWidget:
+            holder = QWidget()
+            holder.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            holder.setStyleSheet("background: transparent;")
+            lay = QHBoxLayout(holder)
+            lay.setContentsMargins(*margins)
+            lay.setSpacing(0)
+            if center:
+                lay.addStretch(1)
+                lay.addWidget(w, 0, Qt.AlignmentFlag.AlignCenter)
+                lay.addStretch(1)
+            else:
+                lay.addWidget(w, 1, Qt.AlignmentFlag.AlignVCenter)
+            return holder
 
-        self.ocr_filter_table.setItem(row, 1, QTableWidgetItem(str(name)))
-        self.ocr_filter_table.setItem(row, 2, QTableWidgetItem(str(r)))
-        self.ocr_filter_table.setItem(row, 3, QTableWidgetItem(str(g)))
-        self.ocr_filter_table.setItem(row, 4, QTableWidgetItem(str(b)))
-        self.ocr_filter_table.setItem(row, 5, QTableWidgetItem(str(tol)))
+        en = QCheckBox()
+        en.setChecked(bool(enabled))
+        en.setStyleSheet("background: transparent;")
+        en.toggled.connect(self._on_ocr_settings_changed)
+        self.ocr_filter_table.setCellWidget(row, 0, _wrap_cell(en, center=True))
+
+        name_le = QLineEdit(str(name or ""))
+        name_le.setPlaceholderText("Filter name")
+        name_le.textChanged.connect(self._on_ocr_settings_changed)
+        name_le.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        if locked_name:
+            name_le.setReadOnly(True)
+            name_le.setProperty("ocr_default_filter", True)
+        self.ocr_filter_table.setCellWidget(row, 1, _wrap_cell(name_le, center=False, margins=(6, 6, 6, 6)))
+
+        def _mk_rgb_spin(value: int, *, maximum: int = 255) -> QSpinBox:
+            sb = _AutoItemSpinBox()
+            sb.setRange(0, int(maximum))
+            sb.setValue(max(0, min(int(maximum), int(value or 0))))
+            sb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            try:
+                sb.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+            except Exception:
+                pass
+            sb.setMinimumWidth(90)
+            sb.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            sb.valueChanged.connect(self._on_ocr_settings_changed)
+            return sb
+
+        r_sb = _mk_rgb_spin(r, maximum=255)
+        g_sb = _mk_rgb_spin(g, maximum=255)
+        b_sb = _mk_rgb_spin(b, maximum=255)
+        tol_sb = _mk_rgb_spin(tol, maximum=255)
+
+        self.ocr_filter_table.setCellWidget(row, 2, _wrap_cell(r_sb, center=True))
+        self.ocr_filter_table.setCellWidget(row, 3, _wrap_cell(g_sb, center=True))
+        self.ocr_filter_table.setCellWidget(row, 4, _wrap_cell(b_sb, center=True))
+        self.ocr_filter_table.setCellWidget(row, 5, _wrap_cell(tol_sb, center=True))
 
     def _remove_selected_filter_rows(self):
         rows = sorted({idx.row() for idx in self.ocr_filter_table.selectedIndexes()}, reverse=True)
+        default_filters = (self.config_manager.default_settings.get("ocr", {}) or {}).get("color_filters", [])
+        default_names = {str(f.get("name", "")).strip() for f in default_filters if str(f.get("name", "")).strip()}
+        def _unwrap(col_widget: QWidget, typ):
+            if col_widget is None:
+                return None
+            if isinstance(col_widget, typ):
+                return col_widget
+            try:
+                return col_widget.findChild(typ)
+            except Exception:
+                return None
         for r in rows:
+            name_w = _unwrap(self.ocr_filter_table.cellWidget(r, 1), QLineEdit)
+            name = name_w.text().strip() if isinstance(name_w, QLineEdit) else ""
+            locked = False
+            if isinstance(name_w, QLineEdit) and name_w.property("ocr_default_filter"):
+                locked = True
+            if name and name in default_names:
+                locked = True
+            if locked:
+                continue
             self.ocr_filter_table.removeRow(r)
 
     def _load_color_filters_table(self, filters: List[dict]):
         self.ocr_filter_table.setRowCount(0)
         defaults = (self.config_manager.default_settings.get("ocr", {}) or {}).get("color_filters", [])
-        for f in filters or defaults:
+        default_names = [str(f.get("name", "")).strip() for f in defaults if str(f.get("name", "")).strip()]
+        default_set = set(default_names)
+        effective_filters = filters or defaults or []
+        seen_defaults = set()
+        for f in effective_filters:
+            if not isinstance(f, dict):
+                continue
+            name = str(f.get("name", "")).strip()
+            locked = bool(name and name in default_set)
+            if locked:
+                seen_defaults.add(name)
             self._add_filter_row(
-                f.get("name", ""),
+                name or "",
                 int(f.get("r", 0)),
                 int(f.get("g", 0)),
                 int(f.get("b", 0)),
                 int(f.get("tol", 0)),
                 bool(f.get("enabled", True)),
+                locked_name=locked,
+            )
+
+        for d in defaults:
+            name = str(d.get("name", "")).strip()
+            if not name or name in seen_defaults:
+                continue
+            self._add_filter_row(
+                name,
+                int(d.get("r", 0)),
+                int(d.get("g", 0)),
+                int(d.get("b", 0)),
+                int(d.get("tol", 0)),
+                bool(d.get("enabled", True)),
+                locked_name=True,
             )
 
     def _current_color_filters(self, as_dataclass: bool = False):
         filters = []
         rows = self.ocr_filter_table.rowCount()
 
-        def _get_int(item: QTableWidgetItem, default: int = 0) -> int:
-            try:
-                return int(item.text())
-            except Exception:
-                return default
-
         for r in range(rows):
-            enabled_item = self.ocr_filter_table.item(r, 0)
-            name_item = self.ocr_filter_table.item(r, 1)
-            r_item = self.ocr_filter_table.item(r, 2)
-            g_item = self.ocr_filter_table.item(r, 3)
-            b_item = self.ocr_filter_table.item(r, 4)
-            tol_item = self.ocr_filter_table.item(r, 5)
+            def _unwrap(col_widget: QWidget, typ):
+                if col_widget is None:
+                    return None
+                if isinstance(col_widget, typ):
+                    return col_widget
+                try:
+                    return col_widget.findChild(typ)
+                except Exception:
+                    return None
 
-            enabled = enabled_item.checkState() == Qt.CheckState.Checked if enabled_item else True
-            name = name_item.text().strip() if name_item else ""
-            rv = _get_int(r_item, 0) if r_item else 0
-            gv = _get_int(g_item, 0) if g_item else 0
-            bv = _get_int(b_item, 0) if b_item else 0
-            tol = _get_int(tol_item, 0) if tol_item else 0
+            en = _unwrap(self.ocr_filter_table.cellWidget(r, 0), QCheckBox)
+            name_w = _unwrap(self.ocr_filter_table.cellWidget(r, 1), QLineEdit)
+            r_w = _unwrap(self.ocr_filter_table.cellWidget(r, 2), QSpinBox)
+            g_w = _unwrap(self.ocr_filter_table.cellWidget(r, 3), QSpinBox)
+            b_w = _unwrap(self.ocr_filter_table.cellWidget(r, 4), QSpinBox)
+            tol_w = _unwrap(self.ocr_filter_table.cellWidget(r, 5), QSpinBox)
+
+            enabled = bool(en.isChecked()) if isinstance(en, QCheckBox) else True
+            name = name_w.text().strip() if isinstance(name_w, QLineEdit) else ""
+            rv = int(r_w.value()) if isinstance(r_w, QSpinBox) else 0
+            gv = int(g_w.value()) if isinstance(g_w, QSpinBox) else 0
+            bv = int(b_w.value()) if isinstance(b_w, QSpinBox) else 0
+            tol = int(tol_w.value()) if isinstance(tol_w, QSpinBox) else 0
 
             if as_dataclass:
                 filters.append(ColorFilter(name, rv, gv, bv, tol, enabled))
@@ -3641,6 +6341,10 @@ class RobloxManagerGUI(QMainWindow):
             "max_captures_per_second": self.ocr_max_caps_spin.value(),
             "cooldown_seconds": self.ocr_cooldown_spin.value(),
             "use_preprocess": bool(self.ocr_preprocess_chk.isChecked()),
+            "frame_diff_tolerance": int(self.ocr_frame_diff_tol_spin.value()),
+            "log_ocr_text": bool(getattr(self, "ocr_log_text_chk", None) and self.ocr_log_text_chk.isChecked()),
+            "log_loop": bool(getattr(self, "ocr_loop_logs_chk", None) and self.ocr_loop_logs_chk.isChecked()),
+            "device_id": self.ocr_device_combo.currentData() if hasattr(self, "ocr_device_combo") else None,
             "roi": {"x": roi[0], "y": roi[1], "w": roi[2], "h": roi[3]},
             "color_filters": self._current_color_filters(as_dataclass=False),
         }
@@ -3657,6 +6361,14 @@ class RobloxManagerGUI(QMainWindow):
             self.ocr_max_caps_spin.setValue(int(cfg.get("max_captures_per_second", defaults.get("max_captures_per_second", 20))))
             self.ocr_cooldown_spin.setValue(int(cfg.get("cooldown_seconds", defaults.get("cooldown_seconds", 600))))
             self.ocr_preprocess_chk.setChecked(bool(cfg.get("use_preprocess", defaults.get("use_preprocess", True))))
+            self.ocr_frame_diff_tol_spin.setValue(int(cfg.get("frame_diff_tolerance", defaults.get("frame_diff_tolerance", 2))))
+            if hasattr(self, "ocr_log_text_chk"):
+                self.ocr_log_text_chk.setChecked(bool(cfg.get("log_ocr_text", defaults.get("log_ocr_text", False))))
+            if hasattr(self, "ocr_loop_logs_chk"):
+                self.ocr_loop_logs_chk.setChecked(bool(cfg.get("log_loop", defaults.get("log_loop", True))))
+            self._load_ocr_device_choices()
+            self._select_ocr_device(cfg.get("device_id", defaults.get("device_id", None)))
+            self._last_ocr_device_id = self.ocr_device_combo.currentData()
 
             roi_cfg = cfg.get("roi") or {}
             rx, ry, rw, rh = roi_cfg.get("x", 0.0), roi_cfg.get("y", 0.0), roi_cfg.get("w", 0.0), roi_cfg.get("h", 0.0)
@@ -3671,7 +6383,7 @@ class RobloxManagerGUI(QMainWindow):
         finally:
             self._loading_ocr_settings = False
 
-        # Reflect current CPU/GPU preprocessing device in the OCR tab
+        # Reflect current OCR device in the OCR tab
         self._update_ocr_device_label()
 
         if self._is_manager_running() and self.ocr_enable_chk.isChecked():
@@ -3685,12 +6397,64 @@ class RobloxManagerGUI(QMainWindow):
             self.ocr_roi_label.setText("ROI: not calibrated")
 
     def _update_ocr_device_label(self):
-        """Update the OCR device label with current CPU/GPU status."""
+        """Update the OCR device label with current OCR runtime status."""
         try:
             summary = get_ocr_device_summary()
         except Exception:
-            summary = "Unknown (error checking Torch/Kornia)"
-        self.ocr_device_label.setText(f"OCR Preprocessing Device: {summary}")
+            summary = "Unknown (error checking OCR device)"
+        self.ocr_device_label.setText(f"OCR Device: {summary}")
+
+    def _load_ocr_device_choices(self) -> None:
+        if not hasattr(self, "ocr_device_combo"):
+            return
+        self.ocr_device_combo.blockSignals(True)
+        self.ocr_device_combo.clear()
+        self.ocr_device_combo.addItem("Auto (default)", None)
+        self.ocr_device_combo.addItem("CPU", "cpu")
+        try:
+            devices = get_ocr_available_devices()
+        except Exception:
+            devices = []
+        for device_id, name in devices:
+            label = f"GPU {device_id}: {name}"
+            self.ocr_device_combo.addItem(label, int(device_id))
+        self.ocr_device_combo.blockSignals(False)
+
+    def _select_ocr_device(self, device_id) -> None:
+        if not hasattr(self, "ocr_device_combo"):
+            return
+        target = None
+        if isinstance(device_id, str):
+            if device_id.strip().lower() in ("cpu", "force_cpu"):
+                target = "cpu"
+            else:
+                try:
+                    target = int(device_id)
+                except Exception:
+                    target = None
+        elif device_id is not None:
+            try:
+                target = int(device_id)
+            except Exception:
+                target = None
+        for idx in range(self.ocr_device_combo.count()):
+            if self.ocr_device_combo.itemData(idx) == target:
+                self.ocr_device_combo.setCurrentIndex(idx)
+                return
+        self.ocr_device_combo.setCurrentIndex(0)
+
+    def _refresh_ocr_device_label(self, attempts: int = 8, delay_ms: int = 500) -> None:
+        """Retry a few times so the label updates after OCR initialization."""
+        def _tick(remaining: int) -> None:
+            self._update_ocr_device_label()
+            try:
+                summary = get_ocr_device_summary()
+            except Exception:
+                summary = "Unknown"
+            if remaining > 0 and str(summary).startswith("Unknown"):
+                QTimer.singleShot(delay_ms, lambda: _tick(remaining - 1))
+
+        _tick(attempts)
 
     def _on_ocr_enabled_toggled(self, checked: bool):
         if self._loading_ocr_settings:
@@ -3722,18 +6486,27 @@ class RobloxManagerGUI(QMainWindow):
         """Apply OCR tab settings immediately and persist them."""
         if self._loading_ocr_settings:
             return
+        ocr_settings = self._get_ocr_settings_from_ui()
+        device_id = ocr_settings.get("device_id")
+        device_changed = device_id != self._last_ocr_device_id
         # Save settings
         try:
             settings = self.config_manager.load_settings()
         except Exception:
             settings = self.config_manager.default_settings.copy()
-        settings["ocr"] = self._get_ocr_settings_from_ui()
+        settings["ocr"] = ocr_settings
         try:
             self.config_manager.save_settings(settings)
         except Exception:
             pass
-        # Live-apply to worker if running
-        self._sync_ocr_worker_settings()
+        # Live-apply to worker if running (restart to apply device changes)
+        if device_changed and self.ocr_worker and self.ocr_worker.isRunning():
+            self._stop_ocr_worker()
+            if self.ocr_enable_chk.isChecked():
+                self._start_ocr_worker()
+        else:
+            self._sync_ocr_worker_settings()
+        self._last_ocr_device_id = device_id
 
     def _reset_ocr_to_defaults(self):
         """Reset only the OCR tab to its default config and live-apply."""
@@ -3745,6 +6518,14 @@ class RobloxManagerGUI(QMainWindow):
             self.ocr_max_caps_spin.setValue(int(defaults.get("max_captures_per_second", 20)))
             self.ocr_cooldown_spin.setValue(int(defaults.get("cooldown_seconds", 600)))
             self.ocr_preprocess_chk.setChecked(bool(defaults.get("use_preprocess", True)))
+            self.ocr_frame_diff_tol_spin.setValue(int(defaults.get("frame_diff_tolerance", 2)))
+            if hasattr(self, "ocr_log_text_chk"):
+                self.ocr_log_text_chk.setChecked(bool(defaults.get("log_ocr_text", False)))
+            if hasattr(self, "ocr_loop_logs_chk"):
+                self.ocr_loop_logs_chk.setChecked(bool(defaults.get("log_loop", True)))
+            self._load_ocr_device_choices()
+            self._select_ocr_device(defaults.get("device_id", None))
+            self._last_ocr_device_id = self.ocr_device_combo.currentData()
             roi_cfg = defaults.get("roi") or {}
             rx, ry, rw, rh = roi_cfg.get("x", 0.0), roi_cfg.get("y", 0.0), roi_cfg.get("w", 0.0), roi_cfg.get("h", 0.0)
             try:
@@ -3914,6 +6695,71 @@ class RobloxManagerGUI(QMainWindow):
                 f"An unexpected error occurred while generating the OCR preview:\n{e}",
             )
 
+    def test_ocr_frame_compare(self):
+        """
+        Capture the OCR frame twice (click multiple times) and report how similar
+        it is to the previous capture using the current tolerance setting.
+        """
+        if not self.ocr_roi:
+            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the chat area first.")
+            return
+
+        windows = enum_roblox_windows()
+        if not windows:
+            QMessageBox.warning(self, "No Roblox windows", "No visible Roblox windows were found.")
+            return
+
+        win = windows[0]
+        img = capture_window_image(win.hwnd, self.ocr_roi)
+        if img is None:
+            QMessageBox.warning(self, "Capture failed", f"Could not capture window '{win.title}'.")
+            return
+
+        try:
+            if self.ocr_preprocess_chk.isChecked():
+                img_for_compare = preprocess_for_ocr(img, self._current_color_filters(as_dataclass=True))
+            else:
+                img_for_compare = img
+
+            current_hash = compute_frame_hash(img_for_compare)
+        except Exception as e:
+            msg = f"[Frame Compare] Error: {e}"
+            try:
+                self._handle_ocr_log(msg)
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Frame Compare Error", f"An unexpected error occurred:\n{e}")
+            return
+
+        tol = float(self.ocr_frame_diff_tol_spin.value()) if hasattr(self, "ocr_frame_diff_tol_spin") else 0.0
+
+        if self._ocr_test_last_hash is None:
+            self._ocr_test_last_hash = current_hash
+            msg = f"[Frame Compare] Baseline captured for PID {win.pid}. Click again to compare."
+            try:
+                self._handle_ocr_log(msg)
+            except Exception:
+                pass
+            QMessageBox.information(self, "Frame Compare", msg)
+            return
+
+        diff_pct = frame_hash_diff_percent(self._ocr_test_last_hash, current_hash)
+        skip = diff_pct <= tol
+        self._ocr_test_last_hash = current_hash
+
+        verdict = "SKIP OCR" if skip else "RUN OCR"
+        msg = f"[Frame Compare] PID {win.pid}: diff={diff_pct:.2f}% (tol={tol:.0f}%) -> {verdict}"
+        try:
+            self._handle_ocr_log(msg)
+        except Exception:
+            pass
+
+        QMessageBox.information(
+            self,
+            "Frame Compare",
+            f"Window: {win.title}\nPID: {win.pid}\nDiff: {diff_pct:.2f}%\nTolerance: {tol:.0f}%\nResult: {verdict}",
+        )
+
     def _resolve_pid_context(self, pid: int) -> Dict[str, str]:
         ctx = {"user_id": "", "username": "", "server_label": "", "ps_link": "", "owner": ""}
         wt = self.worker_thread
@@ -3960,6 +6806,7 @@ class RobloxManagerGUI(QMainWindow):
         if status_upper == "running":
             self.ocr_status_label.setText("Status: Running")
             self.ocr_status_label.setStyleSheet(f"color:{ModernStyle.SECONDARY}; font-weight: bold;")
+            self._refresh_ocr_device_label()
         else:
             self.ocr_status_label.setText("Status: Stopped")
             self.ocr_status_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY}; font-weight: bold;")
@@ -4054,6 +6901,8 @@ class RobloxManagerGUI(QMainWindow):
         headers = ["Name", "Webhook URL"] + GUI_BIOME_NAMES
         self.webhooks_table.setHorizontalHeaderLabels(headers)
         self.webhooks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.webhooks_table.setShowGrid(False)
+        self.webhooks_table.setAlternatingRowColors(False)
 
         header = self.webhooks_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -4061,8 +6910,10 @@ class RobloxManagerGUI(QMainWindow):
         # Make biome columns wide enough so the combobox text is visible when closed
         header.setMinimumSectionSize(150)
         vh = self.webhooks_table.verticalHeader()
-        vh.setDefaultSectionSize(30)   # good-looking row height
-        vh.setMinimumSectionSize(30)   # prevents squeeze below readable height
+        vh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        vh.setDefaultSectionSize(62)   # match Auto Item table sizing
+        vh.setMinimumSectionSize(62)   # prevents squeeze below readable height
+        # Keep the existing dropdown behavior; just remove gridlines/fit row height above.
 
         for c in range(2, 2 + len(GUI_BIOME_NAMES)):
             header.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
@@ -4073,10 +6924,84 @@ class RobloxManagerGUI(QMainWindow):
         add_btn = QPushButton("Add Webhook")
         rem_btn = QPushButton("Remove Selected")
         route_btn = QPushButton("Assign Users...")
-        btn_row.addWidget(add_btn); btn_row.addWidget(rem_btn); btn_row.addWidget(route_btn); btn_row.addStretch()
+        cols_btn = QPushButton("Biome Columns...")
+        btn_row.addWidget(add_btn); btn_row.addWidget(rem_btn); btn_row.addWidget(route_btn); btn_row.addWidget(cols_btn); btn_row.addStretch()
         webhooks_v.addLayout(btn_row)
 
         MODE_ITEMS = ("None", "Message", "Everyone")  # tri-mode per biome cell
+
+        def _apply_webhook_biome_column_visibility(hidden_biomes=None):
+            """Hide biome columns visually; values still load/save normally."""
+            hidden_set = set()
+            if isinstance(hidden_biomes, (list, tuple, set)):
+                hidden_set = {str(b).strip().upper() for b in hidden_biomes if str(b).strip()}
+
+            self._webhooks_hidden_biomes = set(hidden_set)
+
+            for idx, biome in enumerate(GUI_BIOME_NAMES):
+                col = 2 + idx
+                self.webhooks_table.setColumnHidden(col, str(biome).strip().upper() in hidden_set)
+
+        def _open_webhook_columns_dialog():
+            current_hidden = getattr(self, "_webhooks_hidden_biomes", set()) or set()
+            if not isinstance(current_hidden, (list, tuple, set)):
+                current_hidden = set()
+            current_hidden = {str(b).strip().upper() for b in current_hidden if str(b).strip()}
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Webhook Biome Columns")
+            dlg.resize(460, 520)
+
+            v = QVBoxLayout(dlg)
+            hint = QLabel("Uncheck biomes to hide their columns in the table.\nHidden columns still load/save and still affect webhooks.")
+            hint.setWordWrap(True)
+            v.addWidget(hint)
+
+            lw = QListWidget()
+            for biome in GUI_BIOME_NAMES:
+                key = str(biome).strip().upper()
+                item = QListWidgetItem(str(biome))
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Unchecked if key in current_hidden else Qt.CheckState.Checked)
+                item.setData(Qt.ItemDataRole.UserRole, key)
+                lw.addItem(item)
+            v.addWidget(lw)
+
+            quick_row = QHBoxLayout()
+            show_all_btn = QPushButton("Show All")
+            hide_all_btn = QPushButton("Hide All")
+            quick_row.addWidget(show_all_btn)
+            quick_row.addWidget(hide_all_btn)
+            quick_row.addStretch()
+            v.addLayout(quick_row)
+
+            btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            v.addWidget(btn_box)
+
+            def _set_all(state: Qt.CheckState):
+                for i in range(lw.count()):
+                    it = lw.item(i)
+                    if it is not None:
+                        it.setCheckState(state)
+
+            show_all_btn.clicked.connect(lambda: _set_all(Qt.CheckState.Checked))
+            hide_all_btn.clicked.connect(lambda: _set_all(Qt.CheckState.Unchecked))
+
+            def _apply_and_close():
+                hidden = set()
+                for i in range(lw.count()):
+                    it = lw.item(i)
+                    if it is None:
+                        continue
+                    key = it.data(Qt.ItemDataRole.UserRole)
+                    if it.checkState() != Qt.CheckState.Checked:
+                        hidden.add(str(key).strip().upper())
+                _apply_webhook_biome_column_visibility(hidden)
+                dlg.accept()
+
+            btn_box.accepted.connect(_apply_and_close)
+            btn_box.rejected.connect(dlg.reject)
+            dlg.exec()
 
         def _apply_user_filter_to_row(row: int, user_ids=None, user_map: Optional[dict] = None, all_user_ids=None):
             """Persist the selected users and surface a quick tooltip."""
@@ -4132,12 +7057,12 @@ class RobloxManagerGUI(QMainWindow):
             cmb.setMinimumContentsLength(9)
             cmb.setMinimumWidth(120)
 
-            # Height: slightly taller so it clears gridlines and looks centered
-            cmb.setMinimumHeight(10)
+            # Match Auto Item control sizing
+            cmb.setMinimumHeight(30)
             cmb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
             cmb.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
 
-            # Tighten vertical padding a bit; keep arrow space
+            # Tighten vertical padding a bit; keep arrow space (legacy behavior).
             cmb.setStyleSheet(
                 "QComboBox{min-height:10px; padding:2px 8px;}"
                 "QComboBox::drop-down{width:22px;}"
@@ -4151,7 +7076,9 @@ class RobloxManagerGUI(QMainWindow):
             """
             holder = QWidget()
             v = QVBoxLayout(holder)
-            v.setContentsMargins(0, 1, 0, 1)   # tiny top/bottom breathing room
+            holder.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            holder.setStyleSheet("background: transparent;")
+            v.setContentsMargins(0, 6, 0, 6)   # breathing room to prevent border clipping
             v.setSpacing(0)
             v.addWidget(w, 1, Qt.AlignCenter)  # true H+V centering
             # ensure the row will be at least the child height + a couple px
@@ -4183,7 +7110,7 @@ class RobloxManagerGUI(QMainWindow):
                 default_mode = "Message" if bkey in allowed_set else "None"
                 mode = biome_modes.get(bkey, default_mode)
                 combo = _mk_mode_combo(mode)
-                if bkey in ("GLITCHED", "DREAMSPACE") and not _bm_relaxed():
+                if bkey in ("GLITCHED", "DREAMSPACE", "CYBERSPACE") and _bm_lock_enforced():
                     combo.setCurrentText("Everyone")
                     combo.setEnabled(False)
                 _place_centered(self.webhooks_table, row, 2 + idx, combo)
@@ -4453,7 +7380,7 @@ class RobloxManagerGUI(QMainWindow):
                             cb = w.findChild(QComboBox)
                         if cb is not None:
                             mode = cb.currentText()
-                            if str(biome_name).upper() in ("GLITCHED", "DREAMSPACE") and not _bm_relaxed():
+                            if str(biome_name).upper() in ("GLITCHED", "DREAMSPACE", "CYBERSPACE") and _bm_lock_enforced():
                                 mode = "Everyone"
                             biome_modes[str(biome_name).upper()] = mode
                             if mode in ("Message", "Everyone"):
@@ -4489,10 +7416,12 @@ class RobloxManagerGUI(QMainWindow):
         add_btn.clicked.connect(lambda: add_webhook_row("", ""))
         rem_btn.clicked.connect(remove_selected_rows)
         route_btn.clicked.connect(_open_webhook_user_dialog)
+        cols_btn.clicked.connect(_open_webhook_columns_dialog)
 
         # expose helpers for load/save
         self._add_webhook_row = add_webhook_row
         self._clear_webhook_rows = lambda: self.webhooks_table.setRowCount(0)
+        self._apply_webhook_biome_column_visibility = _apply_webhook_biome_column_visibility
 
         content_layout.addWidget(webhooks_group)
 
@@ -4746,7 +7675,7 @@ class RobloxManagerGUI(QMainWindow):
         support_label2.setStyleSheet(f"color: {ModernStyle.TEXT_PRIMARY}; font-weight: bold; margin-bottom: 5px;")
         support_layout2.addWidget(support_label2)
 
-        discord_btn2 = QPushButton("https://discord.gg/YPvhKFTjEF")
+        discord_btn2 = QPushButton("https://discord.gg/TheGlitchCore")
         discord_btn2.setStyleSheet(f"""
             QPushButton {{
                 background-color: 
@@ -4761,8 +7690,30 @@ class RobloxManagerGUI(QMainWindow):
                 background-color: 
             }}
         """)
-        discord_btn2.clicked.connect(lambda: self.open_url("https://discord.gg/YPvhKFTjEF"))
+        discord_btn2.clicked.connect(lambda: self.open_url("https://discord.gg/TheGlitchCore"))
         support_layout2.addWidget(discord_btn2)
+
+        bes_label = QLabel("BES (Battle Encoder Shirasé):")
+        bes_label.setStyleSheet(f"color: {ModernStyle.TEXT_PRIMARY}; font-weight: bold; margin-top: 10px; margin-bottom: 5px;")
+        support_layout2.addWidget(bes_label)
+
+        bes_btn = QPushButton("https://mion.yosei.fi/BES/")
+        bes_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: 
+                color: white;
+                border: none;
+                padding: 12px 20px;
+                border-radius: 6px;
+                font-weight: bold;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background-color: 
+            }}
+        """)
+        bes_btn.clicked.connect(lambda: self.open_url("https://mion.yosei.fi/BES/"))
+        support_layout2.addWidget(bes_btn)
 
         content_layout.addWidget(support_group2)
         
@@ -4971,7 +7922,10 @@ class RobloxManagerGUI(QMainWindow):
 
     def update_process_data(self, process_data):
         self.process_data = process_data
-        self.refresh_processes()
+        try:
+            self._refresh_users_created_column()
+        except Exception:
+            pass
 
     def refresh_users(self):
         self.users_table.setRowCount(len(self.user_data))
@@ -5024,112 +7978,110 @@ class RobloxManagerGUI(QMainWindow):
             self.users_table.setItem(row, 5, status_item)
 
             # runtime columns
-            pids = runtime.get('pids', [])
+            pids = runtime.get('pids', []) or []
+            if not isinstance(pids, (list, tuple)):
+                pids = [pids]
             self.users_table.setItem(row, 6, QTableWidgetItem(', '.join(map(str, pids)) or 'None'))
 
-            ttl_list = runtime.get('ttl', [])
+            ttl_list = runtime.get('ttl', []) or []
+            if not isinstance(ttl_list, (list, tuple)):
+                ttl_list = [ttl_list]
             self.users_table.setItem(row, 7, QTableWidgetItem(', '.join(f"{t}s" for t in ttl_list) or 'N/A'))
 
-            last_active = runtime.get('last_active', 0)
-            last_active_str = datetime.fromtimestamp(last_active).strftime("%H:%M:%S") if last_active else "Never"
-            self.users_table.setItem(row, 8, QTableWidgetItem(last_active_str))
+            created_vals: List[str] = []
+            for pid in (pids or []):
+                try:
+                    pid_i = int(pid)
+                except Exception:
+                    continue
+                pdata = (self.process_data or {}).get(pid_i) or (self.process_data or {}).get(str(pid_i)) or {}
+                c = str(pdata.get("created", "") or "").strip()
+                if c:
+                    created_vals.append(c)
+            created_str = ", ".join(created_vals) if created_vals else "N/A"
+            self.users_table.setItem(row, 8, QTableWidgetItem(created_str))
 
-            inactive_since = runtime.get('inactive_since')
-            dur = int(time.time() - inactive_since) if inactive_since else None
-            self.users_table.setItem(row, 9, QTableWidgetItem(f"{dur}s" if dur else "N/A"))
+            last_active_str = "Never"
+            try:
+                last_active_ts = float(runtime.get('last_active', 0) or 0)
+                if last_active_ts > 0:
+                    last_active_str = datetime.fromtimestamp(last_active_ts).strftime("%H:%M:%S")
+            except Exception:
+                last_active_str = "Never"
+            self.users_table.setItem(row, 9, QTableWidgetItem(last_active_str))
+
+            dur = None
+            try:
+                inactive_since = float(runtime.get('inactive_since') or 0)
+                if inactive_since > 0:
+                    dur = int(time.time() - inactive_since)
+            except Exception:
+                dur = None
+            self.users_table.setItem(row, 10, QTableWidgetItem(f"{dur}s" if dur else "N/A"))
 
             # action buttons
             actions_widget  = QWidget()
-            actions_layout  = QHBoxLayout(actions_widget)
-            actions_layout.setContentsMargins(8, 5, 8, 5)
-            actions_layout.setSpacing(12)
+            actions_layout = QHBoxLayout(actions_widget)
+            actions_layout.setContentsMargins(6, 4, 6, 4)
+            actions_layout.setSpacing(6)
+            actions_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
             restart_btn = QPushButton("Restart")
-            restart_btn.setStyleSheet(self._get_action_button_style("primary"))
             restart_btn.clicked.connect(lambda _, uid=user_id: self.restart_user_session(uid))
             actions_layout.addWidget(restart_btn)
 
             kill_btn = QPushButton("Kill")
-            kill_btn.setStyleSheet(self._get_action_button_style("danger"))
+            try:
+                kill_btn.setProperty("class", "danger")
+            except Exception:
+                pass
             kill_btn.clicked.connect(lambda _, uid=user_id: self.kill_user_processes(uid))
             actions_layout.addWidget(kill_btn)
 
-            self.users_table.setCellWidget(row, 10, actions_widget)
+            self.users_table.setCellWidget(row, 11, actions_widget)
 
-
-    def refresh_processes(self):
-        self.processes_table.setRowCount(len(self.process_data))
-
-        for row, (pid, data) in enumerate(self.process_data.items()):
-            self.processes_table.setItem(row, 0, QTableWidgetItem(str(pid)))
-            self.processes_table.setItem(row, 1, QTableWidgetItem(data.get('user_id', 'Unknown')))
-            self.processes_table.setItem(row, 2, QTableWidgetItem(data.get('created', 'Unknown')))
-
-            windows = data.get('windows', 0)
-            windows_item = QTableWidgetItem(str(windows))
-            if windows > 1:
-                windows_item.setForeground(QColor(ModernStyle.WARNING))
-            self.processes_table.setItem(row, 3, windows_item)
-
-            actions_widget = QWidget()
-            actions_layout = QHBoxLayout(actions_widget)
-            actions_layout.setContentsMargins(8, 5, 8, 5)
-
-            kill_btn = QPushButton("Kill")
-            kill_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {ModernStyle.ERROR};
-                    color: {ModernStyle.TEXT_PRIMARY};
-                    border: none;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    font-weight: 500;
-                    font-size: 11px;
-                    min-width: 50px;
-                    max-width: 60px;
-                    min-height: 26px;
-                    max-height: 28px;
-                }}
-                QPushButton:hover {{
-                    background-color: 
-                }}
-            """)
-            kill_btn.clicked.connect(lambda checked, p=pid: self.kill_specific_process(p))
-            actions_layout.addWidget(kill_btn)
-
-            self.processes_table.setCellWidget(row, 4, actions_widget)
-    
-    def _get_action_button_style(self, color_type="primary"):
-        if color_type == "danger":
-            bg_color = ModernStyle.ERROR
-            hover_color = "#dc2626"
-            pressed_color = "#b91c1c"
-        else:
-            bg_color = ModernStyle.PRIMARY
-            hover_color = ModernStyle.PRIMARY_VARIANT
-            pressed_color = "#3730a3"
-
-        return f"""
-            QPushButton {{
-                background-color: {bg_color};
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: 600;
-                font-size: 12px;
-                min-width: 70px;
-                max-width: 80px;
-                min-height: 30px;
-                max-height: 32px;
-            }}
-            QPushButton:hover {{
-                background-color: {hover_color};
-            }}
-            QPushButton:pressed {{
-                background-color: {pressed_color};
-            }}
+    def _refresh_users_created_column(self) -> None:
         """
+        Update only the Users tab "Created" column from the latest per-PID process info.
+        This avoids rebuilding the entire table on every process-signal tick.
+        """
+        table = getattr(self, "users_table", None)
+        if table is None:
+            return
+
+        try:
+            row_count = int(table.rowCount())
+        except Exception:
+            return
+
+        for row in range(row_count):
+            try:
+                uid_item = table.item(row, 0)
+                if uid_item is None:
+                    continue
+                uid = str(uid_item.text() or "").strip()
+                if not uid:
+                    continue
+
+                runtime = (self.user_data or {}).get(uid, {}) or {}
+                pids = runtime.get("pids", []) or []
+                if not isinstance(pids, (list, tuple)):
+                    pids = [pids]
+
+                created_vals: List[str] = []
+                for pid in (pids or []):
+                    try:
+                        pid_i = int(pid)
+                    except Exception:
+                        continue
+                    pdata = (self.process_data or {}).get(pid_i) or (self.process_data or {}).get(str(pid_i)) or {}
+                    c = str(pdata.get("created", "") or "").strip()
+                    if c:
+                        created_vals.append(c)
+                created_str = ", ".join(created_vals) if created_vals else "N/A"
+                table.setItem(row, 8, QTableWidgetItem(created_str))
+            except Exception:
+                continue
 
     def append_log(self, message: str):
         """Compatibility wrapper so helpers can call parent.append_log()."""
@@ -5207,6 +8159,16 @@ class RobloxManagerGUI(QMainWindow):
         self.kill_timeout_input.setEnabled(self.kill_after_enable_chk.isChecked())
 
         # ---------- Webhooks table (tri-mode + legacy) ----------
+        ui = settings.get("ui", {}) or {}
+        if not isinstance(ui, dict):
+            ui = {}
+        hidden_biomes = ui.get("webhooks_hidden_biomes", []) or []
+        if hasattr(self, "_apply_webhook_biome_column_visibility"):
+            try:
+                self._apply_webhook_biome_column_visibility(hidden_biomes)
+            except Exception:
+                pass
+
         self._clear_webhook_rows()
         for wh in (settings.get("webhooks", []) or []):
             name    = wh.get("name", "")
@@ -5317,7 +8279,7 @@ class RobloxManagerGUI(QMainWindow):
 
                 if cb is not None:
                     mode = cb.currentText()
-                    if str(biome_name).upper() in ("GLITCHED", "DREAMSPACE") and not _bm_relaxed():
+                    if str(biome_name).upper() in ("GLITCHED", "DREAMSPACE", "CYBERSPACE") and _bm_lock_enforced():
                         mode = "Everyone"
                     biome_modes[str(biome_name).upper()] = mode
                     if mode in ("Message", "Everyone"):
@@ -5334,6 +8296,16 @@ class RobloxManagerGUI(QMainWindow):
             webhooks.append(entry)
 
         settings["webhooks"] = webhooks
+
+        # ---------- UI: Webhooks column visibility ----------
+        ui = settings.get("ui", {}) or {}
+        if not isinstance(ui, dict):
+            ui = {}
+        hidden = getattr(self, "_webhooks_hidden_biomes", set()) or set()
+        if not isinstance(hidden, (list, tuple, set)):
+            hidden = set()
+        ui["webhooks_hidden_biomes"] = sorted({str(b).strip().upper() for b in hidden if str(b).strip()})
+        settings["ui"] = ui
 
         # ---------- Optional: Merchant + Pings (safe if widgets exist) ----------
         ms = settings.get("multiscope", {}) or {}
@@ -5406,6 +8378,13 @@ class RobloxManagerGUI(QMainWindow):
         self.webhook_input.setText(t["webhook_url"])
         self.ping_msg_input.setText(t["ping_message"])
 
+        # Reset UI-only settings (column visibility)
+        if hasattr(self, "_apply_webhook_biome_column_visibility"):
+            try:
+                self._apply_webhook_biome_column_visibility([])
+            except Exception:
+                pass
+
         # -- OCR --
         self._apply_ocr_settings_to_ui(defaults.get("ocr", {}))
         if self.ocr_worker and self.ocr_worker.isRunning():
@@ -5455,12 +8434,11 @@ class RobloxManagerGUI(QMainWindow):
 
     def show_about(self):
         config_info = self.config_manager.get_config_info()
-        QMessageBox.about(self, "About JARAM",
-                         "JARAM X Jirach1(Just Another Roblox Account Manager) v1.1\n\n"
+        QMessageBox.about(self, "About J.JARAM",
+                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JNX 2010\n\n"
                          "Advanced multi-account Roblox session manager\n"
                          "with automated presence monitoring and process management.\n\n"
                          "Built with PyQt6 and modern design principles.\n\n"
-                         "Jirach1 was here.\n\n"
                          f"Configuration stored in:\n{config_info['config_dir']}")
 
     def restart_all_sessions(self):
@@ -5512,6 +8490,52 @@ class RobloxManagerGUI(QMainWindow):
         self.worker_thread.restart_user_session(user_id)
 
     # ---------------- Accounts tab helpers ----------------
+    def extract_account_cookie_from_browser(self):
+        try:
+            btn = getattr(self, "account_browser_login_btn", None)
+            if btn is not None:
+                btn.setEnabled(False)
+                btn.setText("Extracting...")
+
+            if getattr(self, "cookie_extractor", None) is None:
+                self.cookie_extractor = CookieExtractor(self)
+
+            self.cookie_extractor.extract_cookie_async(
+                callback=self._on_account_cookie_extraction_complete,
+                parent_widget=self,
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start cookie extraction: {str(e)}")
+            self._reset_account_browser_button()
+
+    def _on_account_cookie_extraction_complete(self, cookie: Optional[str]):
+        try:
+            if cookie:
+                self.account_cookie.setText(cookie)
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    "Cookie extracted successfully!\n\n"
+                    "The cookie has been automatically filled in the input field.",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Extraction Cancelled",
+                    "Cookie extraction was cancelled or failed.\n\n"
+                    "You can try again or enter the cookie manually.",
+                )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error handling extracted cookie: {str(e)}")
+        finally:
+            self._reset_account_browser_button()
+
+    def _reset_account_browser_button(self):
+        btn = getattr(self, "account_browser_login_btn", None)
+        if btn is not None:
+            btn.setEnabled(True)
+            btn.setText("Login with Browser")
+
     def on_account_server_type_changed(self):
         if self.account_private_radio.isChecked():
             self.account_place_id_label.hide()
@@ -5546,12 +8570,6 @@ class RobloxManagerGUI(QMainWindow):
             username = f"User_{user_id}"
         if not cookie:
             QMessageBox.warning(self, "Error", "Cookie is required!")
-            return
-        if server_type == "private" and not private_link:
-            QMessageBox.warning(self, "Error", "Private server link is required for private servers!")
-            return
-        if server_type == "public" and not place_id:
-            QMessageBox.warning(self, "Error", "Place ID is required for public servers!")
             return
 
         users_config = self.config_manager.load_users()
@@ -5607,21 +8625,13 @@ class RobloxManagerGUI(QMainWindow):
                 status_item.setForeground(QColor("#66FF66"))
             self.accounts_list.setItem(row, 3, status_item)
 
-            action_cell = QWidget()
-            action_layout = QHBoxLayout(action_cell)
-            action_layout.setContentsMargins(0, 0, 0, 0)
-            action_layout.setSpacing(4)
-
             edit_btn = QPushButton("Edit")
             edit_btn.setStyleSheet(
                 "QPushButton {background-color:%s; color:white; border:none; padding:2px 4px; border-radius:3px; font-size:8px; font-weight:bold; min-width:50px; max-width:80px; min-height:18px; max-height:22px;} QPushButton:hover {background-color:%s;}"
                 % (ModernStyle.PRIMARY, ModernStyle.PRIMARY_VARIANT)
             )
             edit_btn.clicked.connect(lambda _, uid=user_id: self.edit_account(uid))
-            action_layout.addWidget(edit_btn)
-
-            action_layout.addStretch()
-            self.accounts_list.setCellWidget(row, 4, action_cell)
+            self.accounts_list.setCellWidget(row, 4, edit_btn)
 
             delete_btn = QPushButton("Del")
             delete_btn.setStyleSheet(
@@ -5768,6 +8778,28 @@ class RobloxManagerGUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to toggle account status: {e}")
             return False
 
+    def kill_selected_user(self):
+        table = getattr(self, "users_table", None)
+        if table is None:
+            return
+
+        row = int(table.currentRow())
+        if row < 0:
+            QMessageBox.information(self, "Select a User", "Select a user row first.")
+            return
+
+        uid_item = table.item(row, 0)
+        if uid_item is None:
+            QMessageBox.information(self, "Select a User", "Select a user row first.")
+            return
+
+        uid = str(uid_item.text() or "").strip()
+        if not uid:
+            QMessageBox.information(self, "Select a User", "Select a user row first.")
+            return
+
+        self.kill_user_processes(uid)
+
     def kill_user_processes(self, user_id):
         if not self.worker_thread or not self.worker_thread.isRunning():
             QMessageBox.warning(self, "Manager Not Running", "Please start the manager first.")
@@ -5778,28 +8810,6 @@ class RobloxManagerGUI(QMainWindow):
                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self.worker_thread.kill_user_processes(user_id)
-
-    def kill_specific_process(self, pid):
-        if not self.worker_thread or not self.worker_thread.isRunning():
-            QMessageBox.warning(self, "Manager Not Running", "Please start the manager first.")
-            return
-
-        reply = QMessageBox.question(self, "Confirm Kill",
-                                   f"Are you sure you want to kill process {pid}?",
-                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            if self.worker_thread.process_mgr:
-                self.worker_thread.process_mgr.terminate_process(
-                    int(pid), self.worker_thread.manager.process_tracker
-                )
-
-    def kill_selected_process(self):
-        current_row = self.processes_table.currentRow()
-        if current_row >= 0:
-            pid_item = self.processes_table.item(current_row, 0)
-            if pid_item:
-                pid = pid_item.text()
-                self.kill_specific_process(pid)
 
     def closeEvent(self, event):
         if self.worker_thread and self.worker_thread.isRunning():
@@ -5815,6 +8825,20 @@ class RobloxManagerGUI(QMainWindow):
                         self.antiafk.shutdown()
                     except Exception:
                         pass
+                if getattr(self, "auto_item_engine", None):
+                    try:
+                        self.auto_item_engine.stop()
+                    except Exception:
+                        pass
+                if getattr(self, "bes_controller", None):
+                    try:
+                        self.bes_controller.shutdown()
+                    except Exception:
+                        pass
+                try:
+                    self._unregister_auto_item_hotkey()
+                except Exception:
+                    pass
                 event.accept()
             else:
                 event.ignore()
@@ -5826,6 +8850,20 @@ class RobloxManagerGUI(QMainWindow):
                     self.antiafk.shutdown()
                 except Exception:
                     pass
+            if getattr(self, "auto_item_engine", None):
+                try:
+                    self.auto_item_engine.stop()
+                except Exception:
+                    pass
+            if getattr(self, "bes_controller", None):
+                try:
+                    self.bes_controller.shutdown()
+                except Exception:
+                    pass
+            try:
+                self._unregister_auto_item_hotkey()
+            except Exception:
+                pass
             event.accept()
     
     def setup_multiscope_tab(self):
@@ -5862,13 +8900,33 @@ class RobloxManagerGUI(QMainWindow):
 
     def update_multiscope(self, rows: list):
         # rows: [{server, users, in_menu, last_biome|biome, biome_age, last_merchant|merchant, merchant_age, events}]
+        try:
+            with self._ms_biome_lock:
+                self._ms_biome_by_server = {
+                    str(row.get("server", "") or ""): str(row.get("last_biome", row.get("biome", "")) or "").strip().upper()
+                    for row in (rows or [])
+                    if str(row.get("server", "") or "").strip()
+                }
+                self._ms_in_menu_by_server = {}
+                for row in (rows or []):
+                    server = str(row.get("server", "") or "").strip()
+                    if not server:
+                        continue
+                    val = row.get("in_menu", None)
+                    self._ms_in_menu_by_server[server] = None if val is None else bool(val)
+        except Exception:
+            pass
+
         self.multiscope_table.setRowCount(len(rows))
         for r, row in enumerate(rows):
             server = row.get("server", "")
             users_list = row.get("users", [])
             users = ", ".join(users_list) if users_list else ""
             in_menu_val = row.get("in_menu")
-            in_menu_txt = "True" if in_menu_val is None else ("True" if in_menu_val else "False")
+            if in_menu_val is None:
+                in_menu_txt = "None"
+            else:
+                in_menu_txt = "True" if in_menu_val else "False"
 
             # accept both key styles
             last_biome = row.get("last_biome", row.get("biome", ""))
@@ -5950,4 +9008,9 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == "__main__":
+    # Needed for frozen executables (Nuitka/PyInstaller) that use multiprocessing/ProcessPoolExecutor
+    # e.g., OCRWorker starts a ProcessPoolExecutor for OCR tasks.
+    from multiprocessing import freeze_support
+
+    freeze_support()
     main()

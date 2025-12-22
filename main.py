@@ -3,13 +3,10 @@ import os
 import time
 import win32gui
 import win32process
-import random
 import requests
 import json
-import shutil
 from log_utils import find_log_for_username, refresh_username_log_map
 from pathlib import Path
-from collections import defaultdict
 
 try:
     from gui import ConfigManager
@@ -957,4 +954,8 @@ def execute_main_loop():
         time.sleep(manager.check_intervals['main_tick'])
 
 if __name__ == "__main__":
+    # Needed for frozen executables (Nuitka/PyInstaller) that use multiprocessing/ProcessPoolExecutor.
+    from multiprocessing import freeze_support
+
+    freeze_support()
     execute_main_loop()

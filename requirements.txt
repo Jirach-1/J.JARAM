@@ -6,6 +6,10 @@ undetected-chromedriver
 selenium
 numpy
 Pillow
-easyocr
-kornia
-torch torchvision --index-url https://download.pytorch.org/whl/cu126
+pyautoit
+watchdog
+rapidocr-onnxruntime
+# Run these separately afterwards
+# pip uninstall onnxruntime
+# pip install onnxruntime-directML
+
