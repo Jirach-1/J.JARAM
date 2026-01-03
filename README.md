@@ -26,7 +26,7 @@
 
 ### OCR Merchant / Event Detection
 - Built-in OCR engine using **RapidOCR (ONNXRuntime)**
-- Supports **DirectML** acceleration (`onnxruntime-directml`) with a CPU fallback option
+- **DirectML** GPU acceleration  with a CPU fallback option
 - ROI calibration, color filters, cooldowns, and frame-diff skipping
 - Discord webhook alerts for merchants (e.g. **Jester** / **Mari**) with biome + server context
 
@@ -70,9 +70,8 @@
 - **Python**: 3.12 (if running from source)
 - **Roblox**: Installed and working on the system
 - **Optional**:
-  - DirectML (`onnxruntime-directml`) for GPU OCR
-  - Chrome + Selenium for browser cookie login + utilities
-  - BES for CPU throttling
+  - Chrome for browser cookie login + utilities
+
 
 ## Configuration Location
 
