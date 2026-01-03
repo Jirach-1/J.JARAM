@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from log_utils import (
     find_log_for_username,
     refresh_username_log_map,
-    R_DISC_REASON, R_DISC_NOTIFY, R_DISC_SENDING, R_CONN_LOST,  
+    R_DISC_REASON, R_DISC_NOTIFY, R_DISC_SENDING, R_CONN_LOST,
 )
 
 # IMPORTANT: we keep strictness; cache is refreshed on demand
@@ -32,7 +32,7 @@ from log_utils import find_log_for_username, refresh_username_log_map
 
 # Optional biomes metadata (color, thumbnail). Fallbacks if missing.
 try:
-    from biomes import load_biomes_catalog, biome_meta, biome_duration
+    from biomes import load_biomes_catalog, biome_meta, biome_duration, biome_names
     load_biomes_catalog()
 except Exception:
     from typing import Tuple, Optional
@@ -40,6 +40,8 @@ except Exception:
         return int(0x3BA55D), ""     # default color, empty thumbnail
     def biome_duration(name: str) -> Optional[int]:
         return None
+    def biome_names() -> list[str]:
+        return ["NORMAL"]
 # -- optional watcher deps -------------------------------------------------
 try:
     from watchdog.observers import Observer as WDObserver
@@ -55,7 +57,7 @@ except Exception:
     WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
 
 
-APP_FOOTER = "J.JARAM JX 2x10"
+APP_FOOTER = "J.JARAM JX 2x27"
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
 # Helpers
@@ -141,13 +143,38 @@ def _extract_in_menu_from_rpc(rpc: dict) -> Optional[bool]:
     data = rpc.get("data")
     if not isinstance(data, dict):
         return None
-    state = data.get("state")
-    if not isinstance(state, str):
+    texts: List[str] = []
+
+    # Bloxstrap schemas can differ; try both "state" and "details".
+    for k in ("state", "details"):
+        try:
+            v = data.get(k)
+        except Exception:
+            continue
+        if isinstance(v, str) and v.strip():
+            texts.append(v.strip())
+            continue
+        if isinstance(v, dict):
+            for kk in ("text", "value", "name", "label", "title"):
+                try:
+                    vv = v.get(kk)
+                except Exception:
+                    continue
+                if isinstance(vv, str) and vv.strip():
+                    texts.append(vv.strip())
+                    break
+
+    if not texts:
         return None
-    s = state.strip().lower()
+
+    s = " ".join(texts).strip().lower()
     if not s:
         return None
-    return "in main menu" in s
+
+    # Treat common variants as "in menu".
+    if ("in main menu" in s) or ("main menu" in s) or ("in menu" in s) or (s in {"menu", "mainmenu"}):
+        return True
+    return False
 
 
 
@@ -594,7 +621,7 @@ class ServerScope:
     last_biome_ts: float = 0.0
     last_merchant: Optional[str] = None
     last_merchant_ts: float = 0.0
-    in_menu: Optional[bool] = True  # default assume main menu until proven otherwise
+    in_menu: Optional[bool] = None  # unknown until proven otherwise
     last_menu_ts: float = 0.0
     events: int = 0
 
@@ -660,6 +687,7 @@ class MultiScopeEngine:
         get_ps_link_for_user: Optional[Callable[[str], str]] = None,
         get_server_owner_for_user: Optional[Callable[[str], str]] = None,  # supplied by GUI
         get_cookie_for_user,            # NEW
+        stats_path: Optional[str] = None,
         log_fn: Optional[Callable[[str], None]] = None,
     ):
         self._get_username = get_username
@@ -714,6 +742,20 @@ class MultiScopeEngine:
         self._event_lock = threading.Lock()
         self._events: list[tuple[str, str, str]] = []   # (kind, uid, payload)
 
+        # Disconnect dedupe: uid -> (normpath, absolute_end_offset)
+        self._last_disconnect_sig_by_uid: Dict[str, Tuple[str, int]] = {}
+
+        # Status snapshot for lookback gates (set in tick()).
+        self._status_snapshot: Dict[str, dict] = {}
+        self._status_snapshot_ts: float = 0.0
+
+        # Persistent "found" counters (biomes + merchants)
+        self._stats_path = str(stats_path or "").strip()
+        self._stats_lock = threading.Lock()
+        self._found_stats: dict = self._default_found_stats()
+        self._load_found_stats()
+        self._ensure_found_stats_catalog()
+
         # -- Tailer pool / concurrency -----------------------------------------
         self._max_workers = 32                      # tune: 24-32 recommended
         self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
@@ -732,6 +774,9 @@ class MultiScopeEngine:
         
         self._normpath_by_uid: Dict[str, str] = {}
         self._menu_unknown_log_by_uid: Dict[str, str] = {}
+        # Disconnect fallback: if in_menu stays unknown too long, recycle that user.
+        self._menu_none_since_by_uid: Dict[str, float] = {}
+        self._menu_none_disconnect_fired_by_uid: Set[str] = set()
         
         # NEW: per-biome notifier modes (biome -> "None" | "Message" | "Everyone")
         self._biome_modes: Dict[str, str] = {}
@@ -836,6 +881,366 @@ class MultiScopeEngine:
         self._lock_forced_biomes = forced_biomes
 
 
+    # -- Persistent "found" counters -------------------------------------------
+
+    def _default_found_stats(self) -> dict:
+        return {
+            "schema": 2,
+            "biomes_total": {},       # biome -> count (ALL TIME)
+            "merchants_total": {},    # merchant -> count (ALL TIME)
+            "biome_events": [],       # [{ts: float, biome: str}] (rolling, for 24h/week/month)
+            "merchant_events": [],    # [{ts: float, merchant: str}] (rolling, for 24h/week/month)
+        }
+
+    def _ensure_found_stats_catalog(self) -> None:
+        """
+        Ensure the persisted stats file always contains:
+        - Every biome from biomes.json (excluding NORMAL) with at least a 0 count
+        - The canonical merchants (Jester/Mari) with at least a 0 count
+        """
+        path = getattr(self, "_stats_path", "") or ""
+        if not path:
+            return
+
+        try:
+            file_exists = os.path.isfile(path)
+        except Exception:
+            file_exists = False
+
+        try:
+            biomes = [b for b in biome_names() if str(b).strip().upper() != "NORMAL"]
+        except Exception:
+            biomes = []
+        biomes = [str(b).strip().upper() for b in biomes if str(b).strip()]
+
+        with self._stats_lock:
+            changed = False
+
+            if self._found_stats.get("schema") != 2:
+                self._found_stats["schema"] = 2
+                changed = True
+
+            bt = self._found_stats.setdefault("biomes_total", {})
+            if not isinstance(bt, dict):
+                bt = {}
+                self._found_stats["biomes_total"] = bt
+                changed = True
+            if "NORMAL" in bt:
+                try:
+                    bt.pop("NORMAL", None)
+                    changed = True
+                except Exception:
+                    pass
+            for b in biomes:
+                if b not in bt:
+                    bt[b] = 0
+                    changed = True
+
+            mt = self._found_stats.setdefault("merchants_total", {})
+            if not isinstance(mt, dict):
+                mt = {}
+                self._found_stats["merchants_total"] = mt
+                changed = True
+            for merch in ("Jester", "Mari"):
+                if merch not in mt:
+                    mt[merch] = 0
+                    changed = True
+
+            if not isinstance(self._found_stats.get("biome_events"), list):
+                self._found_stats["biome_events"] = []
+                changed = True
+            if not isinstance(self._found_stats.get("merchant_events"), list):
+                self._found_stats["merchant_events"] = []
+                changed = True
+
+            self._prune_found_events_locked(now_ts=time.time())
+
+            if changed or not file_exists:
+                self._save_found_stats_locked()
+
+    def _prune_found_events_locked(self, *, now_ts: Optional[float] = None) -> None:
+        try:
+            events = self._found_stats.get("biome_events")
+            if not isinstance(events, list):
+                self._found_stats["biome_events"] = []
+                events = []
+
+            now_v = float(now_ts if now_ts is not None else time.time())
+            # Keep ~31 days so "month" (30d) always has coverage.
+            cutoff = now_v - (31 * 24 * 3600)
+
+            kept = []
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                ts_raw = ev.get("ts")
+                biome_raw = ev.get("biome")
+                try:
+                    ts_f = float(ts_raw)
+                except Exception:
+                    continue
+                if ts_f < cutoff:
+                    continue
+                if not isinstance(biome_raw, str):
+                    continue
+                b = biome_raw.strip().upper()
+                if not b or b == "NORMAL":
+                    continue
+                kept.append({"ts": ts_f, "biome": b})
+
+            kept.sort(key=lambda d: d.get("ts", 0.0))
+            MAX_EVENTS = 20_000
+            if len(kept) > MAX_EVENTS:
+                kept = kept[-MAX_EVENTS:]
+
+            self._found_stats["biome_events"] = kept
+        except Exception:
+            self._found_stats["biome_events"] = []
+
+        try:
+            events = self._found_stats.get("merchant_events")
+            if not isinstance(events, list):
+                self._found_stats["merchant_events"] = []
+                events = []
+
+            now_v = float(now_ts if now_ts is not None else time.time())
+            cutoff = now_v - (31 * 24 * 3600)
+
+            kept = []
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                ts_raw = ev.get("ts")
+                merch_raw = ev.get("merchant")
+                try:
+                    ts_f = float(ts_raw)
+                except Exception:
+                    continue
+                if ts_f < cutoff:
+                    continue
+                if not isinstance(merch_raw, str):
+                    continue
+                m = merch_raw.strip().title()
+                if not m:
+                    continue
+                kept.append({"ts": ts_f, "merchant": m})
+
+            kept.sort(key=lambda d: d.get("ts", 0.0))
+            MAX_EVENTS = 20_000
+            if len(kept) > MAX_EVENTS:
+                kept = kept[-MAX_EVENTS:]
+
+            self._found_stats["merchant_events"] = kept
+        except Exception:
+            self._found_stats["merchant_events"] = []
+
+    def _load_found_stats(self) -> None:
+        path = getattr(self, "_stats_path", "") or ""
+        if not path:
+            return
+        try:
+            if not os.path.isfile(path):
+                return
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                raw = json.load(f)
+        except Exception:
+            return
+        if not isinstance(raw, dict):
+            return
+
+        stats = self._default_found_stats()
+
+        bt = raw.get("biomes_total")
+        if isinstance(bt, dict):
+            for k, v in bt.items():
+                if not isinstance(k, str):
+                    continue
+                b = k.strip().upper()
+                if not b:
+                    continue
+                try:
+                    stats["biomes_total"][b] = int(v)
+                except Exception:
+                    continue
+
+        mt = raw.get("merchants_total")
+        if isinstance(mt, dict):
+            for k, v in mt.items():
+                if not isinstance(k, str):
+                    continue
+                m = k.strip().title()
+                if not m:
+                    continue
+                try:
+                    stats["merchants_total"][m] = int(v)
+                except Exception:
+                    continue
+
+        evs = raw.get("biome_events")
+        if isinstance(evs, list):
+            stats["biome_events"] = evs
+        mevs = raw.get("merchant_events")
+        if isinstance(mevs, list):
+            stats["merchant_events"] = mevs
+
+        with self._stats_lock:
+            self._found_stats = stats
+            self._prune_found_events_locked(now_ts=time.time())
+
+    def _save_found_stats_locked(self) -> None:
+        path = getattr(self, "_stats_path", "") or ""
+        if not path:
+            return
+        try:
+            dirpath = os.path.dirname(path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+        except Exception:
+            pass
+
+        tmp = f"{path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._found_stats, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def _record_found_biome(self, biome: str, *, ts_epoch: Optional[float] = None) -> None:
+        b = str(biome or "").strip().upper()
+        if not b or b == "NORMAL":
+            return
+        try:
+            ts = float(ts_epoch if ts_epoch is not None else time.time())
+        except Exception:
+            ts = time.time()
+
+        with self._stats_lock:
+            bt = self._found_stats.setdefault("biomes_total", {})
+            try:
+                bt[b] = int(bt.get(b, 0)) + 1
+            except Exception:
+                bt[b] = 1
+
+            self._found_stats.setdefault("biome_events", []).append({"ts": ts, "biome": b})
+            self._prune_found_events_locked(now_ts=ts)
+            self._save_found_stats_locked()
+
+    def _record_found_merchant(self, merchant: str, *, ts_epoch: Optional[float] = None) -> None:
+        m = str(merchant or "").strip().title()
+        if not m:
+            return
+        try:
+            ts = float(ts_epoch if ts_epoch is not None else time.time())
+        except Exception:
+            ts = time.time()
+        with self._stats_lock:
+            mt = self._found_stats.setdefault("merchants_total", {})
+            try:
+                mt[m] = int(mt.get(m, 0)) + 1
+            except Exception:
+                mt[m] = 1
+            self._found_stats.setdefault("merchant_events", []).append({"ts": ts, "merchant": m})
+            self._prune_found_events_locked(now_ts=ts)
+            self._save_found_stats_locked()
+
+    def get_found_stats_snapshot(self) -> dict:
+        with self._stats_lock:
+            snap = json.loads(json.dumps(self._found_stats))
+
+        bt = snap.get("biomes_total") if isinstance(snap.get("biomes_total"), dict) else {}
+        mt = snap.get("merchants_total") if isinstance(snap.get("merchants_total"), dict) else {}
+        try:
+            biome_total = sum(int(v) for v in bt.values())
+        except Exception:
+            biome_total = 0
+        try:
+            merchant_total = sum(int(v) for v in mt.values())
+        except Exception:
+            merchant_total = 0
+
+        return {
+            "biomes_total": bt,
+            "merchants_total": mt,
+            "biomes_total_count": biome_total,
+            "merchants_total_count": merchant_total,
+        }
+
+    def get_biomes_found_counts(self, window_seconds: float) -> dict:
+        try:
+            window = float(window_seconds)
+        except Exception:
+            window = 0.0
+        if window <= 0:
+            return {"counts": {}, "total": 0, "window_seconds": window_seconds}
+
+        now_ts = time.time()
+        cutoff = now_ts - window
+        counts: Dict[str, int] = {}
+
+        with self._stats_lock:
+            events = list(self._found_stats.get("biome_events") or [])
+
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            try:
+                ts = float(ev.get("ts", 0))
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            biome = ev.get("biome")
+            if not isinstance(biome, str):
+                continue
+            b = biome.strip().upper()
+            if not b or b == "NORMAL":
+                continue
+            counts[b] = counts.get(b, 0) + 1
+
+        total = sum(counts.values())
+        return {"counts": counts, "total": total, "window_seconds": window_seconds}
+
+    def get_merchants_found_counts(self, window_seconds: float) -> dict:
+        try:
+            window = float(window_seconds)
+        except Exception:
+            window = 0.0
+        if window <= 0:
+            return {"counts": {}, "total": 0, "window_seconds": window_seconds}
+
+        now_ts = time.time()
+        cutoff = now_ts - window
+        counts: Dict[str, int] = {}
+
+        with self._stats_lock:
+            events = list(self._found_stats.get("merchant_events") or [])
+
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            try:
+                ts = float(ev.get("ts", 0))
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            merch = ev.get("merchant")
+            if not isinstance(merch, str):
+                continue
+            m = merch.strip().title()
+            if not m:
+                continue
+            counts[m] = counts.get(m, 0) + 1
+
+        total = sum(counts.values())
+        return {"counts": counts, "total": total, "window_seconds": window_seconds}
+
+
     # -- Watcher plumbing ------------------------------------------------------
 
     def _watch_dir_for_path(self, path: str) -> None:
@@ -923,10 +1328,6 @@ class MultiScopeEngine:
             self._resolve_current_log(uid, force=True)
             cur = self._cur.get(uid)
             if cur and cur.path:
-                try:
-                    self._seed_last_rpc_state(uid, cur.path)
-                except Exception:
-                    pass
                 self._watch_dir_for_path(cur.path)
 
         # Do the I/O-heavy warmstarts last, also outside the lock
@@ -947,6 +1348,12 @@ class MultiScopeEngine:
             return
 
         cur = self._cur.get(uid) or Cursor()
+        prev_np = self._normpath_by_uid.get(uid)
+        if not prev_np and cur.path:
+            try:
+                prev_np = os.path.normcase(os.path.abspath(cur.path))
+            except Exception:
+                prev_np = os.path.normcase(str(cur.path))
         # NEW: canonicalize both sides and skip if unchanged
         new_np = os.path.normcase(os.path.abspath(path))
         cur_np = self._normpath_by_uid.get(uid)
@@ -983,17 +1390,14 @@ class MultiScopeEngine:
 
         # Switch
         cur.path = path
+        if prev_np and new_np != prev_np:
+            # Prevent stitching a partial line from the previous file into the new one.
+            cur.carry = ""
         try:
             # seek to EOF so we only read NEW data from the new file
             cur.pos = os.path.getsize(path) if os.path.isfile(path) else 0
         except Exception:
             cur.pos = 0
-
-        # Immediately seed menu/biome from existing content of the new log
-        try:
-            self._seed_last_rpc_state(uid, cur.path)
-        except Exception:
-            pass
 
         self._cur[uid] = cur
         # remember last switch time
@@ -1007,6 +1411,15 @@ class MultiScopeEngine:
         self._normpath_by_uid[uid] = new_np
 
         self._log(f"[MultiScope] switched log for {uname} - {os.path.basename(path)}")
+        # Warmstart on log switches so we still seed in_menu/merchant state from the new file.
+        if prev_np and new_np != prev_np:
+            try:
+                self._executor.submit(self._warmstart_user_tail, uid)
+            except Exception:
+                try:
+                    self._warmstart_user_tail(uid)
+                except Exception:
+                    pass
 
     def _maybe_refresh_paths(self, status_by_uid: Dict[str, dict]) -> None:
         """
@@ -1061,11 +1474,22 @@ class MultiScopeEngine:
             size_now = os.path.getsize(cur.path)
             with open(cur.path, "r", encoding="utf-8", errors="ignore") as f:
                 window = 8 * 1024 * 1024  # read up to last 8 MiB for seeds
+                base_offset = 0
                 if size_now > window:
-                    f.seek(size_now - window)
+                    base_offset = int(size_now - window)
+                    f.seek(base_offset)
                 chunk = f.read()
         except Exception:
             return
+
+        # Disconnect lookback: only when the manager considers this uid active/recent.
+        # This avoids firing disconnect events for idle users when MultiScope starts.
+        disconnect_hit = False
+        try:
+            if self._should_disconnect_lookback(uid):
+                disconnect_hit = self._scan_disconnect_in_text(uid, chunk, path=cur.path, base_offset=base_offset)
+        except Exception:
+            disconnect_hit = False
 
         # merchant seed (no notify) +' seed *scope* timestamps to avoid retro spam across users
         matches = list(MERCHANT_RE.finditer(chunk))
@@ -1096,63 +1520,20 @@ class MultiScopeEngine:
                 st = _extract_in_menu_from_rpc(rpc)
                 if st is not None:
                     latest_state = st
-            if latest_state is not None:
+            if (not disconnect_hit) and latest_state is not None:
                 key = self._server_key_for(uid)
                 scope = self._scope(key)
                 scope.in_menu = latest_state
                 scope.last_menu_ts = time.time()
-        else:
-            # as a fallback, scan the tail of the file for the latest RPC to seed menu state
-            self._seed_last_rpc_state(uid, cur.path)
-
-    def _seed_last_rpc_state(self, uid: str, path: str) -> None:
-        """Scan the tail of a log for the most recent BloxstrapRPC to seed menu/biome."""
-        if not path or not os.path.isfile(path):
-            return
-        try:
-            size_now = os.path.getsize(path)
-            window = 16 * 1024 * 1024  # 16 MiB tail
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                if size_now > window:
-                    f.seek(size_now - window)
-                chunk = f.read()
-        except Exception:
-            return
-
-        rpcs = _extract_rpc_jsons_from_text(chunk)
-        if not rpcs and size_now <= window:
-            # if small file and still none, try full file just in case
-            try:
-                chunk = Path(path).read_text(encoding="utf-8", errors="ignore")
-                rpcs = _extract_rpc_jsons_from_text(chunk)
-            except Exception:
-                return
-        if not rpcs:
-            return
-
-        latest_state: Optional[bool] = None
-        latest_biome: Optional[str] = None
-        for rpc in rpcs:
-            st = _extract_in_menu_from_rpc(rpc)
-            if st is not None:
-                latest_state = st
-            b = _extract_biome_from_rpc(rpc)
-            if b:
-                latest_biome = str(b).upper()
-
-        key = self._server_key_for(uid)
-        scope = self._scope(key)
-        now_t = time.time()
-        if latest_state is not None:
-            scope.in_menu = latest_state
-            scope.last_menu_ts = now_t
-            self._clear_menu_unknown(uid)
-        else:
-            scope.in_menu = scope.in_menu if scope.in_menu is not None else True
-        if latest_biome:
-            scope.last_biome = latest_biome
-            scope.last_biome_ts = now_t
-        scope.users.add(uid)
+                try:
+                    self._log(f"[SCAN-TRACE] {uid}: warmstart in_menu={latest_state} server={key}")
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._log(f"[SCAN-TRACE] {uid}: warmstart no in_menu found rpc={len(rpcs)}")
+                except Exception:
+                    pass
 
     def _emit_event(self, kind: str, uid: str, payload: str = "") -> None:
         with self._event_lock:
@@ -1186,18 +1567,89 @@ class MultiScopeEngine:
         except Exception:
             pass
 
+    def _scan_disconnect_in_text(
+        self,
+        uid: str,
+        text: str,
+        *,
+        path: Optional[str] = None,
+        base_offset: int = 0,
+    ) -> bool:
+        """Scan `text` for disconnect signals; emits at most once per log position."""
+        if not text:
+            return False
+
+        # Fast negative check before doing full finditers (keeps behavior close to the old scanner).
+        try:
+            if not (R_DISC_REASON.search(text) or
+                    R_DISC_NOTIFY.search(text) or
+                    R_DISC_SENDING.search(text) or
+                    R_CONN_LOST.search(text)):
+                return False
+        except Exception:
+            pass
+
+        last_end: Optional[int] = None
+        last_payload = "detected in log"
+
+        def _consider(match, payload: str) -> None:
+            nonlocal last_end, last_payload
+            try:
+                end = int(match.end())
+            except Exception:
+                return
+            if last_end is None or end >= last_end:
+                last_end = end
+                last_payload = payload
+
+        try:
+            for m in R_DISC_REASON.finditer(text):
+                _consider(m, f"reason={m.group(1)}")
+        except Exception:
+            pass
+        try:
+            for m in R_DISC_NOTIFY.finditer(text):
+                _consider(m, f"reason={m.group(1)}")
+        except Exception:
+            pass
+        try:
+            for m in R_DISC_SENDING.finditer(text):
+                _consider(m, f"reason={m.group(1)}")
+        except Exception:
+            pass
+        try:
+            for m in R_CONN_LOST.finditer(text):
+                _consider(m, "connection lost")
+        except Exception:
+            pass
+
+        if last_end is None:
+            return False
+
+        norm_path = ""
+        if path:
+            try:
+                norm_path = os.path.normcase(os.path.abspath(path))
+            except Exception:
+                norm_path = str(path)
+
+        try:
+            abs_end = max(0, int(base_offset)) + int(last_end)
+        except Exception:
+            abs_end = int(last_end)
+
+        prev = self._last_disconnect_sig_by_uid.get(str(uid))
+        if prev and prev[0] == norm_path and abs_end <= int(prev[1]):
+            return False
+
+        self._last_disconnect_sig_by_uid[str(uid)] = (norm_path, abs_end)
+        self._emit_event("disconnect", uid, last_payload)
+        self._mark_menu_unknown(uid)
+        return True
+
     def _scan_disconnect_in_chunk(self, uid: str, chunk: str) -> bool:
         """Check a just-read log chunk for Roblox disconnect signals."""
-        if not chunk:
-            return False
-        if (R_DISC_REASON.search(chunk) or
-            R_DISC_NOTIFY.search(chunk) or
-            R_DISC_SENDING.search(chunk) or
-            R_CONN_LOST.search(chunk)):
-            self._emit_event("disconnect", uid, "detected in log")
-            self._mark_menu_unknown(uid)
-            return True
-        return False
+        return self._scan_disconnect_in_text(uid, chunk)
 
     def begin_handoff(self, donor_uid: str, spare_uid: str) -> None:
         with self._lock:
@@ -1215,7 +1667,23 @@ class MultiScopeEngine:
     # -- Scope/owner helpers ---------------------------------------------------
 
     def _server_key_for(self, uid: str) -> str:
-        return self._get_server_label(uid) or "Unknown"
+        label = (self._get_server_label(uid) or "").strip()
+        if not label:
+            return "Unknown"
+        upper = label.upper()
+        if upper.startswith("DISCONNECTED") or upper.startswith("OFFLINE"):
+            return "Disconnected"
+        if upper.startswith("PUBLIC:"):
+            return f"{label} #{uid}"
+        return label
+
+    def _display_server_label(self, server_key: str) -> str:
+        if not server_key:
+            return "Unknown"
+        upper = server_key.upper()
+        if upper.startswith("PUBLIC:") and " #" in server_key:
+            return server_key.split(" #", 1)[0]
+        return server_key
 
     def _scope(self, key: str) -> ServerScope:
         return self._scopes.setdefault(key, ServerScope(key))
@@ -1358,12 +1826,17 @@ class MultiScopeEngine:
 
     def _emit_biome_event(self, uid: str, server_key: str, biome: str, *, event_type: str, ts_epoch: Optional[float] = None) -> None:
         detector     = self._get_username(uid) or uid
-        server_label = server_key
+        server_label = self._display_server_label(server_key)
         owner        = self._resolve_owner(uid, server_label)
         ps_link      = self._get_ps_link(uid) or ""
         scope        = self._scope(server_key)
 
         b = (biome or "").upper()
+        if str(event_type).lower() == "start":
+            try:
+                self._record_found_biome(b, ts_epoch=ts_epoch)
+            except Exception:
+                pass
         base_modes = getattr(self, "_biome_modes", {}) or {}
         base_modes_user = getattr(self, "_biome_modes_user", {}) or {}
         lock_disabled = not self._is_bm_lock_enforced()
@@ -1465,13 +1938,25 @@ class MultiScopeEngine:
 
 
     def _emit_merchant(self, uid: str, who: str, event_time_utc: datetime, full_line: str) -> None:
+        try:
+            self._record_found_merchant(who, ts_epoch=event_time_utc.timestamp())
+        except Exception:
+            pass
+
+        server_key   = self._server_key_for(uid)
+        scope = self._scopes.setdefault(server_key, ServerScope(server_key))
+        scope.last_merchant = who
+        try:
+            scope.last_merchant_ts = float(event_time_utc.timestamp())
+        except Exception:
+            scope.last_merchant_ts = time.time()
+        scope.users.add(uid)
+
         if not self._merchant_hook:
             return
         if not self._merchant_filters.get(who, True):
             return
-
-        server_key   = self._server_key_for(uid)
-        server_label = server_key
+        server_label = self._display_server_label(server_key)
         detector     = self._get_username(uid) or uid
         owner        = self._resolve_owner(uid, server_label)
         ps_link      = self._get_ps_link(uid) or ""
@@ -1506,11 +1991,45 @@ class MultiScopeEngine:
         if who == "Jester":
             self._maybe_start_temp_block(uid, "Jester")
 
-        scope = self._scopes.setdefault(server_key, ServerScope(server_key))
-        scope.last_merchant = who
-        scope.last_merchant_ts = time.time()
-        scope.users.add(uid)
         scope.events += 1
+
+    def record_ocr_merchant(self, uid: str, merchant: str) -> None:
+        """
+        Update the per-scope "last merchant" tracker from an OCR detection.
+
+        This does not emit/ping webhooks (OCR already does that); it only updates
+        MultiScope's last_merchant/age and scope-level dedupe timestamp so the
+        MultiScope table + scheduler reflect OCR-found merchants.
+        """
+        uid = str(uid or "").strip()
+        if not uid:
+            return
+
+        m = str(merchant or "").strip().lower()
+        if m not in ("jester", "mari"):
+            return
+        who = m.title()
+  
+        now_ts = time.time()
+        with self._lock:
+            scope_key = self._server_key_for(uid)
+            scope = self._scope(scope_key)
+            try:
+                if self._scope_dedupe_merchant_ts(scope_key, who, float(now_ts), window=10.0):
+                    return
+            except Exception:
+                pass
+            try:
+                self._record_found_merchant(who, ts_epoch=now_ts)
+            except Exception:
+                pass
+            scope.last_merchant = who
+            scope.last_merchant_ts = now_ts
+            scope.users.add(uid)
+            try:
+                self._last_merchant_ts_by_scope.setdefault(scope_key, {})[who] = float(now_ts)
+            except Exception:
+                pass
 
     # ---- Cadence model -------------------------------------------------
 
@@ -1582,6 +2101,7 @@ class MultiScopeEngine:
 
         disconnect_hit = False
         try:
+            start_pos = int(cur.pos or 0)
             read_start = _t.perf_counter()
             chunks = []
             bytes_read = 0
@@ -1607,13 +2127,19 @@ class MultiScopeEngine:
                 return
 
             chunk = "".join(chunks)
-            disconnect_hit = self._scan_disconnect_in_chunk(uid, chunk)
 
         except Exception:
             return
 
         # Stitch with any carried partial line from last time, and only parse full lines
         text = (cur.carry or "") + (chunk or "")
+
+        # Disconnect look-back: include the carried partial line so we don't miss split lines.
+        try:
+            base_offset = max(0, start_pos - len(cur.carry or ""))
+        except Exception:
+            base_offset = 0
+        disconnect_hit = self._scan_disconnect_in_text(uid, text, path=cur.path, base_offset=base_offset)
         nl = text.rfind("\n")
         if nl == -1:
             # still no complete line; carry everything
@@ -1661,6 +2187,8 @@ class MultiScopeEngine:
             latest_biome: Optional[str] = None
             latest_menu_ts: Optional[float] = None
             latest_menu_flag: Optional[bool] = None
+            fallback_count: int = 0
+            fallback_sample: Optional[dict] = None
 
             server_key = self._server_key_for(uid)
             scope = self._scopes.setdefault(server_key, ServerScope(server_key))
@@ -1705,6 +2233,13 @@ class MultiScopeEngine:
                 except Exception:
                     fallback_rpcs = []
                 if fallback_rpcs:
+                    try:
+                        fallback_count = int(len(fallback_rpcs))
+                        if isinstance(fallback_rpcs[-1], dict):
+                            fallback_sample = fallback_rpcs[-1]
+                    except Exception:
+                        fallback_count = 0
+                        fallback_sample = None
                     now_f = time.time()
                     for rpc in fallback_rpcs:
                         if latest_menu_ts is None:
@@ -1721,14 +2256,35 @@ class MultiScopeEngine:
             if not disconnect_hit:
                 if latest_menu_ts is not None:
                     if latest_menu_ts >= getattr(scope, "last_menu_ts", 0.0):
+                        prev_menu = getattr(scope, "in_menu", None)
                         scope.in_menu = latest_menu_flag
                         scope.last_menu_ts = latest_menu_ts
+                        if prev_menu != scope.in_menu:
+                            try:
+                                self._log(f"[SCAN-TRACE] {uid}: in_menu={scope.in_menu} server={server_key}")
+                            except Exception:
+                                pass
                     scope.users.add(uid)
                     self._clear_menu_unknown(uid)
                 else:
-                    # keep default True when no RPC state parsed yet
-                    scope.in_menu = scope.in_menu if scope.in_menu is not None else True
                     scope.users.add(uid)
+                    # Debug: RPC lines present but no menu state extracted.
+                    try:
+                        diag = ""
+                        if isinstance(fallback_sample, dict):
+                            data = fallback_sample.get("data")
+                            if isinstance(data, dict):
+                                sk = list(data.keys())[:8]
+                                st = data.get("state")
+                                dtl = data.get("details")
+                                diag = f" data_keys={sk} state={st!r} details={dtl!r}"
+                        self._throttled_log(
+                            key=f"menu-miss:{uid}",
+                            msg=f"[SCAN-TRACE] {uid}: no in_menu parsed from RPC matches={len(matches)} fallback={fallback_count} server={server_key}{diag}",
+                            every=30.0,
+                        )
+                    except Exception:
+                        pass
             else:
                 scope.users.add(uid)
 
@@ -1785,6 +2341,15 @@ class MultiScopeEngine:
 
     def tick(self, status_by_uid: Dict[str, dict]) -> None:
         with self._lock:
+            # Keep a snapshot for lookback gates (used by warmstart on log switches).
+            try:
+                import time
+                self._status_snapshot = status_by_uid or {}
+                self._status_snapshot_ts = float(time.time())
+            except Exception:
+                self._status_snapshot = status_by_uid or {}
+                self._status_snapshot_ts = 0.0
+
             # ensure scopes contain their current members
             for uid in list(self._cur.keys()):
                 key = self._server_key_for(uid)
@@ -1794,31 +2359,53 @@ class MultiScopeEngine:
             # fallback refresher (1s jitter; includes cache refresh)
             self._maybe_refresh_paths(status_by_uid)
 
-            # Seed menu state on-demand if still unknown for a scope
-            for key, scope in list(self._scopes.items()):
-                if scope.in_menu is None:
-                    # try any member we have a log for
-                    for uid in list(scope.users):
-                        cur = self._cur.get(uid)
-                        if not cur or not cur.path:
-                            continue
-                        blocked = self._menu_unknown_log_by_uid.get(str(uid))
-                        if blocked:
-                            try:
-                                if os.path.abspath(blocked) == os.path.abspath(cur.path):
-                                    continue
-                            except Exception:
-                                if blocked == cur.path:
-                                    continue
-                        try:
-                            self._seed_last_rpc_state(uid, cur.path)
-                        except Exception:
-                            pass
-                        break
-
             # ---- SCHEDULER: poll by scope, not by user -----------------------
             import time
             now_t = time.time()
+
+            # Disconnect condition: in-menu remains unknown for too long.
+            # Skip users already in the disconnected pool.
+            try:
+                for uid, st in (status_by_uid or {}).items():
+                    try:
+                        key = self._server_key_for(uid)
+                    except Exception:
+                        key = "Unknown"
+
+                    if key == "Disconnected":
+                        self._menu_none_since_by_uid.pop(uid, None)
+                        self._menu_none_disconnect_fired_by_uid.discard(uid)
+                        continue
+
+                    pids = []
+                    try:
+                        if isinstance(st, dict):
+                            pids = st.get("pids") or []
+                    except Exception:
+                        pids = []
+
+                    # Only apply while the user is actually running.
+                    if not pids:
+                        self._menu_none_since_by_uid.pop(uid, None)
+                        self._menu_none_disconnect_fired_by_uid.discard(uid)
+                        continue
+
+                    scope = self._scope(key)
+                    scope.users.add(uid)
+
+                    if scope.in_menu is None:
+                        since = self._menu_none_since_by_uid.get(uid)
+                        if since is None:
+                            self._menu_none_since_by_uid[uid] = now_t
+                        elif (now_t - since) >= 120.0 and uid not in self._menu_none_disconnect_fired_by_uid:
+                            self._emit_event("disconnect", uid, "in_menu_none_timeout=120")
+                            self._mark_menu_unknown(uid)
+                            self._menu_none_disconnect_fired_by_uid.add(uid)
+                    else:
+                        self._menu_none_since_by_uid.pop(uid, None)
+                        self._menu_none_disconnect_fired_by_uid.discard(uid)
+            except Exception:
+                pass
 
             # Compute a stable list of active scopes for this pass
             active_keys = sorted(self._scopes.keys())
@@ -1855,8 +2442,10 @@ class MultiScopeEngine:
         out: List[dict] = []
         now_t = time.time()
         for key, s in sorted(self._scopes.items(), key=lambda kv: kv[0]):
+            server_label = self._display_server_label(key)
             out.append({
-                "server": key,
+                "server": server_label,
+                "server_key": key,
                 "users": sorted(list(s.users)),
                 "in_menu": s.in_menu,
                 "last_biome": s.last_biome or "",
@@ -1876,6 +2465,47 @@ class MultiScopeEngine:
         if (now - last) >= every:
             self._last_log_by_key[key] = now
             self._log(msg)
+
+    def _should_disconnect_lookback(self, uid: str) -> bool:
+        """
+        Guard for disconnect lookback scans:
+        - Avoid triggering restarts for idle users when MultiScope starts.
+        - Allow for users that are active OR recently active (PID died but log flushed a disconnect).
+        """
+        try:
+            key = self._server_key_for(uid)
+            if key == "Disconnected":
+                return False
+        except Exception:
+            pass
+
+        try:
+            st = (self._status_snapshot or {}).get(uid)
+        except Exception:
+            st = None
+        if not isinstance(st, dict):
+            return False
+
+        try:
+            pids = st.get("pids") or []
+        except Exception:
+            pids = []
+        if pids:
+            return True
+
+        try:
+            last_active = float(st.get("last_active", 0) or 0)
+        except Exception:
+            last_active = 0.0
+
+        try:
+            now_t = float(getattr(self, "_status_snapshot_ts", 0.0) or 0.0) or time.time()
+        except Exception:
+            now_t = time.time()
+
+        # If the user was active recently, still allow the lookback (disconnect may have been written
+        # before we switched to the newest log file, or after the PID already died).
+        return bool(last_active and (now_t - last_active) <= 180.0)
     
     def _scope_dedupe_merchant_ts(self, scope_key: str, merchant: str, ts_epoch: float, window: float = 2.0) -> bool:
         """
@@ -1914,6 +2544,12 @@ class MultiScopeEngine:
         # optional: clear bookkeeping
         self._watched_dirs.clear()
         # temp-block sessions currently auto-expire; no explicit cancel hook yet
+        try:
+            with self._stats_lock:
+                self._prune_found_events_locked(now_ts=time.time())
+                self._save_found_stats_locked()
+        except Exception:
+            pass
 
 
 

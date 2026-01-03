@@ -573,7 +573,8 @@ def _ocr_pool_task(
             purple_filters: List[ColorFilter] = []
             saw_purple = False
             for cf in filters:
-                enabled = (cf.name or "").lower() == "purple_text"
+                name = (cf.name or "").strip().lower()
+                enabled = name in ("jester", "purple_text")
                 if enabled:
                     saw_purple = True
                 purple_filters.append(ColorFilter(cf.name, cf.r, cf.g, cf.b, cf.tol, enabled))
@@ -855,9 +856,15 @@ def _filters_from_cfg(raw_filters: List[Dict[str, Any]]) -> List[ColorFilter]:
     filters: List[ColorFilter] = []
     for f in raw_filters or []:
         try:
+            name = str(f.get("name", "")).strip()
+            lower = name.lower()
+            if lower == "white_text":
+                name = "Mari"
+            elif lower == "purple_text":
+                name = "Jester"
             filters.append(
                 ColorFilter(
-                    str(f.get("name", "")),
+                    name,
                     int(f.get("r", 0)),
                     int(f.get("g", 0)),
                     int(f.get("b", 0)),
@@ -869,8 +876,8 @@ def _filters_from_cfg(raw_filters: List[Dict[str, Any]]) -> List[ColorFilter]:
             continue
     if not filters:
         filters = [
-            ColorFilter("white_text", 255, 255, 255, 40, True),
-            ColorFilter("purple_text", 145, 67, 255, 40, True),
+            ColorFilter("Mari", 255, 255, 255, 40, True),
+            ColorFilter("Jester", 145, 67, 255, 40, True),
         ]
     return filters
 
@@ -920,6 +927,7 @@ class OCRWorker(QThread):
 
     log_signal = pyqtSignal(str)
     status_signal = pyqtSignal(str)
+    merchant_signal = pyqtSignal(str, str)  # (user_id, merchant)
 
     def __init__(
         self,
@@ -999,8 +1007,9 @@ class OCRWorker(QThread):
                     self._log(f"[Loop {loop_idx}] Enumerated {len(windows)} Roblox window(s).")
                     if not windows:
                         self._log("No Roblox windows found.")
-                        self._log(f"[Loop {loop_idx}] Sleeping 1.00s (no windows).")
-                        time.sleep(1.0)
+                        sleep_for = max(0.0, getattr(self, "_batch_delay_seconds", 1.0))
+                        self._log(f"[Loop {loop_idx}] Sleeping {sleep_for:.2f}s (no windows).")
+                        time.sleep(sleep_for)
                         continue
 
                     work_list = self._select_windows(windows)
@@ -1102,8 +1111,9 @@ class OCRWorker(QThread):
                         self._log(f"[Loop {loop_idx}] No windows eligible for capture this cycle.")
 
                     elapsed = time.time() - start
-                    if elapsed < 1.0:
-                        sleep_for = max(0.0, 1.0 - elapsed)
+                    target_delay = max(0.0, getattr(self, "_batch_delay_seconds", 1.0))
+                    if elapsed < target_delay:
+                        sleep_for = max(0.0, target_delay - elapsed)
                         self._log(f"[Loop {loop_idx}] Sleeping {sleep_for:.2f}s to throttle loop.")
                         time.sleep(sleep_for)
                 except Exception as e:
@@ -1183,6 +1193,12 @@ class OCRWorker(QThread):
 
     def _handle_detection(self, merchant: str, pid: int, raw_img: Image.Image) -> None:
         ctx = self._context_provider(pid) if self._context_provider else {}
+        try:
+            uid = str(ctx.get("user_id") or "").strip()
+            if uid and merchant:
+                self.merchant_signal.emit(uid, str(merchant))
+        except Exception:
+            pass
         username = ctx.get("username") or f"PID {pid}"
         owner = ctx.get("owner") or username
         server_label = ctx.get("server_label") or "Unknown"
@@ -1257,7 +1273,8 @@ class OCRWorker(QThread):
         purple_filters: List[ColorFilter] = []
         saw_purple = False
         for cf in self._filters:
-            enabled = (cf.name or "").lower() == "purple_text"
+            name = (cf.name or "").strip().lower()
+            enabled = name in ("jester", "purple_text")
             if enabled:
                 saw_purple = True
             purple_filters.append(ColorFilter(cf.name, cf.r, cf.g, cf.b, cf.tol, enabled))
@@ -1345,6 +1362,10 @@ class OCRWorker(QThread):
         self._roi = _roi_from_cfg(self._ocr_cfg.get("roi") or {})
         self._workers = max(1, int(self._ocr_cfg.get("workers", 1) or 1))
         self._max_captures_per_second = max(1, int(self._ocr_cfg.get("max_captures_per_second", 20) or 1))
+        try:
+            self._batch_delay_seconds = max(0.0, float(self._ocr_cfg.get("batch_delay_seconds", 1.0)))
+        except Exception:
+            self._batch_delay_seconds = 1.0
         self._cooldown_seconds = float(self._ocr_cfg.get("cooldown_seconds", 600) or 600)
         self._use_preprocess = bool(self._ocr_cfg.get("use_preprocess", True))
         self._device_id, self._force_cpu = _parse_device_id(self._ocr_cfg.get("device_id"))

@@ -50,6 +50,53 @@ except ImportError:
                 pass
 
 
+    def limit_roblox_crash_handlers(threshold: int = 2, *, kill_all: bool = False) -> None:
+        """
+        Trim RobloxCrashHandler*.exe processes.
+
+        ƒ?› kill_all = False  ƒzo keep the **oldest** crash handler and terminate any
+        extras once the running count reaches or exceeds *threshold*.
+        ƒ?› kill_all = True   ƒzo terminate **every** crash handler.
+
+        Pass threshold=2 to keep at most one; threshold=1 to trim unconditionally.
+        """
+        crash_handlers = []
+        try:
+            for p in psutil.process_iter(['name', 'create_time']):
+                try:
+                    name = p.info.get('name')
+                    if not name:
+                        continue
+                    n = str(name).lower()
+                    if n.startswith('robloxcrashhandler') and n.endswith('.exe'):
+                        crash_handlers.append(p)
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+        if not crash_handlers:
+            return
+
+        if kill_all:
+            for p in crash_handlers:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            return
+
+        if len(crash_handlers) < threshold:
+            return
+
+        crash_handlers.sort(key=lambda p: p.info.get('create_time') or 0)  # oldest first
+        for p in crash_handlers[1:]:  # keep index-0
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
     class ConfigManager:
         def __init__(self):
             self.app_name = "JARAM"
@@ -185,6 +232,8 @@ class ProcessTracker:
         self.process_owners = {}                  # pid -> user_id
         self.creation_timestamps = {}             # pid -> create_time
         self.user_server = {}                     # user_id -> human label of server joined
+        # Per-user grace window used to avoid false "DISCONNECTED" during launch/PID handoff.
+        self.pid_grace_until = {}                 # user_id -> epoch seconds
         self.protection_period = 60               # seconds to protect very new PIDs from aggression
         self.initialization_mode = False
     
@@ -406,24 +455,203 @@ class ProcessManager:
 
     def await_new_process(self, user_id, launch_timestamp, timeout, tracker):
         start_time = time.time()
+        iters = 0
+        last_err = None
+        newer_candidates = []
+        seen_candidate_pids = set()
+        ignored_pids = set()
 
-        while time.time() - start_time < timeout:
-            for process in psutil.process_iter(['pid', 'name', 'create_time']):
-                if process.info['name'] == self.process_name and process.info['pid'] != self.excluded_pid:
-                    pid = process.info['pid']
-                    create_time = process.info['create_time']
+        stable_seconds = 3.0
+        # Once we've seen a candidate process and it disappears, we enter a final
+        # short handoff window where we will NOT fall back to the full `timeout`.
+        handoff_deadline = None
+        picked_pid = None
+        picked_ct = None
+        picked_at = None
 
-                    if create_time > launch_timestamp and pid not in tracker.process_owners:
-                        tracker.process_owners[pid] = user_id
-                        tracker.user_processes[user_id].append(pid)
-                        tracker.creation_timestamps[pid] = create_time
-                        return pid
+        initial_deadline = start_time + float(timeout or 0)
+        deadline = initial_deadline
+        hard_deadline = initial_deadline + stable_seconds
+
+        def _emit(msg: str) -> None:
+            sink = getattr(tracker, "debug_log", None) if tracker is not None else None
+            if not callable(sink):
+                sink = print
+            try:
+                sink(msg)
+            except Exception:
+                try:
+                    print(msg)
+                except Exception:
+                    pass
+
+        while time.time() < deadline:
+            iters += 1
+            now = time.time()
+
+            # If our currently picked PID vanished within the stabilization window, drop it.
+            if picked_pid is not None:
+                alive = False
+                try:
+                    alive = self.verify_process_active(picked_pid)
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                    if err != last_err:
+                        _emit(f"[PIDWAIT ERROR] uid={user_id} err={err}")
+                    last_err = err
+                    alive = False
+
+                if not alive:
+                    age = (now - picked_at) if picked_at is not None else None
+                    _emit(f"[PIDWAIT DROP] uid={user_id} pid={picked_pid} ct={picked_ct} age={age}")
+                    ignored_pids.add(picked_pid)
+                    picked_pid = None
+                    picked_ct = None
+                    picked_at = None
+
+                    # Final handoff timeout: after the first disappearance, only give
+                    # `stable_seconds` to find another suitable process.
+                    if handoff_deadline is None:
+                        handoff_deadline = now + stable_seconds
+                        deadline = handoff_deadline
+                        _emit(
+                            f"[PIDWAIT HANDOFF] uid={user_id} final_deadline={handoff_deadline} "
+                            f"dt={handoff_deadline - start_time}"
+                        )
+
+            # Scan for the newest candidate created after launch_timestamp.
+            best_pid = None
+            best_ct = None
+            try:
+                for process in psutil.process_iter(['pid', 'name', 'create_time']):
+                    try:
+                        info = process.info or {}
+                        if info.get('name') != self.process_name:
+                            continue
+
+                        pid = info.get('pid')
+                        if not pid or pid == self.excluded_pid:
+                            continue
+
+                        create_time = info.get('create_time')
+                        if not create_time or create_time <= launch_timestamp:
+                            continue
+
+                        owned = False
+                        try:
+                            owned = pid in tracker.process_owners
+                        except Exception:
+                            owned = False
+
+                        if pid not in seen_candidate_pids and len(newer_candidates) < 8:
+                            seen_candidate_pids.add(pid)
+                            newer_candidates.append((pid, create_time, bool(owned)))
+
+                        if owned or pid in ignored_pids:
+                            continue
+
+                        if (
+                            best_ct is None
+                            or create_time > best_ct
+                            or (create_time == best_ct and (best_pid is None or pid > best_pid))
+                        ):
+                            best_pid = pid
+                            best_ct = create_time
+                    except Exception as e:
+                        err = f"{type(e).__name__}: {e}"
+                        if err != last_err:
+                            _emit(f"[PIDWAIT ERROR] uid={user_id} err={err}")
+                        last_err = err
+                        continue
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                if err != last_err:
+                    _emit(f"[PIDWAIT ERROR] uid={user_id} err={err}")
+                last_err = err
+
+            # Always prefer the newest process. If a newer one appears, switch and restart the stability window.
+            if best_pid is not None and (picked_ct is None or best_ct > picked_ct):
+                picked_pid = best_pid
+                picked_ct = best_ct
+                picked_at = now
+                # Only extend the deadline to allow stabilization while we're still
+                # in the initial wait; once we enter the handoff window, its deadline
+                # is final.
+                if handoff_deadline is None:
+                    try:
+                        deadline = max(deadline, min(hard_deadline, picked_at + stable_seconds))
+                    except Exception:
+                        pass
+                try:
+                    grace_map = getattr(tracker, "pid_grace_until", None)
+                    if grace_map is None:
+                        tracker.pid_grace_until = grace_map = {}
+                    grace_map[user_id] = picked_at + stable_seconds
+                except Exception:
+                    pass
+                _emit(f"[PIDWAIT PICK] uid={user_id} pid={picked_pid} ct={picked_ct}")
+
+            # If the current pick survives for stable_seconds, accept it as the launch PID.
+            required_alive = stable_seconds if handoff_deadline is None else 0.0
+            if picked_pid is not None and picked_at is not None and (now - picked_at) >= required_alive:
+                stable_alive = False
+                try:
+                    stable_alive = self.verify_process_active(picked_pid)
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                    if err != last_err:
+                        _emit(f"[PIDWAIT ERROR] uid={user_id} err={err}")
+                    last_err = err
+                    stable_alive = False
+
+                if stable_alive:
+                    try:
+                        owned = picked_pid in tracker.process_owners
+                    except Exception:
+                        owned = False
+
+                    if not owned:
+                        try:
+                            tracker.process_owners[picked_pid] = user_id
+                        except Exception:
+                            pass
+                        try:
+                            if picked_pid not in tracker.user_processes[user_id]:
+                                tracker.user_processes[user_id].append(picked_pid)
+                        except Exception:
+                            pass
+                    try:
+                        tracker.creation_timestamps[picked_pid] = picked_ct
+                    except Exception:
+                        pass
+
+                    _emit(
+                        f"[PIDWAIT OK] uid={user_id} pid={picked_pid} ct={picked_ct} "
+                        f"iters={iters} dt={now - start_time}"
+                    )
+                    return picked_pid
 
             time.sleep(0.5)
 
+        _emit(
+            f"[PIDWAIT TIMEOUT] uid={user_id} timeout={timeout} iters={iters} launch_ts={launch_timestamp} "
+            f"newer_candidates={newer_candidates} last_err={last_err}"
+        )
         return None
 
     def cleanup_dead_processes(self, tracker):
+        def _emit(msg: str) -> None:
+            sink = getattr(tracker, "debug_log", None) if tracker is not None else None
+            if not callable(sink):
+                sink = print
+            try:
+                sink(msg)
+            except Exception:
+                try:
+                    print(msg)
+                except Exception:
+                    pass
+
         active_pids = set()
         for process in psutil.process_iter(['pid', 'name']):
             if process.info['name'] == self.process_name and process.info['pid'] != self.excluded_pid:
@@ -433,6 +661,11 @@ class ProcessManager:
 
         for pid in dead_pids:
             user_id = tracker.process_owners[pid]
+            try:
+                ct = tracker.creation_timestamps.get(pid)
+            except Exception:
+                ct = None
+            _emit(f"[PID DEAD] pid={pid} uid={user_id} ct={ct}")
             if pid in tracker.user_processes.get(user_id, []):
                 tracker.user_processes[user_id].remove(pid)
             del tracker.process_owners[pid]
@@ -442,6 +675,13 @@ class ProcessManager:
         # NEW: move users with no live processes into the disconnected pool
         for uid, lst in list(tracker.user_processes.items()):
             if not lst:
+                grace_until = 0
+                try:
+                    grace_until = (tracker.pid_grace_until or {}).get(uid, 0)
+                except Exception:
+                    grace_until = 0
+                if grace_until and time.time() < grace_until:
+                    continue
                 tracker.user_server[uid] = "DISCONNECTED"
 
     def eliminate_orphaned_processes(self, tracker, valid_users):
@@ -616,6 +856,14 @@ class GameLauncher:
 
         # server label (keep short-code for PS; public = place)
         server_label = (f"{(private_code or '')[:10]}" if private_code else f"Public:{target_place}")
+        is_public = server_label.startswith("Public:")
+
+        # High-signal launch attempt log (works in GUI + console)
+        self.log(
+            f"[LAUNCH] uid={user_id} place={target_place} label={server_label} "
+            f"private={'yes' if private_code else 'no'} link_type={link_type} "
+            f"skip_cleanup={'yes' if skip_cleanup else 'no'}"
+        )
 
         # ---- Reservation guard (prevents races vs handoff pre-joins) --------------
         allow_shared = bool((user_info or {}).get("allow_shared_server"))
@@ -637,7 +885,7 @@ class GameLauncher:
             return False
 
         # ---- One-per-server guard (live occupants) --------------------------------
-        if not allow_shared:
+        if not allow_shared and not is_public:
             for other_uid, other_label in (self.tracker.user_server or {}).items():
                 if other_uid != user_id and other_label == server_label:
                     now = time.time()
@@ -653,6 +901,7 @@ class GameLauncher:
         # ---- Build auth + URL ------------------------------------------------------
         auth_ticket = self.auth_handler.obtain_auth_ticket(cookie)
         if not auth_ticket:
+            self.log(f"[LAUNCH FAIL] uid={user_id} label={server_label} reason=no_auth_ticket")
             self.cfg.mark_bad_cookie(user_id, True)
             if user_info is not None:
                 user_info["bad"] = True
@@ -686,7 +935,17 @@ class GameLauncher:
                     if pid != self.process_manager.excluded_pid:
                         self.process_manager.terminate_process(pid, self.tracker)
 
+            self.log(f"[LAUNCH] uid={user_id} label={server_label} calling os.startfile()")
             os.startfile(game_url)
+            self.log(f"[LAUNCH] uid={user_id} label={server_label} startfile returned, waiting for PID...")
+
+            # Allow ProcessManager.await_new_process to emit into the same log sink
+            if getattr(self, "tracker", None) is not None:
+                try:
+                    self.tracker.debug_log = self.log
+                except Exception:
+                    pass
+
             new_pid = self.process_manager.await_new_process(user_id, launch_ts, self.process_timeout, self.tracker)
             if new_pid:
                 # clear bad flag if we just launched fine
@@ -717,10 +976,20 @@ class GameLauncher:
                 return True
 
             # failed to see a process — leave cleanup to caller/TTL
+            self.log(
+                f"[LAUNCH FAIL] uid={user_id} label={server_label} reason=pid_not_found "
+                f"timeout={self.process_timeout}"
+            )
             return False
 
-        except Exception:
+        except Exception as e:
             # on exception, do nothing; TTL will prune any stale reservations
+            try:
+                self.log(f"[LAUNCH ERROR] uid={user_id} label={server_label} err={e!r}")
+                import traceback
+                self.log(f"[LAUNCH TRACE] uid={user_id} label={server_label}\n{traceback.format_exc()}")
+            except Exception:
+                pass
             return False
 
 
@@ -883,7 +1152,13 @@ def execute_main_loop():
             live_pids = [pid for pid in manager.process_tracker.user_processes.get(uid, [])
                         if process_mgr.verify_process_active(pid)]
             if not live_pids:
-                manager.process_tracker.user_server[uid] = "DISCONNECTED"
+                grace_until = 0
+                try:
+                    grace_until = (manager.process_tracker.pid_grace_until or {}).get(uid, 0)
+                except Exception:
+                    grace_until = 0
+                if not (grace_until and now < grace_until):
+                    manager.process_tracker.user_server[uid] = "DISCONNECTED"
             if live_pids:
                 continue
 
@@ -899,18 +1174,20 @@ def execute_main_loop():
             info   = st["user_info"] if isinstance(st["user_info"], dict) else {}
             cookie = info.get("cookie", "") if isinstance(info, dict) else info
             server_label = launcher.compute_server_label(info, cookie)
+            is_public = server_label.startswith("Public:")
 
             # 5) preflight checks with LOGGING (do NOT bump last_launch on skips)
             #    (a) already occupied by someone else?
-            occupied_by = next(
-                (other_uid for other_uid, other_label in servers_live.items()
-                if other_uid != uid and other_label == server_label),
-                None
-            )
-            if occupied_by:
-                manager.process_tracker.skip_until_by_user[uid] = now + 30
-                launcher.log_skip(uid, server_label, f"already occupied by {occupied_by}")
-                continue
+            if not is_public:
+                occupied_by = next(
+                    (other_uid for other_uid, other_label in servers_live.items()
+                    if other_uid != uid and other_label == server_label),
+                    None
+                )
+                if occupied_by:
+                    manager.process_tracker.skip_until_by_user[uid] = now + 30
+                    launcher.log_skip(uid, server_label, f"already occupied by {occupied_by}")
+                    continue
 
             #    (b) reserved by an in-flight handoff/normal?
             r = reserved.get(server_label)

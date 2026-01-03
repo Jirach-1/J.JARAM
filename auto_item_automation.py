@@ -135,11 +135,11 @@ def _mouse_move_natural(x: int, y: int) -> None:
         # AutoIt speed: 0=fastest (instant), 1..100 slower.
         # Keep motion "human-ish" but prioritize speed.
         if dist >= 250:
-            speed = 3
+            speed = 1
         elif dist >= 120:
-            speed = 4
+            speed = 2
         else:
-            speed = 5
+            speed = 3
 
         jx = random.randint(-1, 1)
         jy = random.randint(-1, 1)
@@ -150,12 +150,27 @@ def _mouse_move_natural(x: int, y: int) -> None:
         pass
 
 
-def _mouse_left_click(x: int, y: int) -> None:
+def _mouse_left_click(hwnd: int, x: int, y: int) -> None:
     x = int(x)
     y = int(y)
 
     if autoit is None:
         return
+
+    try:
+        if hwnd and win32gui.IsWindow(hwnd) and win32gui.GetForegroundWindow() != hwnd:
+            _bring_window_foreground(hwnd)
+            time.sleep(0.01)
+    except Exception:
+        # Best-effort; clicks can still work even if focus is blocked by OS rules.
+        pass
+
+    def _force_left_up() -> None:
+        try:
+            # Fail-safe: if AutoIt errors between mouse_down/mouse_up, never leave LMB logically held.
+            ctypes.windll.user32.mouse_event(int(win32con.MOUSEEVENTF_LEFTUP), 0, 0, 0, 0)
+        except Exception:
+            pass
 
     # Move like a person and add small dwell time before pressing.
     _mouse_move_natural(x, y)
@@ -164,9 +179,15 @@ def _mouse_left_click(x: int, y: int) -> None:
     try:
         autoit.mouse_down("left")
         time.sleep(random.uniform(0.015, 0.03))
-        autoit.mouse_up("left")
     except Exception:
+        # Ensure we still attempt to release in the finally block.
         pass
+    finally:
+        try:
+            autoit.mouse_up("left")
+        except Exception:
+            pass
+        _force_left_up()
 
 
 def _send_ctrl_a() -> None:
@@ -497,7 +518,7 @@ class AutoItemEngine:
                 if cond_abs_xy:
                     px = _screen_pixel_rgb(*cond_abs_xy)
                     if px is not None and _color_close(px, _hex_to_rgb(conditional.color_hex), conditional.tolerance):
-                        _mouse_left_click(*cond_abs_xy)
+                        _mouse_left_click(hwnd, *cond_abs_xy)
                         cond_clicked = True
                         time.sleep(max(0.02, float(click_delay)))
 
@@ -505,7 +526,7 @@ class AutoItemEngine:
                 p = coords[name]
                 abs_xy = _abs_from_rel(hwnd, p)
                 if abs_xy:
-                    _mouse_left_click(*abs_xy)
+                    _mouse_left_click(hwnd, *abs_xy)
                 time.sleep(max(0.01, float(click_delay)))
 
             # Open inventory -> items
@@ -543,10 +564,10 @@ class AutoItemEngine:
                 px_end = _screen_pixel_rgb(*cond_abs_xy)
                 if px_end is not None:
                     if not _color_close(px_end, _hex_to_rgb(conditional.color_hex), conditional.tolerance):
-                        _mouse_left_click(*cond_abs_xy)
+                        _mouse_left_click(hwnd, *cond_abs_xy)
                         time.sleep(max(0.02, float(click_delay)))
                 elif cond_clicked:
-                    _mouse_left_click(*cond_abs_xy)
+                    _mouse_left_click(hwnd, *cond_abs_xy)
                     time.sleep(max(0.02, float(click_delay)))
 
     def _eligible_in_biome(self, biome: str, rule: ItemRule) -> bool:

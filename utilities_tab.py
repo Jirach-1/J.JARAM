@@ -824,8 +824,8 @@ class _PSLWorker(QThread):
         self._emit("[PSL] " + ("Cancelled." if self._cancel else "Done."))
         self.done.emit()
 
-# ---------------- GUI tab ----------------
-def setup_UTILITIES_tab(self):
+# ---------------- GUI ----------------
+def build_utilities_widget(self) -> QWidget:
     tab = QWidget()
     v = QVBoxLayout(tab)
 
@@ -1042,5 +1042,9 @@ def setup_UTILITIES_tab(self):
     run_block_btn.clicked.connect(_start_block)
     run_unblock_btn.clicked.connect(_start_unblock)
     run_psl_btn.clicked.connect(_start_psl)
+    return tab
 
+
+def setup_UTILITIES_tab(self):
+    tab = build_utilities_widget(self)
     self.tab_widget.addTab(tab, "Utilities")
