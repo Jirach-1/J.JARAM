@@ -23,6 +23,12 @@ ext_modules = [
         libraries=["winmm"],
     ),
     Pybind11Extension(
+        "ram_limiter_native",
+        [str(BASE_DIR / "ram_limiter_native.cpp")],
+        cxx_std=17,
+        libraries=["psapi"],
+    ),
+    Pybind11Extension(
         "antiafk_native",
         [str(BASE_DIR / "antiafk_native.cpp")],
         cxx_std=17,

@@ -29,15 +29,18 @@ namespace py = pybind11;
 namespace {
 
 constexpr int kActionDelayMs = 30;
-constexpr int kAltDelayMs = 400;
-constexpr int kMaxWaitTimeS = 1140;
-constexpr int kActivityStatusEveryS = 30;
+constexpr int kDefaultAltDelayMs = 400;
+constexpr int kMinAltDelayMs = 10;
+constexpr int kMaxAltDelayMs = 5000;
 constexpr int kNoWindowsStatusEveryS = 10;
 constexpr int kLoopIdleWaitS = 1;
 constexpr int kNoWindowsWaitS = 5;
-constexpr int kUserInactivityWaitS = 5;
 
 using Clock = std::chrono::steady_clock;
+
+int clamp_alt_delay_ms(int ms) {
+  return std::clamp(ms, kMinAltDelayMs, kMaxAltDelayMs);
+}
 
 std::int64_t mono_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
@@ -99,43 +102,34 @@ std::wstring window_text(HWND hwnd, bool* timed_out = nullptr) {
   if (timed_out) {
     *timed_out = false;
   }
-  const int len = ::GetWindowTextLengthW(hwnd);
-  if (len <= 0) {
-    return {};
-  }
+  // NOTE: Avoid GetWindowTextLengthW/GetWindowTextW for out-of-process windows; they can hang when
+  // the target is throttled/unresponsive. Use a bounded SendMessageTimeout instead.
+  constexpr int kTimeoutMs = 150;
+  constexpr size_t kMaxChars = 1024;
   std::wstring out;
-  out.resize(static_cast<size_t>(len) + 1);
-  if (timed_out) {
-    DWORD_PTR message_result = 0;
-    ::SetLastError(ERROR_SUCCESS);
-    const int timeout_ms = 150;
-    const BOOL sent = ::SendMessageTimeoutW(
-        hwnd,
-        WM_GETTEXT,
-        static_cast<WPARAM>(out.size()),
-        reinterpret_cast<LPARAM>(out.data()),
-        SMTO_ABORTIFHUNG | SMTO_BLOCK,
-        timeout_ms,
-        &message_result);
-    if (!sent) {
-      if (::GetLastError() == ERROR_TIMEOUT) {
-        *timed_out = true;
-      }
-      return {};
-    }
-    const int copied = static_cast<int>(message_result);
-    if (copied <= 0) {
-      return {};
-    }
-    out.resize(static_cast<size_t>(copied));
-    return out;
-  }
+  out.resize(kMaxChars);
 
-  const int written = ::GetWindowTextW(hwnd, out.data(), static_cast<int>(out.size()));
-  if (written <= 0) {
+  DWORD_PTR message_result = 0;
+  ::SetLastError(ERROR_SUCCESS);
+  const LRESULT sent = ::SendMessageTimeoutW(
+      hwnd,
+      WM_GETTEXT,
+      static_cast<WPARAM>(out.size()),
+      reinterpret_cast<LPARAM>(out.data()),
+      SMTO_ABORTIFHUNG | SMTO_BLOCK,
+      kTimeoutMs,
+      &message_result);
+  if (sent == 0) {
+    if (timed_out && ::GetLastError() == ERROR_TIMEOUT) {
+      *timed_out = true;
+    }
     return {};
   }
-  out.resize(static_cast<size_t>(written));
+  const int copied = static_cast<int>(message_result);
+  if (copied <= 0) {
+    return {};
+  }
+  out.resize(static_cast<size_t>(copied));
   return out;
 }
 
@@ -260,7 +254,7 @@ struct ThreadInputAttachGuard {
 
   ThreadInputAttachGuard() = default;
   ThreadInputAttachGuard(DWORD a_, DWORD b_) : a(a_), b(b_) {
-    if (a != 0 && b != 0) {
+    if (a != 0 && b != 0 && a != b) {
       attached = ::AttachThreadInput(a, b, TRUE) != FALSE;
     }
   }
@@ -299,9 +293,11 @@ struct ForegroundLockGuard {
   }
 };
 
-bool should_abort(const std::atomic<bool>* stop_requested, const std::atomic<bool>* shutdown_requested) {
-  return (stop_requested && stop_requested->load()) ||
-         (shutdown_requested && shutdown_requested->load());
+bool should_abort(const std::atomic<bool>* stop_requested,
+                  const std::atomic<bool>* shutdown_requested,
+                  const std::atomic<bool>* pause_requested = nullptr) {
+  return (stop_requested && stop_requested->load()) || (shutdown_requested && shutdown_requested->load()) ||
+         (pause_requested && pause_requested->load());
 }
 
 void key_event_down(int vk_code) {
@@ -316,10 +312,11 @@ void key_event_up(int vk_code) {
 
 void sleep_abortable(int delay_ms,
                      const std::atomic<bool>* stop_requested,
-                     const std::atomic<bool>* shutdown_requested) {
+                     const std::atomic<bool>* shutdown_requested,
+                     const std::atomic<bool>* pause_requested = nullptr) {
   constexpr int kSliceMs = 25;
   int remaining = delay_ms;
-  while (remaining > 0 && !should_abort(stop_requested, shutdown_requested)) {
+  while (remaining > 0 && !should_abort(stop_requested, shutdown_requested, pause_requested)) {
     const int slice = std::min(kSliceMs, remaining);
     ::Sleep(static_cast<DWORD>(slice));
     remaining -= slice;
@@ -330,25 +327,44 @@ bool focus_window_best_effort(HWND hwnd, DWORD window_tid) {
   if (!hwnd || !::IsWindow(hwnd)) {
     return false;
   }
-  if (::GetForegroundWindow() == hwnd) {
+  const HWND current_foreground = ::GetForegroundWindow();
+  if (current_foreground == hwnd) {
     return true;
   }
 
   const DWORD current_tid = ::GetCurrentThreadId();
-  if (window_tid != 0) {
-    ThreadInputAttachGuard attach(current_tid, window_tid);
+  const DWORD foreground_tid =
+      current_foreground ? ::GetWindowThreadProcessId(current_foreground, nullptr) : 0;
+
+  auto attempt = [&](bool make_topmost) -> bool {
+    if (make_topmost) {
+      set_topmost(hwnd);
+    }
+
+    // Attach to both the target thread and the current foreground thread where possible.
+    // This improves SetForegroundWindow reliability when running out-of-process.
+    ThreadInputAttachGuard attach_target(current_tid, window_tid);
+    ThreadInputAttachGuard attach_foreground(current_tid, foreground_tid);
+
     (void)::BringWindowToTop(hwnd);
     (void)::SetForegroundWindow(hwnd);
-  } else {
-    (void)::SetForegroundWindow(hwnd);
-  }
+    (void)::SetActiveWindow(hwnd);
 
-  if (::GetForegroundWindow() == hwnd) {
+    if (::GetForegroundWindow() == hwnd) {
+      return true;
+    }
+
+    // Retry: Windows sometimes ignores the first activation attempt.
+    (void)::BringWindowToTop(hwnd);
+    (void)::SetForegroundWindow(hwnd);
+    (void)::SetActiveWindow(hwnd);
+    return ::GetForegroundWindow() == hwnd;
+  };
+
+  if (attempt(false)) {
     return true;
   }
-
-  (void)::SetForegroundWindow(hwnd);
-  return ::GetForegroundWindow() == hwnd;
+  return attempt(true);
 }
 
 bool ensure_foreground(HWND hwnd,
@@ -356,15 +372,16 @@ bool ensure_foreground(HWND hwnd,
                        int attempts,
                        int sleep_ms,
                        const std::atomic<bool>* stop_requested,
-                       const std::atomic<bool>* shutdown_requested) {
+                       const std::atomic<bool>* shutdown_requested,
+                       const std::atomic<bool>* pause_requested = nullptr) {
   for (int i = 0; i < attempts; ++i) {
-    if (should_abort(stop_requested, shutdown_requested)) {
+    if (should_abort(stop_requested, shutdown_requested, pause_requested)) {
       return false;
     }
     if (focus_window_best_effort(hwnd, window_tid)) {
       return true;
     }
-    ::Sleep(static_cast<DWORD>(sleep_ms));
+    sleep_abortable(sleep_ms, stop_requested, shutdown_requested, pause_requested);
   }
   return ::GetForegroundWindow() == hwnd;
 }
@@ -374,19 +391,26 @@ bool press_key_defensive(HWND hwnd,
                          int vk_code,
                          int delay_ms,
                          const std::atomic<bool>* stop_requested,
-                         const std::atomic<bool>* shutdown_requested) {
-  constexpr int kFocusAttempts = 8;
-  constexpr int kFocusSleepMs = 20;
+                         const std::atomic<bool>* shutdown_requested,
+                         const std::atomic<bool>* pause_requested = nullptr) {
+  constexpr int kFocusAttempts = 20;
+  constexpr int kFocusSleepMs = 25;
 
-  if (!ensure_foreground(hwnd, window_tid, kFocusAttempts, kFocusSleepMs, stop_requested, shutdown_requested)) {
+  if (!ensure_foreground(hwnd,
+                         window_tid,
+                         kFocusAttempts,
+                         kFocusSleepMs,
+                         stop_requested,
+                         shutdown_requested,
+                         pause_requested)) {
     return false;
   }
 
   key_event_down(vk_code);
-  sleep_abortable(delay_ms, stop_requested, shutdown_requested);
+  sleep_abortable(delay_ms, stop_requested, shutdown_requested, pause_requested);
 
   // Best-effort: try to ensure the window is still foreground before releasing.
-  (void)ensure_foreground(hwnd, window_tid, 2, kFocusSleepMs, stop_requested, shutdown_requested);
+  (void)ensure_foreground(hwnd, window_tid, 2, kFocusSleepMs, stop_requested, shutdown_requested, pause_requested);
   key_event_up(vk_code);
   return true;
 }
@@ -400,14 +424,18 @@ ActionResult action_task_impl(HWND hwnd,
                               const std::string& base_action,
                               bool menu_autoreconnect,
                               bool in_menu,
-                              std::atomic<bool>* stop_requested = nullptr,
-                              std::atomic<bool>* shutdown_requested = nullptr) {
+                              int alt_delay_ms,
+                              const std::atomic<bool>* stop_requested = nullptr,
+                              const std::atomic<bool>* shutdown_requested = nullptr,
+                              const std::atomic<bool>* pause_requested = nullptr,
+                              bool restore_foreground = true) {
   ActionResult out;
   const std::uint64_t hwnd_int = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(hwnd));
   const std::string effective_action = (menu_autoreconnect && in_menu) ? "AutoReconnect" : base_action;
+  const int alt_delay = clamp_alt_delay_ms(alt_delay_ms);
 
   const auto aborting = [&]() -> bool {
-    return (stop_requested && stop_requested->load()) || (shutdown_requested && shutdown_requested->load());
+    return should_abort(stop_requested, shutdown_requested, pause_requested);
   };
 
   HWND old_hwnd = nullptr;
@@ -445,91 +473,138 @@ ActionResult action_task_impl(HWND hwnd,
     return out;
   }
 
-  old_hwnd = ::GetForegroundWindow();
+  if (restore_foreground) {
+    old_hwnd = ::GetForegroundWindow();
+  }
   const BOOL was_minimized = ::IsIconic(hwnd);
 
   try {
-    ForegroundLockGuard fg_lock;
-
     if (was_minimized) {
       ::ShowWindow(hwnd, SW_RESTORE);
     }
 
-    if (!ensure_foreground(hwnd, window_tid, /*attempts=*/10, /*sleep_ms=*/20, stop_requested, shutdown_requested)) {
+    if (!ensure_foreground(hwnd,
+                           window_tid,
+                           /*attempts=*/40,
+                           /*sleep_ms=*/25,
+                           stop_requested,
+                           shutdown_requested,
+                           pause_requested)) {
       out.ok = false;
-      out.message = "Failed to focus target window for Anti-AFK action";
+      if (aborting()) {
+        return out;
+      }
+      const HWND fg = ::GetForegroundWindow();
+      if (fg && ::IsWindow(fg) && fg != hwnd) {
+        DWORD fg_pid = 0;
+        (void)::GetWindowThreadProcessId(fg, &fg_pid);
+        bool fg_title_timed_out = false;
+        const std::wstring fg_title = window_text(fg, &fg_title_timed_out);
+        const std::wstring fg_cls = window_class_name(fg);
+        std::string fg_exe;
+        if (fg_pid != 0) {
+          fg_exe = wide_to_utf8(process_basename(fg_pid).value_or(L""));
+        }
+        out.message =
+            "Failed to focus target window for Anti-AFK action (foreground: '" + wide_to_utf8(fg_title) +
+            "'" + (fg_title_timed_out ? ", title_timeout" : "") + ", class: '" + wide_to_utf8(fg_cls) +
+            "', pid: " + std::to_string(fg_pid) + (fg_exe.empty() ? "" : ", exe: " + fg_exe) + ")";
+      } else {
+        out.message = "Failed to focus target window for Anti-AFK action";
+      }
       return out;
     }
 
-    ::Sleep(static_cast<DWORD>(kActionDelayMs));
+    sleep_abortable(kActionDelayMs, stop_requested, shutdown_requested, pause_requested);
 
     const auto press_key = [&](int vk_code, int delay_ms) {
-      return press_key_defensive(hwnd, window_tid, vk_code, delay_ms, stop_requested, shutdown_requested);
+      return press_key_defensive(
+          hwnd, window_tid, vk_code, delay_ms, stop_requested, shutdown_requested, pause_requested);
     };
 
     if (effective_action == "space") {
-      if (!press_key(VK_SPACE, kAltDelayMs)) {
+      if (!press_key(VK_SPACE, alt_delay)) {
         out.ok = false;
-        out.message = "Lost focus before key press (space)";
+        if (!aborting()) {
+          out.message = "Lost focus before key press (space)";
+        }
         return out;
       }
     } else if (effective_action == "ws") {
-      if (!press_key(static_cast<int>('W'), kAltDelayMs)) {
+      if (!press_key(static_cast<int>('W'), alt_delay)) {
         out.ok = false;
-        out.message = "Lost focus before key press (W)";
+        if (!aborting()) {
+          out.message = "Lost focus before key press (W)";
+        }
         return out;
       }
-      ::Sleep(static_cast<DWORD>(kAltDelayMs));
-      if (!press_key(static_cast<int>('S'), kAltDelayMs)) {
+      sleep_abortable(alt_delay, stop_requested, shutdown_requested, pause_requested);
+      if (!press_key(static_cast<int>('S'), alt_delay)) {
         out.ok = false;
-        out.message = "Lost focus before key press (S)";
+        if (!aborting()) {
+          out.message = "Lost focus before key press (S)";
+        }
         return out;
       }
     } else if (effective_action == "zoom") {
-      if (!press_key(static_cast<int>('I'), kAltDelayMs)) {
+      if (!press_key(static_cast<int>('I'), alt_delay)) {
         out.ok = false;
-        out.message = "Lost focus before key press (I)";
+        if (!aborting()) {
+          out.message = "Lost focus before key press (I)";
+        }
         return out;
       }
-      ::Sleep(static_cast<DWORD>(kAltDelayMs));
-      if (!press_key(static_cast<int>('O'), kAltDelayMs)) {
+      sleep_abortable(alt_delay, stop_requested, shutdown_requested, pause_requested);
+      if (!press_key(static_cast<int>('O'), alt_delay)) {
         out.ok = false;
-        out.message = "Lost focus before key press (O)";
+        if (!aborting()) {
+          out.message = "Lost focus before key press (O)";
+        }
         return out;
       }
     } else if (effective_action == "AutoReconnect") {
       const int vk_backslash = ::VkKeyScanA('\\') & 0xFF;
-      if (!press_key(vk_backslash, kAltDelayMs)) {
+      if (!press_key(vk_backslash, alt_delay)) {
         out.ok = false;
-        out.message = "Lost focus before key press (\\\\)";
+        if (!aborting()) {
+          out.message = "Lost focus before key press (\\\\)";
+        }
         return out;
       }
-      ::Sleep(static_cast<DWORD>(kAltDelayMs));
+      sleep_abortable(alt_delay, stop_requested, shutdown_requested, pause_requested);
 
       const int vk_a = ::VkKeyScanA('a') & 0xFF;
-      if (!press_key(vk_a, kAltDelayMs)) {
+      if (!press_key(vk_a, alt_delay)) {
         out.ok = false;
-        out.message = "Lost focus before key press (a)";
+        if (!aborting()) {
+          out.message = "Lost focus before key press (a)";
+        }
         return out;
       }
-      ::Sleep(static_cast<DWORD>(kAltDelayMs));
+      sleep_abortable(alt_delay, stop_requested, shutdown_requested, pause_requested);
 
-      if (!press_key(static_cast<int>('S'), kAltDelayMs)) {
+      if (!press_key(static_cast<int>('S'), alt_delay)) {
         out.ok = false;
-        out.message = "Lost focus before key press (S)";
+        if (!aborting()) {
+          out.message = "Lost focus before key press (S)";
+        }
         return out;
       }
 
-      if (!press_key(VK_RETURN, kAltDelayMs)) {
+      if (!press_key(VK_RETURN, alt_delay)) {
         out.ok = false;
-        out.message = "Lost focus before key press (Enter)";
+        if (!aborting()) {
+          out.message = "Lost focus before key press (Enter)";
+        }
         return out;
       }
-      ::Sleep(static_cast<DWORD>(kAltDelayMs));
+      sleep_abortable(alt_delay, stop_requested, shutdown_requested, pause_requested);
 
-      if (!press_key(vk_backslash, kAltDelayMs)) {
+      if (!press_key(vk_backslash, alt_delay)) {
         out.ok = false;
-        out.message = "Lost focus before key press (\\\\)";
+        if (!aborting()) {
+          out.message = "Lost focus before key press (\\\\)";
+        }
         return out;
       }
     } else {
@@ -538,13 +613,13 @@ ActionResult action_task_impl(HWND hwnd,
       return out;
     }
 
-    ::Sleep(static_cast<DWORD>(kActionDelayMs));
+    sleep_abortable(kActionDelayMs, stop_requested, shutdown_requested, pause_requested);
 
     if (was_minimized) {
       ::ShowWindow(hwnd, SW_MINIMIZE);
     }
 
-    if (!aborting() && old_hwnd && old_hwnd != hwnd && ::IsWindow(old_hwnd)) {
+    if (restore_foreground && !aborting() && old_hwnd && old_hwnd != hwnd && ::IsWindow(old_hwnd)) {
       if (::IsWindowVisible(old_hwnd) && !::IsIconic(old_hwnd)) {
         const std::wstring cls = window_class_name(old_hwnd);
         if (cls != L"AntiAFK-RBX-tray") {
@@ -577,7 +652,7 @@ ActionResult action_task_impl(HWND hwnd,
     if (was_minimized) {
       ::ShowWindow(hwnd, SW_MINIMIZE);
     }
-    if (!aborting() && old_hwnd && ::IsWindow(old_hwnd)) {
+    if (restore_foreground && !aborting() && old_hwnd && ::IsWindow(old_hwnd)) {
       (void)::SetForegroundWindow(old_hwnd);
     }
     out.ok = false;
@@ -588,7 +663,7 @@ ActionResult action_task_impl(HWND hwnd,
     if (was_minimized) {
       ::ShowWindow(hwnd, SW_MINIMIZE);
     }
-    if (!aborting() && old_hwnd && ::IsWindow(old_hwnd)) {
+    if (restore_foreground && !aborting() && old_hwnd && ::IsWindow(old_hwnd)) {
       (void)::SetForegroundWindow(old_hwnd);
     }
     out.ok = false;
@@ -600,12 +675,14 @@ ActionResult action_task_impl(HWND hwnd,
 py::tuple action_task(std::uint64_t hwnd_int,
                       const std::string& base_action,
                       bool menu_autoreconnect,
-                      bool in_menu) {
+                      bool in_menu,
+                      std::optional<int> alt_delay_ms = std::nullopt) {
   ActionResult res;
   {
     py::gil_scoped_release release;
     const HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(hwnd_int));
-    res = action_task_impl(hwnd, base_action, menu_autoreconnect, in_menu);
+    res = action_task_impl(
+        hwnd, base_action, menu_autoreconnect, in_menu, alt_delay_ms.value_or(kDefaultAltDelayMs));
   }
   return py::make_tuple(res.ok, res.message);
 }
@@ -834,9 +911,7 @@ class AntiAFK {
   void apply_host_config(std::optional<bool> multi_instance_enabled = std::nullopt,
                          std::optional<int> interval = std::nullopt,
                          std::optional<std::string> action = std::nullopt,
-                         std::optional<bool> user_safe = std::nullopt,
-                         std::optional<bool> sequential_mode = std::nullopt,
-                         std::optional<double> sequential_delay = std::nullopt,
+                         std::optional<int> alt_delay_ms = std::nullopt,
                          std::optional<bool> menu_autoreconnect = std::nullopt);
 
   void toggle_antiafk(py::object enable_obj = py::none());
@@ -854,13 +929,10 @@ class AntiAFK {
   void hide_roblox_windows();
 
   bool perform_antiafk_action(std::uint64_t hwnd_int,
-                             std::optional<std::string> action_type = std::nullopt);
+                             std::optional<std::string> action_type = std::nullopt,
+                             bool restore_foreground = true);
   void test_action();
   void test_action_with_delay();
-
-  void start_activity_monitor();
-  void stop_activity_monitor();
-  bool check_user_active();
 
   bool is_window_fullscreen(std::uint64_t hwnd_int);
   void restore_foreground_window(std::uint64_t hwnd_int);
@@ -868,12 +940,10 @@ class AntiAFK {
   void shutdown();
 
  private:
-  static double clamp_delay(double d);
   void ensure_defaults_locked();
 
   int get_int(const char* key, int fallback) const;
   bool get_bool(const char* key, bool fallback) const;
-  double get_double(const char* key, double fallback) const;
   std::string get_str(const char* key, std::string fallback) const;
 
   void emit_status(const std::string& message);
@@ -886,10 +956,12 @@ class AntiAFK {
 
   void cleanup_topmost_after_error(const std::string& reason, bool emit);
   void restore_foreground_window_impl(HWND hwnd);
-  ActionResult run_action(HWND hwnd, const std::string& base_action, bool menu_autoreconnect);
+  ActionResult run_action(HWND hwnd,
+                          const std::string& base_action,
+                          bool menu_autoreconnect,
+                          bool restore_foreground = true);
 
   void antiafk_loop_thread();
-  void monitor_user_activity_thread();
   void run_test_thread(std::vector<std::uint64_t> windows);
 
   void shutdown_impl(bool emit);
@@ -903,35 +975,16 @@ class AntiAFK {
   std::atomic<bool> paused_{false};
   std::atomic<bool> shutdown_requested_{false};
 
-  std::atomic<bool> monitor_running_{false};
-  std::atomic<bool> user_active_{false};
-  std::atomic<std::int64_t> last_activity_ms_{0};
-
   std::atomic<bool> test_running_{false};
 
   mutable std::mutex cv_mutex_;
   std::condition_variable cv_;
 
   std::thread antiafk_thread_;
-  std::thread monitor_thread_;
   std::thread test_thread_;
 
   HANDLE multi_instance_mutex_{nullptr};
-
-  mutable std::mutex activity_check_mutex_;
-  std::optional<POINT> last_check_pos_;
-  std::optional<std::uintptr_t> last_check_foreground_;
 };
-
-double AntiAFK::clamp_delay(double d) {
-  if (d < 0.1) {
-    return 0.1;
-  }
-  if (d > 5.0) {
-    return 5.0;
-  }
-  return d;
-}
 
 void AntiAFK::ensure_defaults_locked() {
   py::gil_scoped_acquire acquire;
@@ -947,11 +1000,18 @@ void AntiAFK::ensure_defaults_locked() {
   set_if_missing("multi_instance_enabled", py::bool_(true));
   set_if_missing("antiafk_interval", py::int_(120));
   set_if_missing("antiafk_action", py::str("space"));
-  set_if_missing("antiafk_user_safe", py::bool_(false));
+  set_if_missing("antiafk_alt_delay_ms", py::int_(kDefaultAltDelayMs));
   set_if_missing("antiafk_dev_mode", py::bool_(false));
-  set_if_missing("antiafk_sequential_mode", py::bool_(false));
-  set_if_missing("antiafk_sequential_delay", py::float_(0.75));
   set_if_missing("antiafk_menu_autoreconnect", py::bool_(false));
+
+  // Feature removals: purge stale keys if present so they don't get re-saved.
+  try {
+    config.attr("pop")(py::str("antiafk_user_safe"), py::none());
+    config.attr("pop")(py::str("antiafk_sequential_mode"), py::none());
+    config.attr("pop")(py::str("antiafk_sequential_delay"), py::none());
+  } catch (...) {
+    PyErr_Clear();
+  }
 }
 
 int AntiAFK::get_int(const char* key, int fallback) const {
@@ -970,17 +1030,6 @@ bool AntiAFK::get_bool(const char* key, bool fallback) const {
   try {
     py::object v = config.attr("get")(py::str(key), py::bool_(fallback));
     return py::cast<bool>(v);
-  } catch (...) {
-    PyErr_Clear();
-    return fallback;
-  }
-}
-
-double AntiAFK::get_double(const char* key, double fallback) const {
-  py::gil_scoped_acquire acquire;
-  try {
-    py::object v = config.attr("get")(py::str(key), py::float_(fallback));
-    return py::cast<double>(v);
   } catch (...) {
     PyErr_Clear();
     return fallback;
@@ -1090,7 +1139,10 @@ void AntiAFK::restore_foreground_window_impl(HWND hwnd) {
   clear_notopmost(hwnd);
 }
 
-ActionResult AntiAFK::run_action(HWND hwnd, const std::string& base_action, bool menu_autoreconnect) {
+ActionResult AntiAFK::run_action(HWND hwnd,
+                                 const std::string& base_action,
+                                 bool menu_autoreconnect,
+                                 bool restore_foreground) {
   bool in_menu = false;
   if (menu_autoreconnect && !is_pid_in_menu_callback.is_none()) {
     DWORD pid = 0;
@@ -1099,7 +1151,18 @@ ActionResult AntiAFK::run_action(HWND hwnd, const std::string& base_action, bool
       in_menu = call_is_pid_in_menu(pid);
     }
   }
-  return action_task_impl(hwnd, base_action, menu_autoreconnect, in_menu, &stop_requested_, &shutdown_requested_);
+  const int alt_delay_ms =
+      clamp_alt_delay_ms(get_int("antiafk_alt_delay_ms", kDefaultAltDelayMs));
+  return action_task_impl(
+      hwnd,
+      base_action,
+      menu_autoreconnect,
+      in_menu,
+      alt_delay_ms,
+      &stop_requested_,
+      &shutdown_requested_,
+      &pause_requested_,
+      restore_foreground);
 }
 
 AntiAFK::AntiAFK(py::object parent, py::object config_obj) : parent_(std::move(parent)) {
@@ -1110,9 +1173,6 @@ AntiAFK::AntiAFK(py::object parent, py::object config_obj) : parent_(std::move(p
     config = py::cast<py::dict>(config_obj);
   }
   ensure_defaults_locked();
-  if (get_bool("antiafk_user_safe", false)) {
-    start_activity_monitor();
-  }
 }
 
 AntiAFK::~AntiAFK() { shutdown_noexcept(); }
@@ -1150,9 +1210,7 @@ void AntiAFK::log_error(py::object exception, py::object message_obj) {
 void AntiAFK::apply_host_config(std::optional<bool> multi_instance_enabled,
                                 std::optional<int> interval,
                                 std::optional<std::string> action,
-                                std::optional<bool> user_safe,
-                                std::optional<bool> sequential_mode,
-                                std::optional<double> sequential_delay,
+                                std::optional<int> alt_delay_ms,
                                 std::optional<bool> menu_autoreconnect) {
   py::gil_scoped_acquire acquire;
   if (multi_instance_enabled.has_value()) {
@@ -1164,28 +1222,26 @@ void AntiAFK::apply_host_config(std::optional<bool> multi_instance_enabled,
   if (action.has_value()) {
     config[py::str("antiafk_action")] = py::str(*action);
   }
-  if (user_safe.has_value()) {
-    config[py::str("antiafk_user_safe")] = py::bool_(*user_safe);
-  }
-  if (sequential_mode.has_value()) {
-    config[py::str("antiafk_sequential_mode")] = py::bool_(*sequential_mode);
-  }
-  if (sequential_delay.has_value()) {
-    config[py::str("antiafk_sequential_delay")] = py::float_(clamp_delay(*sequential_delay));
+  if (alt_delay_ms.has_value()) {
+    config[py::str("antiafk_alt_delay_ms")] = py::int_(clamp_alt_delay_ms(*alt_delay_ms));
   }
   if (menu_autoreconnect.has_value()) {
     config[py::str("antiafk_menu_autoreconnect")] = py::bool_(*menu_autoreconnect);
   }
 
-  if (get_bool("antiafk_user_safe", false)) {
-    start_activity_monitor();
-  } else {
-    stop_activity_monitor();
+  // Feature removals: purge stale keys if present so they don't get re-saved.
+  try {
+    config.attr("pop")(py::str("antiafk_user_safe"), py::none());
+    config.attr("pop")(py::str("antiafk_sequential_mode"), py::none());
+    config.attr("pop")(py::str("antiafk_sequential_delay"), py::none());
+  } catch (...) {
+    PyErr_Clear();
   }
 
   std::ostringstream oss;
   oss << "Configuration updated: Interval=" << get_int("antiafk_interval", 120)
-      << "s, Action=" << get_str("antiafk_action", "space");
+      << "s, Action=" << get_str("antiafk_action", "space")
+      << ", AltDelayMs=" << clamp_alt_delay_ms(get_int("antiafk_alt_delay_ms", kDefaultAltDelayMs));
   emit_status(oss.str());
 }
 
@@ -1245,10 +1301,6 @@ void AntiAFK::start_antiafk() {
 
   antiafk_thread_ = std::thread([this] { antiafk_loop_thread(); });
 
-  if (get_bool("antiafk_user_safe", false)) {
-    start_activity_monitor();
-  }
-
   emit_status("Anti-AFK started");
   emit_button_state(true);
 }
@@ -1273,7 +1325,9 @@ void AntiAFK::stop_antiafk() {
   }
 
   antiafk_running_.store(false);
-  stop_activity_monitor();
+  stop_requested_.store(false);
+  pause_requested_.store(false);
+  paused_.store(false);
   cleanup_topmost_after_error("stop", /*emit=*/false);
 
   emit_status("Anti-AFK stopped");
@@ -1407,7 +1461,9 @@ void AntiAFK::hide_roblox_windows() {
   emit_status("Hid " + std::to_string(windows.size()) + " Roblox window(s)");
 }
 
-bool AntiAFK::perform_antiafk_action(std::uint64_t hwnd_int, std::optional<std::string> action_type) {
+bool AntiAFK::perform_antiafk_action(std::uint64_t hwnd_int,
+                                     std::optional<std::string> action_type,
+                                     bool restore_foreground) {
   const std::string base_action = action_type.value_or(get_str("antiafk_action", "space"));
   const bool menu_autoreconnect = get_bool("antiafk_menu_autoreconnect", false);
 
@@ -1415,7 +1471,7 @@ bool AntiAFK::perform_antiafk_action(std::uint64_t hwnd_int, std::optional<std::
   {
     py::gil_scoped_release release;
     const HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(hwnd_int));
-    res = run_action(hwnd, base_action, menu_autoreconnect);
+    res = run_action(hwnd, base_action, menu_autoreconnect, restore_foreground);
   }
 
   if (!res.ok && !res.message.empty()) {
@@ -1426,6 +1482,7 @@ bool AntiAFK::perform_antiafk_action(std::uint64_t hwnd_int, std::optional<std::
 
 void AntiAFK::test_action() {
   const std::string action = get_str("antiafk_action", "space");
+  const bool menu_autoreconnect = get_bool("antiafk_menu_autoreconnect", false);
   std::vector<std::uint64_t> windows = find_roblox_windows(true);
   if (windows.empty()) {
     emit_status("No Roblox windows found for testing");
@@ -1442,7 +1499,11 @@ void AntiAFK::test_action() {
                 std::to_string(w) + ")");
     for (int j = 0; j < 3; ++j) {
       emit_status("Action attempt " + std::to_string(j + 1) + "/3...");
-      if (!perform_antiafk_action(w, action)) {
+      const ActionResult res = run_action(hwnd, action, menu_autoreconnect, /*restore_foreground=*/false);
+      if (!res.ok) {
+        if (!res.message.empty()) {
+          emit_status(res.message);
+        }
         emit_status("Action failed, aborting remaining attempts");
         break;
       }
@@ -1558,7 +1619,7 @@ void AntiAFK::run_test_thread(std::vector<std::uint64_t> windows) {
     emit_status("Testing on window " + std::to_string(i + 1) + "/" + std::to_string(windows.size()) +
                 ": '" + wide_to_utf8(window_text(hwnd)) + "'");
     emit_status("===== DIRECT METHOD WITH MapVirtualKey =====");
-    const ActionResult res = run_action(hwnd, action_type, menu_autoreconnect);
+    const ActionResult res = run_action(hwnd, action_type, menu_autoreconnect, /*restore_foreground=*/false);
     if (!res.ok && !res.message.empty()) {
       emit_status(res.message);
     }
@@ -1569,85 +1630,6 @@ void AntiAFK::run_test_thread(std::vector<std::uint64_t> windows) {
   if (old_hwnd && ::IsWindow(old_hwnd)) {
     ::SetForegroundWindow(old_hwnd);
   }
-}
-
-void AntiAFK::start_activity_monitor() {
-  if (monitor_running_.load() || shutdown_requested_.load()) {
-    return;
-  }
-  monitor_running_.store(true);
-  user_active_.store(false);
-  last_activity_ms_.store(mono_ms());
-  monitor_thread_ = std::thread([this] { monitor_user_activity_thread(); });
-  emit_status("User activity monitoring started");
-}
-
-void AntiAFK::stop_activity_monitor() {
-  if (!monitor_running_.load()) {
-    return;
-  }
-  monitor_running_.store(false);
-  cv_.notify_all();
-
-  std::thread t = std::move(monitor_thread_);
-  {
-    py::gil_scoped_release release;
-    if (t.joinable()) {
-      t.join();
-    }
-  }
-  emit_status("User activity monitoring stopped");
-}
-
-bool AntiAFK::check_user_active() {
-  std::lock_guard<std::mutex> g(activity_check_mutex_);
-
-  POINT current_pos{};
-  if (::GetCursorPos(&current_pos)) {
-    if (last_check_pos_.has_value() &&
-        (current_pos.x != last_check_pos_->x || current_pos.y != last_check_pos_->y)) {
-      last_check_pos_ = current_pos;
-      return true;
-    }
-    last_check_pos_ = current_pos;
-  }
-
-  const int game_keys[] = {
-      0x20,  // SPACE
-      0x57,  // W
-      0x41,  // A
-      0x53,  // S
-      0x44,  // D
-      0x45,  // E
-      0x52,  // R
-      0x51,  // Q
-      0x46,  // F
-      0x51,  // Q
-      0x31, 0x32, 0x33, 0x34, 0x35, 0x36,  // 1-6
-      0x10,  // SHIFT
-      0x11,  // CTRL
-  };
-  for (int key : game_keys) {
-    if ((::GetAsyncKeyState(key) & 0x8000) != 0) {
-      return true;
-    }
-  }
-
-  const int mouse_buttons[] = {0x01, 0x02, 0x04};
-  for (int button : mouse_buttons) {
-    if ((::GetKeyState(button) & 0x8000) != 0) {
-      return true;
-    }
-  }
-
-  const HWND fg = ::GetForegroundWindow();
-  const std::uintptr_t fg_int = reinterpret_cast<std::uintptr_t>(fg);
-  if (last_check_foreground_.has_value() && fg_int != *last_check_foreground_) {
-    last_check_foreground_ = fg_int;
-    return true;
-  }
-  last_check_foreground_ = fg_int;
-  return false;
 }
 
 bool AntiAFK::is_window_fullscreen(std::uint64_t hwnd_int) {
@@ -1684,24 +1666,17 @@ void AntiAFK::antiafk_loop_thread() {
 
     int interval = get_int("antiafk_interval", 120);
     std::string action_type = get_str("antiafk_action", "space");
-    bool user_safe = get_bool("antiafk_user_safe", false);
-    bool sequential_mode = get_bool("antiafk_sequential_mode", false);
-    double sequential_delay = clamp_delay(get_double("antiafk_sequential_delay", 0.75));
+    bool menu_autoreconnect = get_bool("antiafk_menu_autoreconnect", false);
+    const int alt_delay_ms =
+        clamp_alt_delay_ms(get_int("antiafk_alt_delay_ms", kDefaultAltDelayMs));
 
-    emit_status("Settings: Interval=" + std::to_string(interval) + "s, Action=" + action_type +
-                ", True-AFK=" + std::string(user_safe ? "True" : "False") +
-                ", Sequential=" + std::string(sequential_mode ? "True" : "False"));
-
-    if (user_safe) {
-      emit_status("True-AFK mode: Will wait for inactivity or max " +
-                  std::to_string(kMaxWaitTimeS / 60) + " minutes since last action");
-      if (last_activity_ms_.load() == 0) {
-        last_activity_ms_.store(mono_ms());
-      }
-    }
+    emit_status(
+        "Settings: Interval=" + std::to_string(interval) + "s, Action=" + action_type +
+        ", AltDelayMs=" + std::to_string(alt_delay_ms) +
+        ", MenuAutoReconnect=" + std::string(menu_autoreconnect ? "True" : "False"));
 
     auto last_action_time = Clock::now() - std::chrono::seconds(std::max(0, interval - 10));
-    auto last_status_update = Clock::now() - std::chrono::seconds(kActivityStatusEveryS + 1);
+    auto last_status_update = Clock::now() - std::chrono::seconds(kNoWindowsStatusEveryS + 1);
     std::optional<Clock::time_point> pause_started;
 
     while (!stop_requested_.load() && !shutdown_requested_.load()) {
@@ -1733,77 +1708,32 @@ void AntiAFK::antiafk_loop_thread() {
 
       interval = get_int("antiafk_interval", interval);
       action_type = get_str("antiafk_action", action_type);
-      user_safe = get_bool("antiafk_user_safe", user_safe);
-      sequential_mode = get_bool("antiafk_sequential_mode", sequential_mode);
-      sequential_delay = clamp_delay(get_double("antiafk_sequential_delay", sequential_delay));
+      menu_autoreconnect = get_bool("antiafk_menu_autoreconnect", menu_autoreconnect);
 
       const auto now = Clock::now();
-      std::vector<std::uint64_t> windows = find_roblox_windows_impl(true);
-
-      if (windows.empty()) {
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_status_update).count() >
-            kNoWindowsStatusEveryS) {
-          emit_status("No Roblox windows found, waiting...");
-          last_status_update = now;
-        }
-        if (wait_for_stop_or_pause(std::chrono::seconds(kNoWindowsWaitS))) {
-          break;
-        }
-        continue;
-      }
 
       const double elapsed_s =
           std::chrono::duration_cast<std::chrono::duration<double>>(now - last_action_time).count();
 
-      const HWND foreground = ::GetForegroundWindow();
+      if (elapsed_s >= static_cast<double>(interval)) {
+        std::vector<std::uint64_t> windows = find_roblox_windows_impl(true);
 
-      if (user_safe &&
-          std::chrono::duration_cast<std::chrono::seconds>(now - last_status_update).count() >
-              kActivityStatusEveryS) {
-        const bool active_now = check_user_active();
-        if (active_now) {
-          const int wait_time = std::max(0, kMaxWaitTimeS - static_cast<int>(elapsed_s));
-          emit_status("User is active. Next action in " + std::to_string(wait_time) +
-                      "s max or when inactive.");
-        } else {
-          const int inactivity = static_cast<int>((mono_ms() - last_activity_ms_.load()) / 1000);
-          const int due_in = std::max(0, interval - static_cast<int>(elapsed_s));
-          emit_status("User inactive for " + std::to_string(inactivity) +
-                      "s. Action due in " + std::to_string(due_in) + "s.");
-        }
-        last_status_update = now;
-      }
-
-      bool perform_action = false;
-      if (user_safe) {
-        const int inactivity = static_cast<int>((mono_ms() - last_activity_ms_.load()) / 1000);
-        if (inactivity >= kUserInactivityWaitS && elapsed_s >= static_cast<double>(interval)) {
-          emit_status("User inactive for " + std::to_string(inactivity) +
-                      "s and interval elapsed - performing action");
-          perform_action = true;
-        }
-        if (elapsed_s >= static_cast<double>(kMaxWaitTimeS)) {
-          emit_status("Maximum wait time reached (" + std::to_string(kMaxWaitTimeS / 60) +
-                      " min since last action) - performing action");
-          perform_action = true;
-        }
-      } else {
-        if (elapsed_s >= static_cast<double>(interval)) {
-          perform_action = true;
-        }
-      }
-
-      if (perform_action) {
-        const bool use_sequential = sequential_mode && windows.size() >= 5;
-        if (use_sequential) {
-          emit_status("Performing SEQUENTIAL Anti-AFK actions on " + std::to_string(windows.size()) +
-                      " Roblox window(s)");
-        } else {
-          emit_status("Performing Anti-AFK action on " + std::to_string(windows.size()) +
-                      " Roblox window(s)");
+        if (windows.empty()) {
+          if (std::chrono::duration_cast<std::chrono::seconds>(now - last_status_update).count() >
+              kNoWindowsStatusEveryS) {
+            emit_status("No Roblox windows found, waiting...");
+            last_status_update = now;
+          }
+          if (wait_for_stop_or_pause(std::chrono::seconds(kNoWindowsWaitS))) {
+            break;
+          }
+          continue;
         }
 
-        const bool menu_autoreconnect = get_bool("antiafk_menu_autoreconnect", false);
+        const HWND foreground = ::GetForegroundWindow();
+
+        emit_status("Performing Anti-AFK action on " + std::to_string(windows.size()) +
+                    " Roblox window(s)");
         bool action_success = true;
 
         for (size_t i = 0; i < windows.size(); ++i) {
@@ -1815,18 +1745,11 @@ void AntiAFK::antiafk_loop_thread() {
           }
           const std::uint64_t hwnd_int = windows[i];
           const HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(hwnd_int));
-          const ActionResult res = run_action(hwnd, action_type, menu_autoreconnect);
+          const ActionResult res = run_action(hwnd, action_type, menu_autoreconnect, /*restore_foreground=*/false);
           if (!res.ok) {
             action_success = false;
             if (!res.message.empty()) {
               emit_status(res.message);
-            }
-          }
-
-          if (use_sequential && i + 1 < windows.size()) {
-            const int delay_ms = static_cast<int>(clamp_delay(sequential_delay) * 1000.0);
-            if (wait_for_stop_or_pause(std::chrono::milliseconds(delay_ms))) {
-              break;
             }
           }
         }
@@ -1874,111 +1797,6 @@ void AntiAFK::antiafk_loop_thread() {
   emit_button_state(false);
 }
 
-void AntiAFK::monitor_user_activity_thread() {
-  try {
-    emit_status("User activity monitoring started - True-AFK mode active");
-
-    constexpr int kMouseCheckIntervalMs = 500;
-    const int mouse_buttons[] = {0x01, 0x02, 0x04};
-    bool last_button_states[3] = {false, false, false};
-
-    POINT last_mouse_pos{};
-    (void)::GetCursorPos(&last_mouse_pos);
-    std::int64_t last_pos_check = mono_ms();
-    std::int64_t last_activity_logged = 0;
-    std::int64_t last_inactivity_logged = 0;
-    std::optional<std::uintptr_t> last_fg;
-
-    while (monitor_running_.load() && !shutdown_requested_.load()) {
-      bool activity = false;
-      const std::int64_t now = mono_ms();
-
-      const int quick_keys[] = {0x08, 0x09, 0x0D, 0x10, 0x11, 0x12, 0x20, 0x25, 0x26, 0x27, 0x28};
-      for (int key : quick_keys) {
-        if ((::GetAsyncKeyState(key) & 0x8000) != 0) {
-          activity = true;
-          break;
-        }
-      }
-
-      if (!activity) {
-        for (int i = 65; i <= 90; ++i) {
-          if ((::GetAsyncKeyState(i) & 0x8000) != 0) {
-            activity = true;
-            break;
-          }
-        }
-      }
-
-      if (!activity) {
-        for (int i = 48; i <= 57; ++i) {
-          if ((::GetAsyncKeyState(i) & 0x8000) != 0) {
-            activity = true;
-            break;
-          }
-        }
-      }
-
-      if (!activity) {
-        for (size_t i = 0; i < 3; ++i) {
-          const int button = mouse_buttons[i];
-          const bool down = (::GetKeyState(button) & 0x8000) != 0;
-          if (down) {
-            activity = true;
-            last_button_states[i] = true;
-            break;
-          }
-          if (last_button_states[i]) {
-            last_button_states[i] = false;
-            activity = true;
-            break;
-          }
-        }
-      }
-
-      if (!activity && (now - last_pos_check) >= kMouseCheckIntervalMs) {
-        POINT cur{};
-        if (::GetCursorPos(&cur)) {
-          if (cur.x != last_mouse_pos.x || cur.y != last_mouse_pos.y) {
-            activity = true;
-          }
-          last_mouse_pos = cur;
-        }
-        last_pos_check = now;
-      }
-
-      if (!activity) {
-        const std::uintptr_t fg = reinterpret_cast<std::uintptr_t>(::GetForegroundWindow());
-        if (last_fg.has_value() && fg != *last_fg) {
-          activity = true;
-        }
-        last_fg = fg;
-      }
-
-      if (activity) {
-        last_activity_ms_.store(now);
-        if (!user_active_.load() && (now - last_activity_logged) > 10000) {
-          emit_status("User activity detected");
-          last_activity_logged = now;
-        }
-        user_active_.store(true);
-      } else {
-        const int inactivity = static_cast<int>((now - last_activity_ms_.load()) / 1000);
-        if (inactivity >= kUserInactivityWaitS) {
-          if (user_active_.load() && (now - last_inactivity_logged) > 10000) {
-            emit_status("User inactive for " + std::to_string(inactivity) + " seconds");
-            last_inactivity_logged = now;
-          }
-          user_active_.store(false);
-        }
-      }
-
-      (void)wait_for_shutdown_or(std::chrono::milliseconds(20));
-    }
-  } catch (...) {
-  }
-}
-
 void AntiAFK::shutdown() {
   shutdown_impl(/*emit=*/false);
 }
@@ -1988,20 +1806,15 @@ void AntiAFK::shutdown_impl(bool emit) {
   stop_requested_.store(true);
   pause_requested_.store(false);
   paused_.store(false);
-  monitor_running_.store(false);
   cv_.notify_all();
 
   std::thread t1 = std::move(antiafk_thread_);
-  std::thread t2 = std::move(monitor_thread_);
   std::thread t3 = std::move(test_thread_);
 
   {
     py::gil_scoped_release release;
     if (t1.joinable()) {
       t1.join();
-    }
-    if (t2.joinable()) {
-      t2.join();
     }
     if (t3.joinable()) {
       t3.join();
@@ -2044,6 +1857,7 @@ PYBIND11_MODULE(antiafk_native, m) {
       py::arg("base_action"),
       py::arg("menu_autoreconnect") = false,
       py::arg("in_menu") = false,
+      py::arg("alt_delay_ms") = std::nullopt,
       "Perform one Anti-AFK action for the given window handle.\n\n"
       "Returns (success: bool, message: str).");
 
@@ -2082,9 +1896,7 @@ PYBIND11_MODULE(antiafk_native, m) {
            py::arg("multi_instance_enabled") = std::nullopt,
            py::arg("interval") = std::nullopt,
            py::arg("action") = std::nullopt,
-           py::arg("user_safe") = std::nullopt,
-           py::arg("sequential_mode") = std::nullopt,
-           py::arg("sequential_delay") = std::nullopt,
+           py::arg("alt_delay_ms") = std::nullopt,
            py::arg("menu_autoreconnect") = std::nullopt)
       .def("toggle_antiafk", &AntiAFK::toggle_antiafk, py::arg("enable") = py::none())
       .def("start_antiafk", &AntiAFK::start_antiafk)
@@ -2098,12 +1910,10 @@ PYBIND11_MODULE(antiafk_native, m) {
       .def("perform_antiafk_action",
            &AntiAFK::perform_antiafk_action,
            py::arg("hwnd"),
-           py::arg("action_type") = std::nullopt)
+           py::arg("action_type") = std::nullopt,
+           py::arg("restore_foreground") = true)
       .def("test_action", &AntiAFK::test_action)
       .def("test_action_with_delay", &AntiAFK::test_action_with_delay)
-      .def("start_activity_monitor", &AntiAFK::start_activity_monitor)
-      .def("stop_activity_monitor", &AntiAFK::stop_activity_monitor)
-      .def("check_user_active", &AntiAFK::check_user_active)
       .def("is_window_fullscreen", &AntiAFK::is_window_fullscreen, py::arg("hwnd"))
       .def("restore_foreground_window", &AntiAFK::restore_foreground_window, py::arg("hwnd"))
       .def("enable_multi_instance", &AntiAFK::enable_multi_instance)
