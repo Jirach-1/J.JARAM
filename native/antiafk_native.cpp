@@ -21,6 +21,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -28,7 +29,16 @@ namespace py = pybind11;
 
 namespace {
 
-constexpr int kActionDelayMs = 30;
+constexpr int kActionDelayMs = 5;
+constexpr int kWindowTextTimeoutMsDefault = 150;
+constexpr int kWindowTextTimeoutMsFast = 40;
+constexpr size_t kFastSweepWindowThreshold = 40;
+constexpr int kFocusAttemptsDefault = 40;
+constexpr int kFocusAttemptsFast = 12;
+constexpr int kFocusSleepMsDefault = 25;
+constexpr int kFocusSleepMsFast = 8;
+constexpr int kPressFocusAttemptsDefault = 20;
+constexpr int kPressFocusAttemptsFast = 6;
 constexpr int kDefaultAltDelayMs = 400;
 constexpr int kMinAltDelayMs = 10;
 constexpr int kMaxAltDelayMs = 5000;
@@ -95,7 +105,7 @@ std::string wide_to_utf8(std::wstring_view w) {
   return out;
 }
 
-std::wstring window_text(HWND hwnd, bool* timed_out = nullptr) {
+std::wstring window_text(HWND hwnd, bool* timed_out = nullptr, int timeout_ms = kWindowTextTimeoutMsDefault) {
   if (!hwnd || !::IsWindow(hwnd)) {
     return {};
   }
@@ -104,7 +114,7 @@ std::wstring window_text(HWND hwnd, bool* timed_out = nullptr) {
   }
   // NOTE: Avoid GetWindowTextLengthW/GetWindowTextW for out-of-process windows; they can hang when
   // the target is throttled/unresponsive. Use a bounded SendMessageTimeout instead.
-  constexpr int kTimeoutMs = 150;
+  const int kTimeoutMs = std::max(1, timeout_ms);
   constexpr size_t kMaxChars = 1024;
   std::wstring out;
   out.resize(kMaxChars);
@@ -346,9 +356,11 @@ bool focus_window_best_effort(HWND hwnd, DWORD window_tid) {
     ThreadInputAttachGuard attach_target(current_tid, window_tid);
     ThreadInputAttachGuard attach_foreground(current_tid, foreground_tid);
 
+    (void)::ShowWindow(hwnd, SW_SHOW);
     (void)::BringWindowToTop(hwnd);
     (void)::SetForegroundWindow(hwnd);
     (void)::SetActiveWindow(hwnd);
+    (void)::SetFocus(hwnd);
 
     if (::GetForegroundWindow() == hwnd) {
       return true;
@@ -358,6 +370,17 @@ bool focus_window_best_effort(HWND hwnd, DWORD window_tid) {
     (void)::BringWindowToTop(hwnd);
     (void)::SetForegroundWindow(hwnd);
     (void)::SetActiveWindow(hwnd);
+    (void)::SetFocus(hwnd);
+    if (::GetForegroundWindow() == hwnd) {
+      return true;
+    }
+
+    // Deprecated but still effective in some focus-lock scenarios.
+    (void)::SwitchToThisWindow(hwnd, TRUE);
+    (void)::BringWindowToTop(hwnd);
+    (void)::SetForegroundWindow(hwnd);
+    (void)::SetActiveWindow(hwnd);
+    (void)::SetFocus(hwnd);
     return ::GetForegroundWindow() == hwnd;
   };
 
@@ -367,39 +390,94 @@ bool focus_window_best_effort(HWND hwnd, DWORD window_tid) {
   return attempt(true);
 }
 
+bool foreground_matches_target(HWND target_hwnd, DWORD target_pid) {
+  const HWND fg = ::GetForegroundWindow();
+  if (fg == target_hwnd) {
+    return true;
+  }
+  if (!fg || !::IsWindow(fg) || target_pid == 0) {
+    return false;
+  }
+  DWORD fg_pid = 0;
+  (void)::GetWindowThreadProcessId(fg, &fg_pid);
+  if (fg_pid != target_pid) {
+    return false;
+  }
+  const LONG_PTR exstyle = ::GetWindowLongPtrW(fg, GWL_EXSTYLE);
+  if (exstyle & WS_EX_NOACTIVATE) {
+    return false;
+  }
+  if (exstyle & WS_EX_TOOLWINDOW) {
+    return false;
+  }
+  if (::GetWindow(fg, GW_OWNER) != nullptr) {
+    return false;
+  }
+  const std::wstring fg_cls = window_class_name(fg);
+  if (is_probably_ime_window(L"", fg_cls)) {
+    return false;
+  }
+  return true;
+}
+
 bool ensure_foreground(HWND hwnd,
                        DWORD window_tid,
+                       DWORD window_pid,
                        int attempts,
                        int sleep_ms,
                        const std::atomic<bool>* stop_requested,
                        const std::atomic<bool>* shutdown_requested,
-                       const std::atomic<bool>* pause_requested = nullptr) {
+                       const std::atomic<bool>* pause_requested = nullptr,
+                       int* out_attempts_used = nullptr) {
+  int attempts_used = 0;
   for (int i = 0; i < attempts; ++i) {
+    attempts_used = i + 1;
     if (should_abort(stop_requested, shutdown_requested, pause_requested)) {
+      if (out_attempts_used) {
+        *out_attempts_used = attempts_used;
+      }
       return false;
     }
+    if (foreground_matches_target(hwnd, window_pid)) {
+      if (out_attempts_used) {
+        *out_attempts_used = attempts_used;
+      }
+      return true;
+    }
     if (focus_window_best_effort(hwnd, window_tid)) {
+      if (out_attempts_used) {
+        *out_attempts_used = attempts_used;
+      }
+      if (foreground_matches_target(hwnd, window_pid)) {
+        return true;
+      }
       return true;
     }
     sleep_abortable(sleep_ms, stop_requested, shutdown_requested, pause_requested);
   }
-  return ::GetForegroundWindow() == hwnd;
+  if (out_attempts_used) {
+    *out_attempts_used = attempts_used;
+  }
+  return foreground_matches_target(hwnd, window_pid);
 }
 
 bool press_key_defensive(HWND hwnd,
-                         DWORD window_tid,
-                         int vk_code,
-                         int delay_ms,
-                         const std::atomic<bool>* stop_requested,
-                         const std::atomic<bool>* shutdown_requested,
-                         const std::atomic<bool>* pause_requested = nullptr) {
-  constexpr int kFocusAttempts = 20;
-  constexpr int kFocusSleepMs = 25;
+                          DWORD window_tid,
+                          DWORD window_pid,
+                          int vk_code,
+                          int delay_ms,
+                          bool fast_focus,
+                          const std::atomic<bool>* stop_requested,
+                          const std::atomic<bool>* shutdown_requested,
+                          const std::atomic<bool>* pause_requested = nullptr) {
+  const int focus_attempts = fast_focus ? kPressFocusAttemptsFast : kPressFocusAttemptsDefault;
+  const int focus_sleep_ms = fast_focus ? kFocusSleepMsFast : kFocusSleepMsDefault;
 
   if (!ensure_foreground(hwnd,
                          window_tid,
-                         kFocusAttempts,
-                         kFocusSleepMs,
+                         window_pid,
+                         focus_attempts,
+                         focus_sleep_ms,
                          stop_requested,
                          shutdown_requested,
                          pause_requested)) {
@@ -410,7 +488,10 @@ bool press_key_defensive(HWND hwnd,
   sleep_abortable(delay_ms, stop_requested, shutdown_requested, pause_requested);
 
   // Best-effort: try to ensure the window is still foreground before releasing.
-  (void)ensure_foreground(hwnd, window_tid, 2, kFocusSleepMs, stop_requested, shutdown_requested, pause_requested);
+  if (!fast_focus) {
+    (void)ensure_foreground(
+        hwnd, window_tid, window_pid, 2, focus_sleep_ms, stop_requested, shutdown_requested, pause_requested);
+  }
   key_event_up(vk_code);
   return true;
 }
@@ -428,11 +509,19 @@ ActionResult action_task_impl(HWND hwnd,
                               const std::atomic<bool>* stop_requested = nullptr,
                               const std::atomic<bool>* shutdown_requested = nullptr,
                               const std::atomic<bool>* pause_requested = nullptr,
-                              bool restore_foreground = true) {
+                              bool restore_foreground = true,
+                              bool fast_focus = false,
+                              int* out_focus_ms = nullptr,
+                              int* out_focus_attempts = nullptr,
+                              int* out_total_ms = nullptr) {
   ActionResult out;
+  const auto start_ts = Clock::now();
   const std::uint64_t hwnd_int = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(hwnd));
   const std::string effective_action = (menu_autoreconnect && in_menu) ? "AutoReconnect" : base_action;
   const int alt_delay = clamp_alt_delay_ms(alt_delay_ms);
+  const int focus_attempts = fast_focus ? kFocusAttemptsFast : kFocusAttemptsDefault;
+  const int focus_sleep_ms = fast_focus ? kFocusSleepMsFast : kFocusSleepMsDefault;
+  const int action_delay_ms = fast_focus ? 0 : kActionDelayMs;
 
   const auto aborting = [&]() -> bool {
     return should_abort(stop_requested, shutdown_requested, pause_requested);
@@ -466,10 +555,10 @@ ActionResult action_task_impl(HWND hwnd,
   }
 
   const std::wstring cls = window_class_name(hwnd);
-  const std::wstring wtitle = window_text(hwnd);
-  if (is_probably_ime_window(wtitle, cls)) {
+  if (is_probably_ime_window(L"", cls)) {
     out.ok = false;
-    out.message = "Window '" + wide_to_utf8(wtitle) + "' is not a valid Roblox game window";
+    out.message = "Window (handle: " + std::to_string(hwnd_int) + ", class: '" + wide_to_utf8(cls) +
+                  "') is not a valid Roblox game window";
     return out;
   }
 
@@ -483,15 +572,30 @@ ActionResult action_task_impl(HWND hwnd,
       ::ShowWindow(hwnd, SW_RESTORE);
     }
 
+    const auto focus_start_ts = Clock::now();
+    int focus_attempts_used = 0;
     if (!ensure_foreground(hwnd,
                            window_tid,
-                           /*attempts=*/40,
-                           /*sleep_ms=*/25,
+                           window_pid,
+                           focus_attempts,
+                           focus_sleep_ms,
                            stop_requested,
                            shutdown_requested,
-                           pause_requested)) {
+                           pause_requested,
+                           &focus_attempts_used)) {
       out.ok = false;
       if (aborting()) {
+        if (out_focus_ms) {
+          *out_focus_ms = static_cast<int>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - focus_start_ts).count());
+        }
+        if (out_focus_attempts) {
+          *out_focus_attempts = focus_attempts_used;
+        }
+        if (out_total_ms) {
+          *out_total_ms = static_cast<int>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start_ts).count());
+        }
         return out;
       }
       const HWND fg = ::GetForegroundWindow();
@@ -512,14 +616,42 @@ ActionResult action_task_impl(HWND hwnd,
       } else {
         out.message = "Failed to focus target window for Anti-AFK action";
       }
+      if (out_focus_ms) {
+        *out_focus_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - focus_start_ts).count());
+      }
+      if (out_focus_attempts) {
+        *out_focus_attempts = focus_attempts_used;
+      }
+      if (out_total_ms) {
+        *out_total_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start_ts).count());
+      }
       return out;
     }
+    if (out_focus_ms) {
+      *out_focus_ms = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - focus_start_ts).count());
+    }
+    if (out_focus_attempts) {
+      *out_focus_attempts = focus_attempts_used;
+    }
 
-    sleep_abortable(kActionDelayMs, stop_requested, shutdown_requested, pause_requested);
+    if (action_delay_ms > 0) {
+      sleep_abortable(action_delay_ms, stop_requested, shutdown_requested, pause_requested);
+    }
 
     const auto press_key = [&](int vk_code, int delay_ms) {
       return press_key_defensive(
-          hwnd, window_tid, vk_code, delay_ms, stop_requested, shutdown_requested, pause_requested);
+          hwnd,
+          window_tid,
+          window_pid,
+          vk_code,
+          delay_ms,
+          fast_focus,
+          stop_requested,
+          shutdown_requested,
+          pause_requested);
     };
 
     if (effective_action == "space") {
@@ -613,7 +745,9 @@ ActionResult action_task_impl(HWND hwnd,
       return out;
     }
 
-    sleep_abortable(kActionDelayMs, stop_requested, shutdown_requested, pause_requested);
+    if (action_delay_ms > 0) {
+      sleep_abortable(action_delay_ms, stop_requested, shutdown_requested, pause_requested);
+    }
 
     if (was_minimized) {
       ::ShowWindow(hwnd, SW_MINIMIZE);
@@ -645,9 +779,13 @@ ActionResult action_task_impl(HWND hwnd,
       }
     }
 
-    out.ok = true;
-    out.message = "Performed " + effective_action + " action on '" + wide_to_utf8(wtitle) + "'";
-    return out;
+     out.ok = true;
+     out.message = "Performed " + effective_action + " action";
+     if (out_total_ms) {
+       *out_total_ms = static_cast<int>(
+           std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start_ts).count());
+     }
+     return out;
   } catch (const std::exception& e) {
     if (was_minimized) {
       ::ShowWindow(hwnd, SW_MINIMIZE);
@@ -655,9 +793,15 @@ ActionResult action_task_impl(HWND hwnd,
     if (restore_foreground && !aborting() && old_hwnd && ::IsWindow(old_hwnd)) {
       (void)::SetForegroundWindow(old_hwnd);
     }
+    const std::string wtitle = wide_to_utf8(window_text(hwnd));
     out.ok = false;
-    out.message = "Error performing anti-AFK action on '" + wide_to_utf8(wtitle) + "': " +
-                  std::string(e.what());
+    out.message =
+        "Error performing anti-AFK action on window " + std::to_string(hwnd_int) +
+        (wtitle.empty() ? "" : " ('" + wtitle + "')") + ": " + std::string(e.what());
+    if (out_total_ms) {
+      *out_total_ms = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start_ts).count());
+    }
     return out;
   } catch (...) {
     if (was_minimized) {
@@ -666,8 +810,14 @@ ActionResult action_task_impl(HWND hwnd,
     if (restore_foreground && !aborting() && old_hwnd && ::IsWindow(old_hwnd)) {
       (void)::SetForegroundWindow(old_hwnd);
     }
+    const std::string wtitle = wide_to_utf8(window_text(hwnd));
     out.ok = false;
-    out.message = "Error performing anti-AFK action on '" + wide_to_utf8(wtitle) + "': unknown error";
+    out.message = "Error performing anti-AFK action on window " + std::to_string(hwnd_int) +
+                  (wtitle.empty() ? "" : " ('" + wtitle + "')") + ": unknown error";
+    if (out_total_ms) {
+      *out_total_ms = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start_ts).count());
+    }
     return out;
   }
 }
@@ -694,6 +844,7 @@ struct FindEnumData {
   };
 
   bool include_hidden{true};
+  int text_timeout_ms{kWindowTextTimeoutMsDefault};
   std::unordered_map<DWORD, bool> roblox_pid_cache;
   std::unordered_map<DWORD, Best> best_by_pid;
 };
@@ -812,7 +963,7 @@ BOOL CALLBACK enum_find_roblox_windows(HWND hwnd, LPARAM lparam) {
 
   const std::wstring cls = window_class_name(hwnd);
   bool title_timed_out = false;
-  const std::wstring title = window_text(hwnd, &title_timed_out);
+  const std::wstring title = window_text(hwnd, &title_timed_out, data->text_timeout_ms);
 
   if (is_probably_ime_window(title, cls)) {
     return TRUE;
@@ -839,9 +990,10 @@ BOOL CALLBACK enum_find_roblox_windows(HWND hwnd, LPARAM lparam) {
   return TRUE;
 }
 
-std::vector<std::uint64_t> find_roblox_windows_impl(bool include_hidden) {
+std::vector<std::uint64_t> find_roblox_windows_impl(bool include_hidden, int text_timeout_ms) {
   FindEnumData data;
   data.include_hidden = include_hidden;
+  data.text_timeout_ms = std::max(1, text_timeout_ms);
   ::EnumWindows(enum_find_roblox_windows, reinterpret_cast<LPARAM>(&data));
 
   // Return at most one hwnd per Roblox PID (the best-scoring candidate).
@@ -865,12 +1017,12 @@ std::vector<std::uint64_t> find_roblox_windows_impl(bool include_hidden) {
 
 std::vector<std::uint64_t> find_roblox_windows(bool include_hidden) {
   py::gil_scoped_release release;
-  return find_roblox_windows_impl(include_hidden);
+  return find_roblox_windows_impl(include_hidden, kWindowTextTimeoutMsDefault);
 }
 
 int clear_notopmost_all_roblox_windows_impl() {
   // Only operate on the main/primary Roblox window per PID.
-  const std::vector<std::uint64_t> windows = find_roblox_windows_impl(true);
+  const std::vector<std::uint64_t> windows = find_roblox_windows_impl(true, kWindowTextTimeoutMsDefault);
   int count = 0;
   for (std::uint64_t w : windows) {
     const HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w));
@@ -898,7 +1050,11 @@ class AntiAFK {
 
   py::object status_callback = py::none();
   py::object button_state_callback = py::none();
+  py::object touch_callback = py::none();
+  py::object pre_action_callback = py::none();
   py::object is_pid_in_menu_callback = py::none();
+  py::object bes_hold_unthrottled_callback = py::none();
+  py::object bes_release_hold_callback = py::none();
 
   py::dict config;
 
@@ -907,6 +1063,9 @@ class AntiAFK {
   void update_status(const std::string& message);
   void update_button_states();
   void log_error(py::object exception, py::object message_obj = py::none());
+
+  void touch_pids(const std::vector<int>& pids);
+  void set_pids_disconnected(const std::vector<int>& pids, bool disconnected = true);
 
   void apply_host_config(std::optional<bool> multi_instance_enabled = std::nullopt,
                          std::optional<int> interval = std::nullopt,
@@ -944,12 +1103,18 @@ class AntiAFK {
 
   int get_int(const char* key, int fallback) const;
   bool get_bool(const char* key, bool fallback) const;
+  double get_double(const char* key, double fallback) const;
   std::string get_str(const char* key, std::string fallback) const;
 
   void emit_status(const std::string& message);
   void emit_button_state(bool running);
+  void emit_touch(DWORD pid);
+  void emit_pre_action(double seconds_until_action);
+  void sort_windows_by_touch(std::vector<std::uint64_t>& windows);
 
   bool call_is_pid_in_menu(DWORD pid);
+  bool call_bes_hold_unthrottled(const std::vector<int>& pids, double seconds);
+  void call_bes_release_hold(const std::vector<int>& pids);
   bool wait_for_stop_or(std::chrono::milliseconds d);
   bool wait_for_stop_or_pause(std::chrono::milliseconds d);
   bool wait_for_shutdown_or(std::chrono::milliseconds d);
@@ -959,7 +1124,8 @@ class AntiAFK {
   ActionResult run_action(HWND hwnd,
                           const std::string& base_action,
                           bool menu_autoreconnect,
-                          bool restore_foreground = true);
+                          bool restore_foreground = true,
+                          bool fast_focus = false);
 
   void antiafk_loop_thread();
   void run_test_thread(std::vector<std::uint64_t> windows);
@@ -984,6 +1150,10 @@ class AntiAFK {
   std::thread test_thread_;
 
   HANDLE multi_instance_mutex_{nullptr};
+
+  std::mutex touch_mutex_;
+  std::unordered_map<DWORD, std::int64_t> last_touch_ms_by_pid_;
+  std::unordered_set<DWORD> disconnected_pids_;
 };
 
 void AntiAFK::ensure_defaults_locked() {
@@ -1003,6 +1173,12 @@ void AntiAFK::ensure_defaults_locked() {
   set_if_missing("antiafk_alt_delay_ms", py::int_(kDefaultAltDelayMs));
   set_if_missing("antiafk_dev_mode", py::bool_(false));
   set_if_missing("antiafk_menu_autoreconnect", py::bool_(false));
+  set_if_missing("antiafk_alert_sound", py::bool_(false));
+  set_if_missing("antiafk_alert_tooltip", py::bool_(false));
+  set_if_missing("antiafk_alert_lead_s", py::float_(3.0));
+  set_if_missing("antiafk_unthrottle_enabled", py::bool_(false));
+  set_if_missing("antiafk_unthrottle_batch_size", py::int_(5));
+  set_if_missing("antiafk_unthrottle_lead_s", py::float_(3.0));
 
   // Feature removals: purge stale keys if present so they don't get re-saved.
   try {
@@ -1030,6 +1206,17 @@ bool AntiAFK::get_bool(const char* key, bool fallback) const {
   try {
     py::object v = config.attr("get")(py::str(key), py::bool_(fallback));
     return py::cast<bool>(v);
+  } catch (...) {
+    PyErr_Clear();
+    return fallback;
+  }
+}
+
+double AntiAFK::get_double(const char* key, double fallback) const {
+  py::gil_scoped_acquire acquire;
+  try {
+    py::object v = config.attr("get")(py::str(key), py::float_(fallback));
+    return py::cast<double>(v);
   } catch (...) {
     PyErr_Clear();
     return fallback;
@@ -1069,6 +1256,30 @@ void AntiAFK::emit_button_state(bool running) {
   }
 }
 
+void AntiAFK::emit_touch(DWORD pid) {
+  py::gil_scoped_acquire acquire;
+  if (touch_callback.is_none()) {
+    return;
+  }
+  try {
+    touch_callback(py::int_(static_cast<int>(pid)));
+  } catch (...) {
+    PyErr_Clear();
+  }
+}
+
+void AntiAFK::emit_pre_action(double seconds_until_action) {
+  py::gil_scoped_acquire acquire;
+  if (pre_action_callback.is_none()) {
+    return;
+  }
+  try {
+    pre_action_callback(py::float_(seconds_until_action));
+  } catch (...) {
+    PyErr_Clear();
+  }
+}
+
 bool AntiAFK::call_is_pid_in_menu(DWORD pid) {
   py::gil_scoped_acquire acquire;
   if (is_pid_in_menu_callback.is_none()) {
@@ -1083,6 +1294,118 @@ bool AntiAFK::call_is_pid_in_menu(DWORD pid) {
   } catch (...) {
     PyErr_Clear();
     return false;
+  }
+}
+
+void AntiAFK::touch_pids(const std::vector<int>& pids) {
+  const std::int64_t now_ms = mono_ms();
+  std::lock_guard<std::mutex> lk(touch_mutex_);
+  for (int pid_i : pids) {
+    if (pid_i <= 0) {
+      continue;
+    }
+    last_touch_ms_by_pid_[static_cast<DWORD>(pid_i)] = now_ms;
+  }
+}
+
+void AntiAFK::set_pids_disconnected(const std::vector<int>& pids, bool disconnected) {
+  std::lock_guard<std::mutex> lk(touch_mutex_);
+  for (int pid_i : pids) {
+    if (pid_i <= 0) {
+      continue;
+    }
+    const DWORD pid = static_cast<DWORD>(pid_i);
+    if (disconnected) {
+      disconnected_pids_.insert(pid);
+    } else {
+      disconnected_pids_.erase(pid);
+    }
+  }
+}
+
+void AntiAFK::sort_windows_by_touch(std::vector<std::uint64_t>& windows) {
+  if (windows.size() < 2) {
+    return;
+  }
+
+  struct SweepEntry {
+    std::uint64_t hwnd = 0;
+    DWORD pid = 0;
+    std::int64_t touched_ms = 0;
+    bool disconnected = false;
+  };
+
+  std::vector<SweepEntry> entries;
+  entries.reserve(windows.size());
+
+  for (std::uint64_t w : windows) {
+    const HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w));
+    if (!hwnd || !::IsWindow(hwnd)) {
+      continue;
+    }
+    DWORD pid = 0;
+    (void)::GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) {
+      continue;
+    }
+    SweepEntry e;
+    e.hwnd = w;
+    e.pid = pid;
+    entries.push_back(e);
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(touch_mutex_);
+    for (auto& e : entries) {
+      e.disconnected = disconnected_pids_.find(e.pid) != disconnected_pids_.end();
+      const auto it = last_touch_ms_by_pid_.find(e.pid);
+      e.touched_ms = (it != last_touch_ms_by_pid_.end()) ? it->second : 0;
+    }
+  }
+
+  std::sort(entries.begin(), entries.end(), [](const SweepEntry& a, const SweepEntry& b) {
+    if (a.disconnected != b.disconnected) {
+      return a.disconnected < b.disconnected;  // connected first
+    }
+    if (a.touched_ms != b.touched_ms) {
+      return a.touched_ms < b.touched_ms;  // oldest first
+    }
+    return a.pid < b.pid;
+  });
+
+  windows.clear();
+  windows.reserve(entries.size());
+  for (const auto& e : entries) {
+    windows.push_back(e.hwnd);
+  }
+}
+
+bool AntiAFK::call_bes_hold_unthrottled(const std::vector<int>& pids, double seconds) {
+  py::gil_scoped_acquire acquire;
+  if (bes_hold_unthrottled_callback.is_none()) {
+    return false;
+  }
+  try {
+    py::object out = bes_hold_unthrottled_callback(py::cast(pids), py::float_(seconds));
+    if (out.is_none()) {
+      return false;
+    }
+    return py::cast<bool>(out);
+  } catch (...) {
+    PyErr_Clear();
+    return false;
+  }
+}
+
+void AntiAFK::call_bes_release_hold(const std::vector<int>& pids) {
+  py::gil_scoped_acquire acquire;
+  if (bes_release_hold_callback.is_none()) {
+    return;
+  }
+  try {
+    (void)bes_release_hold_callback(py::cast(pids));
+  } catch (...) {
+    PyErr_Clear();
   }
 }
 
@@ -1142,18 +1465,29 @@ void AntiAFK::restore_foreground_window_impl(HWND hwnd) {
 ActionResult AntiAFK::run_action(HWND hwnd,
                                  const std::string& base_action,
                                  bool menu_autoreconnect,
-                                 bool restore_foreground) {
+                                 bool restore_foreground,
+                                 bool fast_focus) {
+  const bool dev_mode = get_bool("antiafk_dev_mode", false);
+
+  DWORD pid = 0;
+  (void)::GetWindowThreadProcessId(hwnd, &pid);
+
   bool in_menu = false;
-  if (menu_autoreconnect && !is_pid_in_menu_callback.is_none()) {
-    DWORD pid = 0;
-    (void)::GetWindowThreadProcessId(hwnd, &pid);
+  int in_menu_ms = 0;
+  if (menu_autoreconnect && pid != 0 && !is_pid_in_menu_callback.is_none()) {
+    const auto start_ts = Clock::now();
     if (pid != 0) {
       in_menu = call_is_pid_in_menu(pid);
     }
+    in_menu_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start_ts).count());
   }
   const int alt_delay_ms =
       clamp_alt_delay_ms(get_int("antiafk_alt_delay_ms", kDefaultAltDelayMs));
-  return action_task_impl(
+  int focus_ms = 0;
+  int focus_attempts = 0;
+  int total_ms = 0;
+  ActionResult res = action_task_impl(
       hwnd,
       base_action,
       menu_autoreconnect,
@@ -1162,7 +1496,28 @@ ActionResult AntiAFK::run_action(HWND hwnd,
       &stop_requested_,
       &shutdown_requested_,
       &pause_requested_,
-      restore_foreground);
+      restore_foreground,
+      fast_focus,
+      dev_mode ? &focus_ms : nullptr,
+      dev_mode ? &focus_attempts : nullptr,
+      dev_mode ? &total_ms : nullptr);
+  if (dev_mode) {
+    emit_status(
+        "[Dev] pid=" + std::to_string(pid) + ", action=" + base_action +
+        ", menu_autoreconnect=" + std::string(menu_autoreconnect ? "true" : "false") +
+        ", in_menu=" + std::string(in_menu ? "true" : "false") + ", menu_ms=" +
+        std::to_string(in_menu_ms) + ", focus_ms=" + std::to_string(focus_ms) +
+        ", focus_attempts=" + std::to_string(focus_attempts) + ", total_ms=" +
+        std::to_string(total_ms));
+  }
+  if (res.ok && pid != 0) {
+    {
+      std::lock_guard<std::mutex> lk(touch_mutex_);
+      last_touch_ms_by_pid_[pid] = mono_ms();
+    }
+    emit_touch(pid);
+  }
+  return res;
 }
 
 AntiAFK::AntiAFK(py::object parent, py::object config_obj) : parent_(std::move(parent)) {
@@ -1344,9 +1699,13 @@ bool AntiAFK::pause_antiafk(bool wait) {
   if (wait) {
     py::gil_scoped_release release;
     std::unique_lock<std::mutex> lk(cv_mutex_);
-    (void)cv_.wait_for(lk, std::chrono::seconds(30), [&] {
+    const bool signaled = cv_.wait_for(lk, std::chrono::seconds(30), [&] {
       return paused_.load() || !antiafk_running_.load() || shutdown_requested_.load();
     });
+    if (!signaled && !paused_.load() && antiafk_running_.load() && !shutdown_requested_.load()) {
+      pause_requested_.store(false);
+      cv_.notify_all();
+    }
     return paused_.load();
   }
   return true;
@@ -1408,7 +1767,7 @@ void AntiAFK::toggle_multi_instance() {
 
 std::vector<std::uint64_t> AntiAFK::find_roblox_windows(bool include_hidden) const {
   py::gil_scoped_release release;
-  return find_roblox_windows_impl(include_hidden);
+  return find_roblox_windows_impl(include_hidden, kWindowTextTimeoutMsDefault);
 }
 
 void AntiAFK::show_roblox_windows() {
@@ -1416,7 +1775,7 @@ void AntiAFK::show_roblox_windows() {
   int visible_count = 0;
   {
     py::gil_scoped_release release;
-    windows = find_roblox_windows_impl(true);
+    windows = find_roblox_windows_impl(true, kWindowTextTimeoutMsDefault);
     for (std::uint64_t w : windows) {
       const HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w));
       if (!::IsWindow(hwnd)) {
@@ -1444,7 +1803,7 @@ void AntiAFK::hide_roblox_windows() {
   std::vector<std::uint64_t> windows;
   {
     py::gil_scoped_release release;
-    windows = find_roblox_windows_impl(false);
+    windows = find_roblox_windows_impl(false, kWindowTextTimeoutMsDefault);
     for (std::uint64_t w : windows) {
       const HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w));
       if (!::IsWindow(hwnd)) {
@@ -1471,7 +1830,7 @@ bool AntiAFK::perform_antiafk_action(std::uint64_t hwnd_int,
   {
     py::gil_scoped_release release;
     const HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(hwnd_int));
-    res = run_action(hwnd, base_action, menu_autoreconnect, restore_foreground);
+    res = run_action(hwnd, base_action, menu_autoreconnect, restore_foreground, /*fast_focus=*/false);
   }
 
   if (!res.ok && !res.message.empty()) {
@@ -1499,7 +1858,8 @@ void AntiAFK::test_action() {
                 std::to_string(w) + ")");
     for (int j = 0; j < 3; ++j) {
       emit_status("Action attempt " + std::to_string(j + 1) + "/3...");
-      const ActionResult res = run_action(hwnd, action, menu_autoreconnect, /*restore_foreground=*/false);
+      const ActionResult res =
+          run_action(hwnd, action, menu_autoreconnect, /*restore_foreground=*/false, /*fast_focus=*/false);
       if (!res.ok) {
         if (!res.message.empty()) {
           emit_status(res.message);
@@ -1619,7 +1979,8 @@ void AntiAFK::run_test_thread(std::vector<std::uint64_t> windows) {
     emit_status("Testing on window " + std::to_string(i + 1) + "/" + std::to_string(windows.size()) +
                 ": '" + wide_to_utf8(window_text(hwnd)) + "'");
     emit_status("===== DIRECT METHOD WITH MapVirtualKey =====");
-    const ActionResult res = run_action(hwnd, action_type, menu_autoreconnect, /*restore_foreground=*/false);
+    const ActionResult res =
+        run_action(hwnd, action_type, menu_autoreconnect, /*restore_foreground=*/false, /*fast_focus=*/false);
     if (!res.ok && !res.message.empty()) {
       emit_status(res.message);
     }
@@ -1678,6 +2039,16 @@ void AntiAFK::antiafk_loop_thread() {
     auto last_action_time = Clock::now() - std::chrono::seconds(std::max(0, interval - 10));
     auto last_status_update = Clock::now() - std::chrono::seconds(kNoWindowsStatusEveryS + 1);
     std::optional<Clock::time_point> pause_started;
+    std::vector<std::uint64_t> sweep_windows;
+    size_t sweep_index = 0;
+    bool sweep_action_success = true;
+    HWND sweep_foreground = nullptr;
+    bool any_pacify_fail = false;
+    auto last_pacify_fail_log = Clock::now() - std::chrono::seconds(31);
+    size_t last_window_count = 0;
+    bool sweep_fast_focus = false;
+    bool last_fast_focus = false;
+    bool pre_action_alert_sent = false;
 
     while (!stop_requested_.load() && !shutdown_requested_.load()) {
       if (pause_requested_.load()) {
@@ -1686,6 +2057,7 @@ void AntiAFK::antiafk_loop_thread() {
           paused_.store(true);
           cv_.notify_all();
           emit_status("Anti-AFK paused");
+          pre_action_alert_sent = false;
         }
 
         {
@@ -1715,10 +2087,55 @@ void AntiAFK::antiafk_loop_thread() {
       const double elapsed_s =
           std::chrono::duration_cast<std::chrono::duration<double>>(now - last_action_time).count();
 
-      if (elapsed_s >= static_cast<double>(interval)) {
-        std::vector<std::uint64_t> windows = find_roblox_windows_impl(true);
+      const bool in_sweep = !sweep_windows.empty() && sweep_index < sweep_windows.size();
 
-        if (windows.empty()) {
+      const bool alert_enabled =
+          get_bool("antiafk_alert_sound", false) || get_bool("antiafk_alert_tooltip", false);
+      if (alert_enabled && !in_sweep && !pre_action_alert_sent) {
+        double lead_s = std::max(0.0, get_double("antiafk_alert_lead_s", 0.0));
+        if (lead_s > 60.0) {
+          lead_s = 60.0;
+        }
+        const double max_lead = std::max(0.0, static_cast<double>(std::max(0, interval)));
+        if (lead_s > max_lead) {
+          lead_s = max_lead;
+        }
+
+        const auto next_action_time = last_action_time + std::chrono::seconds(std::max(0, interval));
+        const double time_to_action_s =
+            std::chrono::duration_cast<std::chrono::duration<double>>(next_action_time - now).count();
+        if (time_to_action_s > 0.0 && time_to_action_s <= lead_s) {
+          bool has_windows = last_window_count > 0;
+          if (!has_windows) {
+            const std::vector<std::uint64_t> probe =
+                find_roblox_windows_impl(true, kWindowTextTimeoutMsFast);
+            has_windows = !probe.empty();
+          }
+          if (has_windows) {
+            emit_pre_action(time_to_action_s);
+            pre_action_alert_sent = true;
+          }
+        }
+      }
+
+      if (!in_sweep && elapsed_s >= static_cast<double>(interval)) {
+        const bool fast_scan = last_window_count >= kFastSweepWindowThreshold;
+        const int text_timeout_ms =
+            fast_scan ? kWindowTextTimeoutMsFast : kWindowTextTimeoutMsDefault;
+        sweep_windows = find_roblox_windows_impl(true, text_timeout_ms);
+        sort_windows_by_touch(sweep_windows);
+        sweep_index = 0;
+        sweep_action_success = true;
+        sweep_foreground = ::GetForegroundWindow();
+        sweep_fast_focus = sweep_windows.size() >= kFastSweepWindowThreshold;
+        last_window_count = sweep_windows.size();
+        if (sweep_fast_focus != last_fast_focus) {
+          last_fast_focus = sweep_fast_focus;
+          emit_status(sweep_fast_focus ? "Anti-AFK fast focus mode enabled (large window count)"
+                                       : "Anti-AFK fast focus mode disabled");
+        }
+
+        if (sweep_windows.empty()) {
           if (std::chrono::duration_cast<std::chrono::seconds>(now - last_status_update).count() >
               kNoWindowsStatusEveryS) {
             emit_status("No Roblox windows found, waiting...");
@@ -1730,40 +2147,136 @@ void AntiAFK::antiafk_loop_thread() {
           continue;
         }
 
-        const HWND foreground = ::GetForegroundWindow();
-
-        emit_status("Performing Anti-AFK action on " + std::to_string(windows.size()) +
-                    " Roblox window(s)");
-        bool action_success = true;
-
-        for (size_t i = 0; i < windows.size(); ++i) {
-          if (stop_requested_.load() || shutdown_requested_.load()) {
-            break;
-          }
-          if (pause_requested_.load()) {
-            break;
-          }
-          const std::uint64_t hwnd_int = windows[i];
-          const HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(hwnd_int));
-          const ActionResult res = run_action(hwnd, action_type, menu_autoreconnect, /*restore_foreground=*/false);
-          if (!res.ok) {
-            action_success = false;
-            if (!res.message.empty()) {
-              emit_status(res.message);
-            }
-          }
+        if (alert_enabled && !pre_action_alert_sent) {
+          emit_pre_action(0.0);
+          pre_action_alert_sent = true;
         }
 
-        if (!stop_requested_.load() && !shutdown_requested_.load() && !pause_requested_.load()) {
-          restore_foreground_window_impl(foreground);
+        emit_status("Performing Anti-AFK action on " + std::to_string(sweep_windows.size()) +
+                    " Roblox window(s)");
+      }
+
+      // Continue an in-progress sweep even if the interval hasn't elapsed yet.
+      if (!sweep_windows.empty() && sweep_index < sweep_windows.size()) {
+        while (sweep_index < sweep_windows.size()) {
+          if (stop_requested_.load() || shutdown_requested_.load() || pause_requested_.load()) {
+            break;
+          }
+
+          const bool unthrottle_enabled = get_bool("antiafk_unthrottle_enabled", false);
+          int batch_size = std::max(1, get_int("antiafk_unthrottle_batch_size", 5));
+          if (batch_size > 50) {
+            batch_size = 50;
+          }
+          double lead_s = std::max(0.0, get_double("antiafk_unthrottle_lead_s", 0.0));
+          if (lead_s > 15.0) {
+            lead_s = 15.0;
+          }
+
+          const size_t batch_end =
+              std::min(sweep_index + static_cast<size_t>(batch_size), sweep_windows.size());
+
+          bool can_unthrottle = false;
+          if (unthrottle_enabled) {
+            py::gil_scoped_acquire acquire;
+            can_unthrottle =
+                !bes_hold_unthrottled_callback.is_none() && !bes_release_hold_callback.is_none();
+          }
+
+          std::vector<int> held_pids;
+          if (can_unthrottle) {
+            std::unordered_set<DWORD> seen;
+            seen.reserve(batch_end - sweep_index);
+            for (size_t i = sweep_index; i < batch_end; ++i) {
+              const HWND hwnd =
+                  reinterpret_cast<HWND>(static_cast<std::uintptr_t>(sweep_windows[i]));
+              if (!hwnd || !::IsWindow(hwnd)) {
+                continue;
+              }
+              DWORD pid = 0;
+              (void)::GetWindowThreadProcessId(hwnd, &pid);
+              if (pid == 0) {
+                continue;
+              }
+              if (seen.insert(pid).second) {
+                held_pids.push_back(static_cast<int>(pid));
+              }
+            }
+
+            if (!held_pids.empty()) {
+              const double hold_s = lead_s + 120.0;
+              const bool hold_ok = call_bes_hold_unthrottled(held_pids, hold_s);
+              if (!hold_ok) {
+                any_pacify_fail = true;
+                if (std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - last_pacify_fail_log)
+                        .count() >= 30) {
+                  last_pacify_fail_log = Clock::now();
+                  emit_status(
+                      "BES pacify: failed to request unthrottle for this batch; inputs may be throttled.");
+                }
+              } else {
+                const double apply_wait_s = std::max(lead_s, 0.25);
+                if (apply_wait_s > 0.0) {
+                  const auto apply_wait_ms = std::chrono::milliseconds(
+                      static_cast<long long>(std::clamp(apply_wait_s, 0.0, 60.0) * 1000.0));
+                  (void)wait_for_stop_or_pause(apply_wait_ms);
+                }
+              }
+            }
+          }
+
+          // Process the batch window-by-window so we can resume mid-batch after a pause.
+          while (sweep_index < batch_end) {
+            if (stop_requested_.load() || shutdown_requested_.load() || pause_requested_.load()) {
+              break;
+            }
+
+            const HWND hwnd =
+                reinterpret_cast<HWND>(static_cast<std::uintptr_t>(sweep_windows[sweep_index]));
+            const ActionResult res =
+                run_action(hwnd, action_type, menu_autoreconnect, /*restore_foreground=*/false, sweep_fast_focus);
+
+            if (!res.ok) {
+              // If we were interrupted (pause/stop/shutdown) mid-action, retry this same window after resume.
+              if (stop_requested_.load() || shutdown_requested_.load() || pause_requested_.load()) {
+                break;
+              }
+
+              sweep_action_success = false;
+              if (!res.message.empty()) {
+                emit_status(res.message);
+              }
+            }
+
+            ++sweep_index;
+          }
+
+          if (!held_pids.empty()) {
+            call_bes_release_hold(held_pids);
+          }
+
+          if (stop_requested_.load() || shutdown_requested_.load() || pause_requested_.load()) {
+            break;
+          }
         }
 
         if (pause_requested_.load()) {
           continue;
         }
+        if (stop_requested_.load() || shutdown_requested_.load()) {
+          break;
+        }
 
-        if (action_success) {
+        // Sweep complete.
+        if (sweep_foreground && ::IsWindow(sweep_foreground)) {
+          restore_foreground_window_impl(sweep_foreground);
+        }
+        sweep_windows.clear();
+        sweep_index = 0;
+
+        if (sweep_action_success) {
           last_action_time = Clock::now();
+          pre_action_alert_sent = false;
           emit_status("Anti-AFK action completed successfully");
           (void)wait_for_stop_or_pause(std::chrono::milliseconds(500));
         } else {
@@ -1889,7 +2402,16 @@ PYBIND11_MODULE(antiafk_native, m) {
       .def_property_readonly("antiafk_running", &AntiAFK::antiafk_running)
       .def_readwrite("status_callback", &AntiAFK::status_callback)
       .def_readwrite("button_state_callback", &AntiAFK::button_state_callback)
+      .def_readwrite("touch_callback", &AntiAFK::touch_callback)
+      .def_readwrite("pre_action_callback", &AntiAFK::pre_action_callback)
       .def_readwrite("is_pid_in_menu_callback", &AntiAFK::is_pid_in_menu_callback)
+      .def_readwrite("bes_hold_unthrottled_callback", &AntiAFK::bes_hold_unthrottled_callback)
+      .def_readwrite("bes_release_hold_callback", &AntiAFK::bes_release_hold_callback)
+      .def("touch_pids", &AntiAFK::touch_pids, py::arg("pids"))
+      .def("set_pids_disconnected",
+           &AntiAFK::set_pids_disconnected,
+           py::arg("pids"),
+           py::arg("disconnected") = true)
       .def("apply_host_config",
            &AntiAFK::apply_host_config,
            py::kw_only(),
