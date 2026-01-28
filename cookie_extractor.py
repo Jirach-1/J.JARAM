@@ -1,7 +1,8 @@
 import time
+import tempfile
 from typing import Optional, Callable
-from PyQt6.QtCore import QThread, pyqtSignal, QObject
-from PyQt6.QtWidgets import QMessageBox, QProgressDialog
+from PySide6.QtCore import QThread, Signal, QObject
+from PySide6.QtWidgets import QMessageBox, QProgressDialog
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -11,16 +12,16 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 
 class CookieExtractionThread(QThread):
 
-    cookie_extracted = pyqtSignal(str)
-    extraction_failed = pyqtSignal(str)
-    status_update = pyqtSignal(str)
-    browser_ready = pyqtSignal()
+    cookie_extracted = Signal(str)
+    extraction_failed = Signal(str)
+    status_update = Signal(str)
+    browser_ready = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.driver = None
         self.should_stop = False
-        self.extraction_timeout = 300
+        self.extraction_timeout = 600
         self.extraction_completed = False
 
     def run(self):
@@ -235,6 +236,134 @@ class CookieExtractionThread(QThread):
             self.extraction_completed = True
         self._cleanup_browser()
 
+
+class BrowserLaunchThread(QThread):
+    launched = Signal(object)
+    launch_failed = Signal(str)
+    status_update = Signal(str)
+
+    def __init__(self, cookie: str, url: str, profile_dir: Optional[str] = None, parent=None):
+        super().__init__(parent)
+        self.cookie = str(cookie or "")
+        self.url = str(url or "")
+        self.profile_dir = str(profile_dir) if profile_dir else None
+        self.driver = None
+        self.should_stop = False
+
+    def run(self):
+        try:
+            self.status_update.emit("Initializing browser...")
+            self._setup_browser(self.profile_dir)
+            if self.should_stop:
+                return
+
+            self.status_update.emit("Opening Roblox...")
+            self.driver.get("https://www.roblox.com/")
+            WebDriverWait(self.driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            if self.should_stop:
+                return
+
+            self.status_update.emit("Injecting cookie...")
+            self._inject_cookie()
+            if self.should_stop:
+                return
+
+            self.status_update.emit("Opening target page...")
+            target = self.url or "https://www.roblox.com/home"
+            self.driver.get(target)
+            WebDriverWait(self.driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+            # IMPORTANT: do not quit the driver here, otherwise Chrome closes immediately.
+            # We keep the session alive by handing the WebDriver back to the caller.
+            self.launched.emit(self.driver)
+        except Exception as e:
+            self.launch_failed.emit(str(e))
+            self._cleanup_browser()
+
+    def _setup_browser(self, profile_dir: Optional[str]):
+        options = Options()
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-plugins-discovery")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1200,800")
+
+        # Keep browser open after driver quits.
+        try:
+            options.add_experimental_option("detach", True)
+        except Exception:
+            pass
+
+        if profile_dir:
+            options.add_argument(f"--user-data-dir={profile_dir}")
+
+        try:
+            self.driver = webdriver.Chrome(options=options)
+        except WebDriverException as e:
+            msg = str(e)
+            # If the user-data-dir is locked (Chrome already open), fall back to a temp profile.
+            if profile_dir and "user data directory is already in use" in msg.lower():
+                tmp_dir = tempfile.mkdtemp(prefix="jaram_browser_")
+                options2 = Options()
+                for arg in options.arguments:
+                    if not str(arg).startswith("--user-data-dir="):
+                        options2.add_argument(arg)
+                try:
+                    options2.add_experimental_option("detach", True)
+                except Exception:
+                    pass
+                options2.add_argument(f"--user-data-dir={tmp_dir}")
+                self.driver = webdriver.Chrome(options=options2)
+            else:
+                raise
+
+        try:
+            self.driver.implicitly_wait(5)
+            self.driver.set_page_load_timeout(30)
+        except Exception:
+            pass
+
+    def _inject_cookie(self):
+        if not self.cookie:
+            raise Exception("Cookie is empty")
+
+        cookie_obj = {
+            "name": ".ROBLOSECURITY",
+            "value": self.cookie,
+            "domain": ".roblox.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": True,
+        }
+
+        try:
+            self.driver.add_cookie(cookie_obj)
+        except Exception:
+            # Domain fallback (some Selenium builds are picky)
+            cookie_obj["domain"] = "roblox.com"
+            self.driver.add_cookie(cookie_obj)
+
+        try:
+            self.driver.get("https://www.roblox.com/home")
+        except Exception:
+            pass
+
+    def _cleanup_browser(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            finally:
+                self.driver = None
+
+    def stop(self):
+        self.should_stop = True
+        self._cleanup_browser()
+
+
 class CookieExtractor(QObject):
 
     def __init__(self, parent=None):
@@ -243,6 +372,8 @@ class CookieExtractor(QObject):
         self.progress_dialog = None
         self.callback = None
         self.callback_called = False
+        self._browser_threads = []
+        self._browser_drivers = []
 
     def extract_cookie_async(self, callback: Callable[[str], None], parent_widget=None):
         if self.extraction_thread and self.extraction_thread.isRunning():
@@ -335,3 +466,76 @@ class CookieExtractor(QObject):
 
         if self.callback:
             self.callback(None)
+
+    def open_logged_in_browser_async(
+        self,
+        cookie: str,
+        url: str,
+        profile_dir: Optional[str] = None,
+        parent_widget=None,
+        show_progress: bool = True,
+    ) -> None:
+        """
+        Open a Chrome window, inject the .ROBLOSECURITY cookie, then navigate to `url`.
+        Uses a per-user profile dir if provided so sessions persist across opens.
+        """
+        thread = BrowserLaunchThread(cookie=cookie, url=url, profile_dir=profile_dir)
+        self._browser_threads.append(thread)
+
+        progress = None
+        if show_progress:
+            progress = QProgressDialog(parent_widget)
+            progress.setWindowTitle("Opening Browser")
+            progress.setLabelText("Initializing browser...")
+            progress.setRange(0, 0)
+            progress.setCancelButtonText("Cancel")
+            progress.setModal(True)
+            try:
+                progress.canceled.connect(thread.stop)
+            except Exception:
+                pass
+            progress.show()
+
+            try:
+                thread.status_update.connect(progress.setLabelText)
+            except Exception:
+                pass
+
+        cleaned = False
+
+        def _cleanup():
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+            try:
+                if progress:
+                    progress.close()
+            except Exception:
+                pass
+            try:
+                if thread in self._browser_threads:
+                    self._browser_threads.remove(thread)
+            except Exception:
+                pass
+
+        def _on_failed(msg: str):
+            _cleanup()
+            QMessageBox.critical(
+                parent_widget,
+                "Browser Launch Failed",
+                f"Failed to open logged-in browser:\n\n{msg}",
+            )
+
+        def _on_ok(driver):
+            try:
+                if driver is not None:
+                    self._browser_drivers.append(driver)
+            except Exception:
+                pass
+            _cleanup()
+
+        thread.launch_failed.connect(_on_failed)
+        thread.launched.connect(_on_ok)
+        thread.finished.connect(_cleanup)
+        thread.start()

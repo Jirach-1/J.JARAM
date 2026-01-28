@@ -15,7 +15,6 @@ import time as _t
 import os, re, json, time, threading, requests
 import requests.exceptions as _rq_exc
 from typing import Optional, Dict
-from selenium.common.exceptions import WebDriverException, UnexpectedAlertPresentException, NoAlertPresentException
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -57,7 +56,7 @@ except Exception:
     WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
 
 
-APP_FOOTER = "J.JARAM JX 2x27"
+APP_FOOTER = "J.JARAM JX 2x40"
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
 # Helpers
@@ -208,7 +207,7 @@ BIOME_RPC_RE = re.compile(
 class _TempBlockSession(threading.Thread):
     """
     3-minute temp blocker for one 'finder' account.
-    - Preloads a Selenium driver for the finder (cookie)
+    - Uses Roblox user-blocking API (no browser)
     - Tails their log for 'Player added: <name> <id>'
     - Blocks only names present in Blank 
     - Grows lookups/blocklist via Bloxlink reverse search
@@ -216,7 +215,6 @@ class _TempBlockSession(threading.Thread):
     """
     GUILD_ID = "1371698242886307921"   # your server (can be moved to credentials if you prefer)
     WINDOW_SEC = 180
-    HEADLESS = True
 
     def __init__(self, log_fn, uid: str, username: str, cookie: str):
         super().__init__(daemon=True)
@@ -371,48 +369,18 @@ class _TempBlockSession(threading.Thread):
         self._log("[TempBlock] Bloxlink: giving up after retries")
         return None
 
-    # ---------- Roblox API (id -> name) ----------
-    @staticmethod
-    def _roblox_name_for(user_id: str) -> str | None:
-        try:
-            r = requests.get(f"https://users.roblox.com/v1/users/{user_id}", timeout=8)
-            if r.status_code == 200:
-                nm = (r.json() or {}).get("name")
-                return str(nm) if nm else None
-        except Exception:
-            pass
-        return None
+    # ---------- Roblox user-blocking API ----------
+    def _make_session(self):
+        from utilities_tab import _make_blocking_api_session  # lazy-import to avoid init cycles
+        return _make_blocking_api_session(self.cookie)
 
-    # ---------- Selenium via your utilities ----------
-    def _make_driver(self):
-        from utilities_tab import _make_driver   # lazy-import to avoid init cycles
-        return _make_driver(self.cookie, headless=self.HEADLESS)
+    def _block_id(self, session, user_id: str) -> str:
+        from utilities_tab import _api_block_user
+        return _api_block_user(session, self.cookie, user_id)
 
-    def _block_id(self, driver, user_id: str) -> str:
-        from utilities_tab import _block_user
-        return _block_user(driver, user_id)
-
-    def _unblock_id(self, driver, user_id: str) -> bool:
-        # we unblock via BlockedUsers page using username-based DOM, same as your Unblocker
-        from utilities_tab import (
-            _BLOCKED_URL,
-            _find_blocked_node_by_name,
-            _fully_load_then_find_by_name,
-            _unblock_display_node,
-        )
-        name = self._roblox_name_for(user_id)
-        if not name:
-            return False
-        try:
-            driver.get(_BLOCKED_URL)
-            time.sleep(0.3)
-            node = (_find_blocked_node_by_name(driver, name.lower(), quick_only=True)
-                    or _fully_load_then_find_by_name(driver, name.lower()))
-            if not node:
-                return True  # already unblocked
-            return bool(_unblock_display_node(driver, node))
-        except Exception:
-            return False
+    def _unblock_id(self, session, user_id: str) -> str:
+        from utilities_tab import _api_unblock_user
+        return _api_unblock_user(session, self.cookie, user_id)
 
     # ---------- Tail the finder's log ----------
     def _tail_new_players(self, f) -> list[tuple[str, str]]:
@@ -439,18 +407,18 @@ class _TempBlockSession(threading.Thread):
             self._log(f"[TempBlock] {self.uid}: missing cookie/username")
             return
 
-        # Open driver up front (preload)
+        # Create API session up front (CSRF + browserid)
         try:
-            driver = self._make_driver()
+            session = self._make_session()
         except Exception as e:
-            self._log(f"[TempBlock] {self.uid}: failed to start browser ({e})")
+            self._log(f"[TempBlock] {self.uid}: failed to start API session ({e})")
             return
 
         # Prepare log tail
         log_path = find_log_for_username(self.username.lower(), allow_fallback=False)
         if not log_path or not os.path.isfile(log_path):
             self._log(f"[TempBlock] {self.uid}: no log for '{self.username}'")
-            try: driver.quit()
+            try: session.close()
             except Exception: pass
             return
 
@@ -458,7 +426,7 @@ class _TempBlockSession(threading.Thread):
             f = open(log_path, "r", encoding="utf-8", errors="ignore")
         except Exception as e:
             self._log(f"[TempBlock] {self.uid}: cannot open log ({e})")
-            try: driver.quit()
+            try: session.close()
             except Exception: pass
             return
 
@@ -476,32 +444,6 @@ class _TempBlockSession(threading.Thread):
 
         try:
             while time.time() < deadline and not self._stop:
-                # --- PRE-SWEEP: clear any surprise alerts before the heartbeat ---
-                try:
-                    a = driver.switch_to.alert
-                    _ = a.text  # poke to ensure it's real
-                    a.dismiss()
-                    self._log(f"[TempBlock] {self.uid}: dismissed unexpected alert during heartbeat (pre-sweep)")
-                except NoAlertPresentException:
-                    pass
-
-                # --- HEARTBEAT: fail fast if the driver is dead ---
-                try:
-                    driver.execute_script("return 1")
-                except UnexpectedAlertPresentException:
-                    # Alert popped between pre-sweep and heartbeat; dismiss and continue
-                    try:
-                        driver.switch_to.alert.dismiss()
-                        self._log(f"[TempBlock] {self.uid}: dismissed alert after heartbeat exception")
-                    except WebDriverException as e:
-                        self._log(f"[TempBlock] {self.uid}: alert dismiss failed - {e}")
-                        self._driver_dead = True
-                        break
-                except WebDriverException as e:
-                    self._log(f"[TempBlock] {self.uid}: browser/WebDriver not reachable - {e.__class__.__name__}: {e}")
-                    self._driver_dead = True
-                    break
-
                 # --- SURGE-AWARE PER-TICK LOGIC ---
                 tick_deadline = time.time() + 0.10  # ~100ms budget per tick
 
@@ -527,12 +469,12 @@ class _TempBlockSession(threading.Thread):
                     # (prevents losing users when we run out of budget)
                     # --- Known bad - block immediately ---
                     if self._in_blocklist(uname, lookup):
-                        res = self._block_id(driver, rid)
+                        res = self._block_id(session, rid)
                         if res in ("blocked", "already_blocked"):
                             self._blocked_ids.add(rid)
                             self._log(f"[TempBlock] blocked @{uname} ({rid}) on {self.uid} - {res} [blocklist]")
                         else:
-                            self._log(f"[TempBlock] failed blocking @{uname} ({rid}) on {self.uid} [blocklist]")
+                            self._log(f"[TempBlock] failed blocking @{uname} ({rid}) on {self.uid} - {res} [blocklist]")
                         self._seen_ids.add(rid)
                         continue
 
@@ -547,12 +489,12 @@ class _TempBlockSession(threading.Thread):
                         self._append_blocklist(lookup, uname)
                         self._save_lookup(lookup)
                         self._log(f"[TempBlock] (SURGE) @{uname} - added to blocklist & blocking now")
-                        res = self._block_id(driver, rid)
+                        res = self._block_id(session, rid)
                         if res in ("blocked", "already_blocked"):
                             self._blocked_ids.add(rid)
                             self._log(f"[TempBlock] (SURGE) blocked @{uname} ({rid}) on {self.uid} - {res}")
                         else:
-                            self._log(f"[TempBlock] (SURGE) failed blocking @{uname} ({rid}) on {self.uid}")
+                            self._log(f"[TempBlock] (SURGE) failed blocking @{uname} ({rid}) on {self.uid} - {res}")
                         self._seen_ids.add(rid)
                         continue
 
@@ -569,22 +511,18 @@ class _TempBlockSession(threading.Thread):
                         self._append_blocklist(lookup, uname)
                         self._save_lookup(lookup)
                         self._log(f"[TempBlock] @{uname} - no Bloxlink match; added to blocklist and blocking now")
-                        res = self._block_id(driver, rid)
+                        res = self._block_id(session, rid)
                         if res in ("blocked", "already_blocked"):
                             self._blocked_ids.add(rid)
                             self._log(f"[TempBlock] blocked @{uname} ({rid}) on {self.uid} - {res} [unknown-blocklist]")
                         else:
-                            self._log(f"[TempBlock] failed blocking @{uname} ({rid}) on {self.uid} [unknown-blocklist]")
+                            self._log(f"[TempBlock] failed blocking @{uname} ({rid}) on {self.uid} - {res} [unknown-blocklist]")
 
                     # we actually processed this entry this tick - safe to mark seen
                     self._seen_ids.add(rid)
                     
                 time.sleep(0.25)
 
-        except WebDriverException as e:
-            # Catch any webdriver issues that bubble out of the loop
-            self._log(f"[TempBlock] {self.uid}: browser crashed - {e.__class__.__name__}: {e}")
-            self._driver_dead = True
         except Exception as e:
             self._log(f"[TempBlock] {self.uid}: loop crashed - {e!r}")
         finally:
@@ -598,14 +536,15 @@ class _TempBlockSession(threading.Thread):
         if self._blocked_ids:
             self._log(f"[TempBlock] {self.uid}: window CLOSED - unblocking {len(self._blocked_ids)} id(s)")
             for rid in list(self._blocked_ids):
-                if self._unblock_id(driver, rid):
-                    self._log(f"[TempBlock] unblocked {rid}")
+                res = self._unblock_id(session, rid)
+                if res in ("unblocked", "already_unblocked"):
+                    self._log(f"[TempBlock] unblocked {rid} - {res}")
                 else:
-                    self._log(f"[TempBlock] unblock failed {rid}")
+                    self._log(f"[TempBlock] unblock failed {rid} - {res}")
         else:
             self._log(f"[TempBlock] {self.uid}: window CLOSED - nothing to unblock")
 
-        try: driver.quit()
+        try: session.close()
         except Exception: pass
 
 # ------------------------------------------------------------------------------
@@ -736,6 +675,7 @@ class MultiScopeEngine:
 
         # Webhooks
         self._biome_webhooks: List[dict] = []
+        self._skip_webhook_unknown_context = False
 
         self._lock = threading.Lock()
         # Events (thread-safe): GUI will drain these and act (e.g., recycle on disconnect)
@@ -819,6 +759,7 @@ class MultiScopeEngine:
         biome_min_interval: float = 2.0,
         # NEW:
         biome_modes: Optional[Dict[str, str]] = None,
+        skip_webhook_unknown_context: bool = False,
     ) -> None:
         lock_enforced = self._is_bm_lock_enforced()
         lock_disabled = not lock_enforced
@@ -879,6 +820,7 @@ class MultiScopeEngine:
         self._bm_relaxed = lock_disabled
         self._bm_lock_confirmed = not lock_disabled
         self._lock_forced_biomes = forced_biomes
+        self._skip_webhook_unknown_context = bool(skip_webhook_unknown_context)
 
 
     # -- Persistent "found" counters -------------------------------------------
@@ -1699,6 +1641,17 @@ class MultiScopeEngine:
         # fallback: current detecting user
         return (self._get_username(uid) or "Unknown").strip()
 
+    def _should_skip_webhook(self, owner_raw: str, server_label: str, ps_link: str) -> bool:
+        if not self._skip_webhook_unknown_context:
+            return False
+        server_unknown = (not server_label) or server_label.strip().lower() == "unknown"
+        owner_unknown = (not owner_raw) or owner_raw.strip().lower() == "unknown"
+        ps_unknown = not bool(ps_link)
+        if server_unknown or owner_unknown or ps_unknown:
+            self._log("[MultiScope] Skipping webhook; owner or private server unknown.")
+            return True
+        return False
+
     def _maybe_start_temp_block(self, uid: str, reason: str):
         now = time.time()
         exp = self._temp_block_sessions.get(uid, 0)
@@ -1827,9 +1780,12 @@ class MultiScopeEngine:
     def _emit_biome_event(self, uid: str, server_key: str, biome: str, *, event_type: str, ts_epoch: Optional[float] = None) -> None:
         detector     = self._get_username(uid) or uid
         server_label = self._display_server_label(server_key)
-        owner        = self._resolve_owner(uid, server_label)
+        owner_raw    = (self._get_owner(uid) or "").strip()
+        owner        = owner_raw or (self._get_username(uid) or "Unknown").strip()
         ps_link      = self._get_ps_link(uid) or ""
         scope        = self._scope(server_key)
+        if self._should_skip_webhook(owner_raw, server_label, ps_link):
+            return
 
         b = (biome or "").upper()
         if str(event_type).lower() == "start":
@@ -1958,8 +1914,11 @@ class MultiScopeEngine:
             return
         server_label = self._display_server_label(server_key)
         detector     = self._get_username(uid) or uid
-        owner        = self._resolve_owner(uid, server_label)
+        owner_raw    = (self._get_owner(uid) or "").strip()
+        owner        = owner_raw or (self._get_username(uid) or "Unknown").strip()
         ps_link      = self._get_ps_link(uid) or ""
+        if self._should_skip_webhook(owner_raw, server_label, ps_link):
+            return
 
         emojis = {"Jester": "🃏", "Mari": "🛍️"}
         colors = {"Jester": 0xA352FF, "Mari": 0xFF82AB}
@@ -2437,6 +2396,293 @@ class MultiScopeEngine:
                 quiet = (now_t - max(scope.last_biome_ts, scope.last_merchant_ts, 0)) > 600
                 if not scope.users and quiet:
                     self._scopes.pop(key, None)
+
+    def export_state(self) -> dict:
+        """
+        Export a JSON-serializable snapshot of MultiScope runtime state.
+        Used by GUI Pause/Resume so in-menu + last biome/merchant state isn't reset.
+        """
+        out: dict = {"version": 1, "ts": time.time()}
+        with self._lock:
+            try:
+                known_uids = set(self._cur.keys())
+            except Exception:
+                known_uids = set()
+
+            scopes: dict = {}
+            for key, s in (self._scopes or {}).items():
+                try:
+                    k = str(key)
+                except Exception:
+                    continue
+
+                try:
+                    users = [str(u) for u in (s.users or set()) if not known_uids or str(u) in known_uids]
+                except Exception:
+                    users = []
+
+                try:
+                    scopes[k] = {
+                        "key": k,
+                        "users": users,
+                        "last_biome": (str(s.last_biome) if s.last_biome else ""),
+                        "last_biome_ts": float(getattr(s, "last_biome_ts", 0.0) or 0.0),
+                        "last_merchant": (str(s.last_merchant) if s.last_merchant else ""),
+                        "last_merchant_ts": float(getattr(s, "last_merchant_ts", 0.0) or 0.0),
+                        "in_menu": (None if getattr(s, "in_menu", None) is None else bool(getattr(s, "in_menu", None))),
+                        "last_menu_ts": float(getattr(s, "last_menu_ts", 0.0) or 0.0),
+                        "events": int(getattr(s, "events", 0) or 0),
+                        "next_tail_at": float(getattr(s, "next_tail_at", 0.0) or 0.0),
+                        "poll_rot": int(getattr(s, "poll_rot", 0) or 0),
+                    }
+                except Exception:
+                    continue
+
+            cursors: dict = {}
+            for uid, cur in (self._cur or {}).items():
+                try:
+                    u = str(uid)
+                except Exception:
+                    continue
+                if known_uids and u not in known_uids:
+                    continue
+                try:
+                    cursors[u] = {
+                        "path": (str(cur.path) if getattr(cur, "path", None) else None),
+                        "pos": int(getattr(cur, "pos", 0) or 0),
+                        "carry": str(getattr(cur, "carry", "") or ""),
+                    }
+                except Exception:
+                    continue
+
+            out["scopes"] = scopes
+            out["cursors"] = cursors
+
+            try:
+                out["handoffs"] = {str(k): str(v) for k, v in (self._handoffs or {}).items()}
+            except Exception:
+                out["handoffs"] = {}
+            try:
+                out["handoff_prev_biome_for_spare"] = {
+                    str(k): str(v) for k, v in (self._handoff_prev_biome_for_spare or {}).items()
+                }
+            except Exception:
+                out["handoff_prev_biome_for_spare"] = {}
+
+            # Best-effort dedupe/throttle caches (safe to omit if they fail)
+            try:
+                out["last_biome_post_by_scope"] = {
+                    str(k): float(v) for k, v in (self._last_biome_post_by_scope or {}).items()
+                }
+            except Exception:
+                out["last_biome_post_by_scope"] = {}
+            try:
+                out["last_merchant_ts_by_scope"] = {
+                    str(scope): {str(m): float(ts) for m, ts in (mm or {}).items()}
+                    for scope, mm in (self._last_merchant_ts_by_scope or {}).items()
+                }
+            except Exception:
+                out["last_merchant_ts_by_scope"] = {}
+            try:
+                out["first_merchant_scan_done"] = [
+                    str(u)
+                    for u in (self._first_merchant_scan_done or set())
+                    if not known_uids or str(u) in known_uids
+                ]
+            except Exception:
+                out["first_merchant_scan_done"] = []
+            try:
+                out["last_disconnect_sig_by_uid"] = {
+                    str(uid): [str(sig[0]), int(sig[1])]
+                    for uid, sig in (self._last_disconnect_sig_by_uid or {}).items()
+                    if not known_uids or str(uid) in known_uids
+                }
+            except Exception:
+                out["last_disconnect_sig_by_uid"] = {}
+
+        return out
+
+    def import_state(self, state: dict) -> bool:
+        """
+        Restore a previously-exported runtime snapshot.
+        Returns True if anything was applied.
+        """
+        if not isinstance(state, dict) or not state:
+            return False
+        try:
+            ver = int(state.get("version", 0) or 0)
+        except Exception:
+            ver = 0
+        if ver != 1:
+            return False
+
+        applied = False
+        with self._lock:
+            try:
+                known_uids = set(self._cur.keys())
+            except Exception:
+                known_uids = set()
+
+            # -- Scopes -------------------------------------------------------
+            scopes_in = state.get("scopes") or {}
+            if isinstance(scopes_in, dict) and scopes_in:
+                for key, raw in scopes_in.items():
+                    if not isinstance(raw, dict):
+                        continue
+                    k = str(key)
+                    scope = self._scopes.get(k) or ServerScope(k)
+                    try:
+                        users_raw = raw.get("users") or []
+                        if isinstance(users_raw, (list, tuple, set)):
+                            scope.users = {str(u) for u in users_raw if not known_uids or str(u) in known_uids}
+                    except Exception:
+                        pass
+                    try:
+                        b = str(raw.get("last_biome") or "").strip().upper()
+                        scope.last_biome = b or None
+                    except Exception:
+                        pass
+                    try:
+                        scope.last_biome_ts = float(raw.get("last_biome_ts", scope.last_biome_ts) or 0.0)
+                    except Exception:
+                        pass
+                    try:
+                        m = str(raw.get("last_merchant") or "").strip().title()
+                        scope.last_merchant = m or None
+                    except Exception:
+                        pass
+                    try:
+                        scope.last_merchant_ts = float(raw.get("last_merchant_ts", scope.last_merchant_ts) or 0.0)
+                    except Exception:
+                        pass
+                    try:
+                        val = raw.get("in_menu", None)
+                        scope.in_menu = None if val is None else bool(val)
+                    except Exception:
+                        pass
+                    try:
+                        scope.last_menu_ts = float(raw.get("last_menu_ts", scope.last_menu_ts) or 0.0)
+                    except Exception:
+                        pass
+                    try:
+                        scope.events = int(raw.get("events", scope.events) or 0)
+                    except Exception:
+                        pass
+                    try:
+                        scope.next_tail_at = float(raw.get("next_tail_at", scope.next_tail_at) or 0.0)
+                    except Exception:
+                        pass
+                    try:
+                        scope.poll_rot = int(raw.get("poll_rot", scope.poll_rot) or 0)
+                    except Exception:
+                        pass
+
+                    self._scopes[k] = scope
+                    applied = True
+
+            # -- Cursors (pos/carry only when path matches current) ----------
+            cursors_in = state.get("cursors") or {}
+            if isinstance(cursors_in, dict) and cursors_in:
+                import os
+                for uid, raw in cursors_in.items():
+                    u = str(uid)
+                    if known_uids and u not in known_uids:
+                        continue
+                    if not isinstance(raw, dict):
+                        continue
+                    cur = self._cur.get(u)
+                    if not cur:
+                        continue
+                    try:
+                        snap_path = raw.get("path")
+                        cur_path = getattr(cur, "path", None)
+                        if snap_path and cur_path:
+                            sp = os.path.normcase(os.path.abspath(str(snap_path)))
+                            cp = os.path.normcase(os.path.abspath(str(cur_path)))
+                            if sp != cp:
+                                continue
+                        elif snap_path or cur_path:
+                            continue
+                    except Exception:
+                        continue
+
+                    try:
+                        cur.pos = int(raw.get("pos", getattr(cur, "pos", 0)) or 0)
+                    except Exception:
+                        pass
+                    try:
+                        cur.carry = str(raw.get("carry", "") or "")
+                    except Exception:
+                        pass
+                    applied = True
+
+            # -- Handoffs -----------------------------------------------------
+            try:
+                h = state.get("handoffs") or {}
+                if isinstance(h, dict):
+                    self._handoffs = {
+                        str(k): str(v)
+                        for k, v in h.items()
+                        if not known_uids or (str(k) in known_uids and str(v) in known_uids)
+                    }
+                    applied = True
+            except Exception:
+                pass
+            try:
+                hb = state.get("handoff_prev_biome_for_spare") or {}
+                if isinstance(hb, dict):
+                    self._handoff_prev_biome_for_spare = {
+                        str(k): str(v) for k, v in hb.items() if not known_uids or str(k) in known_uids
+                    }
+                    applied = True
+            except Exception:
+                pass
+
+            # -- Dedupe/throttle caches --------------------------------------
+            try:
+                lbp = state.get("last_biome_post_by_scope") or {}
+                if isinstance(lbp, dict):
+                    self._last_biome_post_by_scope = {str(k): float(v) for k, v in lbp.items()}
+                    applied = True
+            except Exception:
+                pass
+            try:
+                lmt = state.get("last_merchant_ts_by_scope") or {}
+                if isinstance(lmt, dict):
+                    merged: dict = {}
+                    for scope, mm in lmt.items():
+                        if not isinstance(mm, dict):
+                            continue
+                        merged[str(scope)] = {str(m): float(ts) for m, ts in mm.items()}
+                    self._last_merchant_ts_by_scope = merged
+                    applied = True
+            except Exception:
+                pass
+            try:
+                fms = state.get("first_merchant_scan_done") or []
+                if isinstance(fms, (list, tuple, set)):
+                    self._first_merchant_scan_done = {
+                        str(u) for u in fms if not known_uids or str(u) in known_uids
+                    }
+                    applied = True
+            except Exception:
+                pass
+            try:
+                lds = state.get("last_disconnect_sig_by_uid") or {}
+                if isinstance(lds, dict):
+                    out = {}
+                    for uid, sig in lds.items():
+                        u = str(uid)
+                        if known_uids and u not in known_uids:
+                            continue
+                        if isinstance(sig, (list, tuple)) and len(sig) == 2:
+                            out[u] = (str(sig[0]), int(sig[1]))
+                    self._last_disconnect_sig_by_uid = out
+                    applied = True
+            except Exception:
+                pass
+
+        return applied
 
     def snapshot(self) -> List[dict]:
         out: List[dict] = []

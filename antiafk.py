@@ -43,30 +43,31 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
         except Exception:
             pass
 
-    # Python-side Anti-AFK loop (lets us integrate with BES without rebuilding the native extension).
-    _loop_lock = threading.Lock()
-    _loop_stop = threading.Event()
-    _loop_pause = threading.Event()
-    _loop_paused = threading.Event()
-    _loop_thread: Optional[threading.Thread] = None
-    _shutdown_flag = threading.Event()
+    def _emit_touch(pid: Any) -> None:
+        try:
+            event_queue.put({"type": "touch", "pid": int(pid)})
+        except Exception:
+            pass
 
-    def _loop_is_running() -> bool:
-        t = _loop_thread
-        return bool(t is not None and t.is_alive())
+    def _emit_pre_action(seconds_until_action: Any) -> None:
+        try:
+            event_queue.put({"type": "pre_action", "seconds": float(seconds_until_action)})
+        except Exception:
+            pass
 
-    def _start_loop() -> None:
-        _emit_status("Anti-AFK native engine is not available")
-
-    def _stop_loop() -> None:
-        return
-
-    def _pause_loop(wait: bool) -> bool:
-        return False
-
-    def _resume_loop() -> bool:
-        return False
+    # Anti-AFK scheduling (including BES "Throttle Pacify") runs in the native engine (C++).
     try:
+        # Prefer the in-repo native build output (./native) when available.
+        try:
+            import sys
+            from pathlib import Path
+
+            native_dir = Path(__file__).resolve().parent / "native"
+            if native_dir.is_dir():
+                sys.path.insert(0, str(native_dir))
+        except Exception:
+            pass
+
         from antiafk_native import AntiAFK as NativeAntiAFK  # type: ignore
 
         cfg = dict(initial_config or {})
@@ -74,6 +75,14 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
 
         native.status_callback = _emit_status
         native.button_state_callback = _emit_state
+        try:
+            native.touch_callback = _emit_touch
+        except Exception:
+            pass
+        try:
+            native.pre_action_callback = _emit_pre_action
+        except Exception:
+            pass
 
         cb_lock = threading.Lock()
         cb_req_id = 0
@@ -166,350 +175,11 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
             res = _cb_rpc({"type": "bes_release_hold", "pids": pid_list}, timeout_s=5.0, default=False)
             return bool(res)
 
-        # Win32 helpers for BES integration / foreground restore.
-        _GetWindowThreadProcessId = None
-        _GetForegroundWindow = None
         try:
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            _GetWindowThreadProcessId = user32.GetWindowThreadProcessId
-            _GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-            _GetWindowThreadProcessId.restype = wintypes.DWORD
-            _GetForegroundWindow = user32.GetForegroundWindow
-            _GetForegroundWindow.argtypes = []
-            _GetForegroundWindow.restype = wintypes.HWND
+            native.bes_hold_unthrottled_callback = _bes_hold_unthrottled
+            native.bes_release_hold_callback = _bes_release_hold
         except Exception:
-            _GetWindowThreadProcessId = None
-            _GetForegroundWindow = None
-
-        def _hwnd_to_pid(hwnd_int: int) -> Optional[int]:
-            if _GetWindowThreadProcessId is None:
-                return None
-            try:
-                pid = wintypes.DWORD(0)
-                tid = _GetWindowThreadProcessId(wintypes.HWND(int(hwnd_int)), ctypes.byref(pid))
-                if int(tid) == 0:
-                    return None
-                return int(pid.value) if int(pid.value) > 0 else None
-            except Exception:
-                return None
-
-        def _get_foreground_hwnd() -> int:
-            if _GetForegroundWindow is None:
-                return 0
-            try:
-                hwnd = _GetForegroundWindow()
-                return int(getattr(hwnd, "value", hwnd) or 0)
-            except Exception:
-                return 0
-
-        def _wait_interruptible(seconds: float) -> bool:
-            """
-            Wait up to `seconds`, returning False if stop/pause/shutdown is requested.
-            """
-            try:
-                total = float(seconds)
-            except Exception:
-                total = 0.0
-            if total <= 0.0:
-                return True
-            end = time.monotonic() + total
-            while time.monotonic() < end:
-                if _shutdown_flag.is_set() or _loop_stop.is_set() or _loop_pause.is_set():
-                    return False
-                time.sleep(min(0.1, max(0.0, end - time.monotonic())))
-            return True
-
-        def _antiafk_python_loop() -> None:
-            crash = None
-            try:
-                _emit_status("Anti-AFK loop started")
-
-                cfg0 = getattr(native, "config", {}) or {}
-                try:
-                    interval = int(cfg0.get("antiafk_interval", 120))
-                except Exception:
-                    interval = 120
-                try:
-                    action_type = str(cfg0.get("antiafk_action", "space"))
-                except Exception:
-                    action_type = "space"
-                try:
-                    alt_delay_ms = int(cfg0.get("antiafk_alt_delay_ms", 400))
-                except Exception:
-                    alt_delay_ms = 400
-                try:
-                    menu_autoreconnect = bool(cfg0.get("antiafk_menu_autoreconnect", False))
-                except Exception:
-                    menu_autoreconnect = False
-
-                _emit_status(
-                    "Settings: Interval="
-                    + str(interval)
-                    + "s, Action="
-                    + str(action_type)
-                    + ", AltDelayMs="
-                    + str(alt_delay_ms)
-                    + ", MenuAutoReconnect="
-                    + ("True" if menu_autoreconnect else "False")
-                )
-
-                last_action_time = time.monotonic() - max(0.0, float(interval) - 10.0)
-                last_no_windows_status = time.monotonic() - 11.0
-                pause_started: Optional[float] = None
-                any_pacify_fail = False
-                last_pacify_fail_log = 0.0
-
-                while not _shutdown_flag.is_set() and not _loop_stop.is_set():
-                    if _loop_pause.is_set():
-                        if pause_started is None:
-                            pause_started = time.monotonic()
-                            _loop_paused.set()
-                            _emit_status("Anti-AFK paused")
-
-                        while _loop_pause.is_set() and not _shutdown_flag.is_set() and not _loop_stop.is_set():
-                            time.sleep(0.1)
-
-                        if _shutdown_flag.is_set() or _loop_stop.is_set():
-                            break
-
-                        paused_for = time.monotonic() - float(pause_started)
-                        last_action_time += paused_for
-                        last_no_windows_status += paused_for
-                        pause_started = None
-                        _loop_paused.clear()
-                        _emit_status("Anti-AFK resumed")
-
-                    cfg = getattr(native, "config", {}) or {}
-                    try:
-                        interval = int(cfg.get("antiafk_interval", interval))
-                    except Exception:
-                        pass
-                    try:
-                        action_type = str(cfg.get("antiafk_action", action_type))
-                    except Exception:
-                        pass
-                    try:
-                        menu_autoreconnect = bool(cfg.get("antiafk_menu_autoreconnect", menu_autoreconnect))
-                    except Exception:
-                        pass
-
-                    now = time.monotonic()
-                    if (now - last_action_time) < float(max(1, interval)):
-                        _wait_interruptible(1.0)
-                        continue
-
-                    try:
-                        windows = list(native.find_roblox_windows(True))
-                    except Exception:
-                        windows = []
-
-                    if not windows:
-                        if (now - last_no_windows_status) >= 10.0:
-                            _emit_status("No Roblox windows found, waiting...")
-                            last_no_windows_status = now
-                        _wait_interruptible(5.0)
-                        continue
-
-                    _emit_status(f"Performing Anti-AFK action on {len(windows)} Roblox window(s)")
-                    action_success = True
-                    old_hwnd = _get_foreground_hwnd()
-
-                    # BES unthrottle integration (optional).
-                    try:
-                        unthrottle_enabled = bool(cfg.get("antiafk_unthrottle_enabled", False))
-                    except Exception:
-                        unthrottle_enabled = False
-                    try:
-                        batch_size = int(cfg.get("antiafk_unthrottle_batch_size", 5) or 5)
-                    except Exception:
-                        batch_size = 5
-                    try:
-                        lead_s = float(cfg.get("antiafk_unthrottle_lead_s", 0.0) or 0.0)
-                    except Exception:
-                        lead_s = 0.0
-                    batch_size = max(1, batch_size)
-                    lead_s = max(0.0, lead_s)
-
-                    for i in range(0, len(windows), batch_size):
-                        if _shutdown_flag.is_set() or _loop_stop.is_set() or _loop_pause.is_set():
-                            break
-                        batch = windows[i : i + batch_size]
-
-                        held_pids = []
-                        try:
-                            if unthrottle_enabled:
-                                seen = set()
-                                for hwnd_int in batch:
-                                    pid = _hwnd_to_pid(int(hwnd_int))
-                                    if pid is None or pid in seen:
-                                        continue
-                                    seen.add(pid)
-                                    held_pids.append(pid)
-
-                                if held_pids:
-                                    hold_s = lead_s + 120.0
-                                    hold_ok = False
-                                    try:
-                                        hold_ok = bool(_bes_hold_unthrottled(held_pids, hold_s))
-                                    except Exception:
-                                        hold_ok = False
-                                    if not hold_ok:
-                                        any_pacify_fail = True
-                                        if (time.monotonic() - float(last_pacify_fail_log)) >= 30.0:
-                                            last_pacify_fail_log = time.monotonic()
-                                            _emit_status(
-                                                "BES pacify: failed to request unthrottle for this batch; inputs may be throttled."
-                                            )
-
-                                    # Always yield a tiny amount after a successful hold so the BES scheduler
-                                    # can process the wake (even when lead time is 0).
-                                    if hold_ok:
-                                        apply_wait_s = max(float(lead_s), 0.25)
-                                        if apply_wait_s > 0.0:
-                                            if not _wait_interruptible(apply_wait_s):
-                                                break
-
-                            for hwnd_int in batch:
-                                if _shutdown_flag.is_set() or _loop_stop.is_set() or _loop_pause.is_set():
-                                    break
-                                try:
-                                    try:
-                                        ok = bool(native.perform_antiafk_action(int(hwnd_int), action_type, False))
-                                    except TypeError:
-                                        ok = bool(native.perform_antiafk_action(int(hwnd_int), action_type))
-                                except Exception:
-                                    ok = False
-                                if not ok:
-                                    action_success = False
-                        finally:
-                            if held_pids:
-                                try:
-                                    _bes_release_hold(held_pids)
-                                except Exception:
-                                    pass
-
-                    if not (_shutdown_flag.is_set() or _loop_stop.is_set() or _loop_pause.is_set()):
-                        try:
-                            if old_hwnd:
-                                native.restore_foreground_window(int(old_hwnd))
-                        except Exception:
-                            pass
-
-                    if _loop_pause.is_set():
-                        continue
-
-                    if action_success:
-                        last_action_time = time.monotonic()
-                        _emit_status("Anti-AFK action completed successfully")
-                        _wait_interruptible(0.5)
-                    else:
-                        _emit_status("Anti-AFK action failed, will retry on next cycle")
-            except Exception:
-                crash = traceback.format_exc()
-
-            if crash:
-                _emit_status("Anti-AFK loop crashed:\n" + crash)
-            else:
-                _emit_status("Anti-AFK loop ended")
-
-            try:
-                _loop_paused.clear()
-            except Exception:
-                pass
-
-            try:
-                _emit_state(False)
-            except Exception:
-                pass
-            if any_pacify_fail:
-                try:
-                    _emit_status("Note: Some BES pacify requests failed or timed out; some windows may stay throttled.")
-                except Exception:
-                    pass
-
-        def _start_loop() -> None:
-            nonlocal _loop_thread
-            if _shutdown_flag.is_set():
-                _emit_status("Anti-AFK is shut down")
-                return
-            # Ensure the native loop isn't also running.
-            try:
-                if native is not None and bool(getattr(native, "antiafk_running", False)):
-                    native.stop_antiafk()
-            except Exception:
-                pass
-            with _loop_lock:
-                if _loop_is_running():
-                    _emit_status("Anti-AFK is already running")
-                    return
-                _loop_stop.clear()
-                _loop_pause.clear()
-                _loop_paused.clear()
-                _loop_thread = threading.Thread(target=_antiafk_python_loop, name="AntiAFKPythonLoop", daemon=True)
-                _loop_thread.start()
-            _emit_status("Anti-AFK started")
-            _emit_state(True)
-
-        def _stop_loop() -> None:
-            nonlocal _loop_thread
-            with _loop_lock:
-                running = _loop_is_running()
-                if running:
-                    _loop_stop.set()
-                    _loop_pause.clear()
-                    _loop_paused.clear()
-                t = _loop_thread
-            native_was_running = False
-            try:
-                native_was_running = bool(native is not None and bool(getattr(native, "antiafk_running", False)))
-            except Exception:
-                native_was_running = False
-            try:
-                if running and t is not None:
-                    t.join(timeout=10.0)
-            except Exception:
-                pass
-            with _loop_lock:
-                _loop_thread = None
-            # Make sure any native loop is also stopped (defensive).
-            try:
-                if native_was_running and native is not None:
-                    native.stop_antiafk()
-            except Exception:
-                pass
-            if running or native_was_running:
-                _emit_status("Anti-AFK stopped")
-                _emit_state(False)
-            else:
-                _emit_status("Anti-AFK is not running")
-                _emit_state(False)
-
-        def _pause_loop(wait: bool) -> bool:
-            if _loop_is_running():
-                _loop_pause.set()
-                if not wait:
-                    return True
-                try:
-                    return bool(_loop_paused.wait(timeout=30.0))
-                except Exception:
-                    return False
-            try:
-                if native is not None:
-                    return bool(native.pause_antiafk(bool(wait)))
-            except Exception:
-                return False
-            return False
-
-        def _resume_loop() -> bool:
-            if _loop_is_running():
-                _loop_pause.clear()
-                return True
-            try:
-                if native is not None:
-                    return bool(native.resume_antiafk())
-            except Exception:
-                return False
-            return False
+            pass
 
         try:
             native.update_button_states()
@@ -550,8 +220,8 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
                     continue
 
                 if cmd == "get_running":
-                    running = bool(_loop_is_running())
-                    if not running and native is not None:
+                    running = False
+                    if native is not None:
                         try:
                             running = bool(getattr(native, "antiafk_running", False))
                         except Exception:
@@ -576,14 +246,6 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
                     continue
 
                 if cmd == "shutdown":
-                    try:
-                        _shutdown_flag.set()
-                    except Exception:
-                        pass
-                    try:
-                        _stop_loop()
-                    except Exception:
-                        pass
                     if native is not None:
                         try:
                             native.shutdown()
@@ -599,49 +261,6 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
                     args = msg.get("args") or []
                     kwargs = msg.get("kwargs") or {}
                     name_s = str(name)
-
-                    # Only use the Python loop when BES unthrottle integration is enabled (or already running).
-                    use_py_loop = bool(_loop_is_running())
-                    if not use_py_loop:
-                        try:
-                            cfg0 = getattr(native, "config", {}) or {}
-                            use_py_loop = bool(cfg0.get("antiafk_unthrottle_enabled", False))
-                        except Exception:
-                            use_py_loop = False
-
-                    if name_s == "start_antiafk" and use_py_loop:
-                        _start_loop()
-                        _reply(True, None)
-                        continue
-                    if name_s == "stop_antiafk" and use_py_loop:
-                        _stop_loop()
-                        _reply(True, None)
-                        continue
-                    if name_s == "toggle_antiafk" and use_py_loop:
-                        if not args:
-                            raise ValueError("toggle_antiafk requires an explicit enable state")
-                        enable = bool(args[0])
-                        try:
-                            native.config["antiafk_enabled"] = bool(enable)
-                        except Exception:
-                            pass
-                        if enable:
-                            _start_loop()
-                        else:
-                            _stop_loop()
-                        _reply(True, None)
-                        continue
-                    if name_s == "pause_antiafk" and use_py_loop:
-                        wait = True
-                        if args:
-                            wait = bool(args[0])
-                        elif isinstance(kwargs, dict) and "wait" in kwargs:
-                            wait = bool(kwargs.get("wait", True))
-                        _reply(True, bool(_pause_loop(bool(wait))))
-                        continue
-                    if name_s == "resume_antiafk" and use_py_loop:
-                        _reply(True, bool(_resume_loop()))
-                        continue
 
                     fn = getattr(native, name_s)
                     result = fn(*args, **kwargs)
@@ -680,6 +299,8 @@ class AntiAFK:
       - config (dict)
       - status_callback (callable | None)
       - button_state_callback (callable | None)
+      - touch_callback (callable | None)
+      - pre_action_callback (callable | None)
       - is_pid_in_menu_callback (callable | None)
       - bes_hold_unthrottled_callback (callable | None)
       - bes_release_hold_callback (callable | None)
@@ -691,6 +312,8 @@ class AntiAFK:
 
         self.status_callback = None
         self.button_state_callback = None
+        self.touch_callback = None
+        self.pre_action_callback = None
         self.is_pid_in_menu_callback = None
         self.bes_hold_unthrottled_callback = None
         self.bes_release_hold_callback = None
@@ -839,6 +462,22 @@ class AntiAFK:
                         cb(running)
                     except Exception:
                         pass
+            elif etype == "touch":
+                pid = evt.get("pid", None)
+                cb = getattr(self, "touch_callback", None)
+                if callable(cb):
+                    try:
+                        cb(pid)
+                    except Exception:
+                        pass
+            elif etype == "pre_action":
+                seconds = evt.get("seconds", 0.0)
+                cb = getattr(self, "pre_action_callback", None)
+                if callable(cb):
+                    try:
+                        cb(seconds)
+                    except Exception:
+                        pass
 
     # ---- Native-compatible API (subset + commonly used helpers) ----
 
@@ -850,6 +489,9 @@ class AntiAFK:
         action: Optional[str] = None,
         alt_delay_ms: Optional[int] = None,
         menu_autoreconnect: Optional[bool] = None,
+        alert_sound_enabled: Optional[bool] = None,
+        alert_tooltip_enabled: Optional[bool] = None,
+        alert_lead_s: Optional[float] = None,
         unthrottle_enabled: Optional[bool] = None,
         unthrottle_batch_size: Optional[int] = None,
         unthrottle_lead_s: Optional[float] = None,
@@ -871,6 +513,21 @@ class AntiAFK:
         if menu_autoreconnect is not None:
             kwargs["menu_autoreconnect"] = bool(menu_autoreconnect)
             self.config["antiafk_menu_autoreconnect"] = bool(menu_autoreconnect)
+        if alert_sound_enabled is not None:
+            v = bool(alert_sound_enabled)
+            extra_updates["antiafk_alert_sound"] = v
+            self.config["antiafk_alert_sound"] = v
+        if alert_tooltip_enabled is not None:
+            v = bool(alert_tooltip_enabled)
+            extra_updates["antiafk_alert_tooltip"] = v
+            self.config["antiafk_alert_tooltip"] = v
+        if alert_lead_s is not None:
+            try:
+                v = max(0.0, float(alert_lead_s))
+            except Exception:
+                v = 0.0
+            extra_updates["antiafk_alert_lead_s"] = v
+            self.config["antiafk_alert_lead_s"] = v
         if unthrottle_enabled is not None:
             v = bool(unthrottle_enabled)
             extra_updates["antiafk_unthrottle_enabled"] = v
@@ -985,6 +642,24 @@ class AntiAFK:
 
     def restore_foreground_window(self, hwnd: int) -> None:
         self._call("restore_foreground_window", int(hwnd))
+
+    def touch_pids(self, pids) -> None:
+        try:
+            pid_list = [int(p) for p in (pids or []) if int(p) > 0]
+        except Exception:
+            pid_list = []
+        if not pid_list:
+            return
+        self._call("touch_pids", pid_list)
+
+    def set_pids_disconnected(self, pids, disconnected: bool = True) -> None:
+        try:
+            pid_list = [int(p) for p in (pids or []) if int(p) > 0]
+        except Exception:
+            pid_list = []
+        if not pid_list:
+            return
+        self._call("set_pids_disconnected", pid_list, bool(disconnected))
 
     def enable_multi_instance(self) -> bool:
         return bool(self._call("enable_multi_instance"))

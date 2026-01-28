@@ -1,4 +1,4 @@
-PyQt6
+PySide6
 psutil
 requests
 pywin32
@@ -12,4 +12,3 @@ rapidocr-onnxruntime
 # Run these separately afterwards
 # pip uninstall onnxruntime
 # pip install onnxruntime-directML
-

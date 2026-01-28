@@ -5,7 +5,7 @@ import json
 import threading
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from multiprocessing import get_context
@@ -13,7 +13,7 @@ from multiprocessing import get_context
 import numpy as np
 import requests
 from PIL import Image, ImageGrab, ImageOps
-from PyQt6.QtCore import QThread, pyqtSignal
+from PySide6.QtCore import QThread, Signal
 
 import difflib
 import psutil
@@ -925,9 +925,9 @@ class OCRWorker(QThread):
     the existing MultiScope merchant webhook and JARAM process metadata.
     """
 
-    log_signal = pyqtSignal(str)
-    status_signal = pyqtSignal(str)
-    merchant_signal = pyqtSignal(str, str)  # (user_id, merchant)
+    log_signal = Signal(str)
+    status_signal = Signal(str)
+    merchant_signal = Signal(str, str)  # (user_id, merchant)
 
     def __init__(
         self,
@@ -1069,15 +1069,35 @@ class OCRWorker(QThread):
                                     except Exception as e:
                                         self._log(f"[OCR] Failed to dispatch process task for PID {win.pid}: {e}")
 
-                                for fut in as_completed(future_map):
-                                    win, raw_img = future_map[fut]
+                                # IMPORTANT: `as_completed()` without a timeout can block forever if the
+                                # pool workers are busy/hung, which prevents a clean shutdown and can
+                                # leave background processes after closing JARAM. Use a short wait loop
+                                # so `stop()` is responsive.
+                                pending = set(future_map.keys())
+                                while pending:
                                     if self._stop_event.is_set():
+                                        for fut in list(pending):
+                                            try:
+                                                fut.cancel()
+                                            except Exception:
+                                                pass
                                         break
-                                    try:
-                                        result = fut.result()
-                                    except Exception as e:
-                                        self._log(f"[OCR] Worker process error for PID {win.pid}: {e}")
+
+                                    done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                                    if not done:
                                         continue
+
+                                    for fut in done:
+                                        win, raw_img = future_map.get(fut, (None, None))
+                                        if win is None:
+                                            continue
+                                        if self._stop_event.is_set():
+                                            break
+                                        try:
+                                            result = fut.result()
+                                        except Exception as e:
+                                            self._log(f"[OCR] Worker process error for PID {win.pid}: {e}")
+                                            continue
 
                                     if not isinstance(result, dict):
                                         continue
@@ -1125,6 +1145,7 @@ class OCRWorker(QThread):
             self.status_signal.emit("stopped")
         finally:
             self._shutdown_ocr_pool()
+            self._shutdown_send_pool()
 
     # ---------------------- detection helpers ---------------------
     def _process_window(self, win) -> None:
@@ -1200,12 +1221,14 @@ class OCRWorker(QThread):
         except Exception:
             pass
         username = ctx.get("username") or f"PID {pid}"
-        owner = ctx.get("owner") or username
-        server_label = ctx.get("server_label") or "Unknown"
-        ps_link = ctx.get("ps_link") or ""
+        owner_raw = str(ctx.get("owner") or "").strip()
+        owner_known = bool(owner_raw)
+        owner = owner_raw or username
+        server_label = str(ctx.get("server_label") or "").strip() or "Unknown"
+        ps_link = str(ctx.get("ps_link") or "").strip()
 
         self._log(f"[DETECT] {merchant.upper()} detected in PID {pid} ({username}).")
-        self._send_webhook(merchant, pid, username, owner, server_label, ps_link, raw_img)
+        self._send_webhook(merchant, pid, username, owner, owner_known, server_label, ps_link, raw_img)
 
     def _send_webhook(
         self,
@@ -1213,6 +1236,7 @@ class OCRWorker(QThread):
         pid: int,
         username: str,
         owner: str,
+        owner_known: bool,
         server_label: str,
         ps_link: str,
         raw_img: Image.Image,
@@ -1221,6 +1245,13 @@ class OCRWorker(QThread):
         if not url:
             self._log("[Webhook] Merchant webhook is not configured.")
             return
+        if bool(getattr(self, "_skip_webhook_unknown_context", False)):
+            server_unknown = (not server_label) or server_label.strip().lower() == "unknown"
+            owner_unknown = (not owner_known) or (str(owner).strip().lower() == "unknown")
+            ps_unknown = not bool(ps_link)
+            if server_unknown or owner_unknown or ps_unknown:
+                self._log("[Webhook] Skipping OCR webhook; owner or private server unknown.")
+                return
 
         ping_map = {
             "jester": (self._ms_cfg or {}).get("jester_ping", ""),
@@ -1371,6 +1402,12 @@ class OCRWorker(QThread):
         self._device_id, self._force_cpu = _parse_device_id(self._ocr_cfg.get("device_id"))
         self._log_ocr_text = bool(self._ocr_cfg.get("log_ocr_text", False))
         self._log_loop = bool(self._ocr_cfg.get("log_loop", True))
+        skip_flag = None
+        if isinstance(self._ms_cfg, dict) and "skip_webhook_unknown_context" in self._ms_cfg:
+            skip_flag = bool(self._ms_cfg.get("skip_webhook_unknown_context", False))
+        if skip_flag is None:
+            skip_flag = bool(self._ocr_cfg.get("skip_webhook_unknown_context", False))
+        self._skip_webhook_unknown_context = bool(skip_flag)
 
         try:
             tol = float(self._ocr_cfg.get("frame_diff_tolerance", 2.0))
@@ -1423,6 +1460,24 @@ class OCRWorker(QThread):
                 pass
             self._ocr_pool = None
 
+    def _shutdown_send_pool(self) -> None:
+        pool = getattr(self, "_send_pool", None)
+        if pool is None:
+            return
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            self._send_pool = None
+        except Exception:
+            pass
+
     # ---------------------------- misc ----------------------------
     def _log(self, msg: str) -> None:
         clean = msg.strip()
@@ -1440,7 +1495,7 @@ class OCRWorker(QThread):
 
     def __del__(self) -> None:  # pragma: no cover - destructor safety
         try:
-            self._send_pool.shutdown(wait=False)
+            self._shutdown_send_pool()
         except Exception:
             pass
         try:

@@ -9,9 +9,9 @@ import faulthandler
 from pathlib import Path
 from typing import Dict, Optional
 
-from PyQt6.QtCore import QPointF, QRect, Qt, QTimer
-from PyQt6.QtGui import QColor, QPainter
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import QPointF, QRect, Qt, QTimer
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QComboBox,
@@ -498,8 +498,8 @@ class FoundStatsMixin:
             v = int(color_int) & 0xFFFFFF
             return QColor((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
 
-        from PyQt6.QtWidgets import QStyledItemDelegate, QStyleOptionViewItem
-        from PyQt6.QtGui import QFontMetrics, QPalette
+        from PySide6.QtWidgets import QStyledItemDelegate, QStyleOptionViewItem
+        from PySide6.QtGui import QFontMetrics, QPalette
         import math
 
         class _AnimatedBiomeNameDelegate(QStyledItemDelegate):

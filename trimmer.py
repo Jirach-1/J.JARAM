@@ -11,7 +11,7 @@ except Exception:  # pragma: no cover
     _native_trim_targets = None
     _USING_NATIVE = False
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -23,8 +23,8 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QScrollArea,
 )
-from PyQt6.QtCore import QTimer
-from PyQt6.QtGui import QFont
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QFont
 
 
 TARGET_PROCESS_NAME = "RobloxPlayerBeta.exe"

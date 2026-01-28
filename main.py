@@ -1,6 +1,7 @@
 import psutil
 import os
 import time
+import threading
 import win32gui
 import win32process
 import requests
@@ -177,13 +178,28 @@ class RobloxManager:
         self.excluded_pid = 0
         from timeout_monitor import TimeoutMonitor   # top-level import
 
-        tm_cfg = app_settings.get("timeout_monitor", {})
+        tm_cfg = app_settings.get("timeout_monitor", {}) or {}
+        if not isinstance(tm_cfg, dict):
+            tm_cfg = {}
+        alerts_cfg = app_settings.get("alerts", {}) or {}
+        if not isinstance(alerts_cfg, dict):
+            alerts_cfg = {}
+        webhook_url = str(alerts_cfg.get("webhook_url") or tm_cfg.get("webhook_url") or "").strip()
+        blackout_ping = str(
+            alerts_cfg.get("blackout_ping")
+            or alerts_cfg.get("ping_message")
+            or tm_cfg.get(
+                "ping_message",
+                "<@YourPing> This message is sent whenever your active processes drop to 1 or 0, for debugging, leave webhook empty if not interested",
+            )
+            or ""
+        ).strip()
 
         self.timeout_monitor = TimeoutMonitor(
             kill_timeout  = tm_cfg.get("kill_timeout", 1740),
             poll_interval = tm_cfg.get("poll_interval", 10),
-            webhook_url   = tm_cfg.get("webhook_url", ""),
-            ping_message  = tm_cfg.get("ping_message", "<@YourPing> This message is sent whenever your active processes drop to 1 or 0, for debugging, leave webhook empty if not interested"),
+            webhook_url   = webhook_url,
+            ping_message  = blackout_ping,
             kill_enabled  = bool(tm_cfg.get("kill_enabled", True))
         )
 
@@ -194,7 +210,7 @@ class RobloxManager:
             if hasattr(self.config_manager, 'get_users_for_manager'):
                 return self.config_manager.get_users_for_manager()   # keep ALL users
 
-            else:
+            elif not is_alternate:
                 users = self.config_manager.load_users()
 
             if not users:
@@ -401,7 +417,7 @@ class ProcessManager:
         from collections import defaultdict
 
         window_counts = defaultdict(int)
-        active_pids = []
+        active_pids = set()
 
         # --- Safely collect Roblox PIDs ------------------------------------
         try:
@@ -415,7 +431,7 @@ class ProcessManager:
                     continue
 
                 if name == self.process_name and pid != self.excluded_pid:
-                    active_pids.append(pid)
+                    active_pids.add(pid)
         except (OSError, psutil.Error):
             # WinError 8 / resource issues → just skip this pass
             return window_counts
@@ -731,19 +747,26 @@ class GameLauncher:
         self.log = log_fn or print
         self._skip_log_until = {}  # (uid, label) -> epoch seconds
 
+        # Prevent duplicate launches of the same uid from concurrent callers (ramp-up thread,
+        # relaunch scheduler, disconnect handling, manual restarts, etc.).
+        self._launch_inflight_lock = threading.Lock()
+        self._launch_inflight = set()
+
 
     def _extract_private_server_info(self, private_server_link, cookie=None):
         import re
         if not private_server_link:
             return None, None, "direct"
 
+        link = str(private_server_link or "").strip()
+
         pattern1 = r'roblox\.com/games/(\d+)/[^?]*\?privateServerLinkCode=([A-Za-z0-9_-]+)'
-        m1 = re.search(pattern1, private_server_link)
+        m1 = re.search(pattern1, link)
         if m1:
             return m1.group(1), m1.group(2), "direct"
 
         pattern2 = r'roblox\.com/share\?code=([A-Za-z0-9_-]+)&type=Server'
-        m2 = re.search(pattern2, private_server_link)
+        m2 = re.search(pattern2, link)
         if m2:
             share_code = m2.group(1)
             if cookie:
@@ -752,6 +775,11 @@ class GameLauncher:
                     return p, code, "resolved"
                 return None, share_code, "share"
             return None, share_code, "share"
+
+        # Allow pasting just a linkCode value (privateServerLinkCode).
+        if re.fullmatch(r"[A-Za-z0-9_-]{5,}", link):
+            return None, link, "code"
+
         return None, None, "invalid"
     
     # main.py — inside class GameLauncher
@@ -802,6 +830,57 @@ class GameLauncher:
         except Exception:
             pass
         return None, None
+
+    def _get_share_resolver_cookies(self, *, prefer_cookie: str = "", exclude_uid: str = "") -> list[str]:
+        """
+        Return a prioritized list of cookies that can be used to resolve a Server share link.
+
+        Share link resolution requires an authenticated request; alternate launch accounts may not
+        have a cookie, so we can borrow any other stored cookie for the one-time resolve.
+        """
+        cookies: list[str] = []
+        seen: set[str] = set()
+
+        def _add(c: str) -> None:
+            c = str(c or "").strip()
+            if not c or c in seen:
+                return
+            seen.add(c)
+            cookies.append(c)
+
+        _add(prefer_cookie)
+
+        try:
+            users = self.cfg.load_users() or {}
+        except Exception:
+            users = {}
+
+        if not isinstance(users, dict) or not users:
+            return cookies
+
+        # Prefer cookies from enabled, non-flagged, non-alternate accounts first.
+        for uid, info in users.items():
+            if exclude_uid and str(uid) == str(exclude_uid):
+                continue
+            if not isinstance(info, dict):
+                continue
+            if bool(info.get("alternate_launch", False)):
+                continue
+            if bool(info.get("disabled", False)) or bool(info.get("bad", False)) or bool(info.get("cap", False)):
+                continue
+            _add(info.get("cookie", ""))
+
+        # Fallback: include any remaining cookies (even if flagged/disabled).
+        for uid, info in users.items():
+            if exclude_uid and str(uid) == str(exclude_uid):
+                continue
+            if not isinstance(info, dict):
+                continue
+            if bool(info.get("alternate_launch", False)):
+                continue
+            _add(info.get("cookie", ""))
+
+        return cookies
     
     def compute_server_label(self, user_info: dict, cookie: str) -> str:
         """
@@ -812,8 +891,10 @@ class GameLauncher:
         psl = (user_info.get("private_server_link") or "").strip() if isinstance(user_info, dict) else ""
         place_cfg = user_info.get("place") if isinstance(user_info, dict) else None
 
+        is_alternate = bool((user_info or {}).get("alternate_launch", False))
+
         # Parse quickly
-        p, code, ltype = self._extract_private_server_info(psl, cookie)
+        p, code, ltype = self._extract_private_server_info(psl, cookie if not is_alternate else None)
 
         # If it's a SHARE link, prefer any previously learned mapping → linkCode
         if ltype == "share" and code:
@@ -829,6 +910,12 @@ class GameLauncher:
                 rp, rc = self._convert_share_link(code, cookie)
                 if rp and rc:
                     p, code, ltype = rp, rc, "resolved"
+                elif is_alternate:
+                    for resolver_cookie in self._get_share_resolver_cookies(prefer_cookie=cookie):
+                        rp, rc = self._convert_share_link(code, resolver_cookie)
+                        if rp and rc:
+                            p, code, ltype = rp, rc, "resolved"
+                            break
 
         target_place = str(p or place_cfg or self.target_place)
         return (code[:10] if code else f"Public:{target_place}")
@@ -838,18 +925,53 @@ class GameLauncher:
         import os, time, random
 
         launch_ts = time.time()
+        uid_key = str(user_id)
+
+        # Fast-path: if this uid is already mid-launch, skip BEFORE any network/auth work or logs.
+        with self._launch_inflight_lock:
+            if uid_key in self._launch_inflight:
+                server_label = "Unknown"
+                try:
+                    us = getattr(self.tracker, "user_server", {}) or {}
+                    server_label = str(us.get(user_id) or us.get(uid_key) or server_label)
+                except Exception:
+                    pass
+                try:
+                    self.log_skip(uid_key, server_label, "launch_inflight", throttle=2.0)
+                except Exception:
+                    try:
+                        self.log(f"[LAUNCH SKIP] {uid_key} -> {server_label} launch_inflight")
+                    except Exception:
+                        pass
+                return False
 
         # pull original config
         psl = ""
         if user_info and isinstance(user_info, dict):
             psl = user_info.get("private_server_link", "")
 
+        is_alternate = bool((user_info or {}).get("alternate_launch", False))
+
         # parse target place / link-code (resolve share links early)
-        place_id, private_code, link_type = self._extract_private_server_info(psl, cookie)
+        place_id, private_code, link_type = self._extract_private_server_info(psl, cookie if not is_alternate else None)
         if link_type == "share" and private_code:
-            rp, rc = self._convert_share_link(private_code, cookie)
-            if rp and rc:
-                place_id, private_code, link_type = rp, rc, "resolved"
+            try:
+                m = self.tracker.share_to_link.get(private_code)
+            except Exception:
+                m = None
+            if m and m.get("place") and m.get("link"):
+                place_id, private_code, link_type = str(m.get("place") or ""), str(m.get("link") or ""), "resolved"
+            else:
+                if is_alternate:
+                    for resolver_cookie in self._get_share_resolver_cookies(prefer_cookie=cookie, exclude_uid=str(user_id)):
+                        rp, rc = self._convert_share_link(private_code, resolver_cookie)
+                        if rp and rc:
+                            place_id, private_code, link_type = rp, rc, "resolved"
+                            break
+                else:
+                    rp, rc = self._convert_share_link(private_code, cookie)
+                    if rp and rc:
+                        place_id, private_code, link_type = rp, rc, "resolved"
 
         user_place_cfg = user_info.get("place") if isinstance(user_info, dict) else None
         target_place = place_id or user_place_cfg or self.target_place
@@ -862,6 +984,7 @@ class GameLauncher:
         self.log(
             f"[LAUNCH] uid={user_id} place={target_place} label={server_label} "
             f"private={'yes' if private_code else 'no'} link_type={link_type} "
+            f"mode={'alternate' if is_alternate else 'cookie'} "
             f"skip_cleanup={'yes' if skip_cleanup else 'no'}"
         )
 
@@ -898,36 +1021,60 @@ class GameLauncher:
                     except Exception:
                         pass
                     return False
-        # ---- Build auth + URL ------------------------------------------------------
-        auth_ticket = self.auth_handler.obtain_auth_ticket(cookie)
-        if not auth_ticket:
-            self.log(f"[LAUNCH FAIL] uid={user_id} label={server_label} reason=no_auth_ticket")
-            self.cfg.mark_bad_cookie(user_id, True)
-            if user_info is not None:
-                user_info["bad"] = True
-                user_info["inactive_since"] = time.time()
-            return False
-
-        browser_id = f"{random.randint(100000,130000)}{random.randint(100000,900000)}"
-        if private_code:
-            launcher_url = (
-                "https://assetgame.roblox.com/game/PlaceLauncher.ashx"
-                f"?request=RequestPrivateGame&placeId={target_place}&linkCode={private_code}"
-            )
+        # ---- Build URL --------------------------------------------------------------
+        if is_alternate:
+            # Alternate mode: no cookies/auth ticket; launch via roblox:// protocol.
+            # Public:  roblox://placeId=<place>
+            # Private: roblox://placeId=<place>&linkCode=<code>
+            if link_type == "share":
+                self.log(f"[LAUNCH FAIL] uid={user_id} label={server_label} reason=share_link_unresolved")
+                return False
+            game_url = f"roblox://placeId={target_place}"
+            if private_code:
+                game_url += f"&linkCode={private_code}"
         else:
-            launcher_url = (
-                "https://assetgame.roblox.com/game/PlaceLauncher.ashx"
-                f"?request=RequestGame&placeId={target_place}"
+            auth_ticket = self.auth_handler.obtain_auth_ticket(cookie)
+            if not auth_ticket:
+                self.log(f"[LAUNCH FAIL] uid={user_id} label={server_label} reason=no_auth_ticket")
+                self.cfg.mark_bad_cookie(user_id, True)
+                if user_info is not None:
+                    user_info["bad"] = True
+                    user_info["inactive_since"] = time.time()
+                return False
+
+            browser_id = f"{random.randint(100000,130000)}{random.randint(100000,900000)}"
+            if private_code:
+                launcher_url = (
+                    "https://assetgame.roblox.com/game/PlaceLauncher.ashx"
+                    f"?request=RequestPrivateGame&placeId={target_place}&linkCode={private_code}"
+                )
+            else:
+                launcher_url = (
+                    "https://assetgame.roblox.com/game/PlaceLauncher.ashx"
+                    f"?request=RequestGame&placeId={target_place}"
+                )
+
+            game_url = (
+                "roblox-player://1/1+launchmode:play"
+                f"+gameinfo:{auth_ticket}"
+                f"+launchtime:{int(launch_ts * 1000)}"
+                f"+browsertrackerid:{browser_id}"
+                f"+placelauncherurl:{launcher_url}"
+                "+robloxLocale:en_us+gameLocale:en_us"
             )
 
-        game_url = (
-            "roblox-player://1/1+launchmode:play"
-            f"+gameinfo:{auth_ticket}"
-            f"+launchtime:{int(launch_ts * 1000)}"
-            f"+browsertrackerid:{browser_id}"
-            f"+placelauncherurl:{launcher_url}"
-            "+robloxLocale:en_us+gameLocale:en_us"
-        )
+        # Per-user "inflight" launch guard: avoids double os.startfile()/PID waits for the same uid.
+        with self._launch_inflight_lock:
+            if uid_key in self._launch_inflight:
+                try:
+                    self.log_skip(uid_key, server_label, "launch_inflight", throttle=2.0)
+                except Exception:
+                    try:
+                        self.log(f"[LAUNCH SKIP] {uid_key} -> {server_label} launch_inflight")
+                    except Exception:
+                        pass
+                return False
+            self._launch_inflight.add(uid_key)
 
         try:
             if not skip_cleanup:
@@ -991,6 +1138,9 @@ class GameLauncher:
             except Exception:
                 pass
             return False
+        finally:
+            with self._launch_inflight_lock:
+                self._launch_inflight.discard(uid_key)
 
 
     def initialize_all_sessions(self, user_configs: dict):
@@ -998,7 +1148,7 @@ class GameLauncher:
         self.tracker.initialization_mode = True
         try:
             for idx, (user_id, user_info) in enumerate(user_configs.items()):
-                if user_info.get("bad", False):
+                if user_info.get("bad", False) or user_info.get("cap", False):
                     continue
                 cookie = user_info.get("cookie", "") if isinstance(user_info, dict) else user_info
                 for pid in self.tracker.user_processes.get(user_id, []).copy():
@@ -1081,6 +1231,7 @@ def execute_main_loop():
     # track the last launch so we honour launch_delay
     user_state = {
         uid: {"last_launch": 0,
+              "log_miss_streak": 0,
               "user_info" : info}
         for uid, info in manager.settings.items()
     }
@@ -1119,24 +1270,50 @@ def execute_main_loop():
         PRECONNECT_GRACE = 120  # seconds
 
         for uid, pids in list(manager.process_tracker.user_processes.items()):
+            uid_s = str(uid)
             live_pids = [pid for pid in pids if process_mgr.verify_process_active(pid)]
             if not live_pids:
                 continue
 
-            info = manager.settings.get(uid, {}) or {}
+            info = manager.settings.get(uid_s, {}) or {}
             uname = str(info.get("username", "")).lower()
             if not uname:
                 continue  # nothing to check
 
             log_path = find_log_for_username(uname, allow_fallback=False)
+            if log_path:
+                try:
+                    user_state[uid_s]["log_miss_streak"] = 0
+                except Exception:
+                    pass
             if not log_path:
                 oldest_ct = min(manager.process_tracker.creation_timestamps.get(pid, now) for pid in live_pids)
                 waited = now - oldest_ct
                 if waited >= PRECONNECT_GRACE:
                     # failed to ever attach to a log with the username — recycle it
+                    if not bool(info.get("cap", False)):
+                        try:
+                            st0 = user_state.get(uid_s, {})
+                            streak = int(st0.get("log_miss_streak", 0) or 0) + 1
+                            st0["log_miss_streak"] = streak
+                            user_state[uid_s] = st0
+                        except Exception:
+                            streak = 0
+
+                        if streak >= 3:
+                            try:
+                                manager.config_manager.mark_cap_flag(uid_s, True)
+                            except Exception:
+                                pass
+                            try:
+                                info["cap"] = True
+                                manager.settings[uid_s]["cap"] = True
+                                user_state[uid_s]["user_info"]["cap"] = True
+                            except Exception:
+                                pass
                     for pid in live_pids:
                         process_mgr.terminate_process(pid, manager.process_tracker)
-                    manager.process_tracker.user_server[uid] = "DISCONNECTED"
+                    manager.process_tracker.user_server[uid_s] = "DISCONNECTED"
         # --- END new watchdog --------------------------------------------------
 
         # --- build eligible candidates for this tick ---------------------------------
@@ -1172,6 +1349,8 @@ def execute_main_loop():
 
             # 4) compute target label exactly as launcher will
             info   = st["user_info"] if isinstance(st["user_info"], dict) else {}
+            if isinstance(info, dict) and (info.get("bad", False) or info.get("cap", False) or info.get("disabled", False)):
+                continue
             cookie = info.get("cookie", "") if isinstance(info, dict) else info
             server_label = launcher.compute_server_label(info, cookie)
             is_public = server_label.startswith("Public:")

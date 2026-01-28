@@ -1,9 +1,19 @@
 import os
 import sys
+import traceback
 from typing import Optional
-from PyQt6.QtCore import Qt, QTimer, QRect, QSize
-from PyQt6.QtGui import QIcon, QPixmap, QColor, QFont, QPainter, QLinearGradient
-from PyQt6.QtWidgets import QApplication, QSplashScreen
+from PySide6.QtCore import Qt, QTimer, QRect, QSize
+from PySide6.QtGui import QIcon, QPixmap, QColor, QFont, QPainter, QLinearGradient
+from PySide6.QtWidgets import (
+    QApplication,
+    QSplashScreen,
+    QDialog,
+    QDialogButtonBox,
+    QLabel,
+    QLineEdit,
+    QVBoxLayout,
+    QMessageBox,
+)
 from multiscope import APP_FOOTER
 
 
@@ -104,10 +114,83 @@ def _create_loading_screen(icon_path: Optional[str]) -> QSplashScreen:
     return splash
 
 
+def _maybe_prompt_cookie_unlock(app: QApplication, parent=None) -> None:
+    try:
+        from gui import ConfigManager
+    except Exception:
+        return
+
+    try:
+        cfg = ConfigManager()
+    except Exception:
+        return
+
+    if not cfg.cookie_encryption_enabled():
+        return
+    if ConfigManager.is_cookie_unlocked():
+        return
+    if not cfg.cookie_encryption_available():
+        return
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Unlock Cookies")
+    dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+    dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+
+    layout = QVBoxLayout(dlg)
+    layout.addWidget(QLabel(
+        "Cookies are encrypted.\n"
+        "Enter your password to unlock now, or skip to unlock later in the app."
+    ))
+    pwd = QLineEdit()
+    pwd.setEchoMode(QLineEdit.EchoMode.Password)
+    layout.addWidget(pwd)
+
+    buttons = QDialogButtonBox()
+    unlock_btn = buttons.addButton("Unlock", QDialogButtonBox.ButtonRole.AcceptRole)
+    skip_btn = buttons.addButton("Skip", QDialogButtonBox.ButtonRole.RejectRole)
+    layout.addWidget(buttons)
+
+    def _attempt_unlock():
+        if not pwd.text().strip():
+            QMessageBox.warning(dlg, "Password Required", "Please enter a password.")
+            return
+        if cfg.unlock_cookie_encryption(pwd.text()):
+            dlg.accept()
+        else:
+            err = cfg.get_cookie_error() or "Incorrect password."
+            box = QMessageBox(dlg)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Unlock Failed")
+            box.setText(err)
+            try_again = box.addButton("Try Again", QMessageBox.ButtonRole.AcceptRole)
+            skip_now = box.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(try_again)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == skip_now:
+                dlg.reject()
+
+    unlock_btn.clicked.connect(_attempt_unlock)
+    skip_btn.clicked.connect(dlg.reject)
+
+    pwd.setFocus()
+    dlg.exec()
+
+
 def main():
+    # Silence noisy Windows DPI-awareness warning:
+    # "qt.qpa.window: SetProcessDpiAwarenessContext() failed: Access is denied."
+    try:
+        from PySide6.QtCore import QLoggingCategory
+
+        QLoggingCategory.setFilterRules("qt.qpa.window.warning=false")
+    except Exception:
+        pass
+
     # Make sure Qt uses the highest-res icons on HiDPI displays
     try:
-        from PyQt6.QtCore import QCoreApplication
+        from PySide6.QtCore import QCoreApplication
 
         QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
     except Exception:
@@ -117,6 +200,25 @@ def main():
     app.setApplicationName("J.JARAM")
     app.setApplicationVersion(APP_FOOTER)
     app.setOrganizationName("cresqnt")
+    # Qt 6 ships a Windows 11 style that can change widget visuals. Force the
+    # Windows 10-era style for consistent UI across OS versions.
+    try:
+        from PySide6.QtWidgets import QStyleFactory
+
+        if "windowsvista" in {str(k).lower() for k in QStyleFactory.keys()}:
+            style = QStyleFactory.create("windowsvista")
+            if style is not None:
+                app.setStyle(style)
+    except Exception:
+        pass
+
+    try:
+        from qt_event_filters import NoEnterInPopupsFilter
+
+        app._no_enter_in_popups_filter = NoEnterInPopupsFilter(app)
+        app.installEventFilter(app._no_enter_in_popups_filter)
+    except Exception:
+        pass
 
     icon_path = _find_icon_path()
     if icon_path and os.path.exists(icon_path):
@@ -128,20 +230,56 @@ def main():
 
     def build_window():
         # Delay heavy imports until after the splash appears
-        from gui import RobloxManagerGUI
+        try:
+            from gui import RobloxManagerGUI
 
-        splash.showMessage("Loading interface...", Qt.AlignBottom | Qt.AlignHCenter, QColor(TEXT_SECONDARY))
-        window = RobloxManagerGUI()
+            splash.showMessage("Loading interface...", Qt.AlignBottom | Qt.AlignHCenter, QColor(TEXT_SECONDARY))
+            window = RobloxManagerGUI()
 
-        splash.showMessage("Starting services...", Qt.AlignBottom | Qt.AlignHCenter, QColor(TEXT_SECONDARY))
-        app.processEvents()
+            splash.showMessage("Starting services...", Qt.AlignBottom | Qt.AlignHCenter, QColor(TEXT_SECONDARY))
+            app.processEvents()
 
-        window.show()
-        splash.finish(window)
+            window.show()
+            splash.finish(window)
+            QTimer.singleShot(0, lambda: _maybe_prompt_cookie_unlock(app, window))
+        except Exception:
+            tb = traceback.format_exc()
+            log_path = None
+            try:
+                appdata = os.environ.get("APPDATA", "")
+                if appdata:
+                    log_dir = os.path.join(appdata, "JARAM")
+                    os.makedirs(log_dir, exist_ok=True)
+                    log_path = os.path.join(log_dir, "launcher_crash.log")
+                else:
+                    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher_crash.log")
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write(tb)
+            except Exception:
+                log_path = None
+
+            try:
+                splash.close()
+            except Exception:
+                pass
+
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("J.JARAM failed to start")
+            msg.setText("An error occurred while starting J.JARAM.")
+            if log_path:
+                msg.setInformativeText(f"Crash log written to:\n{log_path}")
+            msg.setDetailedText(tb)
+            msg.exec()
+            raise
 
     QTimer.singleShot(0, build_window)
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
+    # Needed for frozen executables (Nuitka/PyInstaller) that use multiprocessing.
+    from multiprocessing import freeze_support
+
+    freeze_support()
     main()

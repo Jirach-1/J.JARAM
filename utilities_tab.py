@@ -8,14 +8,14 @@
 #   - self.tab_widget (QTabWidget) to add the tab
 # ──────────────────────────────────────────────────────────────────────────────
 
-import os, json, time, urllib.parse as _urlparse
+import os, json, time, urllib.parse as _urlparse, random, threading
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional, Set
 from collections import defaultdict
 
 import requests
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import QThread, Signal, Qt
+from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QLineEdit,
     QPushButton, QPlainTextEdit, QCheckBox, QLabel, QScrollArea,
     QDialog, QProgressBar
@@ -56,6 +56,29 @@ def _save_json(path: str, obj) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
+
+_CONFIG_MANAGER = None
+
+def _set_config_manager(config_manager) -> None:
+    global _CONFIG_MANAGER
+    _CONFIG_MANAGER = config_manager
+
+def _load_users() -> Dict[str, Any]:
+    if _CONFIG_MANAGER is not None:
+        try:
+            return _CONFIG_MANAGER.load_users() or {}
+        except Exception:
+            return {}
+    return _load_json(_users_json_path(), {})
+
+def _save_users(users: Dict[str, Any]) -> bool:
+    if _CONFIG_MANAGER is not None:
+        try:
+            return bool(_CONFIG_MANAGER.save_users(users))
+        except Exception:
+            return False
+    _save_json(_users_json_path(), users)
+    return True
 
 # ---------------- Block log schema (new) ----------------
 # {
@@ -330,6 +353,221 @@ def _unblock_display_node(driver, node) -> bool:
     except Exception:
         return False
 
+# ---------------- Roblox API (Blocking/Unblocking) ----------------
+_BLOCKING_API_BASE = "https://apis.roblox.com/user-blocking-api/v1/users"
+_CSRF_CACHE: Dict[str, Dict[str, Any]] = {}
+_BROWSER_ID_CACHE: Dict[str, str] = {}
+_API_CACHE_LOCK = threading.Lock()
+_BLOCKING_CALL_DELAY_SEC = 1.0
+_USER_SWAP_DELAY_SEC = 5.0
+
+def _generate_browser_id() -> str:
+    # Mirrors `browser_id = f"{rand}{rand}"` in main.py
+    return f"{random.randint(100000,130000)}{random.randint(100000,900000)}"
+
+def _get_or_create_browser_id(cookie: str) -> str:
+    if not cookie:
+        return _generate_browser_id()
+    with _API_CACHE_LOCK:
+        bid = _BROWSER_ID_CACHE.get(cookie)
+        if bid:
+            return bid
+        bid = _generate_browser_id()
+        _BROWSER_ID_CACHE[cookie] = bid
+        return bid
+
+def _get_cached_csrf(cookie: str) -> Optional[str]:
+    if not cookie:
+        return None
+    with _API_CACHE_LOCK:
+        entry = _CSRF_CACHE.get(cookie) or {}
+        if float(entry.get("expires") or 0) > time.time():
+            tok = str(entry.get("token") or "").strip()
+            return tok or None
+    return None
+
+def _set_cached_csrf(cookie: str, token: str) -> None:
+    if not cookie or not token:
+        return
+    with _API_CACHE_LOCK:
+        _CSRF_CACHE[cookie] = {"token": token, "expires": time.time() + 1800}
+
+def _retrieve_csrf_token(cookie: str) -> Optional[str]:
+    cached = _get_cached_csrf(cookie)
+    if cached:
+        return cached
+
+    # Roblox returns the CSRF token in a 403 response header.
+    browser_id = _get_or_create_browser_id(cookie)
+    s = requests.Session()
+    s.headers.update({
+        "Referer": "https://www.roblox.com/",
+        "Origin": "https://www.roblox.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Cookie": f"RBXEventTrackerV2=browserid={browser_id}; .ROBLOSECURITY={cookie}",
+    })
+
+    try:
+        r = s.post("https://auth.roblox.com/v1/authentication-ticket", timeout=6)
+        if r.status_code == 403:
+            token = r.headers.get("x-csrf-token") or r.headers.get("X-CSRF-TOKEN")
+            if token:
+                _set_cached_csrf(cookie, token)
+                return token
+    except Exception:
+        pass
+    return None
+
+def _make_blocking_api_session(cookie: str) -> requests.Session:
+    """
+    Create a requests Session for the Roblox user-blocking API.
+    Sends:
+      - Cookie: RBXEventTrackerV2=browserid=<browser_id>; .ROBLOSECURITY=<cookie>
+      - x-csrf-token: <token>
+    """
+    browser_id = _get_or_create_browser_id(cookie)
+    s = requests.Session()
+    s.headers.update({
+        "Referer": "https://www.roblox.com/",
+        "Origin": "https://www.roblox.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept": "application/json",
+        "Cookie": f"RBXEventTrackerV2=browserid={browser_id}; .ROBLOSECURITY={cookie}",
+    })
+    token = _retrieve_csrf_token(cookie)
+    if token:
+        s.headers["x-csrf-token"] = token
+    return s
+
+def _roblox_error_hint(resp: requests.Response) -> str:
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            errs = data.get("errors")
+            if isinstance(errs, list) and errs:
+                e0 = errs[0] if isinstance(errs[0], dict) else {}
+                msg = (e0.get("message") or e0.get("userFacingMessage") or "").strip()
+                code = e0.get("code")
+                if msg and code is not None:
+                    return f"{code}: {msg}"
+                if msg:
+                    return msg
+    except Exception:
+        pass
+    txt = (resp.text or "").strip().replace("\n", " ")
+    return txt[:160]
+
+def _roblox_error_code(resp: requests.Response) -> Optional[int]:
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            errs = data.get("errors")
+            if isinstance(errs, list) and errs and isinstance(errs[0], dict):
+                code = errs[0].get("code")
+                if code is not None:
+                    try:
+                        return int(code)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    try:
+        txt = (resp.text or "").strip()
+        if txt.isdigit():
+            return int(txt)
+    except Exception:
+        pass
+    return None
+
+def _roblox_post(session: requests.Session, cookie: str, url: str, timeout: float = 12.0) -> Optional[requests.Response]:
+    last = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(min(0.5 * (2 ** (attempt - 1)), 3.0))
+        try:
+            r = session.post(url, timeout=timeout)
+            last = r
+        except Exception:
+            continue
+
+        # CSRF refresh pattern: 403 + x-csrf-token header
+        if r.status_code == 403:
+            tok = r.headers.get("x-csrf-token") or r.headers.get("X-CSRF-TOKEN")
+            if tok:
+                session.headers["x-csrf-token"] = tok
+                _set_cached_csrf(cookie, tok)
+                try:
+                    r = session.post(url, timeout=timeout)
+                    last = r
+                except Exception:
+                    continue
+
+        # Rate-limit: retry a couple times (short backoff)
+        if r.status_code == 429 and attempt < 2:
+            ra = r.headers.get("Retry-After")
+            if ra:
+                try:
+                    time.sleep(min(float(ra), 5.0))
+                except Exception:
+                    pass
+            continue
+
+        return r
+
+    return last
+
+def _api_block_user(session: requests.Session, cookie: str, target_user_id: str) -> str:
+    url = f"{_BLOCKING_API_BASE}/{target_user_id}/block-user"
+    r = _roblox_post(session, cookie, url)
+    if r is None:
+        return "failed"
+
+    if r.status_code in (200, 204):
+        return "blocked"
+
+    if r.status_code in (401, 403):
+        return "bad_cookie"
+
+    if r.status_code in (409,):
+        return "already_blocked"
+
+    hint = _roblox_error_hint(r)
+    if r.status_code == 400:
+        if _roblox_error_code(r) == 1:
+            return "already_blocked"
+        lhint = hint.lower()
+        if "already" in lhint and "block" in lhint:
+            return "already_blocked"
+
+    return f"failed ({r.status_code})" + (f" {hint}" if hint else "")
+
+def _api_unblock_user(session: requests.Session, cookie: str, target_user_id: str) -> str:
+    url = f"{_BLOCKING_API_BASE}/{target_user_id}/unblock-user"
+    r = _roblox_post(session, cookie, url)
+    if r is None:
+        return "failed"
+
+    if r.status_code in (200, 204):
+        return "unblocked"
+
+    if r.status_code in (401, 403):
+        return "bad_cookie"
+
+    if r.status_code in (404, 409):
+        # best-effort: treat as already unblocked / not present
+        return "already_unblocked"
+
+    hint = _roblox_error_hint(r)
+    if r.status_code == 400:
+        if _roblox_error_code(r) == 4:
+            return "already_unblocked"
+        lhint = hint.lower()
+        if ("not" in lhint and "block" in lhint) or ("already" in lhint and "unblock" in lhint):
+            return "already_unblocked"
+
+    return f"failed ({r.status_code})" + (f" {hint}" if hint else "")
+
 # ---------------- PSL helpers ----------------
 def _game_instances_url(place_id: str, slug: str) -> str:
     slug = slug or "Example"
@@ -409,21 +647,26 @@ class _UtilitiesRunDialog(QDialog):
 
 # ---------------- Workers ----------------
 class _BlockWorker(QThread):
-    progress = pyqtSignal(str)
-    tick = pyqtSignal(int, int)
-    done = pyqtSignal()
+    progress = Signal(str)
+    tick = Signal(int, int)
+    done = Signal()
 
-    def __init__(self, headless: bool, targets_text: str):
+    def __init__(self, headless: bool, targets_text: str, allowed_uids=None, force: bool = False):
         super().__init__()
         self.headless = headless
         self.targets_text = targets_text
+        if allowed_uids is None:
+            self.allowed_uids = None
+        else:
+            self.allowed_uids = {str(x) for x in allowed_uids}
+        self.force = bool(force)
         self._cancel = False
 
     def cancel(self): self._cancel = True
     def _emit(self, s: str): self.progress.emit(s)
 
     def run(self):
-        users = _load_json(_users_json_path(), {})
+        users = _load_users()
         blocklog = _load_blocklog_migrated(users)
         username_cache: Dict[str, str] = blocklog.get("username_cache", {})
 
@@ -439,20 +682,29 @@ class _BlockWorker(QThread):
             self.done.emit(); return
 
         per_uid_targets: Dict[str, List[str]] = {}
+        eligible_users = 0
         total = 0
         for uid, data in users.items():
+            uid = str(uid)
+            if self.allowed_uids is not None and uid not in self.allowed_uids:
+                continue
             cookie = str(data.get("cookie") or "")
             bad = bool(data.get("bad", False))
             if not cookie or bad:
                 continue
-            already = set(map(str, blocklog.get("by_user", {}).get(str(uid), {}).get("blocked", [])))
-            remaining = [t for t in targets if t not in already]
+            eligible_users += 1
+            already = set(map(str, blocklog.get("by_user", {}).get(uid, {}).get("blocked", [])))
+            remaining = list(targets) if self.force else [t for t in targets if t not in already]
             if remaining:
-                per_uid_targets[str(uid)] = remaining
+                per_uid_targets[uid] = remaining
                 total += len(remaining)
 
+        if eligible_users == 0:
+            self._emit("[Block] No eligible users selected.")
+            self.done.emit(); return
+
         if total == 0:
-            self._emit("[Block] Everyone already blocked; nothing to do.")
+            self._emit("[Block] All selected users already have these targets blocked; nothing to do.")
             self.done.emit(); return
 
         for u, rem in per_uid_targets.items():
@@ -461,28 +713,35 @@ class _BlockWorker(QThread):
         cur = 0
         self.tick.emit(cur, total)
 
-        for uid, to_do in per_uid_targets.items():
+        work_items = list(per_uid_targets.items())
+        for user_idx, (uid, to_do) in enumerate(work_items):
             if self._cancel: break
             data = users.get(uid, {})
             cookie = str(data.get("cookie") or "")
             self._emit(f"[Block] {uid}: starting session")
 
             try:
-                driver = _make_driver(cookie, headless=self.headless)
+                session = _make_blocking_api_session(cookie)
             except Exception as e:
-                self._emit(f"[Block] {uid}: cookie failed auth ({e})")
+                self._emit(f"[Block] {uid}: failed to start API session ({e})")
+                if (not self._cancel) and user_idx < (len(work_items) - 1):
+                    time.sleep(_USER_SWAP_DELAY_SEC)
                 continue
 
             blocklog.setdefault("by_user", {}).setdefault(uid, {}).setdefault("blocked", [])
             blocked = set(map(str, blocklog["by_user"][uid]["blocked"]))
 
             try:
+                did_call = False
                 for t in to_do:
                     if self._cancel: break
-                    if t in blocked:
+                    if (not self.force) and t in blocked:
                         cur += 1; self.tick.emit(cur, total)
                         continue
-                    res = _block_user(driver, t)
+                    if did_call:
+                        time.sleep(_BLOCKING_CALL_DELAY_SEC)
+                    res = _api_block_user(session, cookie, t)
+                    did_call = True
                     if res == "bad_cookie":
                         self._emit(f"[Block] {uid}: cookie became invalid mid-run")
                         break
@@ -493,11 +752,16 @@ class _BlockWorker(QThread):
                         _save_json(_block_log_path(), blocklog)
                         self._emit(f"[Block] {uid}: {t} → {res}")
                     else:
-                        self._emit(f"[Block] {uid}: {t} → failed")
+                        self._emit(f"[Block] {uid}: {t} → {res}")
                     cur += 1; self.tick.emit(cur, total)
             finally:
-                try: driver.quit()
+                try: session.close()
                 except Exception: pass
+
+            if self._cancel:
+                break
+            if user_idx < (len(work_items) - 1):
+                time.sleep(_USER_SWAP_DELAY_SEC)
 
         blocklog["username_cache"] = username_cache
         _save_json(_block_log_path(), blocklog)
@@ -506,51 +770,64 @@ class _BlockWorker(QThread):
         self.done.emit()
 
 class _UnblockWorker(QThread):
-    progress = pyqtSignal(str)
-    tick = pyqtSignal(int, int)
-    scrub_from_persistent = pyqtSignal(list)
-    done = pyqtSignal()
+    progress = Signal(str)
+    tick = Signal(int, int)
+    scrub_from_persistent = Signal(list)
+    done = Signal()
 
-    def __init__(self, headless: bool, unblock_text: str):
+    def __init__(self, headless: bool, unblock_text: str, allowed_uids=None, force: bool = False):
         super().__init__()
         self.headless = headless
         self.unblock_text = unblock_text
+        if allowed_uids is None:
+            self.allowed_uids = None
+        else:
+            self.allowed_uids = {str(x) for x in allowed_uids}
+        self.force = bool(force)
         self._cancel = False
 
     def cancel(self): self._cancel = True
     def _emit(self, s: str): self.progress.emit(s)
 
     def run(self):
-        users = _load_json(_users_json_path(), {})
+        users = _load_users()
         blocklog = _load_blocklog_migrated(users)
         username_cache: Dict[str, str] = blocklog.get("username_cache", {}) or {}
 
         raw_targets = [ln.strip() for ln in self.unblock_text.splitlines() if ln.strip()]
         targets, id_to_raw, unresolved = _coerce_targets_to_ids_and_names(raw_targets, username_cache)
-        target_ids = set(targets)
         if unresolved:
             self._emit("[Unblock] Unresolved usernames: " + ", ".join(unresolved))
 
-        if not target_ids:
+        if not targets:
             self._emit("[Unblock] No targets.")
             self.done.emit(); return
 
         # Build per-user work map from new schema
         work_map: Dict[str, List[str]] = {}
+        eligible_users = 0
         total = 0
         for uid, data in users.items():
+            uid = str(uid)
+            if self.allowed_uids is not None and uid not in self.allowed_uids:
+                continue
             cookie = str(data.get("cookie") or "")
             bad = bool(data.get("bad", False))
             if not cookie or bad:
                 continue
-            blocked_ids = set(map(str, blocklog.get("by_user", {}).get(str(uid), {}).get("blocked", [])))
-            hits = [t for t in target_ids if t in blocked_ids]
+            eligible_users += 1
+            blocked_ids = set(map(str, blocklog.get("by_user", {}).get(uid, {}).get("blocked", [])))
+            hits = list(targets) if self.force else [t for t in targets if t in blocked_ids]
             if hits:
-                work_map[str(uid)] = hits
+                work_map[uid] = hits
                 total += len(hits)
 
+        if eligible_users == 0:
+            self._emit("[Unblock] No eligible users selected.")
+            self.done.emit(); return
+
         if total == 0:
-            self._emit("[Unblock] None of the targets are currently blocked; nothing to do.")
+            self._emit("[Unblock] None of the targets are currently blocked on the selected users; nothing to do.")
             self.done.emit(); return
 
         cur = 0
@@ -559,63 +836,41 @@ class _UnblockWorker(QThread):
         removed_ids_global: Set[str] = set()
         removed_names_global: Set[str] = set()
 
-        # Reverse map id->name (best effort; don't write new cache entries here)
-        id_to_name_lower: Dict[str, str] = {}
-        for nm, rid in username_cache.items():
-            id_to_name_lower[str(rid)] = str(nm).lower()
-
-        for uid, hits_for_uid in work_map.items():
+        work_items = list(work_map.items())
+        for user_idx, (uid, hits_for_uid) in enumerate(work_items):
             if self._cancel: break
 
             data = users.get(uid, {})
             cookie = str(data.get("cookie") or "")
             blocked_ids = set(map(str, blocklog.get("by_user", {}).get(uid, {}).get("blocked", [])))
 
-            driver = None
             try:
-                driver = _make_driver(cookie, headless=self.headless)
-                driver.get(_BLOCKED_URL)
-                time.sleep(0.4)
+                session = _make_blocking_api_session(cookie)
+            except Exception as e:
+                self._emit(f"[Unblock] {uid}: failed to start API session ({e})")
+                cur += len(hits_for_uid); self.tick.emit(cur, total)
+                if (not self._cancel) and user_idx < (len(work_items) - 1):
+                    time.sleep(_USER_SWAP_DELAY_SEC)
+                continue
 
-                for t in list(hits_for_uid):
+            try:
+                did_call = False
+                for t in hits_for_uid:
                     if self._cancel: break
 
-                    uname_lower = id_to_name_lower.get(t)
-                    if not uname_lower:
-                        # resolve name on the fly (don't persist to cache to avoid duplicates)
-                        try:
-                            r = requests.get(f"https://users.roblox.com/v1/users/{t}", timeout=8)
-                            if r.status_code == 200 and r.json().get("name"):
-                                uname_lower = r.json()["name"].lower()
-                                id_to_name_lower[t] = uname_lower
-                        except Exception:
-                            pass
+                    raws = list(id_to_raw.get(t, []))
+                    raw_name = next((x for x in raws if not str(x).isdigit()), None)
+                    label = f"@{str(raw_name).lower()}" if raw_name else t
 
-                    if not uname_lower:
-                        self._emit(f"[Unblock] {uid}: id {t} has no resolvable name for DOM; skipping.")
-                        cur += 1; self.tick.emit(cur, total)
-                        continue
+                    if did_call:
+                        time.sleep(_BLOCKING_CALL_DELAY_SEC)
+                    res = _api_unblock_user(session, cookie, t)
+                    did_call = True
+                    if res == "bad_cookie":
+                        self._emit(f"[Unblock] {uid}: cookie became invalid mid-run")
+                        break
 
-                    node = (_find_blocked_node_by_name(driver, uname_lower, quick_only=True)
-                            or _fully_load_then_find_by_name(driver, uname_lower))
-
-                    if not node:
-                        # Already unblocked → sync
-                        blocked = [x for x in blocked_ids if x != t]
-                        blocklog.setdefault("by_user", {}).setdefault(uid, {})["blocked"] = sorted(blocked)
-                        _save_json(_block_log_path(), blocklog)
-                        blocked_ids = set(blocked)  # <-- keep our working set in sync for subsequent removals
-
-
-                        removed_ids_global.add(t)
-                        for rawname in id_to_raw.get(t, []):
-                            removed_names_global.add(rawname)
-                        self._emit(f"[Unblock] {uid}: @{uname_lower} ({t}) not present → synced")
-                        cur += 1; self.tick.emit(cur, total)
-                        continue
-
-                    ok = _unblock_display_node(driver, node)
-                    if ok:
+                    if res in ("unblocked", "already_unblocked"):
                         blocked = [x for x in blocked_ids if x != t]
                         blocklog.setdefault("by_user", {}).setdefault(uid, {})["blocked"] = sorted(blocked)
                         _save_json(_block_log_path(), blocklog)
@@ -624,15 +879,18 @@ class _UnblockWorker(QThread):
                         removed_ids_global.add(t)
                         for rawname in id_to_raw.get(t, []):
                             removed_names_global.add(rawname)
-                        self._emit(f"[Unblock] {uid}: @{uname_lower} ({t}) unblocked")
-                    else:
-                        self._emit(f"[Unblock] {uid}: @{uname_lower} ({t}) still present")
 
+                    self._emit(f"[Unblock] {uid}: {label} ({t}) → {res}")
                     cur += 1; self.tick.emit(cur, total)
 
             finally:
-                try: driver.quit()
+                try: session.close()
                 except Exception: pass
+
+            if self._cancel:
+                break
+            if user_idx < (len(work_items) - 1):
+                time.sleep(_USER_SWAP_DELAY_SEC)
 
         # Scrub persistent users_to_block.txt and notify GUI to scrub the box
         scrub_names = list(removed_ids_global) + list(removed_names_global)
@@ -652,9 +910,9 @@ class _PSLOpts:
     only_missing: bool
 
 class _PSLWorker(QThread):
-    progress = pyqtSignal(str)
-    tick = pyqtSignal(int, int)
-    done = pyqtSignal()
+    progress = Signal(str)
+    tick = Signal(int, int)
+    done = Signal()
 
     def __init__(self, opts: _PSLOpts):
         super().__init__()
@@ -665,7 +923,7 @@ class _PSLWorker(QThread):
     def _emit(self, s: str): self.progress.emit(s)
 
     def run(self):
-        users = _load_json(_users_json_path(), {})
+        users = _load_users()
         work = [(uid, d) for uid, d in users.items()
                 if str(d.get("cookie") or "") and not bool(d.get("bad", False))]
         # NEW: filter to users that don't already have a private server link
@@ -820,19 +1078,37 @@ class _PSLWorker(QThread):
             cur += 1; self.tick.emit(cur, total)
 
         if any_update:
-            _save_json(_users_json_path(), users)
+            if not _save_users(users):
+                self._emit("[PSL] Failed to save users.json")
         self._emit("[PSL] " + ("Cancelled." if self._cancel else "Done."))
         self.done.emit()
 
 # ---------------- GUI ----------------
 def build_utilities_widget(self) -> QWidget:
+    _set_config_manager(getattr(self, "config_manager", None))
     tab = QWidget()
     v = QVBoxLayout(tab)
 
-    # Global toggle
+    # Global toggles + account selector (single row)
     self.utilities_headless_chk = QCheckBox("Run non-headless (debug)")
     self.utilities_headless_chk.setChecked(False)
-    v.addWidget(self.utilities_headless_chk)
+
+    self.utilities_force_chk = QCheckBox("Force block/unblock")
+    self.utilities_force_chk.setChecked(False)
+
+    # Accounts selector (applies to Blocking / Unblocking)
+    if not hasattr(self, "_utilities_selected_uids"):
+        self._utilities_selected_uids = None  # None => all eligible users
+
+    self.utilities_accounts_btn = QPushButton("Accounts…")
+    self.utilities_accounts_label = QLabel("Accounts: All")
+    top_row = QHBoxLayout()
+    top_row.addWidget(self.utilities_headless_chk)
+    top_row.addWidget(self.utilities_force_chk)
+    top_row.addStretch()
+    top_row.addWidget(self.utilities_accounts_label)
+    top_row.addWidget(self.utilities_accounts_btn)
+    v.addLayout(top_row)
 
     # Scroll container
     scroll = QScrollArea(); scroll.setWidgetResizable(True)
@@ -909,14 +1185,148 @@ def build_utilities_widget(self) -> QWidget:
     _register_btn(run_block_btn)
     _register_btn(run_unblock_btn)
     _register_btn(run_psl_btn)
+    _register_btn(self.utilities_accounts_btn)
 
     self._util_busy = False
     def _set_util_busy(on: bool):
         self._util_busy = on
         for b in self._util_buttons:
             b.setEnabled(not on)
+        try: self.utilities_force_chk.setEnabled(not on)
+        except Exception: pass
+        try: self.utilities_headless_chk.setEnabled(not on)
+        except Exception: pass
 
     # ---- helpers ----
+    def _is_eligible_user(uid: str, data: dict) -> bool:
+        cookie = str((data or {}).get("cookie") or "")
+        bad = bool((data or {}).get("bad", False))
+        return bool(cookie) and not bad
+
+    def _update_accounts_label():
+        try:
+            users_now = _load_users() or {}
+        except Exception:
+            users_now = {}
+
+        eligible = [
+            str(uid) for uid, data in users_now.items()
+            if _is_eligible_user(str(uid), data)
+        ]
+
+        if not eligible:
+            self.utilities_accounts_label.setText("Accounts: None")
+            return
+
+        eligible_set = set(eligible)
+        sel = getattr(self, "_utilities_selected_uids", None)
+        if sel is None:
+            self.utilities_accounts_label.setText(f"Accounts: All ({len(eligible)})")
+            return
+
+        sel_set = {str(x) for x in sel} & eligible_set
+        if sel_set == eligible_set:
+            self._utilities_selected_uids = None
+            self.utilities_accounts_label.setText(f"Accounts: All ({len(eligible)})")
+            return
+
+        self._utilities_selected_uids = sel_set
+        self.utilities_accounts_label.setText(f"Accounts: {len(sel_set)}/{len(eligible)}")
+
+    def _open_accounts_dialog():
+        if getattr(self, "_util_busy", False):
+            self.append_log("[Utilities] A job is already running.")
+            return
+
+        users_now = _load_users() or {}
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select Accounts (Blocking/Unblocking)")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(520)
+
+        vbox = QVBoxLayout(dlg)
+        vbox.addWidget(QLabel("Choose which accounts will run Blocking/Unblocking.\n(Only accounts with a valid cookie are selectable.)"))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        inner_v = QVBoxLayout(inner)
+        scroll.setWidget(inner)
+        vbox.addWidget(scroll)
+
+        eligible_uids: List[str] = []
+        boxes: Dict[str, QCheckBox] = {}
+
+        current_sel = getattr(self, "_utilities_selected_uids", None)
+
+        for uid, data in users_now.items():
+            uid_str = str(uid)
+            username = str((data or {}).get("username") or "").strip()
+            cookie = str((data or {}).get("cookie") or "")
+            bad = bool((data or {}).get("bad", False))
+
+            label = uid_str
+            if username:
+                label += f"  ({username})"
+            if bad:
+                label += "  [BAD]"
+            if not cookie:
+                label += "  [NO COOKIE]"
+
+            cb = QCheckBox(label)
+            eligible = _is_eligible_user(uid_str, data)
+            cb.setEnabled(bool(eligible))
+
+            if eligible:
+                eligible_uids.append(uid_str)
+                if current_sel is None:
+                    cb.setChecked(True)
+                else:
+                    cb.setChecked(uid_str in set(map(str, current_sel)))
+            else:
+                cb.setChecked(False)
+
+            boxes[uid_str] = cb
+            inner_v.addWidget(cb)
+
+        inner_v.addStretch()
+
+        btn_row = QHBoxLayout()
+        sel_all_btn = QPushButton("Select All")
+        sel_none_btn = QPushButton("Select None")
+        btn_row.addWidget(sel_all_btn)
+        btn_row.addWidget(sel_none_btn)
+        btn_row.addStretch()
+        vbox.addLayout(btn_row)
+
+        action_row = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        ok_btn = QPushButton("OK")
+        action_row.addStretch()
+        action_row.addWidget(cancel_btn)
+        action_row.addWidget(ok_btn)
+        vbox.addLayout(action_row)
+
+        def _set_all(val: bool):
+            for uid_str in eligible_uids:
+                boxes[uid_str].setChecked(val)
+
+        sel_all_btn.clicked.connect(lambda: _set_all(True))
+        sel_none_btn.clicked.connect(lambda: _set_all(False))
+        cancel_btn.clicked.connect(dlg.reject)
+        ok_btn.clicked.connect(dlg.accept)
+
+        if dlg.exec() != 1:
+            return
+
+        eligible_set = set(eligible_uids)
+        chosen = {uid for uid in eligible_uids if boxes[uid].isChecked()}
+        self._utilities_selected_uids = None if chosen == eligible_set else chosen
+        _update_accounts_label()
+
+    self.utilities_accounts_btn.clicked.connect(_open_accounts_dialog)
+    _update_accounts_label()
+
     def _save_blocklist():
         with open(_persistent_blocklist_path(), "w", encoding="utf-8") as f:
             f.write(self.block_persistent_box.toPlainText())
@@ -972,7 +1382,12 @@ def build_utilities_widget(self) -> QWidget:
         headless = not self.utilities_headless_chk.isChecked()
         targets_text = self.block_persistent_box.toPlainText()
 
-        w = _BlockWorker(headless=headless, targets_text=targets_text)
+        w = _BlockWorker(
+            headless=headless,
+            targets_text=targets_text,
+            allowed_uids=getattr(self, "_utilities_selected_uids", None),
+            force=bool(self.utilities_force_chk.isChecked()),
+        )
         dlg = _UtilitiesRunDialog(self, "Blocking…")
         _set_util_busy(True)
 
@@ -991,7 +1406,12 @@ def build_utilities_widget(self) -> QWidget:
             self.append_log("[Utilities] A job is already running.")
             return
         headless = not self.utilities_headless_chk.isChecked()
-        w = _UnblockWorker(headless=headless, unblock_text=self.unblock_box.toPlainText())
+        w = _UnblockWorker(
+            headless=headless,
+            unblock_text=self.unblock_box.toPlainText(),
+            allowed_uids=getattr(self, "_utilities_selected_uids", None),
+            force=bool(self.utilities_force_chk.isChecked()),
+        )
 
         dlg = _UtilitiesRunDialog(self, "Unblocking…")
         _set_util_busy(True)
