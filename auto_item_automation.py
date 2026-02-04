@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import random
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from ctypes import wintypes
 
@@ -68,6 +71,54 @@ class ItemRule:
 
 
 APP_FOOTER = "J.JARAM JX 2x27"
+
+
+_AUTO_ITEM_ALERT_UNLOCKED = False
+
+
+def _auto_item_alerts_unlocked() -> bool:
+    """
+    Gate Auto-Item webhook alerts behind the same sentinel/env check as the biome lock.
+
+    Unlock conditions:
+      - env var: JARAM_UNLOCK=1
+      - sentinel file: JARAM.biu (cwd, next to this file, or PyInstaller _MEIPASS)
+    """
+    global _AUTO_ITEM_ALERT_UNLOCKED
+    if _AUTO_ITEM_ALERT_UNLOCKED:
+        return True
+
+    try:
+        if os.environ.get("JARAM_UNLOCK", "").strip() == "1":
+            _AUTO_ITEM_ALERT_UNLOCKED = True
+            return True
+    except Exception:
+        pass
+
+    try:
+        candidates = [Path("JARAM.biu")]
+        try:
+            candidates.append(Path(__file__).resolve().with_name("JARAM.biu"))
+        except Exception:
+            pass
+        try:
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(Path(meipass) / "JARAM.biu")
+        except Exception:
+            pass
+
+        for p in candidates:
+            try:
+                if p.exists():
+                    _AUTO_ITEM_ALERT_UNLOCKED = True
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return False
 
 
 def _post_webhook(url: str, payload: dict) -> None:
@@ -921,6 +972,7 @@ class AutoItemEngine:
         mouse_block_notify: Optional[Callable[[bool], None]] = None,
         pause_antiafk: Optional[Callable[[], None]] = None,
         resume_antiafk: Optional[Callable[[], None]] = None,
+        antiafk_overdue_within_provider: Optional[Callable[[float], bool]] = None,
         pre_action_hook: Optional[Callable[[str, int], float]] = None,
         post_action_hook: Optional[Callable[[str, int], None]] = None,
     ) -> None:
@@ -935,6 +987,7 @@ class AutoItemEngine:
         self._mouse_block_notify = mouse_block_notify
         self._pause_antiafk = pause_antiafk
         self._resume_antiafk = resume_antiafk
+        self._antiafk_overdue_within_provider = antiafk_overdue_within_provider
         self._pre_action_hook = pre_action_hook
         self._post_action_hook = post_action_hook
 
@@ -954,6 +1007,9 @@ class AutoItemEngine:
         self._pending_item_name: Dict[str, Dict[int, str]] = {}
         self._not_in_menu_since: Dict[str, float] = {}
         self._state_lock = threading.Lock()
+
+        # Throttle "alert suppressed" logs when Anti-AFK is overdue.
+        self._last_antiafk_overdue_alert_log_ts: float = 0.0
 
     def _username(self, uid: str) -> str:
         fn = self._username_provider
@@ -1366,6 +1422,43 @@ class AutoItemEngine:
         """
         if not (r.alert_enabled and r.alert_webhook and float(r.alert_lead_s) > 0.0):
             return False
+        if not _auto_item_alerts_unlocked():
+            return False
+
+        # Suppress alerts when Anti-AFK is (or is about to be) overdue.
+        try:
+            fn = getattr(self, "_antiafk_overdue_within_provider", None)
+            if fn is not None:
+                # Overdue now => don't send alerts and don't attempt to use items (Auto-Item will yield to Anti-AFK).
+                if bool(fn(0.0)):
+                    try:
+                        now_ts = time.time()
+                        if (now_ts - float(self._last_antiafk_overdue_alert_log_ts)) >= 30.0:
+                            self._last_antiafk_overdue_alert_log_ts = float(now_ts)
+                            self._log("[Auto-Item] Anti-AFK overdue; suppressing Auto-Item alerts until it catches up.")
+                    except Exception:
+                        pass
+                    return True
+
+                # Stop alerts early when we are too close to becoming overdue for the alert's lead time.
+                try:
+                    lead_s = max(0.0, float(r.alert_lead_s))
+                except Exception:
+                    lead_s = 0.0
+                window_s = lead_s + 15.0
+                if window_s > 0.0 and bool(fn(float(window_s))):
+                    try:
+                        now_ts = time.time()
+                        if (now_ts - float(self._last_antiafk_overdue_alert_log_ts)) >= 30.0:
+                            self._last_antiafk_overdue_alert_log_ts = float(now_ts)
+                            self._log(
+                                f"[Auto-Item] Anti-AFK nearing overdue (<= {window_s:.0f}s); suppressing Auto-Item alerts for now."
+                            )
+                    except Exception:
+                        pass
+                    return False
+        except Exception:
+            pass
 
         now = time.time()
         use_at = now + float(r.alert_lead_s)
@@ -1412,6 +1505,12 @@ class AutoItemEngine:
             cfg = self._cfg_snapshot()
             enabled = bool(cfg.get("enabled", False))
             interval = float(cfg.get("tick_interval", 1.0) or 1.0)
+
+            # If alerts are locked, ensure they never delay actions via stale schedules.
+            if not _auto_item_alerts_unlocked():
+                with self._state_lock:
+                    self._pending_use_at.clear()
+                    self._pending_item_name.clear()
 
             if not enabled:
                 # Avoid resuming delayed actions after a manual disable/enable flip.

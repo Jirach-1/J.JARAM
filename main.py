@@ -795,6 +795,114 @@ class GameLauncher:
             self.log(f"[LAUNCH SKIP] {user_id} -> {server_label} {reason}")
 
 
+    def _find_visible_window_for_pid(self, pid: int):
+        candidates = []
+
+        def window_callback(hwnd, _extra):
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return
+                if win32gui.IsIconic(hwnd):
+                    return
+                _, hwnd_pid = win32process.GetWindowThreadProcessId(hwnd)
+                if int(hwnd_pid) != int(pid):
+                    return
+                candidates.append(hwnd)
+            except Exception:
+                pass
+
+        try:
+            win32gui.EnumWindows(window_callback, None)
+        except Exception:
+            pass
+
+        if not candidates:
+            return None
+
+        best_hwnd = None
+        best_area = -1
+        for hwnd in candidates:
+            try:
+                l, t, r, b = win32gui.GetWindowRect(hwnd)
+                area = int(r - l) * int(b - t)
+                if area > best_area:
+                    best_area = area
+                    best_hwnd = hwnd
+            except Exception:
+                continue
+        return best_hwnd
+
+    def _wait_for_visible_window_for_pid(self, pid: int, timeout_s: float = 8.0):
+        deadline = time.time() + float(timeout_s or 0)
+        while time.time() < deadline:
+            hwnd = self._find_visible_window_for_pid(pid)
+            if hwnd:
+                return hwnd
+            time.sleep(0.15)
+        return None
+
+    def _maybe_enforce_roblox_window_geometry(self, user_id: str, pid: int) -> None:
+        try:
+            if hasattr(self.cfg, "peek_settings"):
+                settings = self.cfg.peek_settings() or {}
+            elif hasattr(self.cfg, "load_settings"):
+                settings = self.cfg.load_settings() or {}
+            else:
+                settings = {}
+        except Exception:
+            settings = {}
+
+        rwg = settings.get("roblox_window_geometry", {}) or {}
+        if not isinstance(rwg, dict):
+            return
+        if not bool(rwg.get("enforce_on_launch", False)):
+            return
+
+        try:
+            x = int(rwg.get("x", 0) or 0)
+            y = int(rwg.get("y", 0) or 0)
+            w = int(rwg.get("w", 0) or 0)
+            h = int(rwg.get("h", 0) or 0)
+        except Exception:
+            return
+
+        if w <= 0 or h <= 0:
+            return
+
+        hwnd = self._wait_for_visible_window_for_pid(int(pid), timeout_s=8.0)
+        if not hwnd:
+            return
+
+        try:
+            cur_l, cur_t, cur_r, cur_b = win32gui.GetWindowRect(hwnd)
+            cur_w = int(cur_r - cur_l)
+            cur_h = int(cur_b - cur_t)
+        except Exception:
+            cur_l = cur_t = cur_w = cur_h = None
+
+        tol = 2
+        if (
+            cur_l is not None
+            and abs(int(cur_l) - x) <= tol
+            and abs(int(cur_t) - y) <= tol
+            and abs(int(cur_w) - w) <= tol
+            and abs(int(cur_h) - h) <= tol
+        ):
+            return
+
+        try:
+            import win32con
+
+            flags = int(win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+            win32gui.SetWindowPos(hwnd, 0, x, y, w, h, flags)
+            self.log(f"[WINPOS] uid={user_id} pid={pid} -> x={x} y={y} w={w} h={h}")
+        except Exception as e:
+            try:
+                self.log(f"[WINPOS FAIL] uid={user_id} pid={pid} err={e!r}")
+            except Exception:
+                pass
+
+
     def _convert_share_link(self, share_code, cookie):
         import requests, json
         if not share_code or not cookie:
@@ -1117,6 +1225,11 @@ class GameLauncher:
                     for lbl, meta in list(rs.items()):
                         if meta.get("by") == user_id:
                             rs.pop(lbl, None)
+                except Exception:
+                    pass
+
+                try:
+                    self._maybe_enforce_roblox_window_geometry(str(user_id), int(new_pid))
                 except Exception:
                     pass
 

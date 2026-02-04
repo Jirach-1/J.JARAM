@@ -57,7 +57,6 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
 
     # Anti-AFK scheduling (including BES "Throttle Pacify") runs in the native engine (C++).
     try:
-        # Prefer the in-repo native build output (./native) when available.
         try:
             import sys
             from pathlib import Path

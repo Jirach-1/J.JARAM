@@ -701,6 +701,16 @@ class ConfigManager:
             "ui": {
                 "show_tutorial_menu": False,
                 "webhooks_hidden_biomes": [],
+                "show_selected_sets_bes_exempt_slot1": False,
+            },
+            "roblox_window_geometry": {
+                # When enabled, each newly launched Roblox window gets a one-time size/position check.
+                # If it differs from the recorded geometry, we move/resize it to match.
+                "enforce_on_launch": False,
+                "x": 0,
+                "y": 0,
+                "w": 0,
+                "h": 0,
             },
             "cookie_encryption": {
                 "enabled": False,
@@ -780,6 +790,7 @@ class ConfigManager:
             "cap": False,
             "disabled": False,
             "alternate_launch": False,
+            "skip_reconnect_on_log_disconnect": False,
         }
 
         # Re-entrant because some cache update paths call helper methods that
@@ -1934,6 +1945,7 @@ class ConfigManager:
                     "bad": False,
                     "cap": False,
                     "alternate_launch": False,
+                    "skip_reconnect_on_log_disconnect": False,
                 }
             else:
 
@@ -1951,6 +1963,16 @@ class ConfigManager:
             if mode == "alternate":
                 return True
             return bool(user_info.get("alternate_launch", user_info.get("alternate", False)))
+
+        def _skip_reconnect_on_log_disconnect(user_info: dict) -> bool:
+            if not isinstance(user_info, dict):
+                return False
+            return bool(
+                user_info.get(
+                    "skip_reconnect_on_log_disconnect",
+                    user_info.get("dont_reconnect_on_log_disconnect", False),
+                )
+            )
 
         def _uid_sort_key(uid: str):
             uid_s = str(uid)
@@ -1976,6 +1998,7 @@ class ConfigManager:
                     "disabled": False,
                     "description": "",
                     "alternate_launch": False,
+                    "skip_reconnect_on_log_disconnect": False,
                 }
             elif isinstance(user_info, dict):
                 private_link = user_info.get("private_server_link", "")
@@ -1999,6 +2022,7 @@ class ConfigManager:
                     "disabled": user_info.get("disabled", False),
                     "description": str(user_info.get("description", "") or ""),
                     "alternate_launch": _is_alternate_launch(user_info),
+                    "skip_reconnect_on_log_disconnect": _skip_reconnect_on_log_disconnect(user_info),
                 }
             else:
 
@@ -2013,6 +2037,7 @@ class ConfigManager:
                     "disabled": False,
                     "description": "",
                     "alternate_launch": False,
+                    "skip_reconnect_on_log_disconnect": False,
                 }
 
         # Enforce: at most one account may have alternate launch enabled.
@@ -2130,6 +2155,7 @@ class ConfigManager:
                     "cap": False,
                     "disabled": False,
                     "alternate_launch": False,
+                    "skip_reconnect_on_log_disconnect": False,
                 }
         return manager_format
 
@@ -2472,8 +2498,6 @@ class WorkerThread(QThread):
         self._last_proc_count = 0
         self._last_growth_ts  = time.time()
         self.log_inactivity_timeout = 120
-
-        self.skip_alt_disconnect_reconnect = False
 
         # Multiscope
         self.ms = None  # ← NEW: MultiScopeEngine instance
@@ -3988,10 +4012,8 @@ class WorkerThread(QThread):
                         if st.get("inactive_since") is None:
                             st["inactive_since"] = now
                         skip_reconnect = bool(st.get("skip_reconnect_on_disconnect", False))
-                        if skip_reconnect and (
-                            (not self.skip_alt_disconnect_reconnect)
-                            or (not bool(info.get("alternate_launch", False)))
-                        ):
+                        skip_cfg = bool(info.get("skip_reconnect_on_log_disconnect", False)) if isinstance(info, dict) else False
+                        if skip_reconnect and (not skip_cfg):
                             st["skip_reconnect_on_disconnect"] = False
                             skip_reconnect = False
                         if (now - st.get("last_active", 0)) > self.restart_threshold:
@@ -4074,13 +4096,9 @@ class WorkerThread(QThread):
                                                 pass
                                         else:
                                             self._log(f"[CAP] {uname} in_menu_none {streak}/3; retrying.")
-                                if (
-                                    self.skip_alt_disconnect_reconnect
-                                    and is_alt
-                                    and self._is_log_disconnect_payload(payload_text)
-                                ):
+                                if bool(info.get("skip_reconnect_on_log_disconnect", False)) and self._is_log_disconnect_payload(payload_text):
                                     self._log(
-                                        f"[Disconnect] {uname} - {payload_text}; alternate auto-reconnect disabled."
+                                        f"[Disconnect] {uname} - {payload_text}; auto-reconnect disabled for this account."
                                     )
                                     try:
                                         self.kill_user_processes(uid)
@@ -4373,6 +4391,11 @@ class UserManagementDialogLegacy(QDialog):
             "window_limit": "Window Limit",
             "spares_mode": "Spares Mode",
             "spares_fraction": "Spare Mode Split",
+            "roblox_window_geometry.enforce_on_launch": "Auto-fix Roblox Window Geometry",
+            "roblox_window_geometry.x": "Roblox Window X",
+            "roblox_window_geometry.y": "Roblox Window Y",
+            "roblox_window_geometry.w": "Roblox Window Width",
+            "roblox_window_geometry.h": "Roblox Window Height",
             "timeouts.offline": "Restart Inactive After",
             "timeouts.initial_delay": "Initial Launch Delay",
             "timeouts.launch_delay": "Launch Delay",
@@ -5375,8 +5398,12 @@ class UserManagementDialog(QDialog):
         form.addRow("Cookie:", cookie_row)
 
         flags_row = QWidget()
-        flags_layout = QHBoxLayout(flags_row)
+        flags_layout = QVBoxLayout(flags_row)
         flags_layout.setContentsMargins(0, 0, 0, 0)
+        flags_layout.setSpacing(4)
+
+        flags_top = QHBoxLayout()
+        flags_top.setContentsMargins(0, 0, 0, 0)
         self.disabled_chk = QCheckBox("Disabled")
         self.bad_chk = QCheckBox("Bad Cookie")
         self.cap_chk = QCheckBox("Captcha Lock")
@@ -5385,15 +5412,26 @@ class UserManagementDialog(QDialog):
             "Alternate launch mode (no cookies).\n"
             "Launches via roblox://placeId=<place> (public) or roblox://placeId=<place>&linkCode=<code> (private)."
         )
+        self.skip_reconnect_on_log_disconnect_chk = QCheckBox("Disable log reconnects")
+        self.skip_reconnect_on_log_disconnect_chk.setToolTip(
+            "When enabled, this account will not auto-reconnect after log disconnects."
+        )
         try:
             self.alternate_chk.toggled.connect(self._on_edit_alternate_toggled)
         except Exception:
             pass
-        flags_layout.addWidget(self.disabled_chk)
-        flags_layout.addWidget(self.bad_chk)
-        flags_layout.addWidget(self.cap_chk)
-        flags_layout.addWidget(self.alternate_chk)
-        flags_layout.addStretch(1)
+        flags_top.addWidget(self.disabled_chk)
+        flags_top.addWidget(self.bad_chk)
+        flags_top.addWidget(self.cap_chk)
+        flags_top.addWidget(self.alternate_chk)
+        flags_top.addStretch(1)
+        flags_layout.addLayout(flags_top)
+
+        flags_bottom = QHBoxLayout()
+        flags_bottom.setContentsMargins(0, 0, 0, 0)
+        flags_bottom.addWidget(self.skip_reconnect_on_log_disconnect_chk)
+        flags_bottom.addStretch(1)
+        flags_layout.addLayout(flags_bottom)
         form.addRow("Flags:", flags_row)
 
         layout.addWidget(self.edit_group)
@@ -5938,6 +5976,8 @@ class UserManagementDialog(QDialog):
                 self.cap_chk.setChecked(False)
             if hasattr(self, "alternate_chk"):
                 self.alternate_chk.setChecked(False)
+            if hasattr(self, "skip_reconnect_on_log_disconnect_chk"):
+                self.skip_reconnect_on_log_disconnect_chk.setChecked(False)
         except Exception:
             pass
         try:
@@ -5961,6 +6001,10 @@ class UserManagementDialog(QDialog):
                 self.cap_chk.setChecked(bool(info.get("cap", False)))
             if hasattr(self, "alternate_chk"):
                 self.alternate_chk.setChecked(bool(info.get("alternate_launch", False)))
+            if hasattr(self, "skip_reconnect_on_log_disconnect_chk"):
+                self.skip_reconnect_on_log_disconnect_chk.setChecked(
+                    bool(info.get("skip_reconnect_on_log_disconnect", False))
+                )
         except Exception:
             pass
         try:
@@ -6029,6 +6073,10 @@ class UserManagementDialog(QDialog):
         bad = bool(self.bad_chk.isChecked())
         cap = bool(getattr(self, "cap_chk", None) and self.cap_chk.isChecked())
         alternate = bool(getattr(self, "alternate_chk", None) and self.alternate_chk.isChecked())
+        skip_reconnect_on_log_disconnect = bool(
+            getattr(self, "skip_reconnect_on_log_disconnect_chk", None)
+            and self.skip_reconnect_on_log_disconnect_chk.isChecked()
+        )
 
         if not user_id:
             QMessageBox.warning(self, "Error", "User ID cannot be empty!")
@@ -6065,6 +6113,7 @@ class UserManagementDialog(QDialog):
             "cap": cap,
             "disabled": disabled,
             "alternate_launch": alternate,
+            "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
         }
 
         self.refresh_user_list()
@@ -6084,6 +6133,10 @@ class UserManagementDialog(QDialog):
         bad = bool(self.bad_chk.isChecked())
         cap = bool(getattr(self, "cap_chk", None) and self.cap_chk.isChecked())
         alternate = bool(getattr(self, "alternate_chk", None) and self.alternate_chk.isChecked())
+        skip_reconnect_on_log_disconnect = bool(
+            getattr(self, "skip_reconnect_on_log_disconnect_chk", None)
+            and self.skip_reconnect_on_log_disconnect_chk.isChecked()
+        )
 
         if not private_server_link:
             if not self._confirm_missing_ps_link():
@@ -6129,6 +6182,7 @@ class UserManagementDialog(QDialog):
                 "cap": cap,
                 "disabled": disabled,
                 "alternate_launch": alternate,
+                "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
             }
         )
         self.original_config[user_id] = updated
@@ -6728,6 +6782,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "window_limit": "Window Limit",
             "spares_mode": "Spares Mode",
             "spares_fraction": "Spare Mode Split",
+            "roblox_window_geometry.enforce_on_launch": "Auto-fix Roblox Window Geometry",
+            "roblox_window_geometry.x": "Roblox Window X",
+            "roblox_window_geometry.y": "Roblox Window Y",
+            "roblox_window_geometry.w": "Roblox Window Width",
+            "roblox_window_geometry.h": "Roblox Window Height",
             "timeouts.offline": "Restart Inactive After",
             "timeouts.initial_delay": "Initial Launch Delay",
             "timeouts.launch_delay": "Launch Delay",
@@ -7648,22 +7707,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         controls_layout.addWidget(kill_selected_btn)
 
         controls_layout.addStretch()
-
-        self.alt_disconnect_chk = QCheckBox("Don't reconnect Alternate on log disconnect")
-        self.alt_disconnect_chk.setChecked(False)
-        self.alt_disconnect_chk.setVisible(False)
-        self.alt_disconnect_chk.setToolTip(
-            "When enabled, the Alternate account will not auto-reconnect after log disconnects."
-        )
-        self.alt_disconnect_chk.toggled.connect(self._on_alt_disconnect_toggle)
-        controls_layout.addWidget(self.alt_disconnect_chk)
         layout.addLayout(controls_layout)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(users_widget)
         self.users_tab_index = self.tab_widget.addTab(scroll, "Users")
-        self._update_alt_disconnect_toggle_visibility()
 
     def setup_accounts_tab(self):
         """Account management tab."""
@@ -7749,13 +7798,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         form_layout.addLayout(cookie_layout)
 
         flags_row = QWidget()
-        flags_layout = QHBoxLayout(flags_row)
+        flags_layout = QVBoxLayout(flags_row)
         flags_layout.setContentsMargins(0, 0, 0, 0)
+        flags_layout.setSpacing(4)
+
+        flags_top = QHBoxLayout()
+        flags_top.setContentsMargins(0, 0, 0, 0)
 
         self.account_disabled = QCheckBox("Disable this account")
-        flags_layout.addWidget(self.account_disabled)
+        flags_top.addWidget(self.account_disabled)
 
-        flags_layout.addSpacing(52)
+        flags_top.addSpacing(52)
 
         self.account_alternate_launch = QCheckBox("Alternate")
         self.account_alternate_launch.setToolTip(
@@ -7766,9 +7819,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.account_alternate_launch.toggled.connect(self._on_account_alternate_launch_toggled)
         except Exception:
             pass
-        flags_layout.addWidget(self.account_alternate_launch)
+        flags_top.addWidget(self.account_alternate_launch)
 
-        flags_layout.addStretch(1)
+        flags_top.addStretch(1)
+        flags_layout.addLayout(flags_top)
+
+        self.account_skip_reconnect_on_log_disconnect = QCheckBox("Disable log reconnects")
+        self.account_skip_reconnect_on_log_disconnect.setToolTip(
+            "When enabled, this account will not auto-reconnect after log disconnects."
+        )
+        flags_bottom = QHBoxLayout()
+        flags_bottom.setContentsMargins(0, 0, 0, 0)
+        flags_bottom.addWidget(self.account_skip_reconnect_on_log_disconnect)
+        flags_bottom.addStretch(1)
+        flags_layout.addLayout(flags_bottom)
         form_layout.addWidget(flags_row)
 
         button_layout = QHBoxLayout()
@@ -7858,7 +7922,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(accounts_widget)
-        self.tab_widget.addTab(scroll, "Accounts")
+        self.accounts_tab_index = self.tab_widget.addTab(scroll, "Accounts")
         self.refresh_accounts_list()
 
     def setup_logs_tab(self):
@@ -9100,6 +9164,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.auto_item_table.setColumnWidth(4, 120)
         self.auto_item_table.setColumnWidth(5, 140)
         self.auto_item_table.setColumnWidth(6, 140)
+        # Hide per-item alert controls unless unlocked (JARAM.biu / JARAM_UNLOCK).
+        try:
+            self.auto_item_table.setColumnHidden(6, not _bm_relaxed())
+        except Exception:
+            pass
         # Compact + consistent controls inside the table (avoid clipped borders inside cells).
         self.auto_item_table.setStyleSheet(
             f"""
@@ -9417,6 +9486,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             mouse_block_notify=self.autoitem_mouse_block_signal.emit,
             pause_antiafk=self._auto_item_pause_antiafk,
             resume_antiafk=self._auto_item_resume_antiafk,
+            antiafk_overdue_within_provider=self._auto_item_is_antiafk_overdue_within,
             pre_action_hook=self._auto_item_pre_action_hook,
             post_action_hook=self._auto_item_post_action_hook,
         )
@@ -9430,6 +9500,73 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.auto_item_engine.update_config(self._get_auto_item_settings_from_ui())
         except Exception:
             pass
+
+    def _auto_item_is_antiafk_overdue_within(self, within_s: float) -> bool:
+        """
+        True when at least one connected user is overdue (or will be overdue soon) for an Anti-AFK touch.
+
+        within_s=0  => already overdue (>=10m since last touch)
+        within_s=45 => within 45s of becoming overdue (>= 9m15s since last touch)
+        """
+        antiafk = getattr(self, "antiafk", None)
+        if not antiafk:
+            return False
+
+        # Only consider "overdue" when Anti-AFK is actually running/enabled.
+        try:
+            if not (
+                self._is_manager_running()
+                and bool(getattr(self, "antiafk_enable_chk", None) and self.antiafk_enable_chk.isChecked())
+                and bool(getattr(antiafk, "antiafk_running", False))
+            ):
+                return False
+        except Exception:
+            return False
+
+        try:
+            window = max(0.0, float(within_s or 0.0))
+        except Exception:
+            window = 0.0
+
+        overdue_age_s = 600.0
+        cutoff_age = overdue_age_s - window
+        if cutoff_age < 0.0:
+            cutoff_age = 0.0
+
+        try:
+            now_ts = time.time()
+            for uid, runtime in (self.user_data or {}).items():
+                runtime = runtime or {}
+                server = str(runtime.get("server", "") or "")
+                if self._is_disconnected_server_label(server):
+                    continue
+                pids = runtime.get("pids", []) or []
+                if not isinstance(pids, (list, tuple, set)):
+                    pids = [pids]
+                has_pid = False
+                for p in (pids or []):
+                    try:
+                        if int(p) > 0:
+                            has_pid = True
+                            break
+                    except Exception:
+                        continue
+                if not has_pid:
+                    continue
+
+                with self._antiafk_touch_lock:
+                    last_ts = self._antiafk_last_touch_by_uid.get(str(uid))
+                if last_ts is None:
+                    continue
+                if (now_ts - float(last_ts)) >= float(cutoff_age):
+                    return True
+        except Exception:
+            pass
+
+        return False
+
+    def _auto_item_is_antiafk_overdue(self) -> bool:
+        return self._auto_item_is_antiafk_overdue_within(0.0)
 
     def _auto_item_pause_antiafk(self):
         """
@@ -9456,44 +9593,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return True
 
         # If any connected user is overdue for an Anti-AFK touch, don't pause for this cycle.
-        try:
-            now_ts = time.time()
-            overdue = False
-            for uid, runtime in (self.user_data or {}).items():
-                runtime = runtime or {}
-                server = str(runtime.get("server", "") or "")
-                if self._is_disconnected_server_label(server):
-                    continue
-                pids = runtime.get("pids", []) or []
-                if not isinstance(pids, (list, tuple, set)):
-                    pids = [pids]
-                has_pid = False
-                for p in (pids or []):
-                    try:
-                        if int(p) > 0:
-                            has_pid = True
-                            break
-                    except Exception:
-                        continue
-                if not has_pid:
-                    continue
-                with self._antiafk_touch_lock:
-                    last_ts = self._antiafk_last_touch_by_uid.get(str(uid))
-                if last_ts is None:
-                    continue
-                if (now_ts - float(last_ts)) >= 600.0:
-                    overdue = True
-                    break
-            if overdue:
-                try:
-                    self.autoitem_log_signal.emit(
-                        "[Auto-Item] Anti-AFK overdue (>=10m on at least one connected user); skipping pause this cycle."
-                    )
-                except Exception:
-                    pass
-                return False
-        except Exception:
-            pass
+        if self._auto_item_is_antiafk_overdue():
+            try:
+                self.autoitem_log_signal.emit(
+                    "[Auto-Item] Anti-AFK overdue (>=10m on at least one connected user); skipping pause this cycle."
+                )
+            except Exception:
+                pass
+            return False
 
         # Preferred: native pause (works for both worker-proxy and in-process engines).
         if hasattr(antiafk, "pause_antiafk"):
@@ -12367,14 +12474,43 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         content_layout.addWidget(basic_group)
 
         # ── Timing ───────────────────────────────────────────────────────────────
+        # Roblox Window Geometry
+        win_geom_group = QGroupBox("Set Roblox Window Geometry")
+        win_geom_layout = QVBoxLayout(win_geom_group)
+
+        self.rbwin_geom_enforce_chk = QCheckBox("Auto-fix Roblox window size/position on launch")
+        self.rbwin_geom_enforce_chk.setToolTip(
+            "When enabled, each Roblox window launched by J.JARAM is checked once.\n"
+            "If its size/position differs from the recorded geometry, it will be moved/resized to match."
+        )
+        win_geom_layout.addWidget(self.rbwin_geom_enforce_chk)
+
+        record_row = QHBoxLayout()
+        self.rbwin_geom_record_btn = QPushButton("Record an open Roblox window")
+        self.rbwin_geom_record_btn.setToolTip(
+            "Records the size and position of an open Roblox window.\n"
+            "Tip: focus the Roblox window you want to record, then click this button."
+        )
+        self.rbwin_geom_record_btn.clicked.connect(self._record_roblox_window_geometry)
+        record_row.addWidget(self.rbwin_geom_record_btn)
+        record_row.addStretch()
+        win_geom_layout.addLayout(record_row)
+
+        self.rbwin_geom_status_lbl = QLabel("Recorded: none")
+        self.rbwin_geom_status_lbl.setWordWrap(True)
+        self.rbwin_geom_status_lbl.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
+        win_geom_layout.addWidget(self.rbwin_geom_status_lbl)
+
+        content_layout.addWidget(win_geom_group)
+
         timing_group = QGroupBox("Timing Settings"); timing_layout = QFormLayout(timing_group)
         self.settings_offline_threshold_input = QSpinBox(); self.settings_offline_threshold_input.setRange(10, 120); self.settings_offline_threshold_input.setSuffix(" s")
         timing_layout.addRow("Restart Inactive After:", self.settings_offline_threshold_input)
 
-        self.settings_initial_delay_input = QSpinBox(); self.settings_initial_delay_input.setRange(5, 60); self.settings_initial_delay_input.setSuffix(" s")
+        self.settings_initial_delay_input = QSpinBox(); self.settings_initial_delay_input.setRange(5, 999999); self.settings_initial_delay_input.setSuffix(" s")
         timing_layout.addRow("Initial Launch Delay:", self.settings_initial_delay_input)
 
-        self.settings_launch_delay_input = QSpinBox(); self.settings_launch_delay_input.setRange(1, 120); self.settings_launch_delay_input.setSuffix(" s")
+        self.settings_launch_delay_input = QSpinBox(); self.settings_launch_delay_input.setRange(1, 999999); self.settings_launch_delay_input.setSuffix(" s")
         timing_layout.addRow("Launch Delay:", self.settings_launch_delay_input)
 
         self.handoff_lead_input = QSpinBox(); self.handoff_lead_input.setRange(5, 300); self.handoff_lead_input.setSuffix(" s")
@@ -12422,7 +12558,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         alerts_layout.addRow("Blackout Ping:", self.blackout_ping_input)
 
         self.cap_msg_input = QLineEdit()
-        self.cap_msg_input.setPlaceholderText("This message is sent whenever your a user is marked for captcha. Leave this empty if not interested. — Supports {username} and {uid}")
+        self.cap_msg_input.setPlaceholderText("This message is sent whenever a user is marked for captcha. Leave this empty if not interested. — Supports {username} and {uid}")
         self.cap_msg_input.setToolTip("Sent when a user is marked CAP. Example Message: User {username} has disconnected, User ID = {uid}.")
         alerts_layout.addRow("CAP Message:", self.cap_msg_input)
 
@@ -12434,6 +12570,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.ui_show_tutorial_menu_chk = QCheckBox("Show Tutorial in Help menu")
         self.ui_show_tutorial_menu_chk.setToolTip("Enable to show Help → Tutorial in the menu bar.")
         misc_layout.addRow(self.ui_show_tutorial_menu_chk)
+        self.ui_show_selected_sets_bes_exempt_slot1_chk = QCheckBox("Show Selected sets BES Exempt Slot 1")
+        self.ui_show_selected_sets_bes_exempt_slot1_chk.setToolTip(
+            "When enabled, Users → Show Selected also assigns that user to BES → Exempt Users → Slot 1.\n"
+            "Tip: Click “Save Settings” to persist this toggle."
+        )
+        misc_layout.addRow(self.ui_show_selected_sets_bes_exempt_slot1_chk)
         self.misc_skip_unknown_webhook_chk = QCheckBox("Skip webhooks if owner/PS unknown")
         self.misc_skip_unknown_webhook_chk.setToolTip(
             "When enabled, webhook messages are suppressed if the owner or private server is unknown."
@@ -13497,7 +13639,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
 
         self.worker_thread = WorkerThread(self.config_manager)
-        self._apply_alt_disconnect_toggle_to_worker()
         self.worker_thread.log_signal.connect(self.add_log)
         self.worker_thread.status_signal.connect(self.update_user_status)
         self.worker_thread.process_signal.connect(self.update_process_data)
@@ -13647,7 +13788,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pass
 
         self.worker_thread = WorkerThread(self.config_manager, resume_state=resume_state)
-        self._apply_alt_disconnect_toggle_to_worker()
         self.worker_thread.log_signal.connect(self.add_log)
         self.worker_thread.status_signal.connect(self.update_user_status)
         self.worker_thread.process_signal.connect(self.update_process_data)
@@ -13682,8 +13822,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.status_label.setStyleSheet(f"color: {ModernStyle.SECONDARY}; font-weight: bold;")
 
     def update_ui(self):
-        self._update_alt_disconnect_toggle_visibility()
-
         active_users = sum(1 for data in self.user_data.values() if data.get('status') == 'Active')
         total_processes = sum(len(data.get('pids', [])) for data in self.user_data.values())
         pending_restarts = sum(1 for data in self.user_data.values() if data.get('needs_restart', False))
@@ -13878,7 +14016,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         table = getattr(self, "users_table", None)
         if table is None:
             return
-        self._update_alt_disconnect_toggle_visibility()
 
         users_cfg = self.config_manager.peek_users() or {}
         if not isinstance(users_cfg, dict):
@@ -14061,42 +14198,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 table.setUpdatesEnabled(True)
             except Exception:
                 pass
-
-    def _on_alt_disconnect_toggle(self, checked: bool) -> None:
-        self._apply_alt_disconnect_toggle_to_worker()
-
-    def _apply_alt_disconnect_toggle_to_worker(self) -> None:
-        chk = getattr(self, "alt_disconnect_chk", None)
-        if chk is None:
-            return
-        wt = getattr(self, "worker_thread", None)
-        if wt:
-            wt.skip_alt_disconnect_reconnect = bool(chk.isChecked())
-
-    def _update_alt_disconnect_toggle_visibility(self) -> None:
-        chk = getattr(self, "alt_disconnect_chk", None)
-        if chk is None:
-            return
-        users_cfg = {}
-        try:
-            users_cfg = self.config_manager.peek_users() or {}
-        except Exception:
-            users_cfg = {}
-        has_alt = False
-        for info in (users_cfg or {}).values():
-            if isinstance(info, dict) and bool(info.get("alternate_launch", False)):
-                has_alt = True
-                break
-        try:
-            chk.setVisible(has_alt)
-        except Exception:
-            pass
-        if not has_alt:
-            try:
-                chk.setChecked(False)
-            except Exception:
-                pass
-        self._apply_alt_disconnect_toggle_to_worker()
 
     def _refresh_users_antiafk_age_column(self) -> None:
         """
@@ -14788,6 +14889,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "window_limit": int(self.settings_window_limit_input.value()),
             "spares_mode": bool(self.spares_mode_chk.isChecked()),
             "spares_fraction": str(self.spares_split_cmb.currentText()),
+            "roblox_window_geometry": {
+                "enforce_on_launch": bool(self.rbwin_geom_enforce_chk.isChecked()) if hasattr(self, "rbwin_geom_enforce_chk") else False,
+                "x": int((getattr(self, "_roblox_window_geometry", {}) or {}).get("x", 0) or 0),
+                "y": int((getattr(self, "_roblox_window_geometry", {}) or {}).get("y", 0) or 0),
+                "w": int((getattr(self, "_roblox_window_geometry", {}) or {}).get("w", 0) or 0),
+                "h": int((getattr(self, "_roblox_window_geometry", {}) or {}).get("h", 0) or 0),
+            },
             "timeouts": {
                 "initial_delay": int(self.settings_initial_delay_input.value()),
                 "offline": int(self.settings_offline_threshold_input.value()),
@@ -14812,6 +14920,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     {str(b).strip().upper() for b in (getattr(self, "_webhooks_hidden_biomes", set()) or set()) if str(b).strip()}
                 ),
                 "show_tutorial_menu": bool(self.ui_show_tutorial_menu_chk.isChecked()) if hasattr(self, "ui_show_tutorial_menu_chk") else False,
+                "show_selected_sets_bes_exempt_slot1": bool(
+                    self.ui_show_selected_sets_bes_exempt_slot1_chk.isChecked()
+                ) if hasattr(self, "ui_show_selected_sets_bes_exempt_slot1_chk") else False,
             },
             "multiscope": {
                 "merchant_webhook": str(self.ms_merchant_webhook_input.text().strip()) if hasattr(self, "ms_merchant_webhook_input") else "",
@@ -14904,6 +15015,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 self._schedule_multiscope_table_refresh(immediate=True)
         except Exception:
             pass
+        try:
+            if getattr(self, "accounts_tab_index", None) is not None and new_index == self.accounts_tab_index:
+                self.refresh_accounts_list()
+        except Exception:
+            pass
 
         if not self._settings_prompt_ready or prev_index is None:
             return
@@ -14951,6 +15067,29 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.spares_mode_chk.setChecked(bool(settings.get("spares_mode", False)))
         self.spares_split_cmb.setCurrentText(settings.get("spares_fraction", "1/2"))
 
+        # ---------- Roblox Window Geometry ----------
+        rwg = settings.get("roblox_window_geometry", {}) or {}
+        if not isinstance(rwg, dict):
+            rwg = {}
+        if hasattr(self, "rbwin_geom_enforce_chk"):
+            try:
+                self.rbwin_geom_enforce_chk.setChecked(bool(rwg.get("enforce_on_launch", False)))
+            except Exception:
+                pass
+        try:
+            self._roblox_window_geometry = {
+                "x": int(rwg.get("x", 0) or 0),
+                "y": int(rwg.get("y", 0) or 0),
+                "w": int(rwg.get("w", 0) or 0),
+                "h": int(rwg.get("h", 0) or 0),
+            }
+        except Exception:
+            self._roblox_window_geometry = {"x": 0, "y": 0, "w": 0, "h": 0}
+        try:
+            self._refresh_rbwin_geom_status()
+        except Exception:
+            pass
+
         # ---------- Timing (timeouts) ----------
         t = settings.get("timeouts", {}) or {}
         self.settings_initial_delay_input.setValue(t.get("initial_delay", 10))
@@ -14981,8 +15120,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         ui = settings.get("ui", {}) or {}
         if not isinstance(ui, dict):
             ui = {}
+        ui_defaults = self.config_manager.default_settings.get("ui", {}) or {}
+        if not isinstance(ui_defaults, dict):
+            ui_defaults = {}
         hidden_biomes = ui.get("webhooks_hidden_biomes", []) or []
         show_tutorial = bool(ui.get("show_tutorial_menu", False))
+        show_selected_sets_bes_slot1 = bool(
+            ui.get(
+                "show_selected_sets_bes_exempt_slot1",
+                ui_defaults.get("show_selected_sets_bes_exempt_slot1", False),
+            )
+        )
         if hasattr(self, "_apply_webhook_biome_column_visibility"):
             try:
                 self._apply_webhook_biome_column_visibility(hidden_biomes)
@@ -14991,6 +15139,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if hasattr(self, "ui_show_tutorial_menu_chk"):
             try:
                 self.ui_show_tutorial_menu_chk.setChecked(show_tutorial)
+            except Exception:
+                pass
+        if hasattr(self, "ui_show_selected_sets_bes_exempt_slot1_chk"):
+            try:
+                self.ui_show_selected_sets_bes_exempt_slot1_chk.setChecked(show_selected_sets_bes_slot1)
             except Exception:
                 pass
         self._apply_tutorial_menu_visibility(show_tutorial)
@@ -15053,6 +15206,102 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             self._settings_baseline = None
 
+    def _refresh_rbwin_geom_status(self) -> None:
+        try:
+            geom = getattr(self, "_roblox_window_geometry", {}) or {}
+        except Exception:
+            geom = {}
+
+        def _i(v, default=0) -> int:
+            try:
+                return int(v)
+            except Exception:
+                return int(default)
+
+        x = _i(geom.get("x", 0))
+        y = _i(geom.get("y", 0))
+        w = _i(geom.get("w", 0))
+        h = _i(geom.get("h", 0))
+
+        if not hasattr(self, "rbwin_geom_status_lbl"):
+            return
+
+        if w > 0 and h > 0:
+            self.rbwin_geom_status_lbl.setText(f"Recorded: x={x}, y={y}, w={w}, h={h}")
+        else:
+            self.rbwin_geom_status_lbl.setText("Recorded: none")
+
+    def _record_roblox_window_geometry(self) -> None:
+        try:
+            import psutil
+            import win32gui as _wgui
+            import win32process as _wproc
+        except Exception as e:
+            QMessageBox.warning(self, "Missing Dependencies", f"Window capture requires pywin32/psutil.\n\n{e}")
+            return
+
+        def _is_roblox_pid(pid: int) -> bool:
+            try:
+                return str(psutil.Process(int(pid)).name()).lower() == "robloxplayerbeta.exe"
+            except Exception:
+                return False
+
+        hwnd = None
+        try:
+            fg = _wgui.GetForegroundWindow()
+            if fg and _wgui.IsWindow(fg):
+                _, pid = _wproc.GetWindowThreadProcessId(fg)
+                if pid and _is_roblox_pid(int(pid)):
+                    hwnd = int(fg)
+        except Exception:
+            hwnd = None
+
+        if not hwnd:
+            try:
+                wins = enum_roblox_windows()
+            except Exception:
+                wins = []
+
+            best_hwnd = None
+            best_area = -1
+            for w in wins:
+                try:
+                    if _wgui.IsIconic(int(w.hwnd)):
+                        continue
+                    wl, wt, wr, wb = _wgui.GetWindowRect(int(w.hwnd))
+                    area = int(wr - wl) * int(wb - wt)
+                    if area > best_area:
+                        best_area = area
+                        best_hwnd = int(w.hwnd)
+                except Exception:
+                    continue
+            hwnd = best_hwnd
+
+        if not hwnd:
+            QMessageBox.warning(self, "No Roblox Window", "No visible Roblox windows were found.")
+            return
+
+        try:
+            wl, wt, wr, wb = _wgui.GetWindowRect(int(hwnd))
+            w = int(wr - wl)
+            h = int(wb - wt)
+        except Exception as e:
+            QMessageBox.warning(self, "Record Failed", f"Failed to read window size/position.\n\n{e}")
+            return
+
+        if w <= 0 or h <= 0:
+            QMessageBox.warning(self, "Record Failed", "Invalid Roblox window size detected.")
+            return
+
+        self._roblox_window_geometry = {"x": int(wl), "y": int(wt), "w": int(w), "h": int(h)}
+        self._refresh_rbwin_geom_status()
+
+        QMessageBox.information(
+            self,
+            "Recorded",
+            "Roblox window size/position recorded.\n\nClick “Save Settings” to persist this change.",
+        )
+
     def save_settings(self, *args, confirm: bool = True):
         """Collect Settings UI and persist to settings.json, then live-apply."""
         if confirm:
@@ -15079,6 +15328,34 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         settings["window_limit"] = self.settings_window_limit_input.value()
         settings["spares_mode"]  = bool(self.spares_mode_chk.isChecked())
         settings["spares_fraction"] = self.spares_split_cmb.currentText()
+
+        # ---------- Roblox Window Geometry ----------
+        rwg = settings.get("roblox_window_geometry", {}) or {}
+        if not isinstance(rwg, dict):
+            rwg = {}
+        if hasattr(self, "rbwin_geom_enforce_chk"):
+            try:
+                rwg["enforce_on_launch"] = bool(self.rbwin_geom_enforce_chk.isChecked())
+            except Exception:
+                rwg["enforce_on_launch"] = False
+        geom = getattr(self, "_roblox_window_geometry", {}) or {}
+        try:
+            rwg["x"] = int(geom.get("x", 0) or 0)
+        except Exception:
+            rwg["x"] = 0
+        try:
+            rwg["y"] = int(geom.get("y", 0) or 0)
+        except Exception:
+            rwg["y"] = 0
+        try:
+            rwg["w"] = int(geom.get("w", 0) or 0)
+        except Exception:
+            rwg["w"] = 0
+        try:
+            rwg["h"] = int(geom.get("h", 0) or 0)
+        except Exception:
+            rwg["h"] = 0
+        settings["roblox_window_geometry"] = rwg
 
         # ---------- Timing (timeouts) ----------
         t = settings.get("timeouts", {}) or {}
@@ -15123,6 +15400,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         ui["webhooks_hidden_biomes"] = sorted({str(b).strip().upper() for b in hidden if str(b).strip()})
         if hasattr(self, "ui_show_tutorial_menu_chk"):
             ui["show_tutorial_menu"] = bool(self.ui_show_tutorial_menu_chk.isChecked())
+        if hasattr(self, "ui_show_selected_sets_bes_exempt_slot1_chk"):
+            ui["show_selected_sets_bes_exempt_slot1"] = bool(
+                self.ui_show_selected_sets_bes_exempt_slot1_chk.isChecked()
+            )
         settings["ui"] = ui
 
         # ---------- Optional: Merchant + Pings (safe if widgets exist) ----------
@@ -15208,6 +15489,21 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         # ── basic limits ──────────────────────────────────────────
         self.settings_window_limit_input.setValue(defaults["window_limit"])
+        try:
+            rwg = defaults.get("roblox_window_geometry", {}) or {}
+            if not isinstance(rwg, dict):
+                rwg = {}
+            if hasattr(self, "rbwin_geom_enforce_chk"):
+                self.rbwin_geom_enforce_chk.setChecked(bool(rwg.get("enforce_on_launch", False)))
+            self._roblox_window_geometry = {
+                "x": int(rwg.get("x", 0) or 0),
+                "y": int(rwg.get("y", 0) or 0),
+                "w": int(rwg.get("w", 0) or 0),
+                "h": int(rwg.get("h", 0) or 0),
+            }
+            self._refresh_rbwin_geom_status()
+        except Exception:
+            pass
 
         # ── launch / restart timings ──────────────────────────────
         self.settings_initial_delay_input.setValue(t["initial_delay"])
@@ -15247,6 +15543,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if hasattr(self, "ui_show_tutorial_menu_chk"):
                 self.ui_show_tutorial_menu_chk.setChecked(show_tutorial)
             self._apply_tutorial_menu_visibility(show_tutorial)
+            show_selected_sets_bes_slot1 = bool(ui_defaults.get("show_selected_sets_bes_exempt_slot1", False))
+            if hasattr(self, "ui_show_selected_sets_bes_exempt_slot1_chk"):
+                self.ui_show_selected_sets_bes_exempt_slot1_chk.setChecked(show_selected_sets_bes_slot1)
         except Exception:
             pass
 
@@ -15344,7 +15643,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def show_about(self):
         config_info = self.config_manager.get_config_info()
         QMessageBox.about(self, "About J.JARAM",
-                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x40\n\n"
+                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x42\n\n"
                          "Advanced multi-account Roblox session manager\n"
                          "with automated log based monitoring and process management.\n\n"
                          "Built with PySide6 and modern design principles.\n\n"
@@ -15686,6 +15985,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.account_alternate_launch.setChecked(False)
         except Exception:
             pass
+        try:
+            self.account_skip_reconnect_on_log_disconnect.setChecked(False)
+        except Exception:
+            pass
         self.account_private_radio.setChecked(True)
         self.on_account_server_type_changed()
         try:
@@ -15709,6 +16012,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         cookie = self.account_cookie.text().strip()
         disabled = self.account_disabled.isChecked()
         alternate = bool(getattr(self, "account_alternate_launch", None) and self.account_alternate_launch.isChecked())
+        skip_reconnect_on_log_disconnect = bool(
+            getattr(self, "account_skip_reconnect_on_log_disconnect", None)
+            and self.account_skip_reconnect_on_log_disconnect.isChecked()
+        )
         server_type = "private" if self.account_private_radio.isChecked() else "public"
 
         if not user_id:
@@ -15750,6 +16057,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "cookie": cookie,
             "disabled": disabled,
             "alternate_launch": alternate,
+            "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
             "cap": False,
         }
         users_config[user_id] = account_data
@@ -15836,6 +16144,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.account_alternate_launch.setChecked(bool(user_info.get("alternate_launch", False)))
         except Exception:
             pass
+        try:
+            self.account_skip_reconnect_on_log_disconnect.setChecked(
+                bool(user_info.get("skip_reconnect_on_log_disconnect", False))
+            )
+        except Exception:
+            pass
         server_type = self._infer_account_server_type(user_info)
         if server_type == "public":
             self.account_public_radio.setChecked(True)
@@ -15870,6 +16184,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         cookie = self.account_cookie.text().strip()
         disabled = self.account_disabled.isChecked()
         alternate = bool(getattr(self, "account_alternate_launch", None) and self.account_alternate_launch.isChecked())
+        skip_reconnect_on_log_disconnect = bool(
+            getattr(self, "account_skip_reconnect_on_log_disconnect", None)
+            and self.account_skip_reconnect_on_log_disconnect.isChecked()
+        )
         server_type = "private" if self.account_private_radio.isChecked() else "public"
 
         if (not alternate) and (not cookie):
@@ -15916,6 +16234,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "bad": bad_flag,
             "cap": existing.get("cap", False),
             "alternate_launch": alternate,
+            "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
         }
         users_config[user_id] = account_data
         if self.config_manager.save_users(users_config):
@@ -16189,6 +16508,90 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 return hwnd
         return None
 
+    def _ui_show_selected_sets_bes_exempt_slot1_enabled(self) -> bool:
+        try:
+            chk = getattr(self, "ui_show_selected_sets_bes_exempt_slot1_chk", None)
+            if chk is not None:
+                return bool(chk.isChecked())
+        except Exception:
+            pass
+
+        try:
+            settings = self.config_manager.peek_settings() or {}
+            ui = settings.get("ui", {}) or {}
+            defaults = self.config_manager.default_settings.get("ui", {}) or {}
+            if not isinstance(ui, dict) or not isinstance(defaults, dict):
+                return False
+            return bool(
+                ui.get(
+                    "show_selected_sets_bes_exempt_slot1",
+                    defaults.get("show_selected_sets_bes_exempt_slot1", False),
+                )
+            )
+        except Exception:
+            return False
+
+    def _set_bes_exempt_slot1_to_user(self, user_id: str) -> None:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return
+
+        combos = getattr(self, "bes_exempt_combos", None) or []
+        if combos:
+            combo = combos[0]
+            try:
+                current = str(combo.currentData() or "").strip()
+            except Exception:
+                current = ""
+            if current == uid:
+                return
+
+            try:
+                if combo.findData(uid) < 0:
+                    combo.insertItem(1, f"Unknown ({uid})", uid)
+                combo.setCurrentIndex(max(0, combo.findData(uid)))
+            except Exception:
+                pass
+
+            # Make sure cache + debounced persistence run even if signals are blocked.
+            try:
+                self._on_bes_ui_changed()
+            except Exception:
+                pass
+            return
+
+        # Fallback when the BES tab isn't available: write config directly.
+        try:
+            settings = self.config_manager.load_settings() or {}
+        except Exception:
+            settings = dict(self.config_manager.default_settings or {})
+
+        bes = settings.get("bes", {}) or {}
+        if not isinstance(bes, dict):
+            bes = {}
+
+        exempt = bes.get("exempt_users", ["", "", ""]) or ["", "", ""]
+        if not isinstance(exempt, list):
+            exempt = ["", "", ""]
+        while len(exempt) < 3:
+            exempt.append("")
+        exempt = exempt[:3]
+
+        if str(exempt[0] or "").strip() == uid:
+            return
+
+        exempt[0] = uid
+        bes["exempt_users"] = exempt
+        settings["bes"] = bes
+        if self.config_manager.save_settings(settings):
+            try:
+                with self._bes_cfg_lock:
+                    cfg = dict(self._bes_cfg_cache or {})
+                    cfg["exempt_users"] = list(exempt)
+                    self._bes_cfg_cache = cfg
+            except Exception:
+                pass
+
     def show_selected_user_window(self) -> None:
         table = getattr(self, "users_table", None)
         if table is None:
@@ -16204,6 +16607,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if not uid:
             QMessageBox.information(self, "Show Selected", "Select a user row first.")
             return
+
+        if self._ui_show_selected_sets_bes_exempt_slot1_enabled():
+            self._set_bes_exempt_slot1_to_user(uid)
 
         hwnd = self._find_roblox_hwnd_for_user(uid)
         if hwnd is None:

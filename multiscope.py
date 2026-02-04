@@ -56,7 +56,7 @@ except Exception:
     WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
 
 
-APP_FOOTER = "J.JARAM JX 2x40"
+APP_FOOTER = "J.JARAM JX 2x42"
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
 # Helpers
@@ -2281,7 +2281,7 @@ class MultiScopeEngine:
                             if biome in ("DREAMSPACE", "GLITCHED", "CYBERSPACE"):
                                 self._maybe_start_temp_block(uid, f"Biome:{biome}")
                         else:
-                            self._log(f"[MultiScope] + NORMAL (start suppressed) | user={self._get_username(uid)} | server={server_key}")
+                            self._log(f"[MultiScope] BIOME START suppressed | biome=NORMAL | user={self._get_username(uid)} | server={server_key}")
         # keep scope membership fresh
         key = self._server_key_for(uid)
         self._scope(key).users.add(uid)
