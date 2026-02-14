@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import threading
 import time
 import traceback
@@ -616,7 +617,9 @@ class ColorFilter:
 MERCHANT_LINES = {
     "jester": "[Merchant]: Jester has arrived on the island!!",
     "mari": "[Merchant]: Mari has arrived on the island...",
+    "rin": "[Merchant]: Rin has arrived on the island!!",
 }
+START_PUZZLE_RE = re.compile(r"start\W*puzzle", re.IGNORECASE)
 
 
 def _normalize_text(s: str) -> str:
@@ -647,10 +650,14 @@ def detect_merchant_type(text: str) -> Optional[str]:
                 return "jester"
             if "mari" in block_lower and "arrived" in block_lower and "island" in block_lower:
                 return "mari"
+            if "rin" in block_lower and "arrived" in block_lower and "island" in block_lower:
+                return "rin"
             if _fuzzy_match(block, MERCHANT_LINES["jester"]):
                 return "jester"
             if _fuzzy_match(block, MERCHANT_LINES["mari"]):
                 return "mari"
+            if _fuzzy_match(block, MERCHANT_LINES["rin"]):
+                return "rin"
     return None
 
 
@@ -862,6 +869,11 @@ def _filters_from_cfg(raw_filters: List[Dict[str, Any]]) -> List[ColorFilter]:
                 name = "Mari"
             elif lower == "purple_text":
                 name = "Jester"
+            elif lower == "orange_text":
+                name = "Rin"
+            elif lower in ("verification check", "verification_check", "verification"):
+                # Verification filter is used only for the verification ROI flow.
+                continue
             filters.append(
                 ColorFilter(
                     name,
@@ -878,7 +890,38 @@ def _filters_from_cfg(raw_filters: List[Dict[str, Any]]) -> List[ColorFilter]:
         filters = [
             ColorFilter("Mari", 255, 255, 255, 40, True),
             ColorFilter("Jester", 145, 67, 255, 40, True),
+            ColorFilter("Rin", 230, 125, 62, 60, True),
         ]
+    else:
+        # Backfill Rin for older settings files that only had Mari/Jester filters.
+        names = {(cf.name or "").strip().lower() for cf in filters if (cf.name or "").strip()}
+        if "rin" not in names:
+            filters.append(ColorFilter("Rin", 230, 125, 62, 60, True))
+    return filters
+
+
+def _verification_filters_from_cfg(raw_filters: List[Dict[str, Any]]) -> List[ColorFilter]:
+    filters: List[ColorFilter] = []
+    for f in raw_filters or []:
+        try:
+            name = str(f.get("name", "")).strip()
+            lower = name.lower()
+            if lower not in ("verification check", "verification_check", "verification"):
+                continue
+            filters.append(
+                ColorFilter(
+                    "Verification Check",
+                    int(f.get("r", 255)),
+                    int(f.get("g", 255)),
+                    int(f.get("b", 255)),
+                    int(f.get("tol", 60)),
+                    bool(f.get("enabled", True)),
+                )
+            )
+        except Exception:
+            continue
+    if not filters:
+        filters = [ColorFilter("Verification Check", 255, 255, 255, 60, True)]
     return filters
 
 
@@ -928,6 +971,7 @@ class OCRWorker(QThread):
     log_signal = Signal(str)
     status_signal = Signal(str)
     merchant_signal = Signal(str, str)  # (user_id, merchant)
+    verification_cap_signal = Signal(str)  # user_id to mark CAP
 
     def __init__(
         self,
@@ -951,6 +995,8 @@ class OCRWorker(QThread):
         self._frame_hash_size = _FRAME_HASH_SIZE
         self._frame_diff_tolerance = 0.0
         self._last_frame_hash_by_pid: Dict[int, int] = {}
+        self._verification_next_check_by_pid: Dict[int, float] = {}
+        self._verification_check_interval = 2.0
 
         self._send_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr-send")
 
@@ -1015,6 +1061,11 @@ class OCRWorker(QThread):
                     work_list = self._select_windows(windows)
                     self._log(f"[Loop {loop_idx}] Selected {len(work_list)} window(s) for capture.")
                     if work_list:
+                        try:
+                            self._run_verification_checks(work_list)
+                        except Exception as e:
+                            self._log(f"[Verification] check error: {e}")
+
                         # Capture raw images first so we can preprocess in batch
                         captured: List[Tuple[Any, Optional[Image.Image]]] = []
                         for win in work_list:
@@ -1111,7 +1162,7 @@ class OCRWorker(QThread):
                                             self._log(f"[OCR TEXT] PID {win.pid}:\n{text}")
 
                                     merchant_type = result.get("merchant")
-                                    if merchant_type in ("jester", "mari"):
+                                    if merchant_type in ("jester", "mari", "rin"):
                                         self._handle_detection(merchant_type, win.pid, raw_img)
                                         self._set_pid_cooldown(win.pid)
                                     processed_count += 1
@@ -1177,7 +1228,7 @@ class OCRWorker(QThread):
         if merchant_type == "jester" and not self._confirm_jester_with_purple(raw_img):
             merchant_type = None
 
-        if merchant_type in ("jester", "mari"):
+        if merchant_type in ("jester", "mari", "rin"):
             self._handle_detection(merchant_type, win.pid, raw_img)
             self._set_pid_cooldown(win.pid)
 
@@ -1256,6 +1307,7 @@ class OCRWorker(QThread):
         ping_map = {
             "jester": (self._ms_cfg or {}).get("jester_ping", ""),
             "mari": (self._ms_cfg or {}).get("mari_ping", ""),
+            "rin": (self._ms_cfg or {}).get("rin_ping", ""),
         }
 
         ts = datetime.now(timezone.utc)
@@ -1263,8 +1315,8 @@ class OCRWorker(QThread):
         ts_full = f"<t:{ts_epoch}:D> - <t:{ts_epoch}:T>"
         ts_rel = f"<t:{ts_epoch}:R>"
 
-        emojis = {"jester": "\U0001f0cf", "mari": "\U0001f6cd"}
-        colors = {"jester": 0xA352FF, "mari": 0xFF82AB}
+        emojis = {"jester": "\U0001f0cf", "mari": "\U0001f6cd", "rin": "\U0001f98a"}
+        colors = {"jester": 0xA352FF, "mari": 0xFF82AB, "rin": 0xFF9F1C}
         title = f"{emojis.get(merchant, '\U0001f4e3')} {merchant.title()} Has Arrived!"
 
         desc = (
@@ -1326,6 +1378,89 @@ class OCRWorker(QThread):
         self._log("[Jester verify] Candidate rejected by purple-only check.")
         return False
 
+    @staticmethod
+    def _is_truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("1", "true", "yes", "y", "on"):
+                return True
+            if v in ("0", "false", "no", "n", "off", ""):
+                return False
+        return bool(value)
+
+    @staticmethod
+    def _contains_start_puzzle_text(text: str) -> bool:
+        raw = str(text or "")
+        if not raw:
+            return False
+        if START_PUZZLE_RE.search(raw):
+            return True
+        squashed = re.sub(r"[^a-z0-9]+", "", raw.lower())
+        return "startpuzzle" in squashed
+
+    def _run_verification_checks(self, windows: List[Any]) -> None:
+        if not self._verification_roi:
+            return
+        enabled_filters = [cf for cf in (self._verification_filters or []) if cf.enabled]
+        if not enabled_filters:
+            return
+        if self._reader is None:
+            return
+
+        now = time.time()
+        for win in windows:
+            if self._stop_event.is_set():
+                return
+            pid = int(getattr(win, "pid", 0) or 0)
+            if pid <= 0:
+                continue
+
+            next_allowed = float(self._verification_next_check_by_pid.get(pid, 0.0) or 0.0)
+            if now < next_allowed:
+                continue
+
+            ctx = self._context_provider(pid) if self._context_provider else {}
+            uid = str((ctx or {}).get("user_id") or "").strip()
+            if not uid:
+                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+                continue
+
+            if self._is_truthy((ctx or {}).get("is_cap")):
+                self._verification_next_check_by_pid[pid] = now + 30.0
+                continue
+
+            if self._is_truthy((ctx or {}).get("has_user_log")):
+                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+                continue
+
+            img = capture_window_image(win.hwnd, self._verification_roi)
+            if img is None:
+                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+                continue
+
+            try:
+                img_for_ocr = preprocess_for_ocr(img, enabled_filters) if self._use_preprocess else img
+                text = _rapidocr_text_only(self._reader, np.array(img_for_ocr))
+            except Exception as e:
+                self._log(f"[Verification] OCR error for PID {pid}: {e}")
+                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+                continue
+
+            if self._contains_start_puzzle_text(text):
+                username = str((ctx or {}).get("username") or uid)
+                self._log(f"[Verification] Start Puzzle found in PID {pid} ({username}); marking CAP.")
+                self._verification_next_check_by_pid[pid] = now + 30.0
+                try:
+                    self.verification_cap_signal.emit(uid)
+                except Exception:
+                    pass
+            else:
+                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+
     # ------------------------- scheduling -------------------------
     def _select_windows(self, windows) -> List[Any]:
         total = len(windows)
@@ -1385,18 +1520,26 @@ class OCRWorker(QThread):
 
         prev_filters = getattr(self, "_filters", None)
         prev_roi = getattr(self, "_roi", None)
+        prev_verification_roi = getattr(self, "_verification_roi", None)
+        prev_verification_filters = getattr(self, "_verification_filters", None)
         prev_use_preprocess = getattr(self, "_use_preprocess", None)
         prev_device_id = getattr(self, "_device_id", None)
         prev_force_cpu = getattr(self, "_force_cpu", None)
 
         self._filters = _filters_from_cfg(self._ocr_cfg.get("color_filters") or [])
         self._roi = _roi_from_cfg(self._ocr_cfg.get("roi") or {})
+        self._verification_roi = _roi_from_cfg(self._ocr_cfg.get("verification_roi") or {})
+        self._verification_filters = _verification_filters_from_cfg(self._ocr_cfg.get("color_filters") or [])
         self._workers = max(1, int(self._ocr_cfg.get("workers", 1) or 1))
         self._max_captures_per_second = max(1, int(self._ocr_cfg.get("max_captures_per_second", 20) or 1))
         try:
             self._batch_delay_seconds = max(0.0, float(self._ocr_cfg.get("batch_delay_seconds", 1.0)))
         except Exception:
             self._batch_delay_seconds = 1.0
+        try:
+            self._verification_check_interval = max(0.5, float(self._ocr_cfg.get("verification_check_interval", 2.0)))
+        except Exception:
+            self._verification_check_interval = 2.0
         self._cooldown_seconds = float(self._ocr_cfg.get("cooldown_seconds", 600) or 600)
         self._use_preprocess = bool(self._ocr_cfg.get("use_preprocess", True))
         self._device_id, self._force_cpu = _parse_device_id(self._ocr_cfg.get("device_id"))
@@ -1418,6 +1561,11 @@ class OCRWorker(QThread):
         if prev_filters != self._filters or prev_roi != self._roi or prev_use_preprocess != self._use_preprocess:
             try:
                 self._last_frame_hash_by_pid.clear()
+            except Exception:
+                pass
+        if prev_verification_roi != self._verification_roi or prev_verification_filters != self._verification_filters:
+            try:
+                self._verification_next_check_by_pid.clear()
             except Exception:
                 pass
         if (

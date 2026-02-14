@@ -19,7 +19,7 @@ R_CONN_LOST    = re.compile(r"\[FLog::Network\]\s+Connection lost", re.I)
 # How deep to read when searching for the username marker
 # (1 MiB matches detection.py’s LOG_READ_SIZE and is plenty fast)
 READ_BYTES    = 1_048_576        # 1 MB
-_SCAN_WINDOW  = 2 * 3600         # look at logs ≤ 2 h old
+_SCAN_WINDOW  = 30 * 60          # look at logs ≤ 30 min old
 _CACHE_TTL    = 60               # rebuild map once a minute
 
 # Internal cache { "map": {username: log_path}, "expire_at": epoch }
@@ -37,7 +37,7 @@ def _rebuild_cache() -> None:
         reverse=True,
     ):
         if now - path.stat().st_mtime > _SCAN_WINDOW:
-            break                               # past the 2 h window
+            break                               # past the 30 m window
 
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as f:

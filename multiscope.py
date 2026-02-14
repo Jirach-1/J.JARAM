@@ -56,7 +56,7 @@ except Exception:
     WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
 
 
-APP_FOOTER = "J.JARAM JX 2x42"
+APP_FOOTER = "J.JARAM JX 2x44"
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
 # Helpers
@@ -183,7 +183,7 @@ MERCHANT_RE = re.compile(
     r"^(?P<full_line>"
     r"(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{0,6})?Z),"  # allow 0-6 ms digits
     r"[^\n]*?\[(?:Merchant|Merchants)\]:?\s*"                               # optional colon after [Merchant]
-    r"(?P<merchant_name>Jester|Mari)\b"
+    r"(?P<merchant_name>Jester|Mari|Rin)\b"
     r"[^\n]*?\b(arrived|spawn(?:ed|ing)?|appeared)\b"
     r"[^\n]*"
     r")$",
@@ -655,8 +655,8 @@ class MultiScopeEngine:
         self._merchant_rate_limit = 15.0
         self._last_merchant_post = 0.0
         self._merchant_hook: str = ""
-        self._merchant_filters = {"Jester": True, "Mari": True}
-        self._ping_map = {"Jester": "", "Mari": ""}
+        self._merchant_filters = {"Jester": True, "Mari": True, "Rin": True}
+        self._ping_map = {"Jester": "", "Mari": "", "Rin": ""}
 
         # Merchant dedupe per uid -> merchant -> last full line  (legacy; no longer used)
         self._first_merchant_scan_done: Set[str] = set()
@@ -713,6 +713,9 @@ class MultiScopeEngine:
         self._watch_cooldown_sec = 2.0     # ignore hits closer than this
         
         self._normpath_by_uid: Dict[str, str] = {}
+        # Per-user log paths that were active when a disconnect fired.
+        # These are ignored on future resolves so we do not re-attach stale logs.
+        self._ignored_logs_by_uid: Dict[str, Set[str]] = {}
         self._menu_unknown_log_by_uid: Dict[str, str] = {}
         # Disconnect fallback: if in_menu stays unknown too long, recycle that user.
         self._menu_none_since_by_uid: Dict[str, float] = {}
@@ -753,8 +756,10 @@ class MultiScopeEngine:
         merchant_hook: str = "",
         enable_jester: bool = True,
         enable_mari: bool = True,
+        enable_rin: bool = True,
         jester_ping: str = "",
         mari_ping: str = "",
+        rin_ping: str = "",
         merchant_rate_limit: float = 15.0,   # kept for backward-compat; ignored
         biome_min_interval: float = 2.0,
         # NEW:
@@ -811,8 +816,12 @@ class MultiScopeEngine:
 
         self._biome_webhooks = normalized_hooks
         self._merchant_hook = (merchant_hook or "").strip()
-        self._merchant_filters = {"Jester": bool(enable_jester), "Mari": bool(enable_mari)}
-        self._ping_map = {"Jester": jester_ping or "", "Mari": mari_ping or ""}
+        self._merchant_filters = {
+            "Jester": bool(enable_jester),
+            "Mari": bool(enable_mari),
+            "Rin": bool(enable_rin),
+        }
+        self._ping_map = {"Jester": jester_ping or "", "Mari": mari_ping or "", "Rin": rin_ping or ""}
         # --- ignore merchant_rate_limit entirely (no cooldown)
         self._biome_min_interval = float(biome_min_interval or 2.0)
         self._biome_modes = base_modes
@@ -838,7 +847,7 @@ class MultiScopeEngine:
         """
         Ensure the persisted stats file always contains:
         - Every biome from biomes.json (excluding NORMAL) with at least a 0 count
-        - The canonical merchants (Jester/Mari) with at least a 0 count
+        - The canonical merchants (Jester/Mari/Rin) with at least a 0 count
         """
         path = getattr(self, "_stats_path", "") or ""
         if not path:
@@ -883,7 +892,7 @@ class MultiScopeEngine:
                 mt = {}
                 self._found_stats["merchants_total"] = mt
                 changed = True
-            for merch in ("Jester", "Mari"):
+            for merch in ("Jester", "Mari", "Rin"):
                 if merch not in mt:
                     mt[merch] = 0
                     changed = True
@@ -1259,22 +1268,80 @@ class MultiScopeEngine:
             refresh_username_log_map()  # build the strict map right now
         except Exception:
             pass
+        user_ids_set = {str(uid) for uid in (user_ids or [])}
         with self._lock:
             # remove stale only
-            for uid in list(self._cur.keys()):
-                if uid not in user_ids:
-                    self._cur.pop(uid, None)
+            stale_uids = {
+                str(uid)
+                for uid in (
+                    set(self._cur.keys())
+                    | set(self._normpath_by_uid.keys())
+                    | set(self._ignored_logs_by_uid.keys())
+                    | set(self._menu_unknown_log_by_uid.keys())
+                    | set(self._last_disconnect_sig_by_uid.keys())
+                )
+                if str(uid) not in user_ids_set
+            }
+            for uid in stale_uids:
+                self._cur.pop(uid, None)
+                self._normpath_by_uid.pop(uid, None)
+                self._ignored_logs_by_uid.pop(uid, None)
+                self._menu_unknown_log_by_uid.pop(uid, None)
+                self._last_disconnect_sig_by_uid.pop(uid, None)
+                try:
+                    if hasattr(self, "_last_switch_ts"):
+                        self._last_switch_ts.pop(uid, None)
+                except Exception:
+                    pass
 
         # Do resolves + watcher setup without holding the engine lock
-        for uid in user_ids:
+        for uid in user_ids_set:
             self._resolve_current_log(uid, force=True)
             cur = self._cur.get(uid)
             if cur and cur.path:
                 self._watch_dir_for_path(cur.path)
 
         # Do the I/O-heavy warmstarts last, also outside the lock
-        for uid in user_ids:
+        for uid in user_ids_set:
             self._warmstart_user_tail(uid)
+
+    @staticmethod
+    def _normalize_log_path(path: Optional[str]) -> str:
+        if not path:
+            return ""
+        try:
+            return os.path.normcase(os.path.abspath(str(path)))
+        except Exception:
+            return str(path)
+
+    def _remember_ignored_log(self, uid: str, path: Optional[str]) -> None:
+        np = self._normalize_log_path(path)
+        if not np:
+            return
+        uid_s = str(uid)
+        ignored = self._ignored_logs_by_uid.setdefault(uid_s, set())
+        ignored.add(np)
+
+    def _drop_user_log_tracking(self, uid: str, *, ignore_current: bool = True) -> None:
+        uid_s = str(uid)
+        cur = self._cur.pop(uid_s, None)
+
+        if ignore_current:
+            try:
+                if cur and cur.path:
+                    self._remember_ignored_log(uid_s, cur.path)
+            except Exception:
+                pass
+
+        prev_np = self._normpath_by_uid.pop(uid_s, None)
+        if ignore_current and prev_np:
+            self._remember_ignored_log(uid_s, prev_np)
+
+        try:
+            if hasattr(self, "_last_switch_ts"):
+                self._last_switch_ts.pop(uid_s, None)
+        except Exception:
+            pass
 
     def _resolve_current_log(self, uid: str, *, force: bool = False) -> None:
         uname = (self._get_username(uid) or "").lower()
@@ -1298,6 +1365,14 @@ class MultiScopeEngine:
                 prev_np = os.path.normcase(str(cur.path))
         # NEW: canonicalize both sides and skip if unchanged
         new_np = os.path.normcase(os.path.abspath(path))
+        ignored_logs = self._ignored_logs_by_uid.get(str(uid), set())
+        if new_np in ignored_logs:
+            self._throttled_log(
+                key=f"ignored-log:{uid}:{new_np}",
+                msg=f"[MultiScope] ignoring stale log for {uname} - {os.path.basename(path)}",
+                every=15.0,
+            )
+            return
         cur_np = self._normpath_by_uid.get(uid)
         if not force and cur_np and new_np == cur_np:
             if cur.path:
@@ -1585,8 +1660,9 @@ class MultiScopeEngine:
             return False
 
         self._last_disconnect_sig_by_uid[str(uid)] = (norm_path, abs_end)
-        self._emit_event("disconnect", uid, last_payload)
         self._mark_menu_unknown(uid)
+        self._drop_user_log_tracking(uid, ignore_current=True)
+        self._emit_event("disconnect", uid, last_payload)
         return True
 
     def _scan_disconnect_in_chunk(self, uid: str, chunk: str) -> bool:
@@ -1920,8 +1996,8 @@ class MultiScopeEngine:
         if self._should_skip_webhook(owner_raw, server_label, ps_link):
             return
 
-        emojis = {"Jester": "🃏", "Mari": "🛍️"}
-        colors = {"Jester": 0xA352FF, "Mari": 0xFF82AB}
+        emojis = {"Jester": "🃏", "Mari": "🛍️", "Rin": "🦊"}
+        colors = {"Jester": 0xA352FF, "Mari": 0xFF82AB, "Rin": 0xFF9F1C}
         title  = f"{emojis.get(who,'📣')} {who} Has Arrived!"
         ts     = int(event_time_utc.timestamp())
         ts_full = f"<t:{ts}:D> • <t:{ts}:T>"
@@ -1965,7 +2041,7 @@ class MultiScopeEngine:
             return
 
         m = str(merchant or "").strip().lower()
-        if m not in ("jester", "mari"):
+        if m not in ("jester", "mari", "rin"):
             return
         who = m.title()
   
@@ -2332,6 +2408,8 @@ class MultiScopeEngine:
                         key = "Unknown"
 
                     if key == "Disconnected":
+                        self._mark_menu_unknown(uid)
+                        self._drop_user_log_tracking(uid, ignore_current=True)
                         self._menu_none_since_by_uid.pop(uid, None)
                         self._menu_none_disconnect_fired_by_uid.discard(uid)
                         continue
@@ -2353,13 +2431,27 @@ class MultiScopeEngine:
                     scope.users.add(uid)
 
                     if scope.in_menu is None:
-                        since = self._menu_none_since_by_uid.get(uid)
-                        if since is None:
-                            self._menu_none_since_by_uid[uid] = now_t
-                        elif (now_t - since) >= 120.0 and uid not in self._menu_none_disconnect_fired_by_uid:
-                            self._emit_event("disconnect", uid, "in_menu_none_timeout=120")
-                            self._mark_menu_unknown(uid)
-                            self._menu_none_disconnect_fired_by_uid.add(uid)
+                        # Only start the in_menu-none timeout after we have a strict
+                        # per-user log attached (username marker found in logs).
+                        has_user_log = False
+                        try:
+                            cur = self._cur.get(uid)
+                            has_user_log = bool(cur and cur.path and os.path.isfile(cur.path))
+                        except Exception:
+                            has_user_log = False
+
+                        if not has_user_log:
+                            self._menu_none_since_by_uid.pop(uid, None)
+                            self._menu_none_disconnect_fired_by_uid.discard(uid)
+                        else:
+                            since = self._menu_none_since_by_uid.get(uid)
+                            if since is None:
+                                self._menu_none_since_by_uid[uid] = now_t
+                            elif (now_t - since) >= 120.0 and uid not in self._menu_none_disconnect_fired_by_uid:
+                                self._mark_menu_unknown(uid)
+                                self._drop_user_log_tracking(uid, ignore_current=True)
+                                self._emit_event("disconnect", uid, "in_menu_none_timeout=120")
+                                self._menu_none_disconnect_fired_by_uid.add(uid)
                     else:
                         self._menu_none_since_by_uid.pop(uid, None)
                         self._menu_none_disconnect_fired_by_uid.discard(uid)
@@ -2499,6 +2591,13 @@ class MultiScopeEngine:
                 }
             except Exception:
                 out["last_disconnect_sig_by_uid"] = {}
+            try:
+                out["ignored_logs_by_uid"] = {
+                    str(uid): sorted(list(paths or []))
+                    for uid, paths in (self._ignored_logs_by_uid or {}).items()
+                }
+            except Exception:
+                out["ignored_logs_by_uid"] = {}
 
         return out
 
@@ -2678,6 +2777,28 @@ class MultiScopeEngine:
                         if isinstance(sig, (list, tuple)) and len(sig) == 2:
                             out[u] = (str(sig[0]), int(sig[1]))
                     self._last_disconnect_sig_by_uid = out
+                    applied = True
+            except Exception:
+                pass
+            try:
+                ilb = state.get("ignored_logs_by_uid") or {}
+                if isinstance(ilb, dict):
+                    out: Dict[str, Set[str]] = {}
+                    for uid, paths in ilb.items():
+                        u = str(uid)
+                        vals: Set[str] = set()
+                        if isinstance(paths, (list, tuple, set)):
+                            for p in paths:
+                                np = self._normalize_log_path(str(p))
+                                if np:
+                                    vals.add(np)
+                        elif isinstance(paths, str):
+                            np = self._normalize_log_path(paths)
+                            if np:
+                                vals.add(np)
+                        if vals:
+                            out[u] = vals
+                    self._ignored_logs_by_uid = out
                     applied = True
             except Exception:
                 pass

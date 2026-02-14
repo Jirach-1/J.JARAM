@@ -10,6 +10,17 @@ from log_utils import find_log_for_username, refresh_username_log_map
 from pathlib import Path
 
 try:
+    from roblox_cookie_utils import (
+        extract_roblosecurity_from_requests_response,
+        normalize_roblosecurity_cookie_value,
+        persist_updated_cookie,
+    )
+except Exception:
+    extract_roblosecurity_from_requests_response = None
+    normalize_roblosecurity_cookie_value = None
+    persist_updated_cookie = None
+
+try:
     from gui import ConfigManager
 except ImportError:
 
@@ -274,6 +285,12 @@ class AuthenticationHandler:
         self.token_cache = {}
 
     def retrieve_csrf_token(self, cookie):
+        cookie = str(cookie or "").strip()
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                cookie = normalize_roblosecurity_cookie_value(cookie)
+            except Exception:
+                cookie = str(cookie or "").strip()
         if cookie in self.token_cache and self.token_cache[cookie]["expires"] > time.time():
             return self.token_cache[cookie]["token"]
 
@@ -298,28 +315,74 @@ class AuthenticationHandler:
         return None
 
     def obtain_auth_ticket(self, cookie):
+        cookie = str(cookie or "").strip()
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                cookie = normalize_roblosecurity_cookie_value(cookie)
+            except Exception:
+                cookie = str(cookie or "").strip()
         session = requests.Session()
-        session.headers.update({
-            "Cookie": f".ROBLOSECURITY={cookie}",
-            "Referer": "https://www.roblox.com/",
-            "User-Agent": "Roblox/WinInet"
-        })
+        session.headers.update(
+            {
+                "Referer": "https://www.roblox.com/",
+                "User-Agent": "Roblox/WinInet",
+            }
+        )
+        try:
+            session.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com", path="/")
+        except Exception:
+            try:
+                session.cookies[".ROBLOSECURITY"] = cookie
+            except Exception:
+                pass
+
+        def _maybe_update_cookie(resp) -> None:
+            nonlocal cookie
+            if not resp or extract_roblosecurity_from_requests_response is None:
+                return
+            try:
+                updated = extract_roblosecurity_from_requests_response(resp, session=session)
+            except Exception:
+                updated = None
+            if updated and updated != cookie:
+                cookie = updated
+                try:
+                    session.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com", path="/")
+                except Exception:
+                    pass
 
         try:
             response = session.post("https://auth.roblox.com/v1/authentication-ticket", timeout=5)
-            if response.status_code == 403 and "x-csrf-token" in response.headers:
-                csrf_token = response.headers["x-csrf-token"]
-                session.headers.update({
-                    "X-CSRF-TOKEN": csrf_token,
-                    "Content-Type": "application/json"
-                })
-                second_response = session.post("https://auth.roblox.com/v1/authentication-ticket", timeout=5)
-                ticket = second_response.headers.get("rbx-authentication-ticket")
-                if ticket:
-                    return ticket
-        except Exception as error:
+            _maybe_update_cookie(response)
+
+            try:
+                ticket = response.headers.get("rbx-authentication-ticket")
+            except Exception:
+                ticket = None
+            if ticket:
+                return ticket, cookie
+
+            if response.status_code == 403:
+                csrf_token = response.headers.get("x-csrf-token") or response.headers.get("X-CSRF-TOKEN")
+                if csrf_token:
+                    session.headers.update(
+                        {
+                            "X-CSRF-TOKEN": csrf_token,
+                            "Content-Type": "application/json",
+                        }
+                    )
+                    second_response = session.post("https://auth.roblox.com/v1/authentication-ticket", timeout=5)
+                    _maybe_update_cookie(second_response)
+                    try:
+                        ticket = second_response.headers.get("rbx-authentication-ticket")
+                    except Exception:
+                        ticket = None
+                    if ticket:
+                        return ticket, cookie
+        except Exception:
             pass
-        return None
+
+        return None, cookie
 
 # ──────────────────────────────────────────────────────────────
 # 1-B. presence monitor class – delete the whole class
@@ -756,31 +819,33 @@ class GameLauncher:
     def _extract_private_server_info(self, private_server_link, cookie=None):
         import re
         if not private_server_link:
-            return None, None, "direct"
+            return None, None, "direct", cookie
 
         link = str(private_server_link or "").strip()
 
         pattern1 = r'roblox\.com/games/(\d+)/[^?]*\?privateServerLinkCode=([A-Za-z0-9_-]+)'
         m1 = re.search(pattern1, link)
         if m1:
-            return m1.group(1), m1.group(2), "direct"
+            return m1.group(1), m1.group(2), "direct", cookie
 
         pattern2 = r'roblox\.com/share\?code=([A-Za-z0-9_-]+)&type=Server'
         m2 = re.search(pattern2, link)
         if m2:
             share_code = m2.group(1)
             if cookie:
-                p, code = self._convert_share_link(share_code, cookie)
+                p, code, updated_cookie = self._convert_share_link(share_code, cookie)
+                if updated_cookie:
+                    cookie = updated_cookie
                 if p and code:
-                    return p, code, "resolved"
-                return None, share_code, "share"
-            return None, share_code, "share"
+                    return p, code, "resolved", cookie
+                return None, share_code, "share", cookie
+            return None, share_code, "share", cookie
 
         # Allow pasting just a linkCode value (privateServerLinkCode).
         if re.fullmatch(r"[A-Za-z0-9_-]{5,}", link):
-            return None, link, "code"
+            return None, link, "code", cookie
 
-        return None, None, "invalid"
+        return None, None, "invalid", cookie
     
     # main.py — inside class GameLauncher
     def log_skip(self, user_id: str, server_label: str, reason: str, throttle: float = 8.0) -> None:
@@ -795,19 +860,62 @@ class GameLauncher:
             self.log(f"[LAUNCH SKIP] {user_id} -> {server_label} {reason}")
 
 
-    def _find_visible_window_for_pid(self, pid: int):
+    def _related_window_search_pids(self, pid_or_pids):
+        targets = set()
+        try:
+            if isinstance(pid_or_pids, (set, tuple, list)):
+                for val in pid_or_pids:
+                    try:
+                        iv = int(val)
+                        if iv > 0:
+                            targets.add(iv)
+                    except Exception:
+                        continue
+            else:
+                iv = int(pid_or_pids)
+                if iv > 0:
+                    targets.add(iv)
+        except Exception:
+            pass
+
+        roots = list(targets)
+        for root_pid in roots:
+            try:
+                proc = psutil.Process(int(root_pid))
+            except Exception:
+                continue
+            try:
+                for child in proc.children(recursive=True):
+                    try:
+                        cpid = int(child.pid)
+                        if cpid > 0:
+                            targets.add(cpid)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        return targets
+
+    def _find_visible_window_for_pid(self, pid_or_pids, *, include_hidden: bool = False, include_minimized: bool = False):
+        targets = self._related_window_search_pids(pid_or_pids)
+        if not targets:
+            return None
+
         candidates = []
 
         def window_callback(hwnd, _extra):
             try:
-                if not win32gui.IsWindowVisible(hwnd):
+                visible = bool(win32gui.IsWindowVisible(hwnd))
+                iconic = bool(win32gui.IsIconic(hwnd))
+                if not include_hidden and not visible:
                     return
-                if win32gui.IsIconic(hwnd):
+                if not include_minimized and iconic:
                     return
                 _, hwnd_pid = win32process.GetWindowThreadProcessId(hwnd)
-                if int(hwnd_pid) != int(pid):
+                if int(hwnd_pid) not in targets:
                     return
-                candidates.append(hwnd)
+                candidates.append((hwnd, visible, iconic))
             except Exception:
                 pass
 
@@ -820,26 +928,57 @@ class GameLauncher:
             return None
 
         best_hwnd = None
-        best_area = -1
-        for hwnd in candidates:
+        best_key = None
+        for hwnd, visible, iconic in candidates:
             try:
                 l, t, r, b = win32gui.GetWindowRect(hwnd)
-                area = int(r - l) * int(b - t)
-                if area > best_area:
-                    best_area = area
+                w = max(0, int(r) - int(l))
+                h = max(0, int(b) - int(t))
+                area = int(w * h)
+                # Prefer visible, non-minimized windows with largest area.
+                key = (1 if visible else 0, 1 if not iconic else 0, area)
+                if best_key is None or key > best_key:
+                    best_key = key
                     best_hwnd = hwnd
             except Exception:
                 continue
         return best_hwnd
 
-    def _wait_for_visible_window_for_pid(self, pid: int, timeout_s: float = 8.0):
+    def _wait_for_visible_window_for_pid(self, pid_or_pids, timeout_s: float = 8.0):
+        targets = self._related_window_search_pids(pid_or_pids)
         deadline = time.time() + float(timeout_s or 0)
+        refresh_at = 0.0
+
         while time.time() < deadline:
-            hwnd = self._find_visible_window_for_pid(pid)
+            now = time.time()
+            if now >= refresh_at:
+                targets = self._related_window_search_pids(targets)
+                refresh_at = now + 0.5
+
+            hwnd = self._find_visible_window_for_pid(targets)
             if hwnd:
                 return hwnd
             time.sleep(0.15)
-        return None
+
+        # Fallbacks for edge cases: minimized first, then hidden.
+        hwnd = self._find_visible_window_for_pid(targets, include_minimized=True)
+        if hwnd:
+            return hwnd
+        return self._find_visible_window_for_pid(targets, include_hidden=True, include_minimized=True)
+
+    def _window_matches_geometry(self, hwnd: int, x: int, y: int, w: int, h: int, tol: int = 2) -> bool:
+        try:
+            l, t, r, b = win32gui.GetWindowRect(int(hwnd))
+            cur_w = int(r - l)
+            cur_h = int(b - t)
+            return (
+                abs(int(l) - int(x)) <= int(tol)
+                and abs(int(t) - int(y)) <= int(tol)
+                and abs(int(cur_w) - int(w)) <= int(tol)
+                and abs(int(cur_h) - int(h)) <= int(tol)
+            )
+        except Exception:
+            return False
 
     def _maybe_enforce_roblox_window_geometry(self, user_id: str, pid: int) -> None:
         try:
@@ -869,60 +1008,138 @@ class GameLauncher:
         if w <= 0 or h <= 0:
             return
 
-        hwnd = self._wait_for_visible_window_for_pid(int(pid), timeout_s=8.0)
+        target_pids = self._related_window_search_pids(int(pid))
+        hwnd = self._wait_for_visible_window_for_pid(target_pids, timeout_s=10.0)
         if not hwnd:
+            try:
+                self.log(f"[WINPOS SKIP] uid={user_id} pid={pid} reason=no_window")
+            except Exception:
+                pass
             return
 
-        try:
-            cur_l, cur_t, cur_r, cur_b = win32gui.GetWindowRect(hwnd)
-            cur_w = int(cur_r - cur_l)
-            cur_h = int(cur_b - cur_t)
-        except Exception:
-            cur_l = cur_t = cur_w = cur_h = None
-
         tol = 2
-        if (
-            cur_l is not None
-            and abs(int(cur_l) - x) <= tol
-            and abs(int(cur_t) - y) <= tol
-            and abs(int(cur_w) - w) <= tol
-            and abs(int(cur_h) - h) <= tol
-        ):
+        if self._window_matches_geometry(hwnd, x, y, w, h, tol=tol):
             return
 
         try:
             import win32con
-
-            flags = int(win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
-            win32gui.SetWindowPos(hwnd, 0, x, y, w, h, flags)
-            self.log(f"[WINPOS] uid={user_id} pid={pid} -> x={x} y={y} w={w} h={h}")
         except Exception as e:
             try:
                 self.log(f"[WINPOS FAIL] uid={user_id} pid={pid} err={e!r}")
             except Exception:
                 pass
+            return
+
+        flags = int(win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+        try:
+            flags |= int(getattr(win32con, "SWP_ASYNCWINDOWPOS", 0))
+        except Exception:
+            pass
+
+        last_err = None
+        applied = False
+        for attempt in range(1, 6):
+            try:
+                if not win32gui.IsWindow(int(hwnd)):
+                    hwnd = self._find_visible_window_for_pid(target_pids, include_minimized=True)
+                    if not hwnd:
+                        target_pids = self._related_window_search_pids(target_pids)
+                        hwnd = self._wait_for_visible_window_for_pid(target_pids, timeout_s=1.25)
+                    if not hwnd:
+                        break
+            except Exception:
+                hwnd = self._find_visible_window_for_pid(target_pids, include_minimized=True)
+                if not hwnd:
+                    break
+
+            try:
+                if win32gui.IsIconic(int(hwnd)) or win32gui.IsZoomed(int(hwnd)):
+                    win32gui.ShowWindow(int(hwnd), int(win32con.SW_RESTORE))
+                    time.sleep(0.06)
+            except Exception:
+                pass
+
+            try:
+                win32gui.SetWindowPos(int(hwnd), 0, int(x), int(y), int(w), int(h), flags)
+            except Exception as e:
+                last_err = e
+                try:
+                    # Fallback for some window-state/style transitions.
+                    win32gui.MoveWindow(int(hwnd), int(x), int(y), int(w), int(h), True)
+                except Exception as move_err:
+                    last_err = move_err
+
+            time.sleep(0.10 if attempt < 3 else 0.20)
+            if self._window_matches_geometry(int(hwnd), x, y, w, h, tol=tol):
+                applied = True
+                break
+
+            target_pids = self._related_window_search_pids(target_pids)
+            hwnd = self._find_visible_window_for_pid(target_pids, include_minimized=True)
+
+        if applied:
+            try:
+                self.log(f"[WINPOS] uid={user_id} pid={pid} -> x={x} y={y} w={w} h={h}")
+            except Exception:
+                pass
+            return
+
+        try:
+            suffix = f" err={last_err!r}" if last_err is not None else ""
+            self.log(
+                f"[WINPOS FAIL] uid={user_id} pid={pid} "
+                f"target=x={x} y={y} w={w} h={h}{suffix}"
+            )
+        except Exception:
+            pass
 
 
     def _convert_share_link(self, share_code, cookie):
         import requests, json
+        cookie = str(cookie or "")
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                cookie = normalize_roblosecurity_cookie_value(cookie)
+            except Exception:
+                cookie = str(cookie or "")
         if not share_code or not cookie:
-            return None, None
+            return None, None, cookie
         url = "https://apis.roblox.com/sharelinks/v1/resolve-link"
         payload = {"linkId": share_code, "linkType": "Server"}
         s = requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
+        try:
+            s.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com", path="/")
+        except Exception:
+            s.cookies[".ROBLOSECURITY"] = cookie
         s.headers.update({
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://www.roblox.com/"
         })
+
+        def _maybe_update_cookie(resp) -> None:
+            nonlocal cookie
+            if not resp or extract_roblosecurity_from_requests_response is None:
+                return
+            try:
+                updated = extract_roblosecurity_from_requests_response(resp, session=s)
+            except Exception:
+                updated = None
+            if updated and updated != cookie:
+                cookie = updated
+                try:
+                    s.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com", path="/")
+                except Exception:
+                    pass
         try:
             r = s.post(url, json=payload, timeout=10)
+            _maybe_update_cookie(r)
             if r.status_code == 403:
                 csrf = r.headers.get("X-CSRF-TOKEN")
                 if csrf:
                     s.headers["X-CSRF-TOKEN"] = csrf
                     r = s.post(url, json=payload, timeout=10)
+                    _maybe_update_cookie(r)
             if r.status_code == 200:
                 data = r.json()
                 invite = data.get("privateServerInviteData") or {}
@@ -934,10 +1151,10 @@ class GameLauncher:
                         self.tracker.share_to_link[share_code] = {"place": place, "link": link}
                 except Exception:
                     pass
-                return place, link
+                return place, link, cookie
         except Exception:
             pass
-        return None, None
+        return None, None, cookie
 
     def _get_share_resolver_cookies(self, *, prefer_cookie: str = "", exclude_uid: str = "") -> list[str]:
         """
@@ -1002,7 +1219,18 @@ class GameLauncher:
         is_alternate = bool((user_info or {}).get("alternate_launch", False))
 
         # Parse quickly
-        p, code, ltype = self._extract_private_server_info(psl, cookie if not is_alternate else None)
+        p, code, ltype, updated_cookie = self._extract_private_server_info(psl, cookie if not is_alternate else None)
+        if (
+            updated_cookie
+            and cookie
+            and updated_cookie != cookie
+            and persist_updated_cookie is not None
+        ):
+            try:
+                persist_updated_cookie(self.cfg, old_cookie=cookie, new_cookie=updated_cookie)
+            except Exception:
+                pass
+            cookie = updated_cookie
 
         # If it's a SHARE link, prefer any previously learned mapping → linkCode
         if ltype == "share" and code:
@@ -1015,12 +1243,33 @@ class GameLauncher:
                 p, code, ltype = (m.get("place") or ""), (m.get("link") or ""), "resolved"
             else:
                 # try to resolve with the current cookie (may fail — that's fine)
-                rp, rc = self._convert_share_link(code, cookie)
+                rp, rc, new_cookie = self._convert_share_link(code, cookie)
+                if (
+                    new_cookie
+                    and cookie
+                    and new_cookie != cookie
+                    and persist_updated_cookie is not None
+                ):
+                    try:
+                        persist_updated_cookie(self.cfg, old_cookie=cookie, new_cookie=new_cookie)
+                    except Exception:
+                        pass
+                    cookie = new_cookie
                 if rp and rc:
                     p, code, ltype = rp, rc, "resolved"
                 elif is_alternate:
                     for resolver_cookie in self._get_share_resolver_cookies(prefer_cookie=cookie):
-                        rp, rc = self._convert_share_link(code, resolver_cookie)
+                        rp, rc, new_resolver_cookie = self._convert_share_link(code, resolver_cookie)
+                        if (
+                            new_resolver_cookie
+                            and resolver_cookie
+                            and new_resolver_cookie != resolver_cookie
+                            and persist_updated_cookie is not None
+                        ):
+                            try:
+                                persist_updated_cookie(self.cfg, old_cookie=resolver_cookie, new_cookie=new_resolver_cookie)
+                            except Exception:
+                                pass
                         if rp and rc:
                             p, code, ltype = rp, rc, "resolved"
                             break
@@ -1034,6 +1283,7 @@ class GameLauncher:
 
         launch_ts = time.time()
         uid_key = str(user_id)
+        original_cookie = str(cookie or "")
 
         # Fast-path: if this uid is already mid-launch, skip BEFORE any network/auth work or logs.
         with self._launch_inflight_lock:
@@ -1061,7 +1311,17 @@ class GameLauncher:
         is_alternate = bool((user_info or {}).get("alternate_launch", False))
 
         # parse target place / link-code (resolve share links early)
-        place_id, private_code, link_type = self._extract_private_server_info(psl, cookie if not is_alternate else None)
+        place_id, private_code, link_type, updated_cookie = self._extract_private_server_info(
+            psl, cookie if not is_alternate else None
+        )
+        if updated_cookie and cookie and updated_cookie != cookie:
+            cookie = updated_cookie
+            if persist_updated_cookie is not None and original_cookie and cookie != original_cookie:
+                try:
+                    persist_updated_cookie(self.cfg, user_id=str(user_id), new_cookie=cookie)
+                    original_cookie = cookie
+                except Exception:
+                    pass
         if link_type == "share" and private_code:
             try:
                 m = self.tracker.share_to_link.get(private_code)
@@ -1072,12 +1332,30 @@ class GameLauncher:
             else:
                 if is_alternate:
                     for resolver_cookie in self._get_share_resolver_cookies(prefer_cookie=cookie, exclude_uid=str(user_id)):
-                        rp, rc = self._convert_share_link(private_code, resolver_cookie)
+                        rp, rc, new_resolver_cookie = self._convert_share_link(private_code, resolver_cookie)
+                        if (
+                            new_resolver_cookie
+                            and resolver_cookie
+                            and new_resolver_cookie != resolver_cookie
+                            and persist_updated_cookie is not None
+                        ):
+                            try:
+                                persist_updated_cookie(self.cfg, old_cookie=resolver_cookie, new_cookie=new_resolver_cookie)
+                            except Exception:
+                                pass
                         if rp and rc:
                             place_id, private_code, link_type = rp, rc, "resolved"
                             break
                 else:
-                    rp, rc = self._convert_share_link(private_code, cookie)
+                    rp, rc, new_cookie = self._convert_share_link(private_code, cookie)
+                    if new_cookie and cookie and new_cookie != cookie:
+                        cookie = new_cookie
+                        if persist_updated_cookie is not None and original_cookie and cookie != original_cookie:
+                            try:
+                                persist_updated_cookie(self.cfg, user_id=str(user_id), new_cookie=cookie)
+                                original_cookie = cookie
+                            except Exception:
+                                pass
                     if rp and rc:
                         place_id, private_code, link_type = rp, rc, "resolved"
 
@@ -1141,7 +1419,15 @@ class GameLauncher:
             if private_code:
                 game_url += f"&linkCode={private_code}"
         else:
-            auth_ticket = self.auth_handler.obtain_auth_ticket(cookie)
+            auth_ticket, new_cookie = self.auth_handler.obtain_auth_ticket(cookie)
+            if new_cookie and cookie and new_cookie != cookie:
+                cookie = new_cookie
+                if persist_updated_cookie is not None and original_cookie and cookie != original_cookie:
+                    try:
+                        persist_updated_cookie(self.cfg, user_id=str(user_id), new_cookie=cookie)
+                        original_cookie = cookie
+                    except Exception:
+                        pass
             if not auth_ticket:
                 self.log(f"[LAUNCH FAIL] uid={user_id} label={server_label} reason=no_auth_ticket")
                 self.cfg.mark_bad_cookie(user_id, True)

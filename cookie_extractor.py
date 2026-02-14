@@ -10,6 +10,17 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
+try:
+    from roblox_cookie_utils import (
+        ROBLOSECURITY_COOKIE_NAME,
+        is_probably_roblosecurity,
+        normalize_roblosecurity_cookie_value,
+    )
+except Exception:
+    is_probably_roblosecurity = None
+    ROBLOSECURITY_COOKIE_NAME = ".ROBLOSECURITY"
+    normalize_roblosecurity_cookie_value = None
+
 class CookieExtractionThread(QThread):
 
     cookie_extracted = Signal(str)
@@ -193,28 +204,37 @@ class CookieExtractionThread(QThread):
 
             time.sleep(1)
 
-            cookies = self.driver.get_cookies()
+            def _is_valid(val: str) -> bool:
+                if is_probably_roblosecurity is not None:
+                    try:
+                        return bool(is_probably_roblosecurity(val))
+                    except Exception:
+                        return False
+                v = str(val or "").strip()
+                return bool(v) and len(v) >= 20
 
-            for cookie in cookies:
-                if cookie['name'] == '.ROBLOSECURITY':
-                    cookie_value = cookie['value']
+            def _extract_once() -> Optional[str]:
+                cookies = self.driver.get_cookies()
+                for cookie in cookies:
+                    try:
+                        if cookie.get("name") == ROBLOSECURITY_COOKIE_NAME:
+                            cookie_value = cookie.get("value")
+                            if _is_valid(cookie_value):
+                                return str(cookie_value)
+                    except Exception:
+                        continue
+                return None
 
-                    if (cookie_value and
-                        len(cookie_value) > 100 and
-                        cookie_value.startswith('_|WARNING:-DO-NOT-SHARE-THIS')):
-                        return cookie_value
+            cookie_value = _extract_once()
+            if cookie_value:
+                return cookie_value
 
             self.driver.refresh()
             time.sleep(2)
 
-            cookies = self.driver.get_cookies()
-            for cookie in cookies:
-                if cookie['name'] == '.ROBLOSECURITY':
-                    cookie_value = cookie['value']
-                    if (cookie_value and
-                        len(cookie_value) > 100 and
-                        cookie_value.startswith('_|WARNING:-DO-NOT-SHARE-THIS')):
-                        return cookie_value
+            cookie_value = _extract_once()
+            if cookie_value:
+                return cookie_value
 
             return None
 
@@ -244,7 +264,12 @@ class BrowserLaunchThread(QThread):
 
     def __init__(self, cookie: str, url: str, profile_dir: Optional[str] = None, parent=None):
         super().__init__(parent)
-        self.cookie = str(cookie or "")
+        self.cookie = str(cookie or "").strip()
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                self.cookie = normalize_roblosecurity_cookie_value(self.cookie)
+            except Exception:
+                self.cookie = str(self.cookie or "").strip()
         self.url = str(url or "")
         self.profile_dir = str(profile_dir) if profile_dir else None
         self.driver = None

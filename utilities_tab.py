@@ -21,6 +21,19 @@ from PySide6.QtWidgets import (
     QDialog, QProgressBar
 )
 
+try:
+    from roblox_cookie_utils import (
+        extract_roblosecurity_from_requests_response,
+        extract_roblosecurity_from_selenium_driver,
+        normalize_roblosecurity_cookie_value,
+        update_cookie_in_users_dict,
+    )
+except Exception:
+    extract_roblosecurity_from_requests_response = None
+    extract_roblosecurity_from_selenium_driver = None
+    normalize_roblosecurity_cookie_value = None
+    update_cookie_in_users_dict = None
+
 # ---------------- Paths ----------------
 def _appdata_dir() -> str:
     base = os.environ.get("APPDATA")
@@ -361,6 +374,61 @@ _API_CACHE_LOCK = threading.Lock()
 _BLOCKING_CALL_DELAY_SEC = 1.0
 _USER_SWAP_DELAY_SEC = 5.0
 
+
+def _transfer_cookie_caches(old_cookie: str, new_cookie: str) -> None:
+    old_cookie = str(old_cookie or "")
+    new_cookie = str(new_cookie or "")
+    if not old_cookie or not new_cookie or old_cookie == new_cookie:
+        return
+    with _API_CACHE_LOCK:
+        try:
+            if old_cookie in _BROWSER_ID_CACHE and new_cookie not in _BROWSER_ID_CACHE:
+                _BROWSER_ID_CACHE[new_cookie] = _BROWSER_ID_CACHE[old_cookie]
+        except Exception:
+            pass
+        try:
+            if old_cookie in _CSRF_CACHE and new_cookie not in _CSRF_CACHE:
+                _CSRF_CACHE[new_cookie] = dict(_CSRF_CACHE[old_cookie])
+        except Exception:
+            pass
+
+
+def _maybe_take_updated_cookie(resp: Optional[requests.Response], cookie: str, *, session: Optional[requests.Session] = None) -> str:
+    cookie = str(cookie or "")
+    if not resp or extract_roblosecurity_from_requests_response is None:
+        return cookie
+    try:
+        updated = extract_roblosecurity_from_requests_response(resp, session=session)
+    except Exception:
+        updated = None
+    if updated and updated != cookie:
+        _transfer_cookie_caches(cookie, updated)
+        return str(updated)
+    return cookie
+
+
+def _apply_session_cookies(session: requests.Session, cookie: str, browser_id: Optional[str] = None) -> None:
+    cookie = str(cookie or "")
+    if normalize_roblosecurity_cookie_value is not None:
+        try:
+            cookie = normalize_roblosecurity_cookie_value(cookie)
+        except Exception:
+            cookie = str(cookie or "")
+    if not session or not cookie:
+        return
+    try:
+        session.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com", path="/")
+    except Exception:
+        try:
+            session.cookies[".ROBLOSECURITY"] = cookie
+        except Exception:
+            pass
+    if browser_id:
+        try:
+            session.cookies.set("RBXEventTrackerV2", f"browserid={browser_id}", domain=".roblox.com", path="/")
+        except Exception:
+            pass
+
 def _generate_browser_id() -> str:
     # Mirrors `browser_id = f"{rand}{rand}"` in main.py
     return f"{random.randint(100000,130000)}{random.randint(100000,900000)}"
@@ -392,52 +460,71 @@ def _set_cached_csrf(cookie: str, token: str) -> None:
     with _API_CACHE_LOCK:
         _CSRF_CACHE[cookie] = {"token": token, "expires": time.time() + 1800}
 
-def _retrieve_csrf_token(cookie: str) -> Optional[str]:
+def _retrieve_csrf_token(cookie: str) -> Tuple[Optional[str], str]:
+    cookie = str(cookie or "")
+    if normalize_roblosecurity_cookie_value is not None:
+        try:
+            cookie = normalize_roblosecurity_cookie_value(cookie)
+        except Exception:
+            cookie = str(cookie or "")
     cached = _get_cached_csrf(cookie)
     if cached:
-        return cached
+        return cached, cookie
 
     # Roblox returns the CSRF token in a 403 response header.
     browser_id = _get_or_create_browser_id(cookie)
     s = requests.Session()
-    s.headers.update({
-        "Referer": "https://www.roblox.com/",
-        "Origin": "https://www.roblox.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Cookie": f"RBXEventTrackerV2=browserid={browser_id}; .ROBLOSECURITY={cookie}",
-    })
+    s.headers.update(
+        {
+            "Referer": "https://www.roblox.com/",
+            "Origin": "https://www.roblox.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        }
+    )
+    _apply_session_cookies(s, cookie, browser_id)
 
     try:
         r = s.post("https://auth.roblox.com/v1/authentication-ticket", timeout=6)
+        cookie = _maybe_take_updated_cookie(r, cookie, session=s)
+        _apply_session_cookies(s, cookie, browser_id)
         if r.status_code == 403:
             token = r.headers.get("x-csrf-token") or r.headers.get("X-CSRF-TOKEN")
             if token:
                 _set_cached_csrf(cookie, token)
-                return token
+                return token, cookie
     except Exception:
         pass
-    return None
+    return None, cookie
 
-def _make_blocking_api_session(cookie: str) -> requests.Session:
+def _make_blocking_api_session(cookie: str) -> Tuple[requests.Session, str]:
     """
     Create a requests Session for the Roblox user-blocking API.
     Sends:
       - Cookie: RBXEventTrackerV2=browserid=<browser_id>; .ROBLOSECURITY=<cookie>
       - x-csrf-token: <token>
     """
+    cookie = str(cookie or "")
+    if normalize_roblosecurity_cookie_value is not None:
+        try:
+            cookie = normalize_roblosecurity_cookie_value(cookie)
+        except Exception:
+            cookie = str(cookie or "")
     browser_id = _get_or_create_browser_id(cookie)
     s = requests.Session()
-    s.headers.update({
-        "Referer": "https://www.roblox.com/",
-        "Origin": "https://www.roblox.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Accept": "application/json",
-        "Cookie": f"RBXEventTrackerV2=browserid={browser_id}; .ROBLOSECURITY={cookie}",
-    })
-    token = _retrieve_csrf_token(cookie)
+    s.headers.update(
+        {
+            "Referer": "https://www.roblox.com/",
+            "Origin": "https://www.roblox.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "application/json",
+        }
+    )
+    _apply_session_cookies(s, cookie, browser_id)
+    token, cookie = _retrieve_csrf_token(cookie)
+    _apply_session_cookies(s, cookie, browser_id)
     if token:
         s.headers["x-csrf-token"] = token
-    return s
+    return s, cookie
 
 def _roblox_error_hint(resp: requests.Response) -> str:
     try:
@@ -480,8 +567,9 @@ def _roblox_error_code(resp: requests.Response) -> Optional[int]:
         pass
     return None
 
-def _roblox_post(session: requests.Session, cookie: str, url: str, timeout: float = 12.0) -> Optional[requests.Response]:
-    last = None
+def _roblox_post(session: requests.Session, cookie: str, url: str, timeout: float = 12.0) -> Tuple[Optional[requests.Response], str]:
+    cookie = str(cookie or "")
+    last: Optional[requests.Response] = None
     for attempt in range(3):
         if attempt:
             time.sleep(min(0.5 * (2 ** (attempt - 1)), 3.0))
@@ -490,6 +578,9 @@ def _roblox_post(session: requests.Session, cookie: str, url: str, timeout: floa
             last = r
         except Exception:
             continue
+
+        cookie = _maybe_take_updated_cookie(r, cookie, session=session)
+        _apply_session_cookies(session, cookie)
 
         # CSRF refresh pattern: 403 + x-csrf-token header
         if r.status_code == 403:
@@ -502,6 +593,8 @@ def _roblox_post(session: requests.Session, cookie: str, url: str, timeout: floa
                     last = r
                 except Exception:
                     continue
+                cookie = _maybe_take_updated_cookie(r, cookie, session=session)
+                _apply_session_cookies(session, cookie)
 
         # Rate-limit: retry a couple times (short backoff)
         if r.status_code == 429 and attempt < 2:
@@ -513,60 +606,60 @@ def _roblox_post(session: requests.Session, cookie: str, url: str, timeout: floa
                     pass
             continue
 
-        return r
+        return r, cookie
 
-    return last
+    return last, cookie
 
-def _api_block_user(session: requests.Session, cookie: str, target_user_id: str) -> str:
+def _api_block_user(session: requests.Session, cookie: str, target_user_id: str) -> Tuple[str, str]:
     url = f"{_BLOCKING_API_BASE}/{target_user_id}/block-user"
-    r = _roblox_post(session, cookie, url)
+    r, cookie = _roblox_post(session, cookie, url)
     if r is None:
-        return "failed"
+        return "failed", cookie
 
     if r.status_code in (200, 204):
-        return "blocked"
+        return "blocked", cookie
 
     if r.status_code in (401, 403):
-        return "bad_cookie"
+        return "bad_cookie", cookie
 
     if r.status_code in (409,):
-        return "already_blocked"
+        return "already_blocked", cookie
 
     hint = _roblox_error_hint(r)
     if r.status_code == 400:
         if _roblox_error_code(r) == 1:
-            return "already_blocked"
+            return "already_blocked", cookie
         lhint = hint.lower()
         if "already" in lhint and "block" in lhint:
-            return "already_blocked"
+            return "already_blocked", cookie
 
-    return f"failed ({r.status_code})" + (f" {hint}" if hint else "")
+    return f"failed ({r.status_code})" + (f" {hint}" if hint else ""), cookie
 
-def _api_unblock_user(session: requests.Session, cookie: str, target_user_id: str) -> str:
+def _api_unblock_user(session: requests.Session, cookie: str, target_user_id: str) -> Tuple[str, str]:
     url = f"{_BLOCKING_API_BASE}/{target_user_id}/unblock-user"
-    r = _roblox_post(session, cookie, url)
+    r, cookie = _roblox_post(session, cookie, url)
     if r is None:
-        return "failed"
+        return "failed", cookie
 
     if r.status_code in (200, 204):
-        return "unblocked"
+        return "unblocked", cookie
 
     if r.status_code in (401, 403):
-        return "bad_cookie"
+        return "bad_cookie", cookie
 
     if r.status_code in (404, 409):
         # best-effort: treat as already unblocked / not present
-        return "already_unblocked"
+        return "already_unblocked", cookie
 
     hint = _roblox_error_hint(r)
     if r.status_code == 400:
         if _roblox_error_code(r) == 4:
-            return "already_unblocked"
+            return "already_unblocked", cookie
         lhint = hint.lower()
         if ("not" in lhint and "block" in lhint) or ("already" in lhint and "unblock" in lhint):
-            return "already_unblocked"
+            return "already_unblocked", cookie
 
-    return f"failed ({r.status_code})" + (f" {hint}" if hint else "")
+    return f"failed ({r.status_code})" + (f" {hint}" if hint else ""), cookie
 
 # ---------------- PSL helpers ----------------
 def _game_instances_url(place_id: str, slug: str) -> str:
@@ -585,28 +678,42 @@ def _extract_share_code(share_url: str) -> Optional[str]:
     except Exception:
         return None
 
-def _resolve_share_code(share_code: str, cookie: str) -> Tuple[Optional[str], Optional[str]]:
+def _resolve_share_code(share_code: str, cookie: str) -> Tuple[Optional[str], Optional[str], str]:
+    cookie = str(cookie or "")
     if not share_code or not cookie:
-        return None, None
+        return None, None, cookie
     url = "https://apis.roblox.com/sharelinks/v1/resolve-link"
     payload = {"linkId": share_code, "linkType": "Server"}
     s = requests.Session()
-    s.cookies[".ROBLOSECURITY"] = cookie
+    _apply_session_cookies(s, cookie)
     s.headers.update({"Content-Type": "application/json", "User-Agent": "Mozilla/5.0", "Referer": "https://www.roblox.com/"})
-    r = s.post(url, json=payload, timeout=12)
+    try:
+        r = s.post(url, json=payload, timeout=12)
+    except Exception:
+        return None, None, cookie
+
+    cookie = _maybe_take_updated_cookie(r, cookie, session=s)
+    _apply_session_cookies(s, cookie)
+
     if r.status_code == 403:
         csrf = r.headers.get("X-CSRF-TOKEN")
         if csrf:
             s.headers["X-CSRF-TOKEN"] = csrf
-            r = s.post(url, json=payload, timeout=12)
+            try:
+                r = s.post(url, json=payload, timeout=12)
+            except Exception:
+                return None, None, cookie
+            cookie = _maybe_take_updated_cookie(r, cookie, session=s)
+            _apply_session_cookies(s, cookie)
+
     if r.status_code == 200:
         data = r.json() or {}
         invite = data.get("privateServerInviteData") or {}
         place = str(invite.get("placeId") or "")
         link_code = invite.get("linkCode")
         if link_code:
-            return place, link_code
-    return None, None
+            return place, link_code, cookie
+    return None, None, cookie
 
 def _compose_ps_link(place_id: str, link_code: str, slug: str) -> str:
     slug = slug or "-"
@@ -714,6 +821,7 @@ class _BlockWorker(QThread):
         self.tick.emit(cur, total)
 
         work_items = list(per_uid_targets.items())
+        users_dirty = False
         for user_idx, (uid, to_do) in enumerate(work_items):
             if self._cancel: break
             data = users.get(uid, {})
@@ -721,7 +829,19 @@ class _BlockWorker(QThread):
             self._emit(f"[Block] {uid}: starting session")
 
             try:
-                session = _make_blocking_api_session(cookie)
+                old_cookie = cookie
+                session, cookie = _make_blocking_api_session(cookie)
+                if cookie and old_cookie and cookie != old_cookie:
+                    if update_cookie_in_users_dict is not None:
+                        users_dirty |= bool(update_cookie_in_users_dict(users, user_id=uid, new_cookie=cookie))
+                    else:
+                        try:
+                            if isinstance(data, dict):
+                                data["cookie"] = cookie
+                                users[uid] = data
+                                users_dirty = True
+                        except Exception:
+                            pass
             except Exception as e:
                 self._emit(f"[Block] {uid}: failed to start API session ({e})")
                 if (not self._cancel) and user_idx < (len(work_items) - 1):
@@ -740,8 +860,20 @@ class _BlockWorker(QThread):
                         continue
                     if did_call:
                         time.sleep(_BLOCKING_CALL_DELAY_SEC)
-                    res = _api_block_user(session, cookie, t)
+                    res, new_cookie = _api_block_user(session, cookie, t)
                     did_call = True
+                    if new_cookie and cookie and new_cookie != cookie:
+                        cookie = new_cookie
+                        if update_cookie_in_users_dict is not None:
+                            users_dirty |= bool(update_cookie_in_users_dict(users, user_id=uid, new_cookie=cookie))
+                        else:
+                            try:
+                                if isinstance(data, dict):
+                                    data["cookie"] = cookie
+                                    users[uid] = data
+                                    users_dirty = True
+                            except Exception:
+                                pass
                     if res == "bad_cookie":
                         self._emit(f"[Block] {uid}: cookie became invalid mid-run")
                         break
@@ -765,6 +897,10 @@ class _BlockWorker(QThread):
 
         blocklog["username_cache"] = username_cache
         _save_json(_block_log_path(), blocklog)
+
+        if users_dirty:
+            if not _save_users(users):
+                self._emit("[Block] Failed to save users.json (cookie updates).")
 
         self._emit("[Block] " + ("Cancelled." if self._cancel else "Done."))
         self.done.emit()
@@ -837,6 +973,7 @@ class _UnblockWorker(QThread):
         removed_names_global: Set[str] = set()
 
         work_items = list(work_map.items())
+        users_dirty = False
         for user_idx, (uid, hits_for_uid) in enumerate(work_items):
             if self._cancel: break
 
@@ -845,7 +982,19 @@ class _UnblockWorker(QThread):
             blocked_ids = set(map(str, blocklog.get("by_user", {}).get(uid, {}).get("blocked", [])))
 
             try:
-                session = _make_blocking_api_session(cookie)
+                old_cookie = cookie
+                session, cookie = _make_blocking_api_session(cookie)
+                if cookie and old_cookie and cookie != old_cookie:
+                    if update_cookie_in_users_dict is not None:
+                        users_dirty |= bool(update_cookie_in_users_dict(users, user_id=uid, new_cookie=cookie))
+                    else:
+                        try:
+                            if isinstance(data, dict):
+                                data["cookie"] = cookie
+                                users[uid] = data
+                                users_dirty = True
+                        except Exception:
+                            pass
             except Exception as e:
                 self._emit(f"[Unblock] {uid}: failed to start API session ({e})")
                 cur += len(hits_for_uid); self.tick.emit(cur, total)
@@ -864,8 +1013,20 @@ class _UnblockWorker(QThread):
 
                     if did_call:
                         time.sleep(_BLOCKING_CALL_DELAY_SEC)
-                    res = _api_unblock_user(session, cookie, t)
+                    res, new_cookie = _api_unblock_user(session, cookie, t)
                     did_call = True
+                    if new_cookie and cookie and new_cookie != cookie:
+                        cookie = new_cookie
+                        if update_cookie_in_users_dict is not None:
+                            users_dirty |= bool(update_cookie_in_users_dict(users, user_id=uid, new_cookie=cookie))
+                        else:
+                            try:
+                                if isinstance(data, dict):
+                                    data["cookie"] = cookie
+                                    users[uid] = data
+                                    users_dirty = True
+                            except Exception:
+                                pass
                     if res == "bad_cookie":
                         self._emit(f"[Unblock] {uid}: cookie became invalid mid-run")
                         break
@@ -898,6 +1059,11 @@ class _UnblockWorker(QThread):
             self.scrub_from_persistent.emit(scrub_names)
 
         _save_json(_block_log_path(), blocklog)
+
+        if users_dirty:
+            if not _save_users(users):
+                self._emit("[Unblock] Failed to save users.json (cookie updates).")
+
         self._emit("[Unblock] " + ("Cancelled." if self._cancel else "Done."))
         self.done.emit()
 
@@ -1056,7 +1222,23 @@ class _PSLWorker(QThread):
                 if not code:
                     raise RuntimeError(f"Could not extract share code from: {share_url}")
 
-                place_from_api, link_code = _resolve_share_code(code, cookie)
+                if extract_roblosecurity_from_selenium_driver is not None:
+                    try:
+                        browser_cookie = extract_roblosecurity_from_selenium_driver(d)
+                    except Exception:
+                        browser_cookie = None
+                    if browser_cookie and browser_cookie != cookie:
+                        cookie = browser_cookie
+                        data["cookie"] = cookie
+                        users[uid] = data
+                        any_update = True
+
+                place_from_api, link_code, new_cookie = _resolve_share_code(code, cookie)
+                if new_cookie and new_cookie != cookie:
+                    cookie = new_cookie
+                    data["cookie"] = cookie
+                    users[uid] = data
+                    any_update = True
                 if not link_code:
                     raise RuntimeError("Failed to resolve share code to privateServerLinkCode.")
 
@@ -1072,6 +1254,19 @@ class _PSLWorker(QThread):
             except Exception as e:
                 self._emit(f"[PSL] {uid}: error → {e}")
             finally:
+                if extract_roblosecurity_from_selenium_driver is not None:
+                    try:
+                        browser_cookie = extract_roblosecurity_from_selenium_driver(d)
+                    except Exception:
+                        browser_cookie = None
+                    if browser_cookie and browser_cookie != cookie:
+                        cookie = browser_cookie
+                        try:
+                            data["cookie"] = cookie
+                            users[uid] = data
+                            any_update = True
+                        except Exception:
+                            pass
                 try: d.quit()
                 except Exception: pass
 

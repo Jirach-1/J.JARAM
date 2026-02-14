@@ -1624,6 +1624,7 @@ class FoundStatsMixin:
 
                     is_jester = merchant_name == "Jester"
                     is_mari = merchant_name == "Mari"
+                    is_rin = merchant_name == "Rin"
 
                     shirt = QColor(120, 210, 255)
                     accent = QColor(255, 255, 255, 0)
@@ -1633,6 +1634,9 @@ class FoundStatsMixin:
                     elif is_mari:
                         shirt = QColor("#7A4A2A")  # brown hoodie
                         accent = QColor(225, 205, 170, 220)  # drawstrings
+                    elif is_rin:
+                        shirt = QColor(230, 125, 62)
+                        accent = QColor(255, 220, 185, 220)
 
                     def _u32(p: int, a: int = 0, b: int = 0, c: int = 0) -> int:
                         x = (int(seed) ^ int(p)) & 0xFFFFFFFF
@@ -1854,6 +1858,51 @@ class FoundStatsMixin:
                                 px(2, left_foot_y, shoes, 2, 1)
                                 px(5, right_foot_y, shoes, 2, 1)
 
+                            elif is_rin:
+                                fur = QColor(230, 125, 62, 245)
+                                fur_dark = _mul_rgb(fur, 0.72)
+                                fur_light = _mul_rgb(fur, 1.16)
+                                ear_inner = QColor(255, 220, 190, 235)
+                                muzzle = QColor(250, 238, 225, 240)
+                                eye = QColor(18, 18, 24, 235)
+                                paw = QColor(110, 70, 48, 220)
+                                tail_tip = QColor(248, 246, 240, 240)
+
+                                # Tail (draw behind body): larger + fluffy tip.
+                                px(0, 4, fur_dark, 3, 4)
+                                px(0, 5, fur, 2, 2)
+                                px(0, 7, tail_tip, 2, 1)
+                                px(1, 8, tail_tip, 1, 1)
+
+                                # Body + chest.
+                                px(2, 5, fur, 5, 3)
+                                px(3, 5, fur_light, 2, 1)
+                                px(3, 6, muzzle, 2, 1)
+
+                                # Head + ears + face (more pronounced).
+                                px(3, 2, fur, 4, 3)
+                                px(3, 0, fur_dark, 1, 2)
+                                px(6, 0, fur_dark, 1, 2)
+                                px(3, 1, ear_inner, 1, 1)
+                                px(6, 1, ear_inner, 1, 1)
+                                px(5, 2, fur_light, 1, 1)   # brow highlight
+                                px(6, 3, muzzle, 2, 2)      # snout
+                                px(4, 3, eye, 1, 1)
+                                px(5, 3, eye, 1, 1)
+                                px(7, 4, eye, 1, 1)         # nose
+
+                                # Legs + paws (short fox proportions).
+                                fox_leg_y = 9
+                                fox_left_h = 2 if left_down else 1
+                                fox_right_h = 2 if right_down else 1
+                                fox_mid_h = 1
+                                px(2, fox_leg_y, fur_dark, 1, fox_left_h)
+                                px(4, fox_leg_y, fur_dark, 1, fox_mid_h)
+                                px(6, fox_leg_y, fur_dark, 1, fox_right_h)
+                                px(2, fox_leg_y + fox_left_h, paw, 1, 1)
+                                px(4, fox_leg_y + fox_mid_h, paw, 1, 1)
+                                px(6, fox_leg_y + fox_right_h, paw, 1, 1)
+
                             else:
                                 skin = QColor(230, 205, 175, 235)
                                 pants = QColor(40, 40, 55, 220)
@@ -2025,7 +2074,7 @@ class FoundStatsMixin:
 
         def _set_merchant_table(rows: list[tuple[str, int]]) -> None:
             merch_table.setRowCount(len(rows))
-            colors = {"Jester": QColor("#A352FF"), "Mari": QColor("#FF82AB")}
+            colors = {"Jester": QColor("#A352FF"), "Mari": QColor("#FF82AB"), "Rin": QColor(230, 125, 62)}
             for r, (name, count) in enumerate(rows):
                 n = str(name or "").strip().title()
                 c = int(count or 0)
@@ -2033,10 +2082,9 @@ class FoundStatsMixin:
                 name_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
                 if n in colors:
                     name_item.setForeground(colors[n])
-                if c > 0:
-                    f = name_item.font()
-                    f.setBold(True)
-                    name_item.setFont(f)
+                f = merch_table.font()
+                f.setBold(c > 0)
+                name_item.setFont(f)
                 merch_table.setItem(r, 0, name_item)
                 it = QTableWidgetItem(str(int(c)))
                 it.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -2137,25 +2185,36 @@ class FoundStatsMixin:
             biome_rows.sort(key=lambda kv: (-kv[1], biome_idx.get(kv[0], 10**9), kv[0]))
             _set_biome_table(biome_rows)
 
-            merchant_rows: list[tuple[str, int]] = []
-            for name in ("Jester", "Mari"):
-                try:
-                    c = int((mcounts or {}).get(name, 0) or 0)
-                except Exception:
-                    c = 0
-                merchant_rows.append((name, c))
+            # Normalize merchant keys to title case so canonical rows (Jester/Mari/Rin)
+            # always pick up existing counts, even from legacy mixed-case data.
+            mcounts_norm: dict[str, int] = {}
             for k, v in (mcounts or {}).items():
                 if not isinstance(k, str):
                     continue
                 name = k.strip().title()
-                if not name or name in ("Jester", "Mari"):
+                if not name:
+                    continue
+                try:
+                    mcounts_norm[name] = mcounts_norm.get(name, 0) + int(v)
+                except Exception:
+                    continue
+
+            merchant_rows: list[tuple[str, int]] = []
+            for name in ("Jester", "Mari", "Rin"):
+                try:
+                    c = int((mcounts_norm or {}).get(name, 0) or 0)
+                except Exception:
+                    c = 0
+                merchant_rows.append((name, c))
+            for name, v in (mcounts_norm or {}).items():
+                if not name or name in ("Jester", "Mari", "Rin"):
                     continue
                 try:
                     c = int(v)
                 except Exception:
                     continue
                 merchant_rows.append((name, c))
-            merch_idx = {"Jester": 0, "Mari": 1}
+            merch_idx = {"Jester": 0, "Mari": 1, "Rin": 2}
             merchant_rows.sort(key=lambda kv: (-kv[1], merch_idx.get(kv[0], 10**9), kv[0]))
             _set_merchant_table(merchant_rows)
 

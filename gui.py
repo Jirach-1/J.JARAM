@@ -10,7 +10,7 @@ import requests
 import re
 import threading
 from collections import deque
-from typing import Dict, Set, List, Tuple, Optional
+from typing import Any, Dict, Set, List, Tuple, Optional
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen
@@ -44,6 +44,21 @@ from PySide6.QtCore import (
     QAbstractNativeEventFilter,
 )
 from PySide6.QtGui import QFont, QIcon, QColor, QPixmap, QMovie, QRegion, QPainter, QPainterPath, QImage, QTextCursor, QKeySequence, QBrush
+
+try:
+    from roblox_cookie_utils import (
+        extract_roblosecurity_from_requests_response,
+        extract_roblosecurity_from_selenium_driver,
+        is_probably_roblosecurity,
+        normalize_roblosecurity_cookie_value,
+        persist_updated_cookie,
+    )
+except Exception:
+    extract_roblosecurity_from_requests_response = None
+    extract_roblosecurity_from_selenium_driver = None
+    is_probably_roblosecurity = None
+    normalize_roblosecurity_cookie_value = None
+    persist_updated_cookie = None
 
 # Windows system sounds
 try:
@@ -668,13 +683,18 @@ class ConfigManager:
                 "webhook_url": "",
                 "blackout_ping": "",
                 "cap_message": "",
+                "bad_message": "",
+                "hourly_users_report_enabled": False,
+                "hourly_users_report_interval_hours": 1,
             },
             "multiscope": {
                 "webhooks": [],   # ← NEW
                 "enable_jester": True,
                 "enable_mari": True,
+                "enable_rin": True,
                 "jester_ping": "",
                 "mari_ping": "",
+                "rin_ping": "",
                 "merchant_rate_limit": 15,   # seconds (global cooldown for merchant alerts)
                 "biome_min_interval": 2,     # seconds per server (dampen bursts)
             },
@@ -690,9 +710,12 @@ class ConfigManager:
                 "log_loop": True,             # include per-loop "[Loop N]" logs in OCR log
                 "device_id": None,            # None => auto/default
                 "roi": {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
+                "verification_roi": {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
                 "color_filters": [
                     {"name": "Mari", "r": 255, "g": 255, "b": 255, "tol": 60, "enabled": True},
                     {"name": "Jester", "r": 145, "g": 67, "b": 255, "tol": 60, "enabled": True},
+                    {"name": "Rin", "r": 230, "g": 125, "b": 62, "tol": 60, "enabled": True},
+                    {"name": "Verification Check", "r": 255, "g": 255, "b": 255, "tol": 60, "enabled": True},
                 ],
             },
             "misc": {
@@ -1868,6 +1891,15 @@ class ConfigManager:
                                 if legacy_ping:
                                     alerts["blackout_ping"] = legacy_ping
 
+                        try:
+                            interval_h = int(alerts.get("hourly_users_report_interval_hours", 1) or 1)
+                        except Exception:
+                            interval_h = 1
+                        alerts["hourly_users_report_interval_hours"] = max(1, min(168, interval_h))
+                        alerts["hourly_users_report_enabled"] = bool(
+                            alerts.get("hourly_users_report_enabled", False)
+                        )
+
                         settings["alerts"] = alerts
                     except Exception:
                         pass
@@ -2063,47 +2095,36 @@ class ConfigManager:
     def mark_bad_cookie(self, user_id: str, state: bool) -> None:
         users = self.load_users()
         if user_id in users and users[user_id].get("bad", False) != state:
+            username = ""
+            try:
+                info = users.get(user_id)
+                if isinstance(info, dict):
+                    username = str(info.get("username") or "")
+            except Exception:
+                username = ""
             users[user_id]["bad"] = state
-            self.save_users(users)
+            if self.save_users(users) and state:
+                self._send_bad_alert_webhook(user_id, username)
 
-    def _send_cap_alert_webhook(self, user_id: str, username: str = "") -> None:
-        """
-        Fire-and-forget Discord webhook alert when a user is marked CAP.
-        Uses settings.json -> alerts.{webhook_url, cap_message}.
-        """
-        uid = str(user_id)
-        uname = str(username or "").strip() or uid
-
-        try:
-            settings = self.peek_settings() or {}
-        except Exception:
-            settings = {}
-
+    def _resolve_alert_webhook_url(self, settings: dict) -> str:
         webhook_url = ""
-        template = ""
         try:
             alerts = settings.get("alerts", {}) or {}
             if isinstance(alerts, dict):
                 webhook_url = str(alerts.get("webhook_url") or "").strip()
-                template = str(alerts.get("cap_message") or "").strip()
             if not webhook_url:
                 tm = settings.get("timeout_monitor", {}) or {}
                 if isinstance(tm, dict):
                     webhook_url = str(tm.get("webhook_url") or "").strip()
         except Exception:
-            return
+            webhook_url = ""
+        return webhook_url
 
-        if not webhook_url or not template:
-            return
-
-        msg = (
-            template.replace("{username}", uname)
-            .replace("{uid}", uid)
-            .replace("{user_id}", uid)
-            .strip()
-        )
-        if not msg:
-            return
+    def _dispatch_alert_message(self, webhook_url: str, message: str) -> bool:
+        webhook_url = str(webhook_url or "").strip()
+        msg = str(message or "").strip()
+        if not webhook_url or not msg:
+            return False
 
         def _post():
             try:
@@ -2115,6 +2136,77 @@ class ConfigManager:
             threading.Thread(target=_post, daemon=True).start()
         except Exception:
             _post()
+        return True
+
+    def _build_user_alert_message(self, template: str, user_id: str, username: str = "") -> str:
+        uid = str(user_id)
+        uname = str(username or "").strip() or uid
+        return (
+            str(template or "")
+            .replace("{username}", uname)
+            .replace("{uid}", uid)
+            .replace("{user_id}", uid)
+            .strip()
+        )
+
+    def _send_cap_alert_webhook(self, user_id: str, username: str = "") -> None:
+        """
+        Fire-and-forget Discord webhook alert when a user is marked CAP.
+        Uses settings.json -> alerts.{webhook_url, cap_message}.
+        """
+        try:
+            settings = self.peek_settings() or {}
+        except Exception:
+            settings = {}
+
+        template = ""
+        try:
+            alerts = settings.get("alerts", {}) or {}
+            if isinstance(alerts, dict):
+                template = str(alerts.get("cap_message") or "").strip()
+        except Exception:
+            return
+
+        if not template:
+            return
+
+        webhook_url = self._resolve_alert_webhook_url(settings)
+        msg = self._build_user_alert_message(template, str(user_id), username)
+        self._dispatch_alert_message(webhook_url, msg)
+
+    def _send_bad_alert_webhook(self, user_id: str, username: str = "") -> None:
+        """
+        Fire-and-forget Discord webhook alert when a user is marked BAD.
+        Uses settings.json -> alerts.{webhook_url, bad_message}.
+        """
+        try:
+            settings = self.peek_settings() or {}
+        except Exception:
+            settings = {}
+
+        template = ""
+        try:
+            alerts = settings.get("alerts", {}) or {}
+            if isinstance(alerts, dict):
+                template = str(alerts.get("bad_message") or "").strip()
+        except Exception:
+            return
+
+        if not template:
+            return
+
+        webhook_url = self._resolve_alert_webhook_url(settings)
+        msg = self._build_user_alert_message(template, str(user_id), username)
+        self._dispatch_alert_message(webhook_url, msg)
+
+    def send_hourly_users_report_webhook(self, total_users: int, active_users: int) -> bool:
+        try:
+            settings = self.peek_settings() or {}
+        except Exception:
+            settings = {}
+        webhook_url = self._resolve_alert_webhook_url(settings)
+        msg = f"Hourly user report: Total Users = {int(total_users)}, Active Users = {int(active_users)}."
+        return self._dispatch_alert_message(webhook_url, msg)
 
     def mark_cap_flag(self, user_id: str, state: bool) -> None:
         users = self.load_users()
@@ -3330,8 +3422,10 @@ class WorkerThread(QThread):
                 merchant_hook=ms_cfg.get("merchant_webhook", ""),
                 enable_jester=ms_cfg.get("enable_jester", True),
                 enable_mari=ms_cfg.get("enable_mari", True),
+                enable_rin=ms_cfg.get("enable_rin", True),
                 jester_ping=ms_cfg.get("jester_ping", ""),
                 mari_ping=ms_cfg.get("mari_ping", ""),
+                rin_ping=ms_cfg.get("rin_ping", ""),
                 merchant_rate_limit=float(ms_cfg.get("merchant_rate_limit", 15)),
                 biome_min_interval=float(ms_cfg.get("biome_min_interval", 2)),
                 skip_webhook_unknown_context=bool(
@@ -3430,8 +3524,10 @@ class WorkerThread(QThread):
                     merchant_hook=ms_cfg.get("merchant_webhook", ""),
                     enable_jester=ms_cfg.get("enable_jester", True),
                     enable_mari=ms_cfg.get("enable_mari", True),
+                    enable_rin=ms_cfg.get("enable_rin", True),
                     jester_ping=ms_cfg.get("jester_ping", ""),
                     mari_ping=ms_cfg.get("mari_ping", ""),
+                    rin_ping=ms_cfg.get("rin_ping", ""),
                     merchant_rate_limit=float(ms_cfg.get("merchant_rate_limit", 15)),
                     biome_min_interval=float(ms_cfg.get("biome_min_interval", 2)),
                     skip_webhook_unknown_context=bool(
@@ -4408,16 +4504,22 @@ class UserManagementDialogLegacy(QDialog):
             "alerts.webhook_url": "Webhook URL",
             "alerts.blackout_ping": "Blackout Ping",
             "alerts.cap_message": "CAP Message",
+            "alerts.bad_message": "BAD Message",
+            "alerts.hourly_users_report_enabled": "Hourly Users Report",
+            "alerts.hourly_users_report_interval_hours": "Hourly Users Report Interval",
             "webhooks": "Webhooks",
             "ui.webhooks_hidden_biomes": "Hidden Webhook Biome Columns",
             "ui.show_tutorial_menu": "Show Tutorial Menu Item",
             "multiscope.merchant_webhook": "Merchant Webhook URL",
             "multiscope.enable_jester": "Enable Jester Pings",
             "multiscope.enable_mari": "Enable Mari Pings",
+            "multiscope.enable_rin": "Enable Rin Pings",
             "multiscope.jester_ping_type": "Jester Ping Type",
             "multiscope.jester_ping_id": "Jester Ping ID",
             "multiscope.mari_ping_type": "Mari Ping Type",
             "multiscope.mari_ping_id": "Mari Ping ID",
+            "multiscope.rin_ping_type": "Rin Ping Type",
+            "multiscope.rin_ping_id": "Rin Ping ID",
         }
         self.selected_user_id = None
         self.setup_ui()
@@ -4878,6 +4980,18 @@ class UserManagementDialogLegacy(QDialog):
         place = self.place_input.text().strip()
         cookie = self.cookie_input.text().strip()
 
+        cookie_raw = cookie
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                cookie = normalize_roblosecurity_cookie_value(cookie)
+            except Exception:
+                cookie = str(cookie or "").strip()
+            if cookie and cookie != cookie_raw:
+                try:
+                    self.cookie_input.setText(cookie)
+                except Exception:
+                    pass
+
         if not username:
             username = f"User_{user_id}"
 
@@ -4962,6 +5076,18 @@ class UserManagementDialogLegacy(QDialog):
             self.cookie_input.setFocus()
             return
 
+        cookie_raw = cookie
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                cookie = normalize_roblosecurity_cookie_value(cookie)
+            except Exception:
+                cookie = str(cookie or "").strip()
+            if cookie and cookie != cookie_raw:
+                try:
+                    self.cookie_input.setText(cookie)
+                except Exception:
+                    pass
+
         if not username:
             username = f"User_{user_id}"
 
@@ -4981,9 +5107,18 @@ class UserManagementDialogLegacy(QDialog):
                 self.private_server_input.setFocus()
                 return
 
-        if not cookie.startswith('_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|_'):
+        should_warn_cookie = False
+        try:
+            if is_probably_roblosecurity is not None:
+                should_warn_cookie = not bool(is_probably_roblosecurity(cookie))
+            else:
+                should_warn_cookie = not bool(str(cookie or "").strip())
+        except Exception:
+            should_warn_cookie = True
+
+        if should_warn_cookie:
             reply = QMessageBox.question(self, "Cookie Warning",
-                                       "The cookie doesn't appear to be in the expected ROBLOSECURITY format. Continue anyway?",
+                                       "The cookie doesn't appear to be a valid .ROBLOSECURITY value. Continue anyway?",
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.No:
                 self.cookie_input.setFocus()
@@ -5027,29 +5162,50 @@ class UserManagementDialogLegacy(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to start cookie extraction: {str(e)}")
             self._reset_browser_button()
 
-    def _fetch_authenticated_user(self, cookie: str) -> Optional[dict]:
+    def _fetch_authenticated_user(self, cookie: str) -> Tuple[Optional[dict], str]:
+        cookie = str(cookie or "").strip()
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                cookie = normalize_roblosecurity_cookie_value(cookie)
+            except Exception:
+                cookie = str(cookie or "").strip()
         if not cookie:
-            return None
+            return None, cookie
         try:
             session = requests.Session()
-            session.cookies.set(".ROBLOSECURITY", cookie)
+            try:
+                session.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com", path="/")
+            except Exception:
+                session.cookies.set(".ROBLOSECURITY", cookie)
+
             response = session.get("https://users.roblox.com/v1/users/authenticated", timeout=8)
+            if extract_roblosecurity_from_requests_response is not None:
+                try:
+                    updated = extract_roblosecurity_from_requests_response(response, session=session)
+                except Exception:
+                    updated = None
+                if updated and updated != cookie:
+                    cookie = updated
+
             if response.status_code != 200:
-                return None
+                return None, cookie
             data = response.json()
             if not isinstance(data, dict):
-                return None
+                return None, cookie
             if "id" not in data or "name" not in data:
-                return None
-            return data
+                return None, cookie
+            return data, cookie
         except Exception:
-            return None
+            return None, cookie
 
     def _on_cookie_extraction_complete(self, cookie: str):
         try:
             if cookie:
                 self.cookie_input.setText(cookie)
-                user_info = self._fetch_authenticated_user(cookie)
+                user_info, updated_cookie = self._fetch_authenticated_user(cookie)
+                if updated_cookie and updated_cookie != cookie:
+                    cookie = updated_cookie
+                    self.cookie_input.setText(cookie)
                 extra = ""
                 if user_info:
                     self.user_id_input.setText(str(user_info.get("id", "")))
@@ -5243,9 +5399,11 @@ class UserManagementDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Save And Close")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Close")
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        cancel_btn.setText("Cancel")
+        cancel_btn.setProperty("class", "danger")
         buttons.accepted.connect(self.save_and_close)
-        buttons.rejected.connect(self.reject)
+        buttons.rejected.connect(self._confirm_close_without_saving)
         main_layout.addWidget(buttons)
 
         self._set_edit_mode(None)
@@ -5552,6 +5710,17 @@ class UserManagementDialog(QDialog):
             if err:
                 msg = msg + "\n\n" + err
             QMessageBox.critical(self, "Error", msg)
+
+    def _confirm_close_without_saving(self) -> None:
+        reply = QMessageBox.warning(
+            self,
+            "Discard Changes?",
+            "Changes made will not save.\n\nAre you sure you want to close?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.reject()
 
     def open_browser_for_selected(self, mode: str) -> None:
         uids = self._get_selected_user_ids()
@@ -6078,6 +6247,18 @@ class UserManagementDialog(QDialog):
             and self.skip_reconnect_on_log_disconnect_chk.isChecked()
         )
 
+        cookie_raw = cookie
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                cookie = normalize_roblosecurity_cookie_value(cookie)
+            except Exception:
+                cookie = str(cookie or "").strip()
+            if cookie and cookie != cookie_raw:
+                try:
+                    self.cookie_input.setText(cookie)
+                except Exception:
+                    pass
+
         if not user_id:
             QMessageBox.warning(self, "Error", "User ID cannot be empty!")
             self.user_id_input.setFocus()
@@ -6137,6 +6318,18 @@ class UserManagementDialog(QDialog):
             getattr(self, "skip_reconnect_on_log_disconnect_chk", None)
             and self.skip_reconnect_on_log_disconnect_chk.isChecked()
         )
+
+        cookie_raw = cookie
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                cookie = normalize_roblosecurity_cookie_value(cookie)
+            except Exception:
+                cookie = str(cookie or "").strip()
+            if cookie and cookie != cookie_raw:
+                try:
+                    self.cookie_input.setText(cookie)
+                except Exception:
+                    pass
 
         if not private_server_link:
             if not self._confirm_missing_ps_link():
@@ -6335,7 +6528,12 @@ class UserManagementDialog(QDialog):
         This does NOT use CookieExtractor (separate workflow from cookie extraction).
         """
         uid = str(uid or "")
-        cookie = str(cookie or "")
+        cookie = str(cookie or "").strip()
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                cookie = normalize_roblosecurity_cookie_value(cookie)
+            except Exception:
+                cookie = str(cookie or "").strip()
         url = str(url or "")
 
         def _worker():
@@ -6456,6 +6654,53 @@ class UserManagementDialog(QDialog):
                 # Keep driver alive to avoid Chrome closing when the session ends/GC occurs.
                 try:
                     UserManagementDialog._browser_driver_keepalive.append(driver)
+                except Exception:
+                    pass
+
+                last_cookie = cookie
+                if extract_roblosecurity_from_selenium_driver is not None:
+                    try:
+                        current_cookie = extract_roblosecurity_from_selenium_driver(driver)
+                    except Exception:
+                        current_cookie = None
+                    if current_cookie and current_cookie != last_cookie:
+                        last_cookie = current_cookie
+                        if persist_updated_cookie is not None:
+                            try:
+                                if persist_updated_cookie(self.config_manager, user_id=uid, new_cookie=last_cookie):
+                                    self._ui_log(f"[Cookie] uid={uid} updated from browser.")
+                                else:
+                                    self._ui_log(f"[Cookie] uid={uid} updated in browser, but failed to save (cookies locked?).")
+                            except Exception:
+                                pass
+
+                def _cookie_watch() -> None:
+                    nonlocal last_cookie
+                    while True:
+                        time.sleep(5.0)
+                        try:
+                            if extract_roblosecurity_from_selenium_driver is not None:
+                                cur = extract_roblosecurity_from_selenium_driver(driver)
+                            else:
+                                obj = driver.get_cookie(".ROBLOSECURITY")
+                                cur = str(obj.get("value") or "") if isinstance(obj, dict) else ""
+                        except Exception:
+                            break
+                        if not cur or cur == last_cookie:
+                            continue
+                        last_cookie = cur
+                        if persist_updated_cookie is None:
+                            continue
+                        try:
+                            if persist_updated_cookie(self.config_manager, user_id=uid, new_cookie=cur):
+                                self._ui_log(f"[Cookie] uid={uid} updated from browser.")
+                            else:
+                                self._ui_log(f"[Cookie] uid={uid} updated in browser, but failed to save (cookies locked?).")
+                        except Exception:
+                            pass
+
+                try:
+                    threading.Thread(target=_cookie_watch, daemon=True).start()
                 except Exception:
                     pass
 
@@ -6735,6 +6980,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._paused_at: Optional[float] = None
         self.ocr_worker: Optional[OCRWorker] = None
         self.ocr_roi: Optional[Tuple[float, float, float, float]] = None
+        self.ocr_verification_roi: Optional[Tuple[float, float, float, float]] = None
         self._last_ocr_log: Optional[str] = None
         self._ocr_test_last_hash: Optional[int] = None
         self.ocr_log_autoscroll: bool = True
@@ -6752,6 +6998,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._utilities_widget: Optional[QWidget] = None
         self.process_data = {}
         self.user_data = {}
+        self._hourly_users_report_last_sent_at: float = 0.0
+        self._hourly_users_report_interval_hours: int = 1
 
         self._users_table_order: List[str] = []
         self._users_table_row_by_uid: Dict[str, int] = {}
@@ -6799,16 +7047,22 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "alerts.webhook_url": "Webhook URL",
             "alerts.blackout_ping": "Blackout Ping",
             "alerts.cap_message": "CAP Message",
+            "alerts.bad_message": "BAD Message",
+            "alerts.hourly_users_report_enabled": "Hourly Users Report",
+            "alerts.hourly_users_report_interval_hours": "Hourly Users Report Interval",
             "webhooks": "Webhooks",
             "ui.webhooks_hidden_biomes": "Hidden Webhook Biome Columns",
             "ui.show_tutorial_menu": "Show Tutorial Menu Item",
             "multiscope.merchant_webhook": "Merchant Webhook URL",
             "multiscope.enable_jester": "Enable Jester Pings",
             "multiscope.enable_mari": "Enable Mari Pings",
+            "multiscope.enable_rin": "Enable Rin Pings",
             "multiscope.jester_ping_type": "Jester Ping Type",
             "multiscope.jester_ping_id": "Jester Ping ID",
             "multiscope.mari_ping_type": "Mari Ping Type",
             "multiscope.mari_ping_id": "Mari Ping ID",
+            "multiscope.rin_ping_type": "Rin Ping Type",
+            "multiscope.rin_ping_id": "Rin Ping ID",
         }
 
         # Anti-AFK engine instance (configured in setup_antiafk_tab)
@@ -8028,18 +8282,31 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         btn_row = QHBoxLayout()
         calibrate_btn = QPushButton("Calibrate chat area")
         calibrate_btn.clicked.connect(self.calibrate_ocr_roi)
-        preview_btn = QPushButton("Test preview")
+        calibrate_btn.setToolTip("Select 6 lines of roblox chat from the bottom")
+        calibrate_verification_btn = QPushButton("Calibrate verification area")
+        calibrate_verification_btn.clicked.connect(self.calibrate_ocr_verification_roi)
+        calibrate_verification_btn.setToolTip("Select the 'Start Puzzle' button.")
+        preview_btn = QPushButton("Preview chat")
         preview_btn.clicked.connect(self.show_ocr_preview)
-        compare_btn = QPushButton("Test frame compare")
+        preview_btn.setToolTip("Preview OCR output using the calibrated chat area.")
+        verification_preview_btn = QPushButton("Preview verification")
+        verification_preview_btn.clicked.connect(self.show_ocr_verification_preview)
+        verification_preview_btn.setToolTip("Preview OCR output using the calibrated verification area.")
+        compare_btn = QPushButton("Chat frame compare")
         compare_btn.clicked.connect(self.test_ocr_frame_compare)
+        compare_btn.setToolTip("Compare frame similarity using the calibrated chat area.")
         btn_row.addWidget(calibrate_btn)
+        btn_row.addWidget(calibrate_verification_btn)
         btn_row.addWidget(preview_btn)
+        btn_row.addWidget(verification_preview_btn)
         btn_row.addWidget(compare_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        self.ocr_roi_label = QLabel("ROI: not calibrated")
+        self.ocr_roi_label = QLabel("Chat ROI: not calibrated")
         layout.addWidget(self.ocr_roi_label)
+        self.ocr_verification_roi_label = QLabel("Verification ROI: not calibrated")
+        layout.addWidget(self.ocr_verification_roi_label)
 
         filters_group = QGroupBox("Color Filters")
         filters_layout = QVBoxLayout(filters_group)
@@ -11774,11 +12041,41 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 return "Mari"
             if lower == "purple_text":
                 return "Jester"
+            if lower == "orange_text":
+                return "Rin"
+            if lower in ("verification_check", "verification"):
+                return "Verification Check"
             return name
         defaults = (self.config_manager.default_settings.get("ocr", {}) or {}).get("color_filters", [])
         default_names = [_rename_filter_name(str(f.get("name", "")).strip()) for f in defaults if str(f.get("name", "")).strip()]
         default_set = set(default_names)
         effective_filters = filters or defaults or []
+        # Keep Rin above Verification Check, including older configs that predate Rin.
+        if filters and isinstance(effective_filters, list):
+            normalized = [f for f in effective_filters if isinstance(f, dict)]
+            names = [_rename_filter_name(str((f or {}).get("name", "")).strip()) for f in normalized]
+            try:
+                ver_idx = names.index("Verification Check")
+            except ValueError:
+                ver_idx = -1
+            try:
+                rin_idx = names.index("Rin")
+            except ValueError:
+                rin_idx = -1
+
+            if ver_idx != -1:
+                if rin_idx == -1:
+                    rin_default = None
+                    for d in defaults:
+                        if _rename_filter_name(str((d or {}).get("name", "")).strip()) == "Rin":
+                            rin_default = d
+                            break
+                    if isinstance(rin_default, dict):
+                        normalized.insert(ver_idx, dict(rin_default))
+                elif rin_idx > ver_idx:
+                    rin_row = normalized.pop(rin_idx)
+                    normalized.insert(ver_idx, rin_row)
+            effective_filters = normalized
         seen_defaults = set()
         for f in effective_filters:
             if not isinstance(f, dict):
@@ -11848,6 +12145,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def _get_ocr_settings_from_ui(self) -> dict:
         roi = self.ocr_roi or (0.0, 0.0, 0.0, 0.0)
+        verification_roi = self.ocr_verification_roi or (0.0, 0.0, 0.0, 0.0)
         return {
             "enabled": bool(self.ocr_enable_chk.isChecked()),
             "workers": self.ocr_workers_spin.value(),
@@ -11860,6 +12158,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "log_loop": bool(getattr(self, "ocr_loop_logs_chk", None) and self.ocr_loop_logs_chk.isChecked()),
             "device_id": self.ocr_device_combo.currentData() if hasattr(self, "ocr_device_combo") else None,
             "roi": {"x": roi[0], "y": roi[1], "w": roi[2], "h": roi[3]},
+            "verification_roi": {
+                "x": verification_roi[0],
+                "y": verification_roi[1],
+                "w": verification_roi[2],
+                "h": verification_roi[3],
+            },
             "color_filters": self._current_color_filters(as_dataclass=False),
         }
 
@@ -11893,6 +12197,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 fx = fy = fw = fh = 0.0
             self.ocr_roi = (fx, fy, fw, fh) if fw > 0 and fh > 0 else None
             self._update_ocr_roi_label()
+            vroi_cfg = cfg.get("verification_roi") or defaults.get("verification_roi", {}) or {}
+            vrx, vry, vrw, vrh = (
+                vroi_cfg.get("x", 0.0),
+                vroi_cfg.get("y", 0.0),
+                vroi_cfg.get("w", 0.0),
+                vroi_cfg.get("h", 0.0),
+            )
+            try:
+                vfx, vfy, vfw, vfh = float(vrx), float(vry), float(vrw), float(vrh)
+            except Exception:
+                vfx = vfy = vfw = vfh = 0.0
+            self.ocr_verification_roi = (vfx, vfy, vfw, vfh) if vfw > 0 and vfh > 0 else None
+            self._update_ocr_verification_roi_label()
 
             self._load_color_filters_table(cfg.get("color_filters") or defaults.get("color_filters", []))
         finally:
@@ -11907,9 +12224,18 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def _update_ocr_roi_label(self):
         if self.ocr_roi:
             x, y, w, h = self.ocr_roi
-            self.ocr_roi_label.setText(f"ROI: x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}")
+            self.ocr_roi_label.setText(f"Chat ROI: x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}")
         else:
-            self.ocr_roi_label.setText("ROI: not calibrated")
+            self.ocr_roi_label.setText("Chat ROI: not calibrated")
+
+    def _update_ocr_verification_roi_label(self):
+        if self.ocr_verification_roi:
+            x, y, w, h = self.ocr_verification_roi
+            self.ocr_verification_roi_label.setText(
+                f"Verification ROI: x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}"
+            )
+        else:
+            self.ocr_verification_roi_label.setText("Verification ROI: not calibrated")
 
     def _update_ocr_device_label(self):
         """Update the OCR device label with current OCR runtime status."""
@@ -12050,6 +12376,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 fx = fy = fw = fh = 0.0
             self.ocr_roi = (fx, fy, fw, fh) if fw > 0 and fh > 0 else None
             self._update_ocr_roi_label()
+            vroi_cfg = defaults.get("verification_roi") or {}
+            vrx, vry, vrw, vrh = (
+                vroi_cfg.get("x", 0.0),
+                vroi_cfg.get("y", 0.0),
+                vroi_cfg.get("w", 0.0),
+                vroi_cfg.get("h", 0.0),
+            )
+            try:
+                vfx, vfy, vfw, vfh = float(vrx), float(vry), float(vrw), float(vrh)
+            except Exception:
+                vfx = vfy = vfw = vfh = 0.0
+            self.ocr_verification_roi = (vfx, vfy, vfw, vfh) if vfw > 0 and vfh > 0 else None
+            self._update_ocr_verification_roi_label()
             self._load_color_filters_table(defaults.get("color_filters", []))
         finally:
             self._loading_ocr_settings = False
@@ -12080,6 +12419,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.ocr_worker.log_signal.connect(self._handle_ocr_log)
         self.ocr_worker.status_signal.connect(self._handle_ocr_status)
         self.ocr_worker.merchant_signal.connect(self._handle_ocr_merchant)
+        self.ocr_worker.verification_cap_signal.connect(self._handle_ocr_verification_cap)
         self.ocr_worker.start()
         self._handle_ocr_status("running")
 
@@ -12202,12 +12542,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             ms["enable_jester"] = bool(self.ms_enable_jester.isChecked())
         if hasattr(self, "ms_enable_mari"):
             ms["enable_mari"] = bool(self.ms_enable_mari.isChecked())
+        if hasattr(self, "ms_enable_rin"):
+            ms["enable_rin"] = bool(self.ms_enable_rin.isChecked())
         if hasattr(self, "ms_jester_type") and hasattr(self, "ms_jester_id"):
             ms["jester_ping_type"] = self.ms_jester_type.currentText()
             ms["jester_ping_id"] = self.ms_jester_id.text().strip()
         if hasattr(self, "ms_mari_type") and hasattr(self, "ms_mari_id"):
             ms["mari_ping_type"] = self.ms_mari_type.currentText()
             ms["mari_ping_id"] = self.ms_mari_id.text().strip()
+        if hasattr(self, "ms_rin_type") and hasattr(self, "ms_rin_id"):
+            ms["rin_ping_type"] = self.ms_rin_type.currentText()
+            ms["rin_ping_id"] = self.ms_rin_id.text().strip()
 
         misc = {}
         try:
@@ -12231,6 +12576,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         ms["jester_ping"] = _mk_ping(ms.get("jester_ping_type", "None"), ms.get("jester_ping_id", ""))
         ms["mari_ping"] = _mk_ping(ms.get("mari_ping_type", "None"), ms.get("mari_ping_id", ""))
+        ms["rin_ping"] = _mk_ping(ms.get("rin_ping_type", "None"), ms.get("rin_ping_id", ""))
         return ms
 
     def calibrate_ocr_roi(self):
@@ -12254,6 +12600,27 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 # Persist new ROI + live-apply
                 self._on_ocr_settings_changed()
 
+    def calibrate_ocr_verification_roi(self):
+        windows = enum_roblox_windows()
+        if not windows:
+            QMessageBox.warning(self, "No Roblox windows", "No visible Roblox windows were found.")
+            return
+        ref_win = windows[0]
+        img = capture_window_image(ref_win.hwnd)
+        if img is None:
+            QMessageBox.warning(self, "Capture failed", f"Could not capture window '{ref_win.title}'.")
+            return
+
+        pixmap = pil_to_pixmap(img)
+        dlg = ROICropDialog(pixmap, self)
+        if dlg.exec():
+            roi = dlg.selected_roi()
+            if roi:
+                self.ocr_verification_roi = roi
+                self._update_ocr_verification_roi_label()
+                # Persist new ROI + live-apply
+                self._on_ocr_settings_changed()
+
     def show_ocr_preview(self):
         """
         Capture the calibrated chat area from a Roblox window and show what the
@@ -12261,7 +12628,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         panel so users can debug missing dependencies or GPU issues.
         """
         if not self.ocr_roi:
-            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the chat area first.")
+            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the chat area first (Test preview uses chat ROI only).")
             return
         windows = enum_roblox_windows()
         if not windows:
@@ -12310,13 +12677,71 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 f"An unexpected error occurred while generating the OCR preview:\n{e}",
             )
 
+    def show_ocr_verification_preview(self):
+        """
+        Capture the calibrated verification area from a Roblox window and show
+        what OCR preprocessing would see for verification checks.
+        """
+        if not self.ocr_verification_roi:
+            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the verification area first.")
+            return
+        windows = enum_roblox_windows()
+        if not windows:
+            QMessageBox.warning(self, "No Roblox windows", "No visible Roblox windows were found.")
+            return
+
+        try:
+            win = windows[0]
+            img = capture_window_image(win.hwnd, self.ocr_verification_roi)
+            if img is None:
+                QMessageBox.warning(self, "Capture failed", f"Could not capture window '{win.title}'.")
+                return
+
+            if self.ocr_preprocess_chk.isChecked():
+                all_filters = self._current_color_filters(as_dataclass=True)
+                verification_filters = []
+                for cf in all_filters:
+                    name = str(getattr(cf, "name", "") or "").strip().lower()
+                    if name in ("verification check", "verification", "verification_check"):
+                        verification_filters.append(cf)
+                if not verification_filters:
+                    verification_filters = [ColorFilter("Verification Check", 255, 255, 255, 60, True)]
+                img_to_show = preprocess_for_ocr(img, verification_filters)
+            else:
+                img_to_show = img
+
+            pm = pil_to_pixmap(img_to_show)
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Verification OCR Preview")
+            v = QVBoxLayout(dlg)
+            lbl = QLabel()
+            lbl.setPixmap(pm)
+            v.addWidget(lbl)
+            dlg.resize(pm.width(), pm.height())
+            dlg.exec()
+        except Exception as e:
+            msg = f"[Verification Preview] Error: {e}"
+            try:
+                self._handle_ocr_log(msg)
+            except Exception:
+                try:
+                    print(msg)
+                except Exception:
+                    pass
+            QMessageBox.critical(
+                self,
+                "Verification Preview Error",
+                f"An unexpected error occurred while generating the verification preview:\n{e}",
+            )
+
     def test_ocr_frame_compare(self):
         """
         Capture the OCR frame twice (click multiple times) and report how similar
         it is to the previous capture using the current tolerance setting.
         """
         if not self.ocr_roi:
-            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the chat area first.")
+            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the chat area first (frame compare uses chat ROI only).")
             return
 
         windows = enum_roblox_windows()
@@ -12375,8 +12800,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             f"Window: {win.title}\nPID: {win.pid}\nDiff: {diff_pct:.2f}%\nTolerance: {tol:.0f}%\nResult: {verdict}",
         )
 
-    def _resolve_pid_context(self, pid: int) -> Dict[str, str]:
-        ctx = {"user_id": "", "username": "", "server_label": "", "ps_link": "", "owner": ""}
+    def _resolve_pid_context(self, pid: int) -> Dict[str, Any]:
+        ctx: Dict[str, Any] = {
+            "user_id": "",
+            "username": "",
+            "server_label": "",
+            "ps_link": "",
+            "owner": "",
+            "has_user_log": False,
+            "is_cap": False,
+        }
         wt = self.worker_thread
         if wt and wt.manager:
             tracker = wt.manager.process_tracker
@@ -12384,8 +12817,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if uid:
                 ctx["user_id"] = uid
                 info = wt.manager.settings.get(uid, {}) or {}
-                ctx["username"] = info.get("username", uid)
-                ctx["server_label"] = tracker.user_server.get(uid, "")
+                ctx["username"] = str(info.get("username", uid) or uid)
+                ctx["server_label"] = str(tracker.user_server.get(uid, "") or "")
+                ctx["is_cap"] = bool(info.get("cap", False))
                 if hasattr(wt, "get_ps_link_for_user"):
                     try:
                         ctx["ps_link"] = wt.get_ps_link_for_user(uid) or ""
@@ -12403,8 +12837,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             ctx["user_id"] = uid
             users_cfg = self.config_manager.peek_users()
             info = users_cfg.get(uid, {}) if isinstance(users_cfg, dict) else {}
-            ctx["username"] = info.get("username", uid)
-            ctx["ps_link"] = info.get("private_server_link", "")
+            ctx["username"] = str(info.get("username", uid) or uid)
+            ctx["ps_link"] = str(info.get("private_server_link", "") or "")
+            ctx["is_cap"] = bool(info.get("cap", False))
+
+        uname_key = str(ctx.get("username") or "").strip().lower()
+        if uname_key:
+            try:
+                ctx["has_user_log"] = bool(find_log_for_username(uname_key, allow_fallback=False))
+            except Exception:
+                ctx["has_user_log"] = False
 
         return ctx
 
@@ -12433,6 +12875,53 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             ms = getattr(wt, "ms", None) if wt else None
             if ms:
                 ms.record_ocr_merchant(uid, merchant)
+        except Exception:
+            pass
+
+    def _handle_ocr_verification_cap(self, uid: str) -> None:
+        uid = str(uid or "").strip()
+        if not uid:
+            return
+
+        wt = self.worker_thread
+        info: Dict[str, Any] = {}
+        try:
+            if wt and wt.manager:
+                info = wt.manager.settings.get(uid, {}) or {}
+        except Exception:
+            info = {}
+        if not info:
+            try:
+                users_cfg = self.config_manager.peek_users()
+                if isinstance(users_cfg, dict):
+                    info = users_cfg.get(uid, {}) or {}
+            except Exception:
+                info = {}
+
+        username = str(info.get("username") or uid)
+        if bool(info.get("cap", False)):
+            return
+
+        self.add_log(f"[CAP] {username} flagged by verification check (Start Puzzle).")
+        try:
+            self.config_manager.mark_cap_flag(uid, True)
+        except Exception:
+            pass
+
+        try:
+            if wt and wt.manager:
+                live_info = wt.manager.settings.get(uid, {}) or {}
+                live_info["cap"] = True
+                st = wt.user_states.get(uid, {})
+                if isinstance(st, dict):
+                    st_info = st.get("user_info")
+                    if isinstance(st_info, dict):
+                        st_info["cap"] = True
+                    st["requires_restart"] = False
+                    st["status"] = "CAP"
+                wt.active_pool.discard(uid)
+                wt.spare_pool.discard(uid)
+                wt.kill_user_processes(uid)
         except Exception:
             pass
 
@@ -12549,7 +13038,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         alerts_group = QGroupBox("Alerts"); alerts_layout = QFormLayout(alerts_group)
 
         self.webhook_input = QLineEdit(); self.webhook_input.setPlaceholderText("Discord webhook alert URL")
-        self.webhook_input.setToolTip("Discord webhook URL used for blackout + CAP alerts.")
+        self.webhook_input.setToolTip("Discord webhook URL used for blackout, CAP, BAD, and hourly user-report alerts.")
         alerts_layout.addRow("Webhook URL:", self.webhook_input)
 
         self.blackout_ping_input = QLineEdit()
@@ -12560,7 +13049,35 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.cap_msg_input = QLineEdit()
         self.cap_msg_input.setPlaceholderText("This message is sent whenever a user is marked for captcha. Leave this empty if not interested. — Supports {username} and {uid}")
         self.cap_msg_input.setToolTip("Sent when a user is marked CAP. Example Message: User {username} has disconnected, User ID = {uid}.")
-        alerts_layout.addRow("CAP Message:", self.cap_msg_input)
+        alerts_layout.addRow("CAP Ping:", self.cap_msg_input)
+
+        self.bad_msg_input = QLineEdit()
+        self.bad_msg_input.setPlaceholderText("This message is sent whenever a user is marked BAD. Leave this empty if not interested. - Supports {username} and {uid}")
+        self.bad_msg_input.setToolTip("Sent when a user is marked BAD. Example Message: User {username} has a bad cookie, User ID = {uid}.")
+        alerts_layout.addRow("BAD Ping:", self.bad_msg_input)
+
+        self.hourly_users_report_chk = QCheckBox("")
+        self.hourly_users_report_chk.setToolTip(
+            "Send periodic webhook messages with total users and active users."
+        )
+        self.hourly_users_report_interval_spin = QSpinBox()
+        self.hourly_users_report_interval_spin.setRange(1, 168)
+        self.hourly_users_report_interval_spin.setSuffix(" h")
+        self.hourly_users_report_interval_spin.setToolTip("Hours between user-report messages.")
+        self.hourly_users_report_interval_spin.setValue(1)
+        self.hourly_users_report_interval_spin.setMinimumWidth(90)
+        self.hourly_users_report_interval_spin.setEnabled(False)
+
+        hourly_row_widget = QWidget()
+        hourly_row_layout = QHBoxLayout(hourly_row_widget)
+        hourly_row_layout.setContentsMargins(0, 0, 0, 0)
+        hourly_row_layout.setSpacing(8)
+        hourly_row_layout.addWidget(self.hourly_users_report_chk)
+        hourly_row_layout.addWidget(QLabel("Send users report every"))
+        hourly_row_layout.addWidget(self.hourly_users_report_interval_spin)
+        hourly_row_layout.addStretch()
+        alerts_layout.addRow("Users Report:", hourly_row_widget)
+        self.hourly_users_report_chk.toggled.connect(self.hourly_users_report_interval_spin.setEnabled)
 
         content_layout.addWidget(alerts_group)
 
@@ -13152,6 +13669,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         self.ms_enable_jester = QCheckBox("Enable Jester pings")
         self.ms_enable_mari   = QCheckBox("Enable Mari pings")
+        self.ms_enable_rin    = QCheckBox("Enable Rin pings")
 
         type_opts = ["None", "User ID", "Role ID"]
 
@@ -13159,6 +13677,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.ms_jester_id   = QLineEdit();  self.ms_jester_id.setPlaceholderText("numeric ID or @everyone")
         self.ms_mari_type   = QComboBox();  self.ms_mari_type.addItems(type_opts)
         self.ms_mari_id     = QLineEdit();  self.ms_mari_id.setPlaceholderText("numeric ID or @everyone")
+        self.ms_rin_type    = QComboBox();  self.ms_rin_type.addItems(type_opts)
+        self.ms_rin_id      = QLineEdit();  self.ms_rin_id.setPlaceholderText("numeric ID or @everyone")
 
         # tidy two-control rows without custom helpers:
         jester_row = QWidget(); jester_h = QHBoxLayout(jester_row); jester_h.setContentsMargins(0,0,0,0)
@@ -13167,11 +13687,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         mari_row = QWidget(); mari_h = QHBoxLayout(mari_row); mari_h.setContentsMargins(0,0,0,0)
         mari_h.addWidget(self.ms_mari_type); mari_h.addWidget(self.ms_mari_id)
 
+        rin_row = QWidget(); rin_h = QHBoxLayout(rin_row); rin_h.setContentsMargins(0,0,0,0)
+        rin_h.addWidget(self.ms_rin_type); rin_h.addWidget(self.ms_rin_id)
+
         ms_form.addRow("Merchant Webhook URL", self.ms_merchant_webhook_input)
         ms_form.addRow(self.ms_enable_jester)
         ms_form.addRow("Jester ping type / ID", jester_row)
         ms_form.addRow(self.ms_enable_mari)
         ms_form.addRow("Mari ping type / ID", mari_row)
+        ms_form.addRow(self.ms_enable_rin)
+        ms_form.addRow("Rin ping type / ID", rin_row)
 
         ms_test_row = QHBoxLayout()
         ms_test_btn = QPushButton("Test Webhook")
@@ -13835,11 +14360,64 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.active_users_label.setText(str(active_users))
         self.total_processes_label.setText(str(total_processes))
         self.pending_restarts_label.setText(str(pending_restarts))
+        self._maybe_send_hourly_users_report(good_count, active_users)
         try:
             if self.users_tab_index is not None and self.tab_widget.currentIndex() == self.users_tab_index:
                 wt = getattr(self, "worker_thread", None)
                 if wt is not None and wt.isRunning():
                     self._refresh_users_antiafk_age_column()
+        except Exception:
+            pass
+
+    def _maybe_send_hourly_users_report(self, total_users: int, active_users: int) -> None:
+        try:
+            settings = self.config_manager.peek_settings() or {}
+        except Exception:
+            return
+
+        alerts = settings.get("alerts", {}) or {}
+        if not isinstance(alerts, dict):
+            return
+
+        enabled = bool(alerts.get("hourly_users_report_enabled", False))
+        try:
+            interval_h = int(alerts.get("hourly_users_report_interval_hours", 1) or 1)
+        except Exception:
+            interval_h = 1
+        interval_h = max(1, min(168, interval_h))
+        now_ts = float(time.time())
+
+        if not enabled:
+            self._hourly_users_report_last_sent_at = 0.0
+            self._hourly_users_report_interval_hours = interval_h
+            return
+
+        wt = getattr(self, "worker_thread", None)
+        if wt is None or not wt.isRunning():
+            self._hourly_users_report_last_sent_at = 0.0
+            self._hourly_users_report_interval_hours = interval_h
+            return
+
+        prev_interval_h = int(getattr(self, "_hourly_users_report_interval_hours", interval_h) or interval_h)
+        if prev_interval_h != interval_h:
+            self._hourly_users_report_interval_hours = interval_h
+            self._hourly_users_report_last_sent_at = now_ts
+            return
+
+        last_sent = float(getattr(self, "_hourly_users_report_last_sent_at", 0.0) or 0.0)
+        if last_sent <= 0:
+            self._hourly_users_report_last_sent_at = now_ts
+            self._hourly_users_report_interval_hours = interval_h
+            return
+
+        interval_s = float(interval_h * 3600)
+        if (now_ts - last_sent) < interval_s:
+            return
+
+        self._hourly_users_report_last_sent_at = now_ts
+        self._hourly_users_report_interval_hours = interval_h
+        try:
+            self.config_manager.send_hourly_users_report_webhook(total_users, active_users)
         except Exception:
             pass
 
@@ -14388,9 +14966,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if not batch:
             return
 
+        autoscroll = bool(getattr(self, "ocr_log_autoscroll", True))
+        scrollbar = None
+        prev_scroll = 0
         try:
-            box.moveCursor(QTextCursor.MoveOperation.End)
-            box.insertPlainText("\n".join(batch) + "\n")
+            scrollbar = box.verticalScrollBar()
+            if scrollbar is not None:
+                prev_scroll = int(scrollbar.value())
+        except Exception:
+            scrollbar = None
+
+        try:
+            cursor = QTextCursor(box.document())
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText("\n".join(batch) + "\n")
         except Exception:
             try:
                 for line in batch:
@@ -14399,7 +14988,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 pass
 
         try:
-            if self.ocr_log_autoscroll:
+            if scrollbar is not None:
+                if autoscroll:
+                    scrollbar.setValue(scrollbar.maximum())
+                else:
+                    scrollbar.setValue(min(prev_scroll, int(scrollbar.maximum())))
+            elif autoscroll:
                 box.moveCursor(QTextCursor.MoveOperation.End)
         except Exception:
             pass
@@ -14913,6 +15507,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "webhook_url": str(self.webhook_input.text().strip()),
                 "blackout_ping": str(self.blackout_ping_input.text().strip()),
                 "cap_message": str(self.cap_msg_input.text().strip()),
+                "bad_message": str(self.bad_msg_input.text().strip()) if hasattr(self, "bad_msg_input") else "",
+                "hourly_users_report_enabled": bool(
+                    self.hourly_users_report_chk.isChecked()
+                ) if hasattr(self, "hourly_users_report_chk") else False,
+                "hourly_users_report_interval_hours": int(
+                    self.hourly_users_report_interval_spin.value()
+                ) if hasattr(self, "hourly_users_report_interval_spin") else 1,
             },
             "webhooks": self._collect_webhooks_from_ui(),
             "ui": {
@@ -14928,10 +15529,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "merchant_webhook": str(self.ms_merchant_webhook_input.text().strip()) if hasattr(self, "ms_merchant_webhook_input") else "",
                 "enable_jester": bool(self.ms_enable_jester.isChecked()) if hasattr(self, "ms_enable_jester") else True,
                 "enable_mari": bool(self.ms_enable_mari.isChecked()) if hasattr(self, "ms_enable_mari") else True,
+                "enable_rin": bool(self.ms_enable_rin.isChecked()) if hasattr(self, "ms_enable_rin") else True,
                 "jester_ping_type": str(self.ms_jester_type.currentText()) if hasattr(self, "ms_jester_type") else "None",
                 "jester_ping_id": str(self.ms_jester_id.text().strip()) if hasattr(self, "ms_jester_id") else "",
                 "mari_ping_type": str(self.ms_mari_type.currentText()) if hasattr(self, "ms_mari_type") else "None",
                 "mari_ping_id": str(self.ms_mari_id.text().strip()) if hasattr(self, "ms_mari_id") else "",
+                "rin_ping_type": str(self.ms_rin_type.currentText()) if hasattr(self, "ms_rin_type") else "None",
+                "rin_ping_id": str(self.ms_rin_id.text().strip()) if hasattr(self, "ms_rin_id") else "",
             },
             "misc": {
                 "skip_webhook_unknown_context": bool(
@@ -15115,6 +15719,21 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             str(alerts.get("blackout_ping") or alerts.get("ping_message") or tm.get("ping_message", "") or "")
         )
         self.cap_msg_input.setText(str(alerts.get("cap_message") or ""))
+        if hasattr(self, "bad_msg_input"):
+            self.bad_msg_input.setText(str(alerts.get("bad_message") or ""))
+        hourly_enabled = bool(alerts.get("hourly_users_report_enabled", False))
+        try:
+            hourly_interval = int(alerts.get("hourly_users_report_interval_hours", 1) or 1)
+        except Exception:
+            hourly_interval = 1
+        hourly_interval = max(1, min(168, hourly_interval))
+        if hasattr(self, "hourly_users_report_chk"):
+            self.hourly_users_report_chk.setChecked(hourly_enabled)
+        if hasattr(self, "hourly_users_report_interval_spin"):
+            self.hourly_users_report_interval_spin.setValue(hourly_interval)
+            self.hourly_users_report_interval_spin.setEnabled(hourly_enabled)
+        self._hourly_users_report_last_sent_at = 0.0
+        self._hourly_users_report_interval_hours = hourly_interval
 
         # ---------- Webhooks table (tri-mode + legacy) ----------
         ui = settings.get("ui", {}) or {}
@@ -15172,6 +15791,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.ms_enable_jester.setChecked(bool(ms.get("enable_jester", True)))
         if hasattr(self, "ms_enable_mari"):
             self.ms_enable_mari.setChecked(bool(ms.get("enable_mari", True)))
+        if hasattr(self, "ms_enable_rin"):
+            self.ms_enable_rin.setChecked(bool(ms.get("enable_rin", True)))
 
         if hasattr(self, "ms_jester_type"):
             self.ms_jester_type.setCurrentText(ms.get("jester_ping_type", "None"))
@@ -15182,6 +15803,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.ms_mari_type.setCurrentText(ms.get("mari_ping_type", "None"))
         if hasattr(self, "ms_mari_id"):
             self.ms_mari_id.setText(ms.get("mari_ping_id", ""))
+        if hasattr(self, "ms_rin_type"):
+            self.ms_rin_type.setCurrentText(ms.get("rin_ping_type", "None"))
+        if hasattr(self, "ms_rin_id"):
+            self.ms_rin_id.setText(ms.get("rin_ping_id", ""))
 
         # ---------- Misc ----------
         misc = settings.get("misc", {}) or {}
@@ -15381,6 +16006,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         alerts["webhook_url"] = self.webhook_input.text().strip()
         alerts["blackout_ping"] = self.blackout_ping_input.text().strip()
         alerts["cap_message"] = self.cap_msg_input.text().strip()
+        alerts["bad_message"] = self.bad_msg_input.text().strip() if hasattr(self, "bad_msg_input") else ""
+        alerts["hourly_users_report_enabled"] = bool(
+            self.hourly_users_report_chk.isChecked()
+        ) if hasattr(self, "hourly_users_report_chk") else False
+        interval_h = 1
+        if hasattr(self, "hourly_users_report_interval_spin"):
+            try:
+                interval_h = int(self.hourly_users_report_interval_spin.value())
+            except Exception:
+                interval_h = 1
+        alerts["hourly_users_report_interval_hours"] = max(1, min(168, interval_h))
         settings["alerts"] = alerts
 
         # Backwards compatibility (older builds read these from timeout_monitor)
@@ -15415,6 +16051,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             ms["enable_jester"] = bool(self.ms_enable_jester.isChecked())
         if hasattr(self, "ms_enable_mari"):
             ms["enable_mari"]   = bool(self.ms_enable_mari.isChecked())
+        if hasattr(self, "ms_enable_rin"):
+            ms["enable_rin"]    = bool(self.ms_enable_rin.isChecked())
 
         if hasattr(self, "ms_jester_type"):
             ms["jester_ping_type"] = self.ms_jester_type.currentText()
@@ -15424,6 +16062,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             ms["mari_ping_type"]   = self.ms_mari_type.currentText()
         if hasattr(self, "ms_mari_id"):
             ms["mari_ping_id"]     = self.ms_mari_id.text().strip()
+        if hasattr(self, "ms_rin_type"):
+            ms["rin_ping_type"]    = self.ms_rin_type.currentText()
+        if hasattr(self, "ms_rin_id"):
+            ms["rin_ping_id"]      = self.ms_rin_id.text().strip()
 
         # ---------- Misc ----------
         misc = settings.get("misc", {}) or {}
@@ -15450,6 +16092,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if ms:
             ms["jester_ping"] = _mk_ping(ms.get("jester_ping_type", "None"), ms.get("jester_ping_id", ""))
             ms["mari_ping"]   = _mk_ping(ms.get("mari_ping_type", "None"),   ms.get("mari_ping_id", ""))
+            ms["rin_ping"]    = _mk_ping(ms.get("rin_ping_type", "None"),    ms.get("rin_ping_id", ""))
             settings["multiscope"] = ms
 
         # ---------- Persist & live-apply ----------
@@ -15528,6 +16171,21 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             str(alerts.get("blackout_ping", alerts.get("ping_message", t.get("ping_message", ""))))
         )
         self.cap_msg_input.setText(str(alerts.get("cap_message", "")))
+        if hasattr(self, "bad_msg_input"):
+            self.bad_msg_input.setText(str(alerts.get("bad_message", "")))
+        hourly_enabled = bool(alerts.get("hourly_users_report_enabled", False))
+        try:
+            hourly_interval = int(alerts.get("hourly_users_report_interval_hours", 1) or 1)
+        except Exception:
+            hourly_interval = 1
+        hourly_interval = max(1, min(168, hourly_interval))
+        if hasattr(self, "hourly_users_report_chk"):
+            self.hourly_users_report_chk.setChecked(hourly_enabled)
+        if hasattr(self, "hourly_users_report_interval_spin"):
+            self.hourly_users_report_interval_spin.setValue(hourly_interval)
+            self.hourly_users_report_interval_spin.setEnabled(hourly_enabled)
+        self._hourly_users_report_last_sent_at = 0.0
+        self._hourly_users_report_interval_hours = hourly_interval
 
         # Reset UI-only settings (column visibility)
         if hasattr(self, "_apply_webhook_biome_column_visibility"):
@@ -15643,7 +16301,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def show_about(self):
         config_info = self.config_manager.get_config_info()
         QMessageBox.about(self, "About J.JARAM",
-                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x42\n\n"
+                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x44\n\n"
                          "Advanced multi-account Roblox session manager\n"
                          "with automated log based monitoring and process management.\n\n"
                          "Built with PySide6 and modern design principles.\n\n"
@@ -15859,23 +16517,41 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         )
         return reply == QMessageBox.StandardButton.Yes
 
-    def _fetch_authenticated_user(self, cookie: str) -> Optional[dict]:
+    def _fetch_authenticated_user(self, cookie: str) -> Tuple[Optional[dict], str]:
+        cookie = str(cookie or "").strip()
+        if normalize_roblosecurity_cookie_value is not None:
+            try:
+                cookie = normalize_roblosecurity_cookie_value(cookie)
+            except Exception:
+                cookie = str(cookie or "").strip()
         if not cookie:
-            return None
+            return None, cookie
         try:
             session = requests.Session()
-            session.cookies.set(".ROBLOSECURITY", cookie)
+            try:
+                session.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com", path="/")
+            except Exception:
+                session.cookies.set(".ROBLOSECURITY", cookie)
+
             response = session.get("https://users.roblox.com/v1/users/authenticated", timeout=8)
+            if extract_roblosecurity_from_requests_response is not None:
+                try:
+                    updated = extract_roblosecurity_from_requests_response(response, session=session)
+                except Exception:
+                    updated = None
+                if updated and updated != cookie:
+                    cookie = updated
+
             if response.status_code != 200:
-                return None
+                return None, cookie
             data = response.json()
             if not isinstance(data, dict):
-                return None
+                return None, cookie
             if "id" not in data or "name" not in data:
-                return None
-            return data
+                return None, cookie
+            return data, cookie
         except Exception:
-            return None
+            return None, cookie
 
     def extract_account_cookie_from_browser(self):
         try:
@@ -15907,7 +16583,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         try:
             if cookie:
                 self.account_cookie.setText(cookie)
-                user_info = self._fetch_authenticated_user(cookie)
+                user_info, updated_cookie = self._fetch_authenticated_user(cookie)
+                if updated_cookie and updated_cookie != cookie:
+                    cookie = updated_cookie
+                    self.account_cookie.setText(cookie)
                 extra = ""
                 if user_info:
                     if hasattr(self, "account_user_id"):
@@ -17042,8 +17721,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             tests.append(("Jester", ms_cfg.get("jester_ping", ""), 0xA352FF))
         if ms_cfg.get("enable_mari", True):
             tests.append(("Mari", ms_cfg.get("mari_ping", ""), 0xFF82AB))
+        if ms_cfg.get("enable_rin", True):
+            tests.append(("Rin", ms_cfg.get("rin_ping", ""), 0xFF9F1C))
         if not tests:
-            QMessageBox.information(self, "Merchant Pings", "Enable Jester or Mari pings to send a test.")
+            QMessageBox.information(self, "Merchant Pings", "Enable Jester, Mari, or Rin pings to send a test.")
             return
 
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -17135,7 +17816,7 @@ def main():
     app = QApplication(sys.argv)
 
     app.setApplicationName("J.JARAM")
-    app.setApplicationVersion("JX 2x40")
+    app.setApplicationVersion("JX 2x44")
     app.setOrganizationName("Jirach1")
     # Qt 6 ships a Windows 11 style that can change widget visuals. Force the
     # Windows 10-era style for consistent UI across OS versions.
