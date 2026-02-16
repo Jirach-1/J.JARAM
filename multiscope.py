@@ -56,7 +56,7 @@ except Exception:
     WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
 
 
-APP_FOOTER = "J.JARAM JX 2x44"
+APP_FOOTER = "J.JARAM JX 2x47"
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
 # Helpers
@@ -1367,11 +1367,6 @@ class MultiScopeEngine:
         new_np = os.path.normcase(os.path.abspath(path))
         ignored_logs = self._ignored_logs_by_uid.get(str(uid), set())
         if new_np in ignored_logs:
-            self._throttled_log(
-                key=f"ignored-log:{uid}:{new_np}",
-                msg=f"[MultiScope] ignoring stale log for {uname} - {os.path.basename(path)}",
-                every=15.0,
-            )
             return
         cur_np = self._normpath_by_uid.get(uid)
         if not force and cur_np and new_np == cur_np:

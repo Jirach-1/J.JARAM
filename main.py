@@ -109,6 +109,48 @@ except ImportError:
                 pass
 
 
+    def limit_msedgewebview2_processes(threshold: int = 1, *, kill_all: bool = True) -> None:
+        """
+        Trim msedgewebview2.exe processes.
+
+        - kill_all = True (default): terminate every msedgewebview2.exe process.
+        - kill_all = False: keep the oldest process and terminate extras once the
+          running count reaches or exceeds *threshold*.
+        """
+        webviews = []
+        try:
+            for p in psutil.process_iter(['name', 'create_time']):
+                try:
+                    name = p.info.get('name')
+                    if name and str(name).lower() == 'msedgewebview2.exe':
+                        webviews.append(p)
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+        if not webviews:
+            return
+
+        if kill_all:
+            for p in webviews:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            return
+
+        if len(webviews) < threshold:
+            return
+
+        webviews.sort(key=lambda p: p.info.get('create_time') or 0)  # oldest first
+        for p in webviews[1:]:  # keep index-0
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
     class ConfigManager:
         def __init__(self):
             self.app_name = "JARAM"

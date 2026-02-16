@@ -457,8 +457,12 @@ class _FunctionRunnable(QRunnable):
 from main import RobloxManager, ProcessManager, GameLauncher
 from cookie_extractor import CookieExtractor
 from RAM_export import transform         # re-use your parsing helper
-from main import limit_strap_helpers, limit_roblox_crash_handlers
-from log_utils import find_log_for_username
+from main import (
+    limit_strap_helpers,
+    limit_roblox_crash_handlers,
+    limit_msedgewebview2_processes,
+)
+from log_utils import find_log_for_username, refresh_username_log_map
 from biomes import biome_names, biome_meta, biome_duration
 from utilities_tab import build_utilities_widget
 from trimmer import setup_TRIMMER_tab
@@ -714,12 +718,14 @@ class ConfigManager:
                 "color_filters": [
                     {"name": "Mari", "r": 255, "g": 255, "b": 255, "tol": 60, "enabled": True},
                     {"name": "Jester", "r": 145, "g": 67, "b": 255, "tol": 60, "enabled": True},
-                    {"name": "Rin", "r": 230, "g": 125, "b": 62, "tol": 60, "enabled": True},
+                    {"name": "Rin", "r": 255, "g": 138, "b": 68, "tol": 60, "enabled": True},
                     {"name": "Verification Check", "r": 255, "g": 255, "b": 255, "tol": 60, "enabled": True},
                 ],
             },
             "misc": {
                 "skip_webhook_unknown_context": True,
+                "log_confirmed_launch_mode": False,
+                "msedgewebview2_limiter_enabled": True,
             },
             "ui": {
                 "show_tutorial_menu": False,
@@ -2570,6 +2576,20 @@ class WorkerThread(QThread):
         self.restart_threshold = 0
         self.strap_threshold   = 50
         self.initial_delay     = 0
+        self.launch_wait_for_log_mode = False
+        self.msedgewebview2_limiter_enabled = True
+        self._launch_tracking_lock = threading.Lock()
+        self._latest_launch_pending_uid: Optional[str] = None
+        self._launch_gate_uid: Optional[str] = None
+        self._launch_gate_started_at: float = 0.0
+        self._launch_gate_min_delay_s: float = 0.0
+        self._launch_gate_log_confirmed_uid: Optional[str] = None
+        self._last_gate_log_refresh_at: float = 0.0
+        self._launch_gate_debug_last_key: str = ""
+        self._launch_gate_debug_last_ts: float = 0.0
+        self._msedge_timed_loop_active: bool = False
+        self._msedge_timed_loop_next_at: float = 0.0
+        self._msedge_timed_loop_interval_s: float = 2.0
 
         # Spare / handoff controls
         self.spares_mode       = False
@@ -2611,6 +2631,421 @@ class WorkerThread(QThread):
         except Exception:
             self._bootstrap_multiscope_rows = None
             self._bootstrap_multiscope_deadline = 0.0
+
+    def _current_launch_gate_delay(self) -> float:
+        try:
+            if bool(getattr(self, "_boot_phase", False)):
+                delay = float(getattr(self, "initial_delay", 0) or 0)
+            else:
+                timeouts = (getattr(self.manager, "timeouts", {}) or {})
+                delay = float(timeouts.get("launch_delay", 0) or 0)
+        except Exception:
+            delay = 0.0
+
+        if delay <= 0:
+            try:
+                delay = float(getattr(getattr(self, "launcher", None), "launch_delay", 0) or 0)
+            except Exception:
+                delay = 0.0
+        return max(0.0, delay)
+
+    def _clear_launch_gate(self, uid: Optional[str] = None) -> None:
+        try:
+            with self._launch_tracking_lock:
+                if uid is not None and self._launch_gate_uid != str(uid):
+                    return
+                self._launch_gate_uid = None
+                self._launch_gate_started_at = 0.0
+                self._launch_gate_min_delay_s = 0.0
+                self._launch_gate_log_confirmed_uid = None
+                self._last_gate_log_refresh_at = 0.0
+        except Exception:
+            pass
+
+    def _register_successful_launch(self, uid: str, launched_at: Optional[float] = None) -> None:
+        uid_s = str(uid)
+        try:
+            ts = time.time() if launched_at is None else float(launched_at)
+        except Exception:
+            ts = time.time()
+        min_delay = self._current_launch_gate_delay()
+        try:
+            with self._launch_tracking_lock:
+                self._latest_launch_pending_uid = uid_s
+                if self.launch_wait_for_log_mode:
+                    self._launch_gate_uid = uid_s
+                    self._launch_gate_started_at = ts
+                    self._launch_gate_min_delay_s = max(0.0, float(min_delay))
+                    self._launch_gate_log_confirmed_uid = None
+                else:
+                    self._launch_gate_uid = None
+                    self._launch_gate_started_at = 0.0
+                    self._launch_gate_min_delay_s = 0.0
+                    self._launch_gate_log_confirmed_uid = None
+                self._last_gate_log_refresh_at = 0.0
+        except Exception:
+            pass
+        if self.launch_wait_for_log_mode:
+            self._log_launch_gate_debug(
+                f"set:{uid_s}",
+                f"set gate uid={uid_s} min_delay={max(0.0, float(min_delay)):.1f}s",
+                min_interval_s=0.0,
+            )
+
+    def _mark_user_log_confirmed(self, uid: str) -> None:
+        uid_s = str(uid)
+        marked = False
+        try:
+            with self._launch_tracking_lock:
+                if self._launch_gate_uid == uid_s:
+                    if self._launch_gate_log_confirmed_uid != uid_s:
+                        self._launch_gate_log_confirmed_uid = uid_s
+                        marked = True
+        except Exception:
+            pass
+        if marked:
+            self._log_launch_gate_debug(
+                f"confirm:{uid_s}",
+                f"uid={uid_s} strict log confirmed",
+                min_interval_s=0.0,
+            )
+
+    def _log_launch_gate_debug(self, key: str, message: str, *, min_interval_s: float = 1.0) -> None:
+        key_s = str(key or "")
+        try:
+            now = float(time.time())
+        except Exception:
+            now = 0.0
+
+        try:
+            last_key = str(getattr(self, "_launch_gate_debug_last_key", "") or "")
+            last_ts = float(getattr(self, "_launch_gate_debug_last_ts", 0.0) or 0.0)
+        except Exception:
+            last_key = ""
+            last_ts = 0.0
+
+        try:
+            gate_s = max(0.0, float(min_interval_s))
+        except Exception:
+            gate_s = 0.0
+
+        if key_s and last_key == key_s and gate_s > 0 and (now - last_ts) < gate_s:
+            return
+
+        try:
+            self._launch_gate_debug_last_key = key_s
+            self._launch_gate_debug_last_ts = now
+        except Exception:
+            pass
+
+        try:
+            self._log(f"[LaunchGate] {message}")
+        except Exception:
+            pass
+
+    def _user_has_strict_log_match(self, uid: str) -> bool:
+        try:
+            st = self.user_states.get(str(uid), {}) or {}
+            info = st.get("user_info", {}) if isinstance(st, dict) else {}
+            if not isinstance(info, dict):
+                info = {}
+            uname = str(info.get("username", "") or "").strip().lower()
+            if not uname:
+                return False
+            return bool(find_log_for_username(uname, allow_fallback=False))
+        except Exception:
+            return False
+
+    def _is_user_live(self, uid: str) -> bool:
+        try:
+            pids = list(self.manager.process_tracker.user_processes.get(str(uid), []) or [])
+        except Exception:
+            pids = []
+        for pid in pids:
+            try:
+                if self.process_mgr.verify_process_active(pid):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _is_launch_gate_ready(
+        self,
+        *,
+        now: Optional[float] = None,
+        strict_log_matches: Optional[dict] = None,
+        live_by_uid: Optional[dict] = None,
+    ) -> bool:
+        if not self.launch_wait_for_log_mode:
+            return True
+
+        try:
+            with self._launch_tracking_lock:
+                gate_uid = self._launch_gate_uid
+                gate_started = float(self._launch_gate_started_at or 0.0)
+                gate_min = float(self._launch_gate_min_delay_s or 0.0)
+                gate_confirmed = (self._launch_gate_log_confirmed_uid == self._launch_gate_uid)
+        except Exception:
+            gate_uid = None
+            gate_started = 0.0
+            gate_min = 0.0
+            gate_confirmed = False
+
+        if not gate_uid:
+            return True
+
+        ts = time.time() if now is None else float(now)
+        elapsed = max(0.0, ts - gate_started)
+
+        st = self.user_states.get(gate_uid, {}) if isinstance(self.user_states, dict) else {}
+        info = st.get("user_info", {}) if isinstance(st, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        if (not st) or bool(info.get("bad", False) or info.get("cap", False) or info.get("disabled", False)):
+            self._log_launch_gate_debug(
+                f"open:invalid:{gate_uid}",
+                f"open uid={gate_uid} reason=state_invalid_or_flagged",
+                min_interval_s=0.0,
+            )
+            self._clear_launch_gate(gate_uid)
+            return True
+
+        live = None
+        if isinstance(live_by_uid, dict):
+            try:
+                live = bool(live_by_uid.get(gate_uid, False))
+            except Exception:
+                live = None
+        if live is None:
+            live = self._is_user_live(gate_uid)
+        if not live:
+            # Don't deadlock launches if the "latest launched" process died before log confirmation.
+            self._log_launch_gate_debug(
+                f"open:not_live:{gate_uid}",
+                f"open uid={gate_uid} reason=not_live",
+                min_interval_s=0.0,
+            )
+            self._clear_launch_gate(gate_uid)
+            return True
+
+        if elapsed < max(0.0, gate_min):
+            remain = max(0.0, gate_min - elapsed)
+            self._log_launch_gate_debug(
+                f"wait:min_delay:{gate_uid}:{int(remain)}",
+                f"wait uid={gate_uid} reason=min_delay elapsed={elapsed:.1f}s remain={remain:.1f}s",
+                min_interval_s=1.0,
+            )
+            return False
+
+        if gate_confirmed:
+            self._log_launch_gate_debug(
+                f"open:confirmed:{gate_uid}",
+                f"open uid={gate_uid} reason=confirmed",
+                min_interval_s=0.0,
+            )
+            self._clear_launch_gate(gate_uid)
+            return True
+
+        # Hard failsafe: never let the gate block beyond preconnect_grace.
+        try:
+            grace_s = float(getattr(self, "preconnect_grace", 0) or 0)
+        except Exception:
+            grace_s = 0.0
+        if grace_s > 0 and elapsed >= grace_s:
+            self._log_launch_gate_debug(
+                f"open:failsafe:{gate_uid}",
+                f"open uid={gate_uid} reason=preconnect_grace elapsed={elapsed:.1f}s grace={grace_s:.1f}s",
+                min_interval_s=0.0,
+            )
+            self._clear_launch_gate(gate_uid)
+            return True
+
+        seen = None
+        if isinstance(strict_log_matches, dict):
+            seen = strict_log_matches.get(gate_uid, None)
+            if seen is not None:
+                seen = bool(seen)
+        if not bool(seen):
+            # Refresh the username->log map opportunistically while waiting so
+            # the gate can react quickly to newly written logs.
+            try:
+                last_refresh = float(getattr(self, "_last_gate_log_refresh_at", 0.0) or 0.0)
+            except Exception:
+                last_refresh = 0.0
+            if (ts - last_refresh) >= 1.0:
+                try:
+                    refresh_username_log_map()
+                except Exception:
+                    pass
+                try:
+                    self._last_gate_log_refresh_at = ts
+                except Exception:
+                    pass
+            seen = bool(seen) or self._user_has_strict_log_match(gate_uid)
+
+        if bool(seen):
+            self._log_launch_gate_debug(
+                f"open:strict_seen:{gate_uid}",
+                f"open uid={gate_uid} reason=strict_log_match elapsed={elapsed:.1f}s",
+                min_interval_s=0.0,
+            )
+            self._clear_launch_gate(gate_uid)
+            return True
+
+        grace_text = f"{grace_s:.1f}s" if grace_s > 0 else "off"
+        self._log_launch_gate_debug(
+            f"wait:strict_missing:{gate_uid}:{int(elapsed)}",
+            f"wait uid={gate_uid} reason=strict_log_missing elapsed={elapsed:.1f}s grace={grace_text}",
+            min_interval_s=1.0,
+        )
+        return False
+
+    def _wait_for_launch_gate_ready(self) -> bool:
+        if not self.launch_wait_for_log_mode:
+            return True
+        if self._is_launch_gate_ready():
+            return True
+        wait_started = time.time()
+        self._log_launch_gate_debug(
+            "wait_loop:start",
+            "blocking launch until latest launched user is confirmed in logs",
+            min_interval_s=0.0,
+        )
+        while self.running:
+            if self._is_launch_gate_ready():
+                waited = max(0.0, time.time() - wait_started)
+                self._log_launch_gate_debug(
+                    f"wait_loop:release:{int(waited)}",
+                    f"release after {waited:.1f}s",
+                    min_interval_s=0.0,
+                )
+                return True
+            time.sleep(0.1)
+        self._log_launch_gate_debug(
+            "wait_loop:stop",
+            "aborted while waiting because worker stopped",
+            min_interval_s=0.0,
+        )
+        return False
+
+    def _maybe_trigger_msedge_kill_for_user(self, uid: str, *, strict_log_seen: bool) -> None:
+        if not strict_log_seen:
+            return
+        if not bool(getattr(self, "msedgewebview2_limiter_enabled", True)):
+            return
+        should_kill = False
+        uid_s = str(uid)
+        try:
+            with self._launch_tracking_lock:
+                if self._latest_launch_pending_uid == uid_s:
+                    self._latest_launch_pending_uid = None
+                    should_kill = True
+        except Exception:
+            should_kill = False
+
+        if not should_kill:
+            return
+        try:
+            limit_msedgewebview2_processes(threshold=1, kill_all=True)
+        except Exception:
+            pass
+
+    def _all_live_users_in_menu_false(self, *, live_by_uid: Optional[dict], multiscope_rows: Optional[list]) -> bool:
+        if not isinstance(live_by_uid, dict):
+            return False
+        live_uids = {str(uid) for uid, is_live in live_by_uid.items() if bool(is_live)}
+        if not live_uids:
+            return False
+        if not isinstance(multiscope_rows, list) or not multiscope_rows:
+            return False
+
+        in_menu_by_uid: Dict[str, Optional[bool]] = {}
+        for row in multiscope_rows:
+            if not isinstance(row, dict):
+                continue
+            users = row.get("users", [])
+            if not isinstance(users, (list, tuple, set)):
+                continue
+            val = row.get("in_menu", None)
+            in_menu_val = None if val is None else bool(val)
+            for uid in users:
+                uid_s = str(uid or "").strip()
+                if uid_s:
+                    in_menu_by_uid[uid_s] = in_menu_val
+
+        for uid_s in live_uids:
+            if in_menu_by_uid.get(uid_s, None) is not False:
+                return False
+        return True
+
+    def _drive_msedge_kill_timed_loop(
+        self,
+        *,
+        live_by_uid: Optional[dict],
+        multiscope_rows: Optional[list],
+        now: Optional[float] = None,
+    ) -> None:
+        if not bool(getattr(self, "msedgewebview2_limiter_enabled", True)):
+            self._msedge_timed_loop_active = False
+            self._msedge_timed_loop_next_at = 0.0
+            return
+
+        try:
+            ts = time.time() if now is None else float(now)
+        except Exception:
+            ts = time.time()
+
+        launched_all_configured = True
+        if not isinstance(self.user_states, dict) or not self.user_states:
+            launched_all_configured = False
+        else:
+            for uid, st in self.user_states.items():
+                _st = st if isinstance(st, dict) else {}
+                info = _st.get("user_info", {}) if isinstance(_st, dict) else {}
+                if not isinstance(info, dict):
+                    info = {}
+                if bool(info.get("disabled", False) or info.get("bad", False) or info.get("cap", False)):
+                    continue
+                try:
+                    if float(_st.get("last_launch", 0) or 0) <= 0:
+                        launched_all_configured = False
+                        break
+                except Exception:
+                    launched_all_configured = False
+                    break
+
+        all_in_menu_false = self._all_live_users_in_menu_false(
+            live_by_uid=live_by_uid,
+            multiscope_rows=multiscope_rows,
+        )
+
+        should_run = bool(launched_all_configured and all_in_menu_false)
+        if not should_run:
+            self._msedge_timed_loop_active = False
+            self._msedge_timed_loop_next_at = 0.0
+            return
+
+        if not bool(self._msedge_timed_loop_active):
+            self._msedge_timed_loop_active = True
+            self._msedge_timed_loop_next_at = 0.0
+
+        try:
+            next_at = float(getattr(self, "_msedge_timed_loop_next_at", 0.0) or 0.0)
+        except Exception:
+            next_at = 0.0
+        if ts < next_at:
+            return
+
+        try:
+            limit_msedgewebview2_processes(threshold=1, kill_all=True)
+        except Exception:
+            pass
+
+        try:
+            interval = max(0.25, float(getattr(self, "_msedge_timed_loop_interval_s", 2.0) or 2.0))
+        except Exception:
+            interval = 2.0
+        self._msedge_timed_loop_next_at = ts + interval
 
     def _is_log_disconnect_payload(self, payload: str) -> bool:
         p = str(payload or "").strip().lower()
@@ -3199,6 +3634,9 @@ class WorkerThread(QThread):
             override["place"] = str(donor_live_place)
             server_label = f"Public:{donor_live_place}"
 
+        if not self._wait_for_launch_gate_ready():
+            return False
+
         # Reserve this server while the spare is spinning up
         self._reserve_server(server_label, spare_uid, "handoff")
 
@@ -3206,7 +3644,9 @@ class WorkerThread(QThread):
         ok = self.launcher.start_game_session(spare_uid, cookie, override)
         if ok:
             self.handoff_for[donor_uid] = spare_uid
-            self.user_states[spare_uid]["last_launch"] = time.time()
+            now2 = time.time()
+            self.user_states[spare_uid]["last_launch"] = now2
+            self._register_successful_launch(spare_uid, now2)
             self._log(
                 f"Spare {spare_uid} pre-joined {donor_uid}'s server"
                 + (f" (owner-pref: {donor_owner})" if donor_owner else "")
@@ -3473,6 +3913,18 @@ class WorkerThread(QThread):
         self.manager.timeouts["offline"]       = t.get("offline", 35)
         self.manager.timeouts["initial_delay"] = t.get("initial_delay", 4)
         self.strap_threshold                    = t.get("strap_threshold", 50)
+        misc_cfg = cfg.get("misc", {}) or {}
+        if not isinstance(misc_cfg, dict):
+            misc_cfg = {}
+        self.launch_wait_for_log_mode = bool(misc_cfg.get("log_confirmed_launch_mode", False))
+        self.msedgewebview2_limiter_enabled = bool(
+            misc_cfg.get("msedgewebview2_limiter_enabled", True)
+        )
+        if not self.launch_wait_for_log_mode:
+            self._clear_launch_gate()
+        if not self.msedgewebview2_limiter_enabled:
+            self._msedge_timed_loop_active = False
+            self._msedge_timed_loop_next_at = 0.0
 
         tm = cfg.get("timeout_monitor", {})
         self.manager.timeout_monitor.kill_enabled  = bool(tm.get("kill_enabled", True))
@@ -3516,9 +3968,6 @@ class WorkerThread(QThread):
         try:
             if self.ms:
                 ms_cfg = (cfg.get("multiscope") or {})
-                misc_cfg = cfg.get("misc", {}) or {}
-                if not isinstance(misc_cfg, dict):
-                    misc_cfg = {}
                 self.ms.configure_webhooks(
                     biome_webhooks=cfg.get("webhooks", []),             # [{"url": "...", "biomes": [...], "biome_modes": {...}}, ...]
                     merchant_hook=ms_cfg.get("merchant_webhook", ""),
@@ -3578,6 +4027,8 @@ class WorkerThread(QThread):
                     live = []
                 if live:
                     continue
+                if not self._wait_for_launch_gate_ready():
+                    break
 
                 cookie = info.get("cookie", "")
                 attempted = False
@@ -3591,6 +4042,7 @@ class WorkerThread(QThread):
                             self.user_states[uid]["inactive_since"] = None
                             self.user_states[uid]["requires_restart"] = False
                             self.user_states[uid]["status"] = "Restarting"
+                            self._register_successful_launch(uid, now2)
                         else:
                             self.user_states[uid]["requires_restart"] = True
                             if self.user_states[uid].get("status") not in ("Bad", "CAP", "Disabled"):
@@ -3616,7 +4068,7 @@ class WorkerThread(QThread):
 
                 # Apply initial_delay only BETWEEN attempted launches, so Pause->Resume doesn't
                 # hold initialization_mode for ages when all users are already running.
-                if attempted and i < total - 1:
+                if (not self.launch_wait_for_log_mode) and attempted and i < total - 1:
                     ticks = max(0, int(self.initial_delay * 10))  # 0.1s steps for responsive stop()
                     for _ in range(ticks):
                         if not self.running:
@@ -3649,11 +4101,13 @@ class WorkerThread(QThread):
             cookie = info.get("cookie", "") if isinstance(info, dict) else info
             ok = self.launcher.start_game_session(user_id, cookie, info)
             if ok:
+                now2 = time.time()
                 self.user_states[user_id]["inactive_since"] = None
                 self.user_states[user_id]["requires_restart"] = False
                 self.user_states[user_id]["skip_reconnect_on_disconnect"] = False
                 self.user_states[user_id]["status"] = "Restarting"
-                self.user_states[user_id]["last_launch"] = time.time()
+                self.user_states[user_id]["last_launch"] = now2
+                self._register_successful_launch(user_id, now2)
             return ok
         except Exception:
             return False
@@ -3678,11 +4132,13 @@ class WorkerThread(QThread):
             cookie = str(info.get("cookie", "") or "")
             ok = bool(self.launcher.start_game_session(user_id, cookie, info, skip_cleanup=bool(skip_cleanup)))
             if ok:
+                now2 = time.time()
                 self.user_states[user_id]["inactive_since"] = None
                 self.user_states[user_id]["requires_restart"] = False
                 self.user_states[user_id]["skip_reconnect_on_disconnect"] = False
                 self.user_states[user_id]["status"] = "Restarting"
-                self.user_states[user_id]["last_launch"] = time.time()
+                self.user_states[user_id]["last_launch"] = now2
+                self._register_successful_launch(user_id, now2)
             return ok
         except Exception:
             return False
@@ -3955,6 +4411,8 @@ class WorkerThread(QThread):
                 # per-user heartbeat
                 status = {}
                 kill_t = self.manager.timeout_monitor.kill_timeout
+                strict_log_matches = {}
+                live_by_uid = {}
 
                 for uid, st in list(self.user_states.items()):
                     info = st["user_info"]
@@ -4007,6 +4465,7 @@ class WorkerThread(QThread):
 
                     live = [pid for pid in self.manager.process_tracker.user_processes.get(uid, [])
                             if self.process_mgr.verify_process_active(pid)]
+                    live_by_uid[uid] = bool(live)
                     
                     # --- NEW: pre-connect watchdog -------------------------------------------
                     # If this account has live processes but we still don't have a strict log
@@ -4018,12 +4477,33 @@ class WorkerThread(QThread):
                     if live:
                         # Strict lookup: only returns a path once the username actually appears in logs
                         log_path = find_log_for_username(uname, allow_fallback=False)
+                        strict_log_matches[uid] = bool(log_path)
                         if log_path:
                             st["log_miss_streak"] = 0
+                            self._mark_user_log_confirmed(uid)
+                            self._maybe_trigger_msedge_kill_for_user(uid, strict_log_seen=True)
 
                         if not log_path:
-                            # oldest process start for this user
-                            oldest_ct = min(self.manager.process_tracker.creation_timestamps.get(pid, now) for pid in live)
+                            # oldest process start for this user. If per-PID create times are
+                            # missing, fall back to this user's last launch timestamp so the
+                            # preconnect watchdog still advances.
+                            ct_candidates = []
+                            for pid in live:
+                                try:
+                                    ct = float(self.manager.process_tracker.creation_timestamps.get(pid, 0) or 0)
+                                except Exception:
+                                    ct = 0.0
+                                if ct > 0:
+                                    ct_candidates.append(ct)
+                            if not ct_candidates:
+                                try:
+                                    fallback_ct = float(st.get("last_launch", 0) or 0)
+                                except Exception:
+                                    fallback_ct = 0.0
+                                if fallback_ct <= 0:
+                                    fallback_ct = now
+                                ct_candidates.append(fallback_ct)
+                            oldest_ct = min(ct_candidates)
                             waited = now - oldest_ct
 
                             if waited >= self.preconnect_grace:
@@ -4057,6 +4537,9 @@ class WorkerThread(QThread):
                                 except Exception:
                                     pass
                                 live = []
+                                live_by_uid[uid] = False
+                    else:
+                        strict_log_matches[uid] = False
 
                     # --- end pre-connect watchdog ---
 
@@ -4132,6 +4615,15 @@ class WorkerThread(QThread):
                         "server_owner": server_owner,
                     }
 
+                try:
+                    self._is_launch_gate_ready(
+                        now=time.time(),
+                        strict_log_matches=strict_log_matches,
+                        live_by_uid=live_by_uid,
+                    )
+                except Exception:
+                    pass
+
                 # After building status, keep pools synced with 'good' users immediately
                 try:
                     current_good = {
@@ -4146,6 +4638,7 @@ class WorkerThread(QThread):
                     self._log(f"[Pools] good-set recompute error: {_e}")
 
                 self.status_signal.emit(status)
+                ms_rows_for_limiter = None
                 
                 # Multiscope: update detection and push snapshot to the tab
                 try:
@@ -4248,9 +4741,19 @@ class WorkerThread(QThread):
                         elif rows and self._bootstrap_multiscope_rows:
                             self._bootstrap_multiscope_rows = None
                             self._bootstrap_multiscope_deadline = 0.0
+                        ms_rows_for_limiter = rows if isinstance(rows, list) else None
                         self.multiscope_signal.emit(rows)    # GUI will render it
                 except Exception as _e:
                     self._log(f"[Multiscope] tick error: {_e}")
+
+                try:
+                    self._drive_msedge_kill_timed_loop(
+                        live_by_uid=live_by_uid,
+                        multiscope_rows=ms_rows_for_limiter,
+                        now=time.time(),
+                    )
+                except Exception:
+                    pass
 
                 # process table signal
                 proc_info = {}
@@ -4277,6 +4780,11 @@ class WorkerThread(QThread):
                     # Per-user gating: honor backoff and per-user launch_delay up front,
                     # so we don't keep picking the same blocked uid over and over.
                     now = time.time()
+                    launch_gate_open = self._is_launch_gate_ready(
+                        now=now,
+                        strict_log_matches=strict_log_matches,
+                        live_by_uid=live_by_uid,
+                    )
                     def _eligible_now(u: str) -> bool:
                         st = self.user_states.get(u, {})
                         info = st.get("user_info", {})
@@ -4306,7 +4814,7 @@ class WorkerThread(QThread):
                     if self._boot_phase:
                         ordered = []
 
-                    if ordered and (now - self.timing_trackers['relaunch']) >= _global_gate:
+                    if ordered and launch_gate_open and (now - self.timing_trackers['relaunch']) >= _global_gate:
                         launched = False
 
                         for uid in ordered:
@@ -4333,11 +4841,13 @@ class WorkerThread(QThread):
 
                             # Safe to try launching
                             if self.launcher.start_game_session(uid, cookie, info):
+                                now2 = time.time()
                                 self.user_states[uid]["inactive_since"]   = None
                                 self.user_states[uid]["requires_restart"] = False
                                 self.user_states[uid]["status"]           = "Restarting"
-                                self.user_states[uid]["last_launch"]      = now
-                                self.timing_trackers['relaunch']          = now
+                                self.user_states[uid]["last_launch"]      = now2
+                                self.timing_trackers['relaunch']          = now2
+                                self._register_successful_launch(uid, now2)
                                 # Move round-robin forward from the *next* uid
                                 self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
                                 launched = True
@@ -4510,6 +5020,9 @@ class UserManagementDialogLegacy(QDialog):
             "webhooks": "Webhooks",
             "ui.webhooks_hidden_biomes": "Hidden Webhook Biome Columns",
             "ui.show_tutorial_menu": "Show Tutorial Menu Item",
+            "misc.skip_webhook_unknown_context": "Skip Unknown-Context Webhooks",
+            "misc.log_confirmed_launch_mode": "Launch Next After Log Confirm",
+            "misc.msedgewebview2_limiter_enabled": "Enable msedgewebview2 Limiter",
             "multiscope.merchant_webhook": "Merchant Webhook URL",
             "multiscope.enable_jester": "Enable Jester Pings",
             "multiscope.enable_mari": "Enable Mari Pings",
@@ -6983,6 +7496,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.ocr_verification_roi: Optional[Tuple[float, float, float, float]] = None
         self._last_ocr_log: Optional[str] = None
         self._ocr_test_last_hash: Optional[int] = None
+        self.log_autoscroll: bool = True
         self.ocr_log_autoscroll: bool = True
         self._last_ocr_device_id = None
         self._loading_ocr_settings = False
@@ -7053,6 +7567,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "webhooks": "Webhooks",
             "ui.webhooks_hidden_biomes": "Hidden Webhook Biome Columns",
             "ui.show_tutorial_menu": "Show Tutorial Menu Item",
+            "misc.skip_webhook_unknown_context": "Skip Unknown-Context Webhooks",
+            "misc.log_confirmed_launch_mode": "Launch Next After Log Confirm",
+            "misc.msedgewebview2_limiter_enabled": "Enable msedgewebview2 Limiter",
             "multiscope.merchant_webhook": "Merchant Webhook URL",
             "multiscope.enable_jester": "Enable Jester Pings",
             "multiscope.enable_mari": "Enable Mari Pings",
@@ -8218,9 +8735,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.launch_debug_chk = QCheckBox("Launch Debug", self)
         self.launch_debug_chk.setChecked(False)  # hidden by default
         controls_layout.addWidget(self.launch_debug_chk)
+
+        self.launch_gate_debug_chk = QCheckBox("Launch Gate Debug", self)
+        self.launch_gate_debug_chk.setChecked(False)
+        controls_layout.addWidget(self.launch_gate_debug_chk)
          
         self.auto_scroll_checkbox = QCheckBox("Auto-scroll")
         self.auto_scroll_checkbox.setChecked(True)
+        self.log_autoscroll = bool(self.auto_scroll_checkbox.isChecked())
+        self.auto_scroll_checkbox.toggled.connect(lambda checked: setattr(self, "log_autoscroll", bool(checked)))
         controls_layout.addWidget(self.auto_scroll_checkbox)
 
         layout.addLayout(controls_layout)
@@ -8935,7 +9458,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         """Qt slot: keep Anti-AFK buttons and inputs in sync with worker state."""
         enabled = bool(enabled)
         for w in (
-            getattr(self, "antiafk_interval_spin", None),
             getattr(self, "antiafk_action_combo", None),
             getattr(self, "antiafk_alt_delay_spin", None),
             getattr(self, "antiafk_alert_sound_chk", None),
@@ -13098,6 +13620,18 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "When enabled, webhook messages are suppressed if the owner or private server is unknown."
         )
         misc_layout.addRow(self.misc_skip_unknown_webhook_chk)
+        self.misc_log_confirmed_launch_mode_chk = QCheckBox("Launch only after previous fully launched")
+        self.misc_log_confirmed_launch_mode_chk.setToolTip(
+            "When enabled, launch delays are treated as minimums and the next account will launch only after "
+            "the latest launched account's username is found in logs (Finished Verification)."
+        )
+        misc_layout.addRow(self.misc_log_confirmed_launch_mode_chk)
+        self.misc_msedgewebview2_limiter_enabled_chk = QCheckBox("Enable msedgewebview2 Limiter")
+        self.misc_msedgewebview2_limiter_enabled_chk.setToolTip(
+            "When enabled, msedgewebview2.exe processes are killed after launch log confirmation. (May interfere with Edge Browser)"
+        )
+        self.misc_msedgewebview2_limiter_enabled_chk.setChecked(True)
+        misc_layout.addRow(self.misc_msedgewebview2_limiter_enabled_chk)
         content_layout.addWidget(misc_box)
 
         # ── Webhooks (Per-webhook biome filters) ─────────────────────────────────
@@ -14923,12 +15457,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 pass
 
+            autoscroll = bool(getattr(self, "log_autoscroll", True))
             try:
-                if self.auto_scroll_checkbox.isChecked():
-                    scrollbar = log_display.verticalScrollBar()
-                    scrollbar.setValue(scrollbar.maximum())
+                chk = getattr(self, "auto_scroll_checkbox", None)
+                if chk is not None:
+                    autoscroll = bool(chk.isChecked())
             except Exception:
                 pass
+            if autoscroll:
+                try:
+                    scrollbar = log_display.verticalScrollBar()
+                    scrollbar.setValue(scrollbar.maximum())
+                except Exception:
+                    pass
         finally:
             try:
                 self._flush_ocr_log_queue()
@@ -15110,9 +15651,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             chk = getattr(self, "scan_trace_chk", None)
             if chk is not None and not chk.isChecked():
                 return
-        if message.startswith("[MultiScope] BIOME "):
+        if (
+            message.startswith("[MultiScope] BIOME ")
+            or message.startswith("[MultiScope] Skipping webhook")
+        ):
             chk = getattr(self, "multiscope_biome_chk", None)
             if not (chk and chk.isChecked()):
+                return
+        if message.startswith("[LaunchGate]"):
+            chk = getattr(self, "launch_gate_debug_chk", None)
+            if chk is not None and not chk.isChecked():
                 return
         if (
             not bool(getattr(self, "launch_debug_chk", None) and self.launch_debug_chk.isChecked())
@@ -15541,6 +16089,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "skip_webhook_unknown_context": bool(
                     self.misc_skip_unknown_webhook_chk.isChecked()
                 ) if hasattr(self, "misc_skip_unknown_webhook_chk") else False,
+                "log_confirmed_launch_mode": bool(
+                    self.misc_log_confirmed_launch_mode_chk.isChecked()
+                ) if hasattr(self, "misc_log_confirmed_launch_mode_chk") else False,
+                "msedgewebview2_limiter_enabled": bool(
+                    self.misc_msedgewebview2_limiter_enabled_chk.isChecked()
+                ) if hasattr(self, "misc_msedgewebview2_limiter_enabled_chk") else True,
             },
         }
         return snapshot
@@ -15811,8 +16365,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         # ---------- Misc ----------
         misc = settings.get("misc", {}) or {}
         skip_unknown = None
+        log_confirmed_launch_mode = None
+        msedge_limiter_enabled = None
         if isinstance(misc, dict) and "skip_webhook_unknown_context" in misc:
             skip_unknown = bool(misc.get("skip_webhook_unknown_context", False))
+        if isinstance(misc, dict) and "log_confirmed_launch_mode" in misc:
+            log_confirmed_launch_mode = bool(misc.get("log_confirmed_launch_mode", False))
+        if isinstance(misc, dict) and "msedgewebview2_limiter_enabled" in misc:
+            msedge_limiter_enabled = bool(misc.get("msedgewebview2_limiter_enabled", True))
         if skip_unknown is None:
             ocr_cfg = settings.get("ocr", {}) or {}
             if isinstance(ocr_cfg, dict) and "skip_webhook_unknown_context" in ocr_cfg:
@@ -15821,8 +16381,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             skip_unknown = bool(
                 self.config_manager.default_settings.get("misc", {}).get("skip_webhook_unknown_context", False)
             )
+        if log_confirmed_launch_mode is None:
+            log_confirmed_launch_mode = bool(
+                self.config_manager.default_settings.get("misc", {}).get("log_confirmed_launch_mode", False)
+            )
+        if msedge_limiter_enabled is None:
+            msedge_limiter_enabled = bool(
+                self.config_manager.default_settings.get("misc", {}).get("msedgewebview2_limiter_enabled", True)
+            )
         if hasattr(self, "misc_skip_unknown_webhook_chk"):
             self.misc_skip_unknown_webhook_chk.setChecked(bool(skip_unknown))
+        if hasattr(self, "misc_log_confirmed_launch_mode_chk"):
+            self.misc_log_confirmed_launch_mode_chk.setChecked(bool(log_confirmed_launch_mode))
+        if hasattr(self, "misc_msedgewebview2_limiter_enabled_chk"):
+            self.misc_msedgewebview2_limiter_enabled_chk.setChecked(bool(msedge_limiter_enabled))
 
         # ---------- OCR tab ----------
         self._apply_ocr_settings_to_ui(settings.get("ocr", {}))
@@ -16073,6 +16645,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             misc = {}
         if hasattr(self, "misc_skip_unknown_webhook_chk"):
             misc["skip_webhook_unknown_context"] = bool(self.misc_skip_unknown_webhook_chk.isChecked())
+        if hasattr(self, "misc_log_confirmed_launch_mode_chk"):
+            misc["log_confirmed_launch_mode"] = bool(self.misc_log_confirmed_launch_mode_chk.isChecked())
+        if hasattr(self, "misc_msedgewebview2_limiter_enabled_chk"):
+            misc["msedgewebview2_limiter_enabled"] = bool(
+                self.misc_msedgewebview2_limiter_enabled_chk.isChecked()
+            )
         settings["misc"] = misc
 
         # ---------- OCR settings ----------
@@ -16217,6 +16795,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.misc_skip_unknown_webhook_chk.setChecked(
                 bool(defaults.get("misc", {}).get("skip_webhook_unknown_context", False))
             )
+        if hasattr(self, "misc_log_confirmed_launch_mode_chk"):
+            self.misc_log_confirmed_launch_mode_chk.setChecked(
+                bool(defaults.get("misc", {}).get("log_confirmed_launch_mode", False))
+            )
+        if hasattr(self, "misc_msedgewebview2_limiter_enabled_chk"):
+            self.misc_msedgewebview2_limiter_enabled_chk.setChecked(
+                bool(defaults.get("misc", {}).get("msedgewebview2_limiter_enabled", True))
+            )
 
         QMessageBox.information(
             self,
@@ -16301,7 +16887,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def show_about(self):
         config_info = self.config_manager.get_config_info()
         QMessageBox.about(self, "About J.JARAM",
-                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x44\n\n"
+                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x47\n\n"
                          "Advanced multi-account Roblox session manager\n"
                          "with automated log based monitoring and process management.\n\n"
                          "Built with PySide6 and modern design principles.\n\n"
@@ -17816,7 +18402,7 @@ def main():
     app = QApplication(sys.argv)
 
     app.setApplicationName("J.JARAM")
-    app.setApplicationVersion("JX 2x44")
+    app.setApplicationVersion("JX 2x47")
     app.setOrganizationName("Jirach1")
     # Qt 6 ships a Windows 11 style that can change widget visuals. Force the
     # Windows 10-era style for consistent UI across OS versions.

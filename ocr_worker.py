@@ -626,12 +626,16 @@ def _normalize_text(s: str) -> str:
     return " ".join(s.lower().split())
 
 
-def _fuzzy_match(line: str, target: str, threshold: float = 0.7) -> bool:
+def _fuzzy_ratio(line: str, target: str) -> float:
     l = _normalize_text(line)
     t = _normalize_text(target)
     if not l or not t:
-        return False
-    return difflib.SequenceMatcher(None, l, t).ratio() >= threshold
+        return 0.0
+    return difflib.SequenceMatcher(None, l, t).ratio()
+
+
+def _fuzzy_match(line: str, target: str, threshold: float = 0.7) -> bool:
+    return _fuzzy_ratio(line, target) >= threshold
 
 
 def detect_merchant_type(text: str) -> Optional[str]:
@@ -652,12 +656,25 @@ def detect_merchant_type(text: str) -> Optional[str]:
                 return "mari"
             if "rin" in block_lower and "arrived" in block_lower and "island" in block_lower:
                 return "rin"
-            if _fuzzy_match(block, MERCHANT_LINES["jester"]):
-                return "jester"
-            if _fuzzy_match(block, MERCHANT_LINES["mari"]):
-                return "mari"
-            if _fuzzy_match(block, MERCHANT_LINES["rin"]):
-                return "rin"
+            scores = {
+                "jester": _fuzzy_ratio(block, MERCHANT_LINES["jester"]),
+                "mari": _fuzzy_ratio(block, MERCHANT_LINES["mari"]),
+                "rin": _fuzzy_ratio(block, MERCHANT_LINES["rin"]),
+            }
+            best_name, best_score = max(scores.items(), key=lambda kv: kv[1])
+            if best_score >= 0.7:
+                mari_score = scores["mari"]
+                rin_score = scores["rin"]
+                # Rare OCR ambiguity: Mari vs Rin can be very close when the name is noisy.
+                # Prefer punctuation cues to avoid false Mari hits on Rin lines.
+                if mari_score >= 0.7 and rin_score >= 0.7 and abs(mari_score - rin_score) <= 0.02:
+                    has_ellipsis = "..." in block
+                    has_exclaim = "!" in block
+                    if has_exclaim and not has_ellipsis:
+                        return "rin"
+                    if has_ellipsis:
+                        return "mari"
+                return best_name
     return None
 
 
@@ -890,13 +907,13 @@ def _filters_from_cfg(raw_filters: List[Dict[str, Any]]) -> List[ColorFilter]:
         filters = [
             ColorFilter("Mari", 255, 255, 255, 40, True),
             ColorFilter("Jester", 145, 67, 255, 40, True),
-            ColorFilter("Rin", 230, 125, 62, 60, True),
+            ColorFilter("Rin", 255, 138, 68, 60, True),
         ]
     else:
         # Backfill Rin for older settings files that only had Mari/Jester filters.
         names = {(cf.name or "").strip().lower() for cf in filters if (cf.name or "").strip()}
         if "rin" not in names:
-            filters.append(ColorFilter("Rin", 230, 125, 62, 60, True))
+            filters.append(ColorFilter("Rin", 255, 138, 68, 60, True))
     return filters
 
 
