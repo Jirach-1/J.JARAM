@@ -6,6 +6,7 @@ import json
 import time
 import os
 import shutil
+import uuid
 import requests
 import re
 import threading
@@ -22,7 +23,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QComboBox, QCheckBox, QSplitter,
                             QAbstractSpinBox, QStyle, QStyleOptionSpinBox,
                             QHeaderView, QMessageBox, QDialog, QDialogButtonBox,
-                            QFormLayout, QScrollArea, QSizePolicy,
+                            QFormLayout, QScrollArea, QSizePolicy, QFileDialog,
                             QAbstractScrollArea,
                             QAbstractItemView, QHeaderView, QScrollArea, QRubberBand,
                             QRadioButton, QListWidget, QListWidgetItem, QKeySequenceEdit)
@@ -42,6 +43,7 @@ from PySide6.QtCore import (
     QRect,
     QPoint,
     QAbstractNativeEventFilter,
+    QEventLoop,
 )
 from PySide6.QtGui import QFont, QIcon, QColor, QPixmap, QMovie, QRegion, QPainter, QPainterPath, QImage, QTextCursor, QKeySequence, QBrush
 
@@ -477,15 +479,73 @@ from ocr_worker import (
     capture_window_image,
     preprocess_for_ocr,
     ColorFilter,
+    get_default_ocr_filters,
     get_ocr_device_summary,
     get_ocr_available_devices,
     compute_frame_hash,
     frame_hash_diff_percent,
 )
 
+OCR_MERCHANT_FILTER_IDS = {"merchant_jester", "merchant_mari", "merchant_rin"}
+OCR_MERCHANT_FILTER_NAMES = {"jester", "mari", "rin", "white_text", "purple_text", "orange_text"}
+MISC_DISABLE_LOG_MERCHANTS_WHEN_OCR_ACTIVE_KEY = (
+    "disable_log_based_merchant_detection_when_ocr_merchants_enabled"
+)
+
+
+def _candidate_ocr_filters_from_cfg(ocr_cfg: object) -> List[dict]:
+    if not isinstance(ocr_cfg, dict):
+        return []
+
+    raw_filters = ocr_cfg.get("filters")
+    if isinstance(raw_filters, list) and raw_filters:
+        return [item for item in raw_filters if isinstance(item, dict)]
+
+    legacy_filters = ocr_cfg.get("color_filters")
+    if isinstance(legacy_filters, list) and legacy_filters:
+        return [item for item in legacy_filters if isinstance(item, dict)]
+
+    try:
+        defaults = get_default_ocr_filters()
+    except Exception:
+        defaults = []
+    return [item for item in defaults if isinstance(item, dict)]
+
+
+def _ocr_merchant_filters_enabled_in_cfg(ocr_cfg: object) -> bool:
+    if not isinstance(ocr_cfg, dict):
+        return False
+    if not bool(ocr_cfg.get("enabled", False)):
+        return False
+
+    for spec in _candidate_ocr_filters_from_cfg(ocr_cfg):
+        if not bool(spec.get("enabled", True)):
+            continue
+        filter_id = str(spec.get("id") or spec.get("filter_id") or "").strip()
+        behavior = str(spec.get("behavior") or "").strip().lower()
+        name = str(spec.get("name") or "").strip().lower()
+        if (
+            filter_id in OCR_MERCHANT_FILTER_IDS
+            or behavior == "merchant"
+            or name in OCR_MERCHANT_FILTER_NAMES
+        ):
+            return True
+    return False
+
+
+def _should_disable_log_based_merchant_detection(settings_cfg: object) -> bool:
+    if not isinstance(settings_cfg, dict):
+        return False
+    misc_cfg = settings_cfg.get("misc")
+    if not isinstance(misc_cfg, dict):
+        misc_cfg = {}
+    if not bool(misc_cfg.get(MISC_DISABLE_LOG_MERCHANTS_WHEN_OCR_ACTIVE_KEY, True)):
+        return False
+    return _ocr_merchant_filters_enabled_in_cfg(settings_cfg.get("ocr"))
+
 # --- Auto Item engine (local module) ---
 try:
-    from auto_item_automation import AutoItemEngine  # type: ignore
+    from auto_actions_automation import AutoActionEngine as AutoItemEngine  # type: ignore
 except Exception:  # pragma: no cover
     AutoItemEngine = None  # type: ignore
 
@@ -696,6 +756,7 @@ class ConfigManager:
                 "enable_jester": True,
                 "enable_mari": True,
                 "enable_rin": True,
+                "merchant_detection_mode": "asset_id",
                 "jester_ping": "",
                 "mari_ping": "",
                 "rin_ping": "",
@@ -704,27 +765,24 @@ class ConfigManager:
             },
             "ocr": {
                 "enabled": False,             # current desired state
+                "only_mapped_pids": False,
                 "workers": 1,
                 "max_captures_per_second": 20,
                 "batch_delay_seconds": 1.0,
-                "cooldown_seconds": 600,
                 "use_preprocess": True,
                 "frame_diff_tolerance": 2,    # percent (skip OCR if frame changes <= this)
                 "log_ocr_text": False,        # debug: include OCR text in OCR log
                 "log_loop": True,             # include per-loop "[Loop N]" logs in OCR log
                 "device_id": None,            # None => auto/default
                 "roi": {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
-                "verification_roi": {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
-                "color_filters": [
-                    {"name": "Mari", "r": 255, "g": 255, "b": 255, "tol": 60, "enabled": True},
-                    {"name": "Jester", "r": 145, "g": 67, "b": 255, "tol": 60, "enabled": True},
-                    {"name": "Rin", "r": 255, "g": 138, "b": 68, "tol": 60, "enabled": True},
-                    {"name": "Verification Check", "r": 255, "g": 255, "b": 255, "tol": 60, "enabled": True},
-                ],
+                "shared_areas": [],
+                "filters": get_default_ocr_filters(),
             },
             "misc": {
                 "skip_webhook_unknown_context": True,
+                "disable_log_based_merchant_detection_when_ocr_merchants_enabled": True,
                 "log_confirmed_launch_mode": False,
+                "disable_manager_bad_marking": False,
                 "msedgewebview2_limiter_enabled": True,
             },
             "ui": {
@@ -775,16 +833,8 @@ class ConfigManager:
                    "disable_mouse_move": False,
                    "toggle_hotkey": "Ctrl+Alt+Space",
                    "users": [],
-                  "coords": {
-                     # Required coords are populated by the Auto Item tab (kept empty by default).
-                     "conditional": {
-                        "enabled": False,
-                        "point": {"x": 0.0, "y": 0.0},
-                        "color": "#FFFFFF",
-                        "tolerance": 10,
-                     }
-                 },
-                  "items": [],
+                   "presets": [],
+                   "items": [],
               },
 
             "bes": {
@@ -2098,7 +2148,19 @@ class ConfigManager:
 
         return new_data
 
+    def auto_bad_marking_enabled(self) -> bool:
+        try:
+            settings = self.peek_settings()
+            misc = settings.get("misc", {}) or {}
+            if isinstance(misc, dict):
+                return not bool(misc.get("disable_manager_bad_marking", False))
+        except Exception:
+            pass
+        return True
+
     def mark_bad_cookie(self, user_id: str, state: bool) -> None:
+        if state and not self.auto_bad_marking_enabled():
+            return
         users = self.load_users()
         if user_id in users and users[user_id].get("bad", False) != state:
             username = ""
@@ -2950,7 +3012,13 @@ class WorkerThread(QThread):
         except Exception:
             pass
 
-    def _all_live_users_in_menu_false(self, *, live_by_uid: Optional[dict], multiscope_rows: Optional[list]) -> bool:
+    def _all_live_users_in_menu_false(
+        self,
+        *,
+        live_by_uid: Optional[dict],
+        multiscope_rows: Optional[list],
+        strict_log_matches: Optional[dict] = None,
+    ) -> bool:
         if not isinstance(live_by_uid, dict):
             return False
         live_uids = {str(uid) for uid, is_live in live_by_uid.items() if bool(is_live)}
@@ -2973,7 +3041,19 @@ class WorkerThread(QThread):
                 if uid_s:
                     in_menu_by_uid[uid_s] = in_menu_val
 
+        strict_by_uid = None
+        if isinstance(strict_log_matches, dict):
+            strict_by_uid = {}
+            for uid, seen in strict_log_matches.items():
+                uid_s = str(uid or "").strip()
+                if uid_s:
+                    strict_by_uid[uid_s] = bool(seen)
+
         for uid_s in live_uids:
+            # A reconnecting session is still "unknown" until its username is
+            # seen in the current Roblox logs again.
+            if strict_by_uid is not None and strict_by_uid.get(uid_s, False) is not True:
+                return False
             if in_menu_by_uid.get(uid_s, None) is not False:
                 return False
         return True
@@ -2983,6 +3063,7 @@ class WorkerThread(QThread):
         *,
         live_by_uid: Optional[dict],
         multiscope_rows: Optional[list],
+        strict_log_matches: Optional[dict] = None,
         now: Optional[float] = None,
     ) -> None:
         if not bool(getattr(self, "msedgewebview2_limiter_enabled", True)):
@@ -2995,10 +3076,9 @@ class WorkerThread(QThread):
         except Exception:
             ts = time.time()
 
-        launched_all_configured = True
-        if not isinstance(self.user_states, dict) or not self.user_states:
-            launched_all_configured = False
-        else:
+        launched_all_configured = False
+        eligible_uids: List[str] = []
+        if isinstance(self.user_states, dict) and self.user_states:
             for uid, st in self.user_states.items():
                 _st = st if isinstance(st, dict) else {}
                 info = _st.get("user_info", {}) if isinstance(_st, dict) else {}
@@ -3006,17 +3086,20 @@ class WorkerThread(QThread):
                     info = {}
                 if bool(info.get("disabled", False) or info.get("bad", False) or info.get("cap", False)):
                     continue
-                try:
-                    if float(_st.get("last_launch", 0) or 0) <= 0:
-                        launched_all_configured = False
-                        break
-                except Exception:
+                eligible_uids.append(str(uid))
+
+        if eligible_uids:
+            launched_all_configured = True
+            live_map = live_by_uid if isinstance(live_by_uid, dict) else {}
+            for uid_s in eligible_uids:
+                if not bool(live_map.get(uid_s, False)):
                     launched_all_configured = False
                     break
 
         all_in_menu_false = self._all_live_users_in_menu_false(
             live_by_uid=live_by_uid,
             multiscope_rows=multiscope_rows,
+            strict_log_matches=strict_log_matches,
         )
 
         should_run = bool(launched_all_configured and all_in_menu_false)
@@ -3691,6 +3774,45 @@ class WorkerThread(QThread):
 
 
     # -------------- manager init --------------
+    def _apply_multiscope_webhook_settings(self, cfg: dict) -> None:
+        if not self.ms or not isinstance(cfg, dict):
+            return
+        ms_cfg = cfg.get("multiscope") or {}
+        if not isinstance(ms_cfg, dict):
+            ms_cfg = {}
+        misc_cfg = cfg.get("misc") or {}
+        if not isinstance(misc_cfg, dict):
+            misc_cfg = {}
+        ocr_cfg = cfg.get("ocr") or {}
+        if not isinstance(ocr_cfg, dict):
+            ocr_cfg = {}
+        self.ms.configure_webhooks(
+            biome_webhooks=cfg.get("webhooks", []),
+            merchant_hook=ms_cfg.get("merchant_webhook", ""),
+            enable_jester=ms_cfg.get("enable_jester", True),
+            enable_mari=ms_cfg.get("enable_mari", True),
+            enable_rin=ms_cfg.get("enable_rin", True),
+            jester_ping=ms_cfg.get("jester_ping", ""),
+            mari_ping=ms_cfg.get("mari_ping", ""),
+            rin_ping=ms_cfg.get("rin_ping", ""),
+            merchant_detection_mode=ms_cfg.get("merchant_detection_mode", "asset_id"),
+            disable_log_based_merchant_detection=_should_disable_log_based_merchant_detection(cfg),
+            merchant_rate_limit=float(ms_cfg.get("merchant_rate_limit", 15)),
+            biome_min_interval=float(ms_cfg.get("biome_min_interval", 2)),
+            skip_webhook_unknown_context=bool(
+                misc_cfg.get(
+                    "skip_webhook_unknown_context",
+                    ocr_cfg.get("skip_webhook_unknown_context", False),
+                )
+            ),
+        )
+
+    def refresh_multiscope_settings(self, cfg: dict) -> None:
+        try:
+            self._apply_multiscope_webhook_settings(cfg)
+        except Exception:
+            pass
+
     def initialize_manager(self) -> bool:
         try:
             resume_state = getattr(self, "_resume_state", None) or None
@@ -3853,28 +3975,7 @@ class WorkerThread(QThread):
 
             # Load and push webhook config
             cfg = self.cfg_manager.load_settings() or {}
-            ms_cfg = (cfg.get("multiscope") or {})
-            misc_cfg = cfg.get("misc", {}) or {}
-            if not isinstance(misc_cfg, dict):
-                misc_cfg = {}
-            self.ms.configure_webhooks(
-                biome_webhooks=cfg.get("webhooks", []),             # [{ "url": "...", "biomes": [...] }, ...]
-                merchant_hook=ms_cfg.get("merchant_webhook", ""),
-                enable_jester=ms_cfg.get("enable_jester", True),
-                enable_mari=ms_cfg.get("enable_mari", True),
-                enable_rin=ms_cfg.get("enable_rin", True),
-                jester_ping=ms_cfg.get("jester_ping", ""),
-                mari_ping=ms_cfg.get("mari_ping", ""),
-                rin_ping=ms_cfg.get("rin_ping", ""),
-                merchant_rate_limit=float(ms_cfg.get("merchant_rate_limit", 15)),
-                biome_min_interval=float(ms_cfg.get("biome_min_interval", 2)),
-                skip_webhook_unknown_context=bool(
-                    misc_cfg.get(
-                        "skip_webhook_unknown_context",
-                        cfg.get("ocr", {}).get("skip_webhook_unknown_context", False),
-                    )
-                ),
-            )
+            self._apply_multiscope_webhook_settings(cfg)
 
             # ↓↓↓ ensure spares_mode, delays, and pools are live before first launch
             self.apply_new_settings(cfg)
@@ -3967,27 +4068,7 @@ class WorkerThread(QThread):
         # ── Multiscope webhooks (biomes + merchants) ──
         try:
             if self.ms:
-                ms_cfg = (cfg.get("multiscope") or {})
-                self.ms.configure_webhooks(
-                    biome_webhooks=cfg.get("webhooks", []),             # [{"url": "...", "biomes": [...], "biome_modes": {...}}, ...]
-                    merchant_hook=ms_cfg.get("merchant_webhook", ""),
-                    enable_jester=ms_cfg.get("enable_jester", True),
-                    enable_mari=ms_cfg.get("enable_mari", True),
-                    enable_rin=ms_cfg.get("enable_rin", True),
-                    jester_ping=ms_cfg.get("jester_ping", ""),
-                    mari_ping=ms_cfg.get("mari_ping", ""),
-                    rin_ping=ms_cfg.get("rin_ping", ""),
-                    merchant_rate_limit=float(ms_cfg.get("merchant_rate_limit", 15)),
-                    biome_min_interval=float(ms_cfg.get("biome_min_interval", 2)),
-                    skip_webhook_unknown_context=bool(
-                        misc_cfg.get(
-                            "skip_webhook_unknown_context",
-                            cfg.get("ocr", {}).get("skip_webhook_unknown_context", False),
-                        )
-                    ),
-                    # if you persist per-biome modes, you can pass a merged map here:
-                    # biome_modes=_merge_modes_from_webhooks(cfg.get("webhooks", []))
-                )
+                self._apply_multiscope_webhook_settings(cfg)
         except Exception:
             pass
 
@@ -4750,6 +4831,7 @@ class WorkerThread(QThread):
                     self._drive_msedge_kill_timed_loop(
                         live_by_uid=live_by_uid,
                         multiscope_rows=ms_rows_for_limiter,
+                        strict_log_matches=strict_log_matches,
                         now=time.time(),
                     )
                 except Exception:
@@ -5022,8 +5104,10 @@ class UserManagementDialogLegacy(QDialog):
             "ui.show_tutorial_menu": "Show Tutorial Menu Item",
             "misc.skip_webhook_unknown_context": "Skip Unknown-Context Webhooks",
             "misc.log_confirmed_launch_mode": "Launch Next After Log Confirm",
+            "misc.disable_manager_bad_marking": "Disable Manager BAD Marking",
             "misc.msedgewebview2_limiter_enabled": "Enable msedgewebview2 Limiter",
             "multiscope.merchant_webhook": "Merchant Webhook URL",
+            "multiscope.merchant_detection_mode": "Merchant Detection Mode",
             "multiscope.enable_jester": "Enable Jester Pings",
             "multiscope.enable_mari": "Enable Mari Pings",
             "multiscope.enable_rin": "Enable Rin Pings",
@@ -5033,6 +5117,7 @@ class UserManagementDialogLegacy(QDialog):
             "multiscope.mari_ping_id": "Mari Ping ID",
             "multiscope.rin_ping_type": "Rin Ping Type",
             "multiscope.rin_ping_id": "Rin Ping ID",
+            "misc.disable_log_based_merchant_detection_when_ocr_merchants_enabled": "Disable Log Merchant Detection While OCR Merchants Active",
         }
         self.selected_user_id = None
         self.setup_ui()
@@ -7453,19 +7538,32 @@ class _SelectableLabel(QLabel):
 
 class ROICropDialog(QDialog):
     """Modal dialog that lets the user pick a chat ROI."""
-    def __init__(self, pixmap: QPixmap, parent=None):
+    def __init__(self, pixmap: QPixmap, parent=None, *, title: str = "Select Chat Area", hint: str = "Drag to draw the chat box. Release to save."):
         super().__init__(parent)
-        self.setWindowTitle("Select Chat Area")
+        self.setWindowTitle(title)
         self._roi: Optional[Tuple[float, float, float, float]] = None
 
         layout = QVBoxLayout(self)
+        hint_lbl = QLabel(hint)
+        hint_lbl.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(hint_lbl)
+
         label = _SelectableLabel(pixmap, self)
         label.roi_selected.connect(self._on_roi_selected)
-        layout.addWidget(label)
 
-        hint = QLabel("Drag to draw the chat box. Release to save.")
-        hint.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
-        layout.addWidget(hint)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(label)
+        layout.addWidget(scroll)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        try:
+            self.resize(min(max(pixmap.width() + 40, 520), 980), min(max(pixmap.height() + 120, 360), 760))
+        except Exception:
+            pass
 
     def _on_roi_selected(self, roi: Tuple[float, float, float, float]):
         self._roi = roi
@@ -7473,6 +7571,81 @@ class ROICropDialog(QDialog):
 
     def selected_roi(self) -> Optional[Tuple[float, float, float, float]]:
         return self._roi
+
+
+class OCRAlertStopDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_offset: Optional[QPoint] = None
+        self.setWindowTitle("OCR Alert")
+        self.setModal(False)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setObjectName("ocrAlertStopWindow")
+        self.setMinimumWidth(220)
+        self.setStyleSheet(
+            f"""
+            QDialog#ocrAlertStopWindow {{
+                background-color: {ModernStyle.SURFACE};
+                border: 1px solid {ModernStyle.BORDER};
+                border-radius: 10px;
+            }}
+            QLabel#ocrAlertTitle {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                background-color: {ModernStyle.SURFACE};
+                font-weight: 600;
+            }}
+            QPushButton#ocrAlertStopButton {{
+                background-color: {ModernStyle.PRIMARY};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 4px 12px;
+                font-weight: 600;
+            }}
+            QPushButton#ocrAlertStopButton:hover {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+            }}
+            """
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+
+        self.title_label = QLabel("Stop OCR Alert")
+        self.title_label.setObjectName("ocrAlertTitle")
+        self.title_label.setCursor(Qt.CursorShape.SizeAllCursor)
+        layout.addWidget(self.title_label, 1)
+
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setObjectName("ocrAlertStopButton")
+        self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout.addWidget(self.stop_btn)
+
+    def mousePressEvent(self, event):
+        try:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        except Exception:
+            self._drag_offset = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None:
+            try:
+                self.move(event.globalPosition().toPoint() - self._drag_offset)
+            except Exception:
+                pass
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
 
 
 class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
@@ -7484,6 +7657,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     autoitem_log_signal = Signal(str)
     autoitem_mouse_block_signal = Signal(bool)
     bes_log_signal = Signal(str)
+    ocr_filter_alert_ui_signal = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -7493,7 +7667,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._paused_at: Optional[float] = None
         self.ocr_worker: Optional[OCRWorker] = None
         self.ocr_roi: Optional[Tuple[float, float, float, float]] = None
+        self.ocr_shared_areas: List[dict] = []
+        self.ocr_only_mapped_pids: bool = False
         self.ocr_verification_roi: Optional[Tuple[float, float, float, float]] = None
+        self._ocr_filter_alert_active: bool = False
+        self._ocr_filter_alert_loop_timer: Optional[QTimer] = None
+        self._ocr_filter_alert_stop_window: Optional[QWidget] = None
+        self._ocr_filter_alert_stop_label: Optional[QLabel] = None
         self._last_ocr_log: Optional[str] = None
         self._ocr_test_last_hash: Optional[int] = None
         self.log_autoscroll: bool = True
@@ -7569,8 +7749,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "ui.show_tutorial_menu": "Show Tutorial Menu Item",
             "misc.skip_webhook_unknown_context": "Skip Unknown-Context Webhooks",
             "misc.log_confirmed_launch_mode": "Launch Next After Log Confirm",
+            "misc.disable_manager_bad_marking": "Disable Manager BAD Marking",
             "misc.msedgewebview2_limiter_enabled": "Enable msedgewebview2 Limiter",
             "multiscope.merchant_webhook": "Merchant Webhook URL",
+            "multiscope.merchant_detection_mode": "Merchant Detection Mode",
             "multiscope.enable_jester": "Enable Jester Pings",
             "multiscope.enable_mari": "Enable Mari Pings",
             "multiscope.enable_rin": "Enable Rin Pings",
@@ -7580,6 +7762,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "multiscope.mari_ping_id": "Mari Ping ID",
             "multiscope.rin_ping_type": "Rin Ping Type",
             "multiscope.rin_ping_id": "Rin Ping ID",
+            "misc.disable_log_based_merchant_detection_when_ocr_merchants_enabled": "Disable Log Merchant Detection While OCR Merchants Active",
         }
 
         # Anti-AFK engine instance (configured in setup_antiafk_tab)
@@ -7646,6 +7829,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.autoitem_log_signal.connect(self._on_autoitem_status)
         self.autoitem_mouse_block_signal.connect(self._on_autoitem_mouse_block)
         self.bes_log_signal.connect(self._on_bes_log)
+        self.ocr_filter_alert_ui_signal.connect(
+            self._handle_ocr_filter_alert_ui,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
         self.setup_ui()
         try:
@@ -8781,8 +8968,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.ocr_batch_delay_spin = QDoubleSpinBox(); self.ocr_batch_delay_spin.setRange(0.0, 60.0); self.ocr_batch_delay_spin.setDecimals(2); self.ocr_batch_delay_spin.setSingleStep(0.1); self.ocr_batch_delay_spin.setSuffix(" s")
         self.ocr_batch_delay_spin.setToolTip("Minimum delay between OCR capture batches (lower = more frequent batches).")
         self.ocr_batch_delay_spin.valueChanged.connect(self._on_ocr_settings_changed)
-        self.ocr_cooldown_spin = QSpinBox(); self.ocr_cooldown_spin.setRange(30, 7200); self.ocr_cooldown_spin.setSuffix(" s")
-        self.ocr_cooldown_spin.valueChanged.connect(self._on_ocr_settings_changed)
         self.ocr_preprocess_chk = QCheckBox("Use preprocessing")
         self.ocr_preprocess_chk.toggled.connect(self._on_ocr_settings_changed)
         self.ocr_frame_diff_tol_spin = QSpinBox(); self.ocr_frame_diff_tol_spin.setRange(0, 100); self.ocr_frame_diff_tol_spin.setSuffix(" %")
@@ -8795,7 +8980,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         controls_form.addRow("OCR workers:", self.ocr_workers_spin)
         controls_form.addRow("Max captures / batch:", self.ocr_max_caps_spin)
         controls_form.addRow("Batch delay:", self.ocr_batch_delay_spin)
-        controls_form.addRow("Cooldown per PID:", self.ocr_cooldown_spin)
         controls_form.addRow("Preprocess chat image:", self.ocr_preprocess_chk)
         controls_form.addRow("Processor:", self.ocr_device_combo)
         controls_form.addRow("Skip OCR if frame change ≤:", self.ocr_frame_diff_tol_spin)
@@ -8806,38 +8990,28 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         calibrate_btn = QPushButton("Calibrate chat area")
         calibrate_btn.clicked.connect(self.calibrate_ocr_roi)
         calibrate_btn.setToolTip("Select 6 lines of roblox chat from the bottom")
-        calibrate_verification_btn = QPushButton("Calibrate verification area")
-        calibrate_verification_btn.clicked.connect(self.calibrate_ocr_verification_roi)
-        calibrate_verification_btn.setToolTip("Select the 'Start Puzzle' button.")
         preview_btn = QPushButton("Preview chat")
         preview_btn.clicked.connect(self.show_ocr_preview)
         preview_btn.setToolTip("Preview OCR output using the calibrated chat area.")
-        verification_preview_btn = QPushButton("Preview verification")
-        verification_preview_btn.clicked.connect(self.show_ocr_verification_preview)
-        verification_preview_btn.setToolTip("Preview OCR output using the calibrated verification area.")
         compare_btn = QPushButton("Chat frame compare")
         compare_btn.clicked.connect(self.test_ocr_frame_compare)
         compare_btn.setToolTip("Compare frame similarity using the calibrated chat area.")
         btn_row.addWidget(calibrate_btn)
-        btn_row.addWidget(calibrate_verification_btn)
         btn_row.addWidget(preview_btn)
-        btn_row.addWidget(verification_preview_btn)
         btn_row.addWidget(compare_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
         self.ocr_roi_label = QLabel("Chat ROI: not calibrated")
         layout.addWidget(self.ocr_roi_label)
-        self.ocr_verification_roi_label = QLabel("Verification ROI: not calibrated")
-        layout.addWidget(self.ocr_verification_roi_label)
 
-        filters_group = QGroupBox("Color Filters")
+        filters_group = QGroupBox("Filters")
         filters_layout = QVBoxLayout(filters_group)
         self.ocr_filter_table = QTableWidget()
-        self.ocr_filter_table.setColumnCount(6)
-        self.ocr_filter_table.setHorizontalHeaderLabels(["Enabled", "Name", "R", "G", "B", "Tol"])
+        self.ocr_filter_table.setColumnCount(7)
+        self.ocr_filter_table.setHorizontalHeaderLabels(["Enabled", "Name", "R", "G", "B", "Tol", "Settings"])
         self.ocr_filter_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.ocr_filter_table.setMinimumHeight(180)
+        self.ocr_filter_table.setMinimumHeight(380)
         self.ocr_filter_table.setShowGrid(False)
         self.ocr_filter_table.setAlternatingRowColors(False)
         header = self.ocr_filter_table.horizontalHeader()
@@ -8847,6 +9021,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         for col in range(2, 6):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
             self.ocr_filter_table.setColumnWidth(col, 95)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.ocr_filter_table.setColumnWidth(6, 120)
         vh = self.ocr_filter_table.verticalHeader()
         vh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         vh.setDefaultSectionSize(62)
@@ -8905,6 +9081,26 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 margin: 0px;
                 background: transparent;
             }}
+
+            QTableWidget QPushButton {{
+                background-color: {ModernStyle.PRIMARY};
+                color: {ModernStyle.TEXT_PRIMARY};
+                border: none;
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-weight: 500;
+                min-width: 80px;
+                min-height: 28px;
+            }}
+
+            QTableWidget QPushButton:hover {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+            }}
+
+            QTableWidget QPushButton:disabled {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_SECONDARY};
+            }}
             """
         )
         filters_layout.addWidget(self.ocr_filter_table)
@@ -8915,8 +9111,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         add_filter_btn.clicked.connect(lambda: (self._add_filter_row(), self._on_ocr_settings_changed()))
         remove_filter_btn = QPushButton("Remove Selected")
         remove_filter_btn.clicked.connect(lambda: (self._remove_selected_filter_rows(), self._on_ocr_settings_changed()))
+        shared_areas_btn = QPushButton("Shared Areas")
+        shared_areas_btn.clicked.connect(self._open_ocr_shared_areas_dialog)
+        filter_users_btn = QPushButton("Filter Users")
+        filter_users_btn.clicked.connect(self._open_ocr_filter_user_assignments_dialog)
+        filter_presets_btn = QPushButton("Preset Filters")
+        filter_presets_btn.clicked.connect(self._open_ocr_filter_presets_dialog)
         filter_btns.addWidget(add_filter_btn)
         filter_btns.addWidget(remove_filter_btn)
+        filter_btns.addWidget(shared_areas_btn)
+        filter_btns.addWidget(filter_users_btn)
+        filter_btns.addWidget(filter_presets_btn)
         filter_btns.addStretch()
         filters_layout.addLayout(filter_btns)
         layout.addWidget(filters_group)
@@ -9430,6 +9635,178 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     pass
         try:
             QApplication.beep()
+        except Exception:
+            pass
+
+    def _replay_ocr_filter_alert_sound(self) -> None:
+        if not bool(getattr(self, "_ocr_filter_alert_active", False)):
+            return
+        self._play_antiafk_alert_sound()
+
+    def _start_ocr_filter_alert_sound(self) -> None:
+        timer = getattr(self, "_ocr_filter_alert_loop_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(3000)
+            timer.timeout.connect(self._replay_ocr_filter_alert_sound)
+            self._ocr_filter_alert_loop_timer = timer
+
+        try:
+            timer.stop()
+        except Exception:
+            pass
+
+        alias = "Notification.Looping.Call"
+        if winsound is not None:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+            try:
+                winsound.PlaySound(str(alias), winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_LOOP)
+                return
+            except Exception:
+                pass
+
+        self._replay_ocr_filter_alert_sound()
+        try:
+            timer.start()
+        except Exception:
+            pass
+
+    def _stop_ocr_filter_alert_sound(self) -> None:
+        timer = getattr(self, "_ocr_filter_alert_loop_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        if winsound is not None:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+
+    def _ensure_ocr_filter_alert_stop_window(self) -> QWidget:
+        window = getattr(self, "_ocr_filter_alert_stop_window", None)
+        if window is not None:
+            return window
+
+        window = OCRAlertStopDialog(self)
+        window.stop_btn.clicked.connect(self._stop_ocr_filter_alert)
+        self._ocr_filter_alert_stop_window = window
+        self._ocr_filter_alert_stop_label = window.title_label
+        return window
+
+    def _show_ocr_filter_alert_stop_window(self, filter_name: str) -> None:
+        window = self._ensure_ocr_filter_alert_stop_window()
+        label = getattr(self, "_ocr_filter_alert_stop_label", None)
+        filter_name_s = str(filter_name or "").strip() or "Filter"
+        if label is not None:
+            label.setText("Stop OCR Alert")
+            label.setToolTip(f"Latest match: {filter_name_s}")
+        try:
+            window.setToolTip(f"Latest match: {filter_name_s}")
+        except Exception:
+            pass
+        try:
+            window.adjustSize()
+        except Exception:
+            pass
+
+        try:
+            anchor = self.mapToGlobal(QPoint(max(0, self.width() - window.width() - 24), 56))
+            x = int(anchor.x())
+            y = int(anchor.y())
+            screen = None
+            try:
+                screen = QApplication.screenAt(anchor)
+            except Exception:
+                screen = None
+            if screen is None:
+                try:
+                    handle = self.windowHandle()
+                    if handle is not None:
+                        screen = handle.screen()
+                except Exception:
+                    screen = None
+            if screen is None:
+                try:
+                    screen = QApplication.primaryScreen()
+                except Exception:
+                    screen = None
+            if screen is not None:
+                available = screen.availableGeometry()
+                x = max(available.left() + 8, min(x, available.right() - window.width() - 8))
+                y = max(available.top() + 8, min(y, available.bottom() - window.height() - 8))
+            window.move(x, y)
+        except Exception:
+            pass
+
+        if window.isVisible():
+            try:
+                window.raise_()
+                window.activateWindow()
+            except Exception:
+                pass
+
+    def _open_ocr_filter_alert_stop_window(self, filter_name: str) -> None:
+        if not bool(getattr(self, "_ocr_filter_alert_active", False)):
+            return
+        window = self._ensure_ocr_filter_alert_stop_window()
+        self._show_ocr_filter_alert_stop_window(filter_name)
+        try:
+            window.show()
+            window.raise_()
+            window.activateWindow()
+        except Exception:
+            pass
+
+    def _stop_ocr_filter_alert(self) -> None:
+        self._ocr_filter_alert_active = False
+        self._stop_ocr_filter_alert_sound()
+        window = getattr(self, "_ocr_filter_alert_stop_window", None)
+        self._ocr_filter_alert_stop_window = None
+        self._ocr_filter_alert_stop_label = None
+        if window is not None:
+            try:
+                window.done(0)
+            except Exception:
+                pass
+            try:
+                window.deleteLater()
+            except Exception:
+                pass
+
+    def _start_ocr_filter_alert(self, filter_name: str) -> None:
+        filter_name_s = str(filter_name or "").strip() or "Filter"
+        already_active = bool(getattr(self, "_ocr_filter_alert_active", False))
+        self._ocr_filter_alert_active = True
+        if not already_active:
+            self._open_ocr_filter_alert_stop_window(filter_name_s)
+            self._start_ocr_filter_alert_sound()
+            return
+        self._show_ocr_filter_alert_stop_window(filter_name_s)
+
+    def _handle_ocr_filter_alert(self, filter_name: str) -> None:
+        self.ocr_filter_alert_ui_signal.emit(str(filter_name or "").strip() or "Filter")
+
+    def _handle_ocr_filter_alert_ui(self, filter_name: str) -> None:
+        self._start_ocr_filter_alert(filter_name)
+
+    def _handle_ocr_filter_match_for_auto_actions(self, pid: int, filter_id: str, filter_name: str) -> None:
+        engine = getattr(self, "auto_item_engine", None)
+        if engine is None or not hasattr(engine, "record_ocr_filter_trigger"):
+            return
+        try:
+            ctx = self._resolve_pid_context(int(pid))
+        except Exception:
+            ctx = {}
+        uid = str((ctx or {}).get("user_id") or "").strip()
+        if not uid:
+            return
+        try:
+            engine.record_ocr_filter_trigger(uid, int(pid), str(filter_id or "").strip(), str(filter_name or "").strip())
         except Exception:
             pass
 
@@ -10159,7 +10536,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def _on_autoitem_mouse_block(self, enabled: bool) -> None:
         enabled = bool(enabled)
         if enabled:
-            self._show_autoitem_center_tooltip("User mouse movement is disabled during Auto-Item.", 600_000)
+            self._show_autoitem_center_tooltip("User mouse movement is disabled during Auto-Actions.", 600_000)
         else:
             self._hide_autoitem_center_tooltip()
 
@@ -10385,7 +10762,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if self._auto_item_is_antiafk_overdue():
             try:
                 self.autoitem_log_signal.emit(
-                    "[Auto-Item] Anti-AFK overdue (>=10m on at least one connected user); skipping pause this cycle."
+                    "[Auto-Actions] Anti-AFK overdue (>=10m on at least one connected user); skipping pause this cycle."
                 )
             except Exception:
                 pass
@@ -10406,7 +10783,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
                 try:
                     self.autoitem_log_signal.emit(
-                        "[Auto-Item] Failed to pause Anti-AFK (timeout); skipping Auto-Item this cycle to keep Anti-AFK running."
+                        "[Auto-Actions] Failed to pause Anti-AFK (timeout); skipping this cycle to keep Anti-AFK running."
                     )
                 except Exception:
                     pass
@@ -10660,7 +11037,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if not s:
             self._unregister_auto_item_hotkey()
             if not quiet:
-                self.autoitem_log_signal.emit("[Auto-Item] Toggle hotkey cleared (disabled).")
+                self.autoitem_log_signal.emit("[Auto-Actions] Toggle hotkey cleared (disabled).")
             return
 
         parsed = self._parse_hotkey_to_win32(s)
@@ -10668,7 +11045,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if not quiet:
                 QMessageBox.warning(
                     self,
-                    "Auto-Item Hotkey",
+                    "Auto-Actions Hotkey",
                     "Unsupported hotkey.\n\nUse a single combo like: Ctrl+Alt+Space",
                 )
             return
@@ -10695,19 +11072,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 self._auto_item_hotkey_registered = True
                 self._auto_item_hotkey_hwnd = int(hwnd)
                 if not quiet:
-                    self.autoitem_log_signal.emit(f"[Auto-Item] Toggle hotkey registered: {s}")
+                    self.autoitem_log_signal.emit(f"[Auto-Actions] Toggle hotkey registered: {s}")
             else:
                 self._auto_item_hotkey_registered = False
                 self._auto_item_hotkey_hwnd = 0
                 msg = f"Could not register hotkey '{s}'. It may be in use by another app."
-                self.autoitem_log_signal.emit(f"[Auto-Item] {msg}")
+                self.autoitem_log_signal.emit(f"[Auto-Actions] {msg}")
                 if not quiet:
-                    QMessageBox.warning(self, "Auto-Item Hotkey", msg)
+                    QMessageBox.warning(self, "Auto-Actions Hotkey", msg)
         except Exception as e:
             self._auto_item_hotkey_registered = False
             self._auto_item_hotkey_hwnd = 0
             if not quiet:
-                QMessageBox.warning(self, "Auto-Item Hotkey", f"Failed to register hotkey:\n{e}")
+                QMessageBox.warning(self, "Auto-Actions Hotkey", f"Failed to register hotkey:\n{e}")
 
     def _on_win_hotkey(self, hotkey_id: int) -> None:
         try:
@@ -10903,7 +11280,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         # - [uids...]     => Only those users
         if raw is None:
             btn.setProperty("users", None)
-            btn.setText("All v")
+            btn.setText("All users")
+            btn.setToolTip("Targets every checked user in the Users panel.")
             return
         if not isinstance(raw, (list, tuple, set)):
             # Be tolerant of Qt container/variant types (e.g., QStringList).
@@ -10913,13 +11291,29 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 raw = list(raw)  # type: ignore[arg-type]
             except Exception:
                 btn.setProperty("users", None)
-                btn.setText("All v")
+                btn.setText("All users")
+                btn.setToolTip("Targets every checked user in the Users panel.")
                 return
 
         users = [str(u).strip() for u in (raw or []) if str(u).strip()]
         btn.setProperty("users", users)
-        label = "None" if not users else f"{len(users)} selected"
-        btn.setText(f"{label} v")
+        if not users:
+            btn.setText("No users")
+            btn.setToolTip("This row will not run for any user until at least one user is assigned.")
+            return
+
+        user_names: List[str] = []
+        try:
+            user_cfg = self.config_manager.peek_users() or {}
+        except Exception:
+            user_cfg = {}
+        for uid in users:
+            try:
+                user_names.append(str((user_cfg.get(uid, {}) or {}).get("username") or uid))
+            except Exception:
+                user_names.append(str(uid))
+        btn.setText("1 user" if len(users) == 1 else f"{len(users)} users")
+        btn.setToolTip("Assigned users: " + ", ".join(user_names))
 
     def _update_alert_btn_text(self, btn: QPushButton):
         try:
@@ -10935,11 +11329,18 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         btn.setProperty("alert_webhook", hook)
 
         if not enabled:
-            btn.setText("Off v")
+            btn.setText("Alert off")
+            btn.setToolTip("No pre-run webhook alert will be sent.")
         elif not hook:
-            btn.setText("No Hook v")
+            btn.setText("Need webhook")
+            btn.setToolTip("Alerts are enabled, but no webhook URL is configured.")
         else:
-            btn.setText("On v")
+            try:
+                lead_s = float(btn.property("alert_lead_s") or 15.0)
+            except Exception:
+                lead_s = 15.0
+            btn.setText("Alert on")
+            btn.setToolTip(f"Webhook alert will be sent {lead_s:.1f}s before the action row runs.")
 
     def _edit_item_biomes(self, btn: QPushButton):
         try:
@@ -10956,6 +11357,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         btn_row = QHBoxLayout()
         sel_all_btn = QPushButton("Select All")
         sel_none_btn = QPushButton("Select None")
+        sel_all_btn.setStyleSheet(self._get_secondary_button_style())
+        sel_none_btn.setStyleSheet(self._get_secondary_button_style())
         btn_row.addWidget(sel_all_btn)
         btn_row.addWidget(sel_none_btn)
         btn_row.addStretch()
@@ -10963,6 +11366,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         lst = QListWidget()
         lst.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        lst.setMinimumHeight(340)
         # Make selected highlight consistent regardless of focus (Select All button vs manual clicks)
         lst.setStyleSheet(
             """
@@ -11022,8 +11426,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         all_uids: List[str] = [str(uid) for uid in sorted(users.keys())]
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("Select Users For This Item")
+        dlg.setWindowTitle("Row Users")
+        dlg.resize(440, 520)
+        self._auto_item_apply_dialog_style(dlg)
         v = QVBoxLayout(dlg)
+
+        hint = QLabel("Choose exactly which users this action row is allowed to run against.")
+        hint.setProperty("role", "hint")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
 
         btn_row = QHBoxLayout()
         sel_all_btn = QPushButton("Select All")
@@ -11112,12 +11523,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             lead_s = 15.0
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("Auto-Item Alert")
+        dlg.setWindowTitle("Row Alert")
+        dlg.resize(520, 320)
+        self._auto_item_apply_dialog_style(dlg)
         v = QVBoxLayout(dlg)
+
+        intro = QLabel("Configure an optional webhook alert before this row executes.")
+        intro.setProperty("role", "hint")
+        intro.setWordWrap(True)
+        v.addWidget(intro)
 
         form = QFormLayout()
 
-        enable_chk = QCheckBox("Enable alert before using this item")
+        enable_chk = QCheckBox("Enable alert before this row runs")
         enable_chk.setChecked(bool(enabled))
         form.addRow(enable_chk)
 
@@ -11129,21 +11547,38 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         form.addRow("Lead seconds:", lead_spin)
 
         hook_le = QLineEdit(hook)
-        hook_le.setPlaceholderText("https://discord.com/api/webhooks/…")
+        hook_le.setPlaceholderText("https://discord.com/api/webhooks/...")
+        try:
+            hook_le.setClearButtonEnabled(True)
+        except Exception:
+            pass
         form.addRow("Webhook URL:", hook_le)
 
         msg_le = QLineEdit(msg)
-        msg_le.setPlaceholderText("(optional) message to send alongside the embed")
+        msg_le.setPlaceholderText("(optional) message to send alongside the alert embed")
+        try:
+            msg_le.setClearButtonEnabled(True)
+        except Exception:
+            pass
         form.addRow("Message:", msg_le)
 
         v.addLayout(form)
 
         hint = QLabel(
-            "Sends a biome/merchant-style embed including the item name and a private server link (when available)."
+            "The alert includes the row name, target account, and private server details when available."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        hint.setProperty("role", "hint")
         v.addWidget(hint)
+
+        def _sync_enabled_state() -> None:
+            active = bool(enable_chk.isChecked())
+            lead_spin.setEnabled(active)
+            hook_le.setEnabled(active)
+            msg_le.setEnabled(active)
+
+        enable_chk.toggled.connect(_sync_enabled_state)
+        _sync_enabled_state()
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(dlg.accept)
@@ -11756,9 +12191,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
         try:
             if bool(chk.isChecked()):
-                chk.setToolTip("User mouse movement is disabled during Auto-Item.")
+                chk.setToolTip("User mouse movement is disabled during Auto-Actions.")
             else:
-                chk.setToolTip("When enabled, physical mouse movement is blocked during Auto-Item to prevent misclicks.")
+                chk.setToolTip("When enabled, physical mouse movement is blocked during Auto-Actions to prevent misclicks.")
         except Exception:
             pass
 
@@ -11947,6 +12382,2181 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 except Exception:
                     pass
             self._load_auto_item_items_table([])
+            self._auto_item_set_all_users(False)
+        finally:
+            self._loading_autoitem_settings = False
+
+        try:
+            self._apply_auto_item_hotkey(hk, quiet=True)
+        except Exception:
+            pass
+
+        self._on_auto_item_ui_changed()
+
+    def _default_auto_item_behavior(self) -> dict:
+        return {
+            "cooldown": 0,
+            "biomes": [],
+            "repeat_mode": "repeat",
+            "repeat_count": 1,
+            "trigger": {"type": "normal", "filter_ids": []},
+        }
+
+    def _make_auto_item_preset_actions(
+        self,
+        legacy_coords: Optional[dict] = None,
+        *,
+        search_text: str = "ITEM NAME",
+        amount_text: str = "1",
+    ) -> List[dict]:
+        coords = legacy_coords if isinstance(legacy_coords, dict) else {}
+
+        def _point(key: str) -> Optional[dict]:
+            raw = coords.get(key)
+            if not isinstance(raw, dict):
+                return None
+            try:
+                return {"x": float(raw.get("x", 0.0)), "y": float(raw.get("y", 0.0))}
+            except Exception:
+                return None
+
+        actions: List[dict] = []
+        conditional = coords.get("conditional") if isinstance(coords.get("conditional"), dict) else {}
+        cond_enabled = bool((conditional or {}).get("enabled", False))
+        cond_point = _point("conditional_point")
+        if cond_enabled and cond_point is not None:
+            actions.append(
+                {
+                    "name": "Conditional gate",
+                    "type": "conditional_click",
+                    "point": cond_point,
+                    "color": str((conditional or {}).get("color", "#FFFFFF") or "#FFFFFF"),
+                    "tolerance": int((conditional or {}).get("tolerance", 10) or 10),
+                }
+            )
+
+        ordered = [
+            ("Inventory button", "click", _point("inv_button")),
+            ("Items tab", "click", _point("items_tab")),
+            ("Search box", "click", _point("search_box")),
+            ("Paste item", "paste", None),
+            ("Query result", "click", _point("query_pos")),
+            ("Amount box", "click", _point("amount_box")),
+            ("Paste amount", "paste", None),
+            ("Use button", "click", _point("use_button")),
+            ("Close button", "click", _point("close_button")),
+            ("Close button", "click", _point("close_button")),
+        ]
+
+        for name, kind, point in ordered:
+            if kind == "paste":
+                actions.append(
+                    {
+                        "name": name,
+                        "type": "paste",
+                        "text": search_text if "item" in name.lower() else amount_text,
+                        "select_all": True,
+                    }
+                )
+                continue
+            actions.append({"name": name, "type": kind, "point": copy.deepcopy(point)})
+
+        return actions
+
+    def _normalize_auto_item_action(self, raw: Any, *, fallback_name: str = "") -> Optional[dict]:
+        if not isinstance(raw, dict):
+            return None
+
+        action_type = str(raw.get("type") or raw.get("kind") or raw.get("action_type") or "").strip().lower()
+        if action_type == "conditional":
+            action_type = "conditional_click"
+        if action_type not in ("click", "conditional_click", "paste", "scroll"):
+            return None
+
+        point = None
+        if isinstance(raw.get("point"), dict):
+            try:
+                point = {
+                    "x": float(raw["point"].get("x", 0.0)),
+                    "y": float(raw["point"].get("y", 0.0)),
+                }
+            except Exception:
+                point = None
+
+        try:
+            tolerance = max(0, int(raw.get("tolerance", 0) or 0))
+        except Exception:
+            tolerance = 0
+
+        return {
+            "name": str(raw.get("name") or fallback_name or action_type.replace("_", " ").title()).strip()
+            or action_type.replace("_", " ").title(),
+            "type": action_type,
+            "point": point,
+            "text": str(raw.get("text") or ""),
+            "color": str(raw.get("color") or raw.get("color_hex") or "#FFFFFF").strip() or "#FFFFFF",
+            "tolerance": tolerance,
+            "select_all": bool(raw.get("select_all", True)),
+            "scroll_direction": (
+                "up"
+                if str(raw.get("scroll_direction") or raw.get("direction") or "").strip().lower() == "up"
+                else "down"
+            ),
+        }
+
+    def _normalize_auto_item_behavior(self, raw: Any, legacy: Optional[dict] = None) -> dict:
+        base = raw if isinstance(raw, dict) else {}
+        legacy = legacy if isinstance(legacy, dict) else {}
+        trigger = base.get("trigger") if isinstance(base.get("trigger"), dict) else {}
+        filter_ids = []
+        for filter_id in trigger.get("filter_ids", base.get("filter_ids", legacy.get("filter_ids", []))) or []:
+            value = str(filter_id or "").strip()
+            if value and value not in filter_ids:
+                filter_ids.append(value)
+
+        raw_trigger_type = str(trigger.get("type") or base.get("trigger_type") or "").strip().lower()
+        if raw_trigger_type in ("normal", "none"):
+            trigger_type = "normal"
+        elif raw_trigger_type == "ocr_filter":
+            trigger_type = "ocr_filter" if filter_ids else "normal"
+        else:
+            trigger_type = "ocr_filter" if filter_ids else "normal"
+        if trigger_type != "ocr_filter":
+            filter_ids = []
+
+        repeat_mode = str(base.get("repeat_mode") or legacy.get("repeat_mode") or "repeat").strip().lower()
+        if repeat_mode not in ("repeat", "count", "once_per_pid"):
+            repeat_mode = "repeat"
+
+        try:
+            repeat_count = max(1, int(base.get("repeat_count", legacy.get("repeat_count", 1)) or 1))
+        except Exception:
+            repeat_count = 1
+
+        try:
+            cooldown = max(
+                0,
+                int(
+                    float(
+                        base.get(
+                            "cooldown",
+                            legacy.get("cooldown", legacy.get("cooldown_s", 0)),
+                        )
+                        or 0
+                    )
+                ),
+            )
+        except Exception:
+            cooldown = 0
+
+        biomes = []
+        for biome in base.get("biomes", legacy.get("biomes", legacy.get("allowed_biomes", []))) or []:
+            value = str(biome or "").strip().upper()
+            if value and value not in biomes:
+                biomes.append(value)
+
+        return {
+            "cooldown": cooldown,
+            "biomes": biomes,
+            "repeat_mode": repeat_mode,
+            "repeat_count": repeat_count,
+            "trigger": {"type": trigger_type, "filter_ids": filter_ids},
+        }
+
+    def _normalize_auto_item_preset(self, raw: Any, *, fallback_index: int = 0) -> Optional[dict]:
+        if not isinstance(raw, dict):
+            return None
+
+        actions = []
+        for idx, action_raw in enumerate(raw.get("actions") or []):
+            action = self._normalize_auto_item_action(action_raw, fallback_name=f"Action {idx + 1}")
+            if action is not None:
+                actions.append(action)
+
+        preset_id = str(raw.get("id") or "").strip() or f"preset_{fallback_index}_{uuid.uuid4().hex[:8]}"
+        name = str(raw.get("name") or f"Preset {fallback_index + 1}").strip() or f"Preset {fallback_index + 1}"
+
+        return {
+            "id": preset_id,
+            "name": name,
+            "builtin": bool(raw.get("builtin", preset_id == "item")),
+            "actions": actions,
+        }
+
+    def _normalize_auto_item_row(self, raw: Any, *, fallback_index: int = 0, legacy_coords: Optional[dict] = None) -> Optional[dict]:
+        if not isinstance(raw, dict):
+            return None
+
+        actions = []
+        for idx, action_raw in enumerate(raw.get("actions") or []):
+            action = self._normalize_auto_item_action(action_raw, fallback_name=f"Action {idx + 1}")
+            if action is not None:
+                actions.append(action)
+
+        if not actions and any(k in raw for k in ("name", "amount", "cooldown", "biomes")):
+            actions = self._make_auto_item_preset_actions(
+                legacy_coords,
+                search_text=str(raw.get("name") or ""),
+                amount_text=str(raw.get("amount", 1) or 1),
+            )
+
+        if not actions:
+            actions = []
+
+        return {
+            "enabled": bool(raw.get("enabled", True)),
+            "name": str(raw.get("name") or f"Action {fallback_index + 1}").strip() or f"Action {fallback_index + 1}",
+            "actions": actions,
+            "behavior": self._normalize_auto_item_behavior(raw.get("behavior"), legacy=raw),
+            "users": copy.deepcopy(raw.get("users")) if "users" in raw else None,
+            "users_explicit": bool(raw.get("users_explicit", False)),
+            "alert_enabled": bool(raw.get("alert_enabled", False)),
+            "alert_webhook": str(raw.get("alert_webhook") or raw.get("alert_webhook_url") or "").strip(),
+            "alert_message": str(raw.get("alert_message") or ""),
+            "alert_lead_s": float(raw.get("alert_lead_s", 15.0) or 15.0),
+        }
+
+    def _default_auto_item_presets(self, legacy_coords: Optional[dict] = None) -> List[dict]:
+        return [
+            {
+                "id": "item",
+                "name": "Item",
+                "builtin": True,
+                "actions": self._make_auto_item_preset_actions(legacy_coords),
+            }
+        ]
+
+    def _normalize_auto_item_cfg(self, cfg: Optional[dict]) -> dict:
+        base = copy.deepcopy(cfg or {})
+        legacy_coords = base.get("coords") if isinstance(base.get("coords"), dict) else {}
+
+        preset_list: List[dict] = []
+        seen_preset_ids: set[str] = set()
+        for idx, raw in enumerate(base.get("presets") or []):
+            preset = self._normalize_auto_item_preset(raw, fallback_index=idx)
+            if preset is None:
+                continue
+            preset_id = str(preset.get("id") or "").strip()
+            if not preset_id or preset_id in seen_preset_ids:
+                continue
+            seen_preset_ids.add(preset_id)
+            preset_list.append(preset)
+
+        if "item" not in seen_preset_ids:
+            preset_list = self._default_auto_item_presets(legacy_coords) + preset_list
+
+        items: List[dict] = []
+        for idx, raw in enumerate(base.get("items") or []):
+            row = self._normalize_auto_item_row(raw, fallback_index=idx, legacy_coords=legacy_coords)
+            if row is not None:
+                items.append(row)
+
+        return {
+            "enabled": bool(base.get("enabled", False)),
+            "tick_interval": float(base.get("tick_interval", 1.0) or 1.0),
+            "click_delay": float(base.get("click_delay", 0.2) or 0.2),
+            "disable_mouse_move": bool(base.get("disable_mouse_move", False)),
+            "toggle_hotkey": str(base.get("toggle_hotkey", "Ctrl+Alt+Space") or "Ctrl+Alt+Space"),
+            "users": [str(uid).strip() for uid in (base.get("users") or []) if str(uid).strip()],
+            "presets": preset_list,
+            "items": items,
+        }
+
+    def _auto_item_filter_catalog(self) -> List[dict]:
+        try:
+            cfg = self._get_ocr_settings_from_ui() or {}
+        except Exception:
+            cfg = {}
+        out: List[dict] = []
+        seen: set[str] = set()
+        for idx, spec in enumerate(cfg.get("filters", []) or []):
+            if not isinstance(spec, dict):
+                continue
+            filter_id = str(spec.get("id") or spec.get("filter_id") or "").strip() or f"filter_{idx + 1}"
+            if filter_id in seen:
+                continue
+            seen.add(filter_id)
+            out.append(
+                {
+                    "id": filter_id,
+                    "name": str(spec.get("name") or filter_id).strip() or filter_id,
+                    "enabled": bool(spec.get("enabled", True)),
+                }
+            )
+        return out
+
+    def _auto_item_filter_name_map(self) -> Dict[str, str]:
+        return {str(entry.get("id") or ""): str(entry.get("name") or entry.get("id") or "") for entry in self._auto_item_filter_catalog()}
+
+    def _auto_item_action_summary_text(self, actions: List[dict]) -> str:
+        actions = list(actions or [])
+        if not actions:
+            return "No steps"
+        count = len(actions)
+        return "1 step" if count == 1 else f"{count} steps"
+
+    def _auto_item_behavior_summary_text(self, behavior: dict) -> str:
+        cfg = self._normalize_auto_item_behavior(behavior)
+        mode = str(cfg.get("repeat_mode") or "repeat")
+        cooldown = int(cfg.get("cooldown", 0) or 0)
+        trigger = cfg.get("trigger") or {}
+        trigger_type = str(trigger.get("type") or "normal")
+        filters = list(trigger.get("filter_ids", [])) if trigger_type == "ocr_filter" else []
+        if mode == "count":
+            mode_text = f"x{max(1, int(cfg.get('repeat_count', 1) or 1))}"
+        elif mode == "once_per_pid":
+            mode_text = "1 per PID"
+        else:
+            mode_text = "Loop"
+
+        if filters:
+            filter_text = "1 filter" if len(filters) == 1 else f"{len(filters)} filters"
+        else:
+            filter_text = "No trigger"
+
+        if cooldown > 0:
+            return f"{filter_text} | {mode_text} | {cooldown}s"
+        return f"{filter_text} | {mode_text}"
+
+    def _auto_item_actions_tooltip(self, actions: List[dict]) -> str:
+        actions = [a for a in (actions or []) if isinstance(a, dict)]
+        if not actions:
+            return "No steps configured.\nClick to build the action string."
+        lines = ["Ordered steps:"]
+        for idx, action in enumerate(actions[:8], 1):
+            name = str(action.get("name") or action.get("type") or f"Step {idx}").strip()
+            kind = str(action.get("type") or "").replace("_", " ").title()
+            lines.append(f"{idx}. {name} [{kind}]")
+        if len(actions) > 8:
+            lines.append(f"... +{len(actions) - 8} more")
+        lines.append("")
+        lines.append("Click to edit the sequence.")
+        return "\n".join(lines)
+
+    def _auto_item_behavior_tooltip(self, behavior: dict) -> str:
+        cfg = self._normalize_auto_item_behavior(behavior)
+        filter_names = self._auto_item_filter_name_map()
+        trigger = cfg.get("trigger") or {}
+        trigger_type = str(trigger.get("type") or "normal")
+        filters = [str(fid).strip() for fid in (trigger.get("filter_ids", []) or []) if str(fid).strip()]
+        if trigger_type != "ocr_filter":
+            filters = []
+        biomes = [str(b).strip().upper() for b in (cfg.get("biomes") or []) if str(b).strip()]
+        mode = str(cfg.get("repeat_mode") or "repeat")
+        if mode == "count":
+            mode_text = f"Play count: {max(1, int(cfg.get('repeat_count', 1) or 1))}"
+        elif mode == "once_per_pid":
+            mode_text = "Play mode: Once per PID"
+        else:
+            mode_text = "Play mode: Repeatedly"
+        lines = [
+            mode_text,
+            f"Cooldown: {int(cfg.get('cooldown', 0) or 0)}s",
+            "Trigger: OCR filter" if trigger_type == "ocr_filter" else "Trigger: Normal",
+        ]
+        if filters:
+            lines.append("Bound filters: " + ", ".join(str(filter_names.get(fid, fid) or fid) for fid in filters))
+        else:
+            lines.append("Bound filters: none")
+        lines.append("Biomes: " + ("Any biome" if not biomes else ", ".join(biomes)))
+        lines.append("")
+        lines.append("Click to edit behavior.")
+        return "\n".join(lines)
+
+    def _auto_item_apply_cell_button_style(self, btn: QPushButton, *, accent: bool = False) -> None:
+        try:
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        except Exception:
+            pass
+        btn.setMinimumHeight(42)
+        btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        border_color = ModernStyle.PRIMARY if accent else ModernStyle.BORDER
+        btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+                border: 1px solid {border_color};
+                border-radius: 9px;
+                padding: 8px 12px;
+                font-weight: 600;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background-color: {ModernStyle.SURFACE};
+                border-color: {ModernStyle.PRIMARY};
+            }}
+            QPushButton:pressed {{
+                background-color: {ModernStyle.SURFACE};
+            }}
+            QPushButton:disabled {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_SECONDARY};
+                border-color: {ModernStyle.BORDER};
+            }}
+            """
+        )
+
+    def _get_primary_button_style(self) -> str:
+        return f"""
+            QPushButton {{
+                background-color: {ModernStyle.PRIMARY};
+                color: {ModernStyle.TEXT_PRIMARY};
+                border: none;
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-weight: 500;
+                font-size: 13px;
+                min-width: 80px;
+                min-height: 28px;
+            }}
+            QPushButton:hover {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+            }}
+            QPushButton:pressed {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+            }}
+            QPushButton:disabled {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_SECONDARY};
+            }}
+        """
+
+    def _get_secondary_button_style(self) -> str:
+        return f"""
+            QPushButton {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+                border: 2px solid {ModernStyle.BORDER};
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-weight: 500;
+                font-size: 13px;
+                min-width: 80px;
+                min-height: 28px;
+            }}
+            QPushButton:hover {{
+                background-color: {ModernStyle.SURFACE};
+                border-color: {ModernStyle.PRIMARY};
+            }}
+            QPushButton:pressed {{
+                background-color: {ModernStyle.SURFACE};
+            }}
+            QPushButton:disabled {{
+                color: {ModernStyle.TEXT_SECONDARY};
+                border-color: {ModernStyle.BORDER};
+            }}
+        """
+
+    def _auto_item_apply_dialog_style(self, dlg: QWidget) -> None:
+        dlg.setStyleSheet(
+            f"""
+            QDialog {{
+                background-color: {ModernStyle.BACKGROUND};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            QListWidget {{
+                background-color: {ModernStyle.SURFACE};
+                border: 2px solid {ModernStyle.BORDER};
+                border-radius: 6px;
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            QListWidget::item {{
+                padding: 6px 8px;
+            }}
+            QListWidget::item:hover {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+            }}
+            QListWidget::item:selected {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            QListWidget::item:selected:!active {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            QLabel[role="hint"] {{
+                color: {ModernStyle.TEXT_SECONDARY};
+                background: transparent;
+            }}
+            QLabel[role="section"] {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                font-weight: 700;
+                background: transparent;
+            }}
+            """
+        )
+
+    def _auto_item_apply_main_table_style(self, table: QTableWidget) -> None:
+        table.setStyleSheet(
+            f"""
+            QTableWidget {{
+                background-color: {ModernStyle.SURFACE};
+                border: 1px solid {ModernStyle.BORDER};
+                border-radius: 12px;
+                gridline-color: transparent;
+                selection-background-color: {ModernStyle.PRIMARY_VARIANT};
+            }}
+            QTableWidget::item {{
+                border: none;
+                padding: 0px;
+            }}
+            QHeaderView::section {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+                padding: 12px 10px;
+                border: none;
+                font-weight: 700;
+            }}
+            QTableWidget QLineEdit {{
+                background-color: {ModernStyle.BACKGROUND};
+                border: 1px solid {ModernStyle.BORDER};
+                border-radius: 9px;
+                padding: 8px 12px;
+                min-height: 24px;
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            QTableWidget QLineEdit:focus {{
+                border-color: {ModernStyle.PRIMARY};
+            }}
+            QTableWidget QCheckBox {{
+                background: transparent;
+                margin: 0px;
+                padding: 0px;
+            }}
+            """
+        )
+
+    def _update_actions_btn_text(self, btn: QPushButton) -> None:
+        actions = btn.property("actions") or []
+        if not isinstance(actions, list):
+            actions = []
+        btn.setProperty("actions", copy.deepcopy(actions))
+        btn.setText(self._auto_item_action_summary_text(actions))
+        btn.setToolTip(self._auto_item_actions_tooltip(actions))
+
+    def _update_behavior_btn_text(self, btn: QPushButton) -> None:
+        behavior = self._normalize_auto_item_behavior(btn.property("behavior"))
+        btn.setProperty("behavior", copy.deepcopy(behavior))
+        btn.setText(self._auto_item_behavior_summary_text(behavior))
+        btn.setToolTip(self._auto_item_behavior_tooltip(behavior))
+
+    def _capture_auto_item_point(self, *, sample_color: bool = False) -> Optional[dict]:
+        try:
+            import ctypes
+            import psutil
+            import win32api as _wapi
+            import win32con as _wcon
+            import win32gui as _wgui
+            import win32process as _wproc
+        except Exception as e:
+            QMessageBox.warning(self, "Capture Failed", f"Missing dependencies for capture:\n{e}")
+            return None
+
+        def _is_roblox_hwnd(hwnd: int) -> bool:
+            try:
+                if not hwnd or not _wgui.IsWindow(hwnd):
+                    return False
+                _, pid = _wproc.GetWindowThreadProcessId(hwnd)
+                if not pid:
+                    return False
+                return str(psutil.Process(int(pid)).name()).lower() == "robloxplayerbeta.exe"
+            except Exception:
+                return False
+
+        def _pick_hwnd() -> Optional[int]:
+            try:
+                fg = _wgui.GetForegroundWindow()
+                if _is_roblox_hwnd(fg):
+                    return int(fg)
+            except Exception:
+                pass
+            try:
+                wins = enum_roblox_windows()
+                if wins:
+                    return int(wins[0].hwnd)
+            except Exception:
+                pass
+            return None
+
+        def _bring_foreground(hwnd: int) -> None:
+            try:
+                if _wgui.IsIconic(hwnd):
+                    _wgui.ShowWindow(hwnd, _wcon.SW_RESTORE)
+                cur_tid = _wapi.GetCurrentThreadId()
+                win_tid = _wproc.GetWindowThreadProcessId(hwnd)[0]
+                ctypes.windll.user32.AttachThreadInput(cur_tid, win_tid, True)
+                try:
+                    _wgui.BringWindowToTop(hwnd)
+                    _wgui.SetForegroundWindow(hwnd)
+                finally:
+                    ctypes.windll.user32.AttachThreadInput(cur_tid, win_tid, False)
+            except Exception:
+                try:
+                    _wgui.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+
+        def _is_blackish(im: Image.Image) -> bool:
+            try:
+                _lo, _hi = im.convert("L").getextrema()
+                return int(_hi) <= 5
+            except Exception:
+                return False
+
+        hwnd = _pick_hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "Capture Failed", "No Roblox window was found.")
+            return None
+
+        try:
+            _bring_foreground(hwnd)
+            time.sleep(0.12)
+
+            _l, _t, cr, cb = _wgui.GetClientRect(hwnd)
+            client_w = int(cr - _l)
+            client_h = int(cb - _t)
+            if client_w <= 0 or client_h <= 0:
+                raise RuntimeError("Invalid Roblox client size.")
+
+            full = capture_window_image(hwnd)
+            if full is None:
+                raise RuntimeError("Failed to capture Roblox window.")
+
+            if _is_blackish(full):
+                try:
+                    from PIL import ImageGrab as _ig
+
+                    wl, wt, wr, wb = _wgui.GetWindowRect(hwnd)
+                    alt = _ig.grab(bbox=(wl, wt, wr, wb))
+                    if alt is not None and not _is_blackish(alt):
+                        full = alt
+                except Exception:
+                    pass
+
+            wl, wt, wr, wb = _wgui.GetWindowRect(hwnd)
+            win_w = max(1, int(wr - wl))
+            win_h = max(1, int(wb - wt))
+            scale_x = float(full.width) / float(win_w) if win_w else 1.0
+            scale_y = float(full.height) / float(win_h) if win_h else 1.0
+
+            client_left, client_top = _wgui.ClientToScreen(hwnd, (0, 0))
+            crop_left = int((client_left - wl) * scale_x)
+            crop_top = int((client_top - wt) * scale_y)
+            crop_right = int(crop_left + (client_w * scale_x))
+            crop_bottom = int(crop_top + (client_h * scale_y))
+
+            crop_left = max(0, min(full.width - 1, crop_left))
+            crop_top = max(0, min(full.height - 1, crop_top))
+            crop_right = max(crop_left + 1, min(full.width, crop_right))
+            crop_bottom = max(crop_top + 1, min(full.height, crop_bottom))
+
+            client_crop_w = max(1, crop_right - crop_left)
+            client_crop_h = max(1, crop_bottom - crop_top)
+            client_img = full.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+            show_img = client_img
+            offset_x = 0
+            offset_y = 0
+            if _is_blackish(client_img) and not _is_blackish(full):
+                show_img = full
+                offset_x = crop_left
+                offset_y = crop_top
+
+            if _is_blackish(show_img):
+                QMessageBox.warning(
+                    self,
+                    "Capture Failed",
+                    "Roblox screenshot capture returned a black image.\n\nTry windowed/borderless mode and capture again.",
+                )
+                return None
+
+            pm = pil_to_pixmap(show_img)
+            dlg = PointPickDialog(pm, "Capture Point", parent=self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return None
+
+            picked = dlg.selected_point()
+            if not picked:
+                return None
+            _xf, _yf, px, py = picked
+
+            rx = (float(px) - float(offset_x)) / float(client_crop_w)
+            ry = (float(py) - float(offset_y)) / float(client_crop_h)
+            if rx < 0.0 or rx > 1.0 or ry < 0.0 or ry > 1.0:
+                QMessageBox.warning(self, "Invalid Selection", "Please click inside the Roblox client area.")
+                return None
+
+            color = None
+            if sample_color:
+                try:
+                    rgb_img = show_img.convert("RGB")
+                    r, g, b = rgb_img.getpixel((int(px), int(py)))[:3]
+                    color = f"#{int(r):02X}{int(g):02X}{int(b):02X}"
+                except Exception:
+                    color = None
+
+            return {
+                "point": {"x": float(rx), "y": float(ry)},
+                "color": color,
+            }
+        except Exception as e:
+            QMessageBox.warning(self, "Capture Failed", str(e))
+            return None
+
+    def _edit_auto_item_action_step_dialog(self, action_type: str, current: Optional[dict] = None) -> Optional[dict]:
+        action = self._normalize_auto_item_action(current or {"type": action_type}, fallback_name=action_type.title())
+        if action is None:
+            action = {
+                "name": action_type.replace("_", " ").title(),
+                "type": action_type,
+                "point": None,
+                "text": "",
+                "color": "#FFFFFF",
+                "tolerance": 10,
+                "select_all": True,
+                "scroll_direction": "down",
+            }
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Edit {action_type.replace('_', ' ').title()} Action")
+        dlg.resize(620, 420 if action_type in ("paste", "scroll") else 360)
+        self._auto_item_apply_dialog_style(dlg)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+
+        intro_map = {
+            "click": "A click action taps a captured point whenever the row executes.",
+            "conditional_click": "A conditional click only fires when the sampled color matches the captured point.",
+            "paste": "A paste action sends text into the active field as part of the row sequence.",
+            "scroll": "A scroll action moves the mouse to a captured point and scrolls either up or down there.",
+        }
+        intro = QLabel(str(intro_map.get(action_type, "Configure the action step.")))
+        intro.setProperty("role", "hint")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        basics_group = QGroupBox("Action Identity")
+        basics_form = QFormLayout(basics_group)
+        name_le = QLineEdit(str(action.get("name") or ""))
+        name_le.setPlaceholderText(action_type.replace("_", " ").title())
+        try:
+            name_le.setClearButtonEnabled(True)
+        except Exception:
+            pass
+        basics_form.addRow("Action name:", name_le)
+        layout.addWidget(basics_group)
+
+        if action_type in ("click", "conditional_click", "scroll"):
+            target_group = QGroupBox("Target")
+            target_layout = QVBoxLayout(target_group)
+            target_hint = QLabel("Capture the exact on-screen point this action should use.")
+            target_hint.setProperty("role", "hint")
+            target_hint.setWordWrap(True)
+            target_layout.addWidget(target_hint)
+
+            point_le = QLineEdit()
+            point_le.setReadOnly(True)
+            point_le.setPlaceholderText("No point captured yet")
+            point = action.get("point") if isinstance(action.get("point"), dict) else None
+            if isinstance(point, dict):
+                point_le.setText(f"{float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}")
+            capture_btn = QPushButton("Capture Point")
+            capture_btn.setToolTip("Minimize the app overlay and click inside the game window to sample a point.")
+            capture_btn.setStyleSheet(self._get_primary_button_style())
+
+            def _capture() -> None:
+                result = self._capture_auto_item_point(sample_color=(action_type == "conditional_click"))
+                if not result:
+                    return
+                point_val = result.get("point")
+                if isinstance(point_val, dict):
+                    action["point"] = {
+                        "x": float(point_val.get("x", 0.0)),
+                        "y": float(point_val.get("y", 0.0)),
+                    }
+                    point_le.setText(f"{action['point']['x']:.4f}, {action['point']['y']:.4f}")
+                if action_type == "conditional_click" and result.get("color"):
+                    color_le.setText(str(result.get("color") or "#FFFFFF"))
+
+            capture_btn.clicked.connect(_capture)
+            row = QHBoxLayout()
+            row.addWidget(point_le, 1)
+            row.addWidget(capture_btn)
+            holder = QWidget()
+            holder.setLayout(row)
+            target_layout.addWidget(holder)
+            layout.addWidget(target_group)
+
+        if action_type == "conditional_click":
+            cond_group = QGroupBox("Condition")
+            cond_layout = QVBoxLayout(cond_group)
+            cond_hint = QLabel("The click only runs when the sampled pixel color matches within the chosen tolerance.")
+            cond_hint.setProperty("role", "hint")
+            cond_hint.setWordWrap(True)
+            cond_layout.addWidget(cond_hint)
+            cond_form = QFormLayout()
+            color_le = QLineEdit(str(action.get("color") or "#FFFFFF"))
+            color_le.setPlaceholderText("#FFFFFF")
+            cond_form.addRow("Expected color:", color_le)
+            tolerance_spin = QSpinBox()
+            tolerance_spin.setRange(0, 255)
+            tolerance_spin.setValue(int(action.get("tolerance", 10) or 10))
+            cond_form.addRow("Tolerance:", tolerance_spin)
+            cond_layout.addLayout(cond_form)
+            layout.addWidget(cond_group)
+
+        if action_type == "scroll":
+            scroll_group = QGroupBox("Scroll")
+            scroll_layout = QVBoxLayout(scroll_group)
+            scroll_hint = QLabel("Choose whether this step scrolls upward or downward at the captured point.")
+            scroll_hint.setProperty("role", "hint")
+            scroll_hint.setWordWrap(True)
+            scroll_layout.addWidget(scroll_hint)
+            scroll_form = QFormLayout()
+            scroll_direction_combo = QComboBox()
+            scroll_direction_combo.addItem("Up", "up")
+            scroll_direction_combo.addItem("Down", "down")
+            scroll_direction_combo.setCurrentIndex(
+                max(0, scroll_direction_combo.findData(str(action.get("scroll_direction") or "down")))
+            )
+            scroll_form.addRow("Direction:", scroll_direction_combo)
+            scroll_layout.addLayout(scroll_form)
+            layout.addWidget(scroll_group)
+
+        if action_type == "paste":
+            paste_group = QGroupBox("Paste Content")
+            paste_layout = QVBoxLayout(paste_group)
+            paste_hint = QLabel("Enter the exact text this step should send. Multi-line text is supported.")
+            paste_hint.setProperty("role", "hint")
+            paste_hint.setWordWrap(True)
+            paste_layout.addWidget(paste_hint)
+            text_le = QTextEdit()
+            text_le.setAcceptRichText(False)
+            text_le.setPlaceholderText("Text to paste when this step runs")
+            text_le.setPlainText(str(action.get("text") or ""))
+            text_le.setMinimumHeight(120)
+            text_le.setMaximumHeight(180)
+            paste_layout.addWidget(text_le)
+            select_all_chk = QCheckBox("Select all before paste")
+            select_all_chk.setChecked(bool(action.get("select_all", True)))
+            paste_layout.addWidget(select_all_chk)
+            layout.addWidget(paste_group)
+
+        layout.addStretch(1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        out = {
+            "name": name_le.text().strip() or action_type.replace("_", " ").title(),
+            "type": action_type,
+            "point": copy.deepcopy(action.get("point")),
+            "text": "",
+            "color": "#FFFFFF",
+            "tolerance": 0,
+            "select_all": True,
+            "scroll_direction": "down",
+        }
+        if action_type == "conditional_click":
+            out["color"] = color_le.text().strip() or "#FFFFFF"
+            out["tolerance"] = int(tolerance_spin.value())
+        if action_type == "scroll":
+            out["scroll_direction"] = str(scroll_direction_combo.currentData() or "down")
+        if action_type == "paste":
+            out["text"] = text_le.toPlainText()
+            out["select_all"] = bool(select_all_chk.isChecked())
+
+        return out
+
+    def _edit_auto_item_actions_dialog(self, actions: List[dict], *, title: str = "Actions") -> Optional[List[dict]]:
+        working = [copy.deepcopy(a) for a in (actions or []) if isinstance(a, dict)]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(920, 560)
+        self._auto_item_apply_dialog_style(dlg)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+
+        intro = QLabel("Build the ordered action string for this row. Use short names so the sequence stays easy to scan.")
+        intro.setProperty("role", "hint")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["Name", "Type", "Details"])
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setShowGrid(False)
+        table.setWordWrap(False)
+        table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        table.verticalHeader().setVisible(False)
+        table.setMinimumHeight(300)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._auto_item_apply_main_table_style(table)
+        layout.addWidget(table)
+
+        def _details(action: dict) -> str:
+            kind = str(action.get("type") or "")
+            if kind == "paste":
+                text = str(action.get("text") or "")
+                text = text.replace("\r", " ").replace("\n", " ")
+                if len(text) > 48:
+                    text = text[:45] + "..."
+                return f"Paste '{text}'"
+            point = action.get("point") if isinstance(action.get("point"), dict) else None
+            if kind == "scroll":
+                direction = "Up" if str(action.get("scroll_direction") or "down").strip().lower() == "up" else "Down"
+                if isinstance(point, dict):
+                    return f"Scroll {direction} at {float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}"
+                return f"Scroll {direction} (no point)"
+            if kind == "conditional_click":
+                if isinstance(point, dict):
+                    return (
+                        f"{float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f} "
+                        f"{str(action.get('color') or '#FFFFFF')}"
+                    )
+                return "No point"
+            if isinstance(point, dict):
+                return f"{float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}"
+            return "No point"
+
+        def _refresh() -> None:
+            table.setRowCount(len(working))
+            for row, action in enumerate(working):
+                try:
+                    table.setRowHeight(row, 46)
+                except Exception:
+                    pass
+                name_item = QTableWidgetItem(str(action.get("name") or ""))
+                type_item = QTableWidgetItem(str(action.get("type") or "").replace("_", " ").title())
+                detail_text = _details(action)
+                detail_item = QTableWidgetItem(detail_text)
+                for item in (name_item, type_item, detail_item):
+                    item.setToolTip(detail_text if item is detail_item else str(item.text() or ""))
+                table.setItem(row, 0, name_item)
+                table.setItem(row, 1, type_item)
+                table.setItem(row, 2, detail_item)
+
+        def _current_row() -> int:
+            row = table.currentRow()
+            if row < 0 and working:
+                row = 0
+            return row
+
+        add_row = QHBoxLayout()
+        add_click_btn = QPushButton("Add Click")
+        add_cond_btn = QPushButton("Add Conditional")
+        add_paste_btn = QPushButton("Add Paste")
+        add_scroll_btn = QPushButton("Add Scroll")
+        edit_btn = QPushButton("Edit")
+        remove_btn = QPushButton("Remove")
+        up_btn = QPushButton("Move Up")
+        down_btn = QPushButton("Move Down")
+        add_click_btn.setStyleSheet(self._get_primary_button_style())
+        for btn in (add_cond_btn, add_paste_btn, add_scroll_btn, edit_btn, remove_btn, up_btn, down_btn):
+            btn.setStyleSheet(self._get_secondary_button_style())
+        for btn in (add_click_btn, add_cond_btn, add_paste_btn, add_scroll_btn):
+            add_row.addWidget(btn)
+        add_row.addStretch()
+        layout.addLayout(add_row)
+
+        manage_row = QHBoxLayout()
+        for btn in (edit_btn, remove_btn, up_btn, down_btn):
+            manage_row.addWidget(btn)
+        manage_row.addStretch()
+        layout.addLayout(manage_row)
+
+        helper = QLabel("Double-click any step to edit it. Reorder with Move Up and Move Down.")
+        helper.setProperty("role", "hint")
+        helper.setWordWrap(True)
+        layout.addWidget(helper)
+
+        def _add(kind: str) -> None:
+            result = self._edit_auto_item_action_step_dialog(kind)
+            if result is None:
+                return
+            working.append(result)
+            _refresh()
+            table.setCurrentCell(max(0, len(working) - 1), 0)
+
+        def _edit_selected() -> None:
+            row = _current_row()
+            if row < 0 or row >= len(working):
+                return
+            current = working[row]
+            result = self._edit_auto_item_action_step_dialog(str(current.get("type") or ""), current)
+            if result is None:
+                return
+            working[row] = result
+            _refresh()
+            table.setCurrentCell(row, 0)
+
+        def _move(delta: int) -> None:
+            row = _current_row()
+            new_row = row + int(delta)
+            if row < 0 or new_row < 0 or new_row >= len(working):
+                return
+            working[row], working[new_row] = working[new_row], working[row]
+            _refresh()
+            table.setCurrentCell(new_row, 0)
+
+        def _remove_selected() -> None:
+            row = _current_row()
+            if row < 0 or row >= len(working):
+                return
+            working.pop(row)
+            _refresh()
+            if working:
+                table.setCurrentCell(max(0, min(row, len(working) - 1)), 0)
+
+        add_click_btn.clicked.connect(lambda: _add("click"))
+        add_cond_btn.clicked.connect(lambda: _add("conditional_click"))
+        add_paste_btn.clicked.connect(lambda: _add("paste"))
+        add_scroll_btn.clicked.connect(lambda: _add("scroll"))
+        edit_btn.clicked.connect(_edit_selected)
+        remove_btn.clicked.connect(_remove_selected)
+        up_btn.clicked.connect(lambda: _move(-1))
+        down_btn.clicked.connect(lambda: _move(1))
+        table.doubleClicked.connect(lambda *_args: _edit_selected())
+
+        _refresh()
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return [copy.deepcopy(a) for a in working]
+
+    def _edit_item_actions(self, btn: QPushButton) -> None:
+        current = btn.property("actions") or []
+        if not isinstance(current, list):
+            current = []
+        updated = self._edit_auto_item_actions_dialog(current, title="Edit Actions")
+        if updated is None:
+            return
+        btn.setProperty("actions", copy.deepcopy(updated))
+        self._update_actions_btn_text(btn)
+        self._on_auto_item_ui_changed()
+
+    def _edit_item_behavior(self, btn: QPushButton) -> None:
+        current = self._normalize_auto_item_behavior(btn.property("behavior"))
+        filters = self._auto_item_filter_catalog()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Action Behavior")
+        dlg.resize(920, 620)
+        self._auto_item_apply_dialog_style(dlg)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+
+        intro = QLabel(
+            "Define when this row is allowed to run, how often it repeats, and which OCR filters can trigger it."
+        )
+        intro.setProperty("role", "hint")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
+        layout.addLayout(top_row)
+
+        playback_group = QGroupBox("Playback")
+        playback_layout = QVBoxLayout(playback_group)
+        form = QFormLayout()
+        cooldown_spin = _AutoItemSpinBox()
+        cooldown_spin.setRange(0, 86400)
+        cooldown_spin.setValue(int(current.get("cooldown", 0) or 0))
+        form.addRow("Cooldown (s):", cooldown_spin)
+
+        repeat_combo = QComboBox()
+        repeat_combo.addItem("Repeatedly", "repeat")
+        repeat_combo.addItem("Set amount of times", "count")
+        repeat_combo.addItem("Once per PID", "once_per_pid")
+        idx = max(0, repeat_combo.findData(str(current.get("repeat_mode") or "repeat")))
+        repeat_combo.setCurrentIndex(idx)
+        form.addRow("Play mode:", repeat_combo)
+
+        repeat_count_holder = QWidget()
+        repeat_count_holder_layout = QHBoxLayout(repeat_count_holder)
+        repeat_count_holder_layout.setContentsMargins(0, 0, 0, 0)
+        repeat_count_holder_layout.setSpacing(0)
+        repeat_count_spin = _AutoItemSpinBox()
+        repeat_count_spin.setRange(1, 999)
+        repeat_count_spin.setValue(int(current.get("repeat_count", 1) or 1))
+        repeat_count_blank = QLineEdit()
+        repeat_count_blank.setReadOnly(True)
+        repeat_count_blank.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        repeat_count_blank.setText("")
+        repeat_count_holder_layout.addWidget(repeat_count_spin)
+        repeat_count_holder_layout.addWidget(repeat_count_blank)
+        form.addRow("Play count:", repeat_count_holder)
+        playback_layout.addLayout(form)
+        mode_hint = QLabel()
+        mode_hint.setProperty("role", "hint")
+        mode_hint.setWordWrap(True)
+        playback_layout.addWidget(mode_hint)
+        top_row.addWidget(playback_group, 1)
+
+        trigger_group = QGroupBox("Trigger")
+        trigger_layout = QVBoxLayout(trigger_group)
+        trigger_combo = QComboBox()
+        trigger_combo.addItem("Normal", "normal")
+        trigger_combo.addItem("OCR filter triggered", "ocr_filter")
+        trigger_idx = max(0, trigger_combo.findData(str((current.get("trigger") or {}).get("type") or "normal")))
+        trigger_combo.setCurrentIndex(trigger_idx)
+        trigger_form = QFormLayout()
+        trigger_form.addRow("Trigger type:", trigger_combo)
+        trigger_layout.addLayout(trigger_form)
+        trigger_hint = QLabel()
+        trigger_hint.setProperty("role", "hint")
+        trigger_hint.setWordWrap(True)
+        trigger_layout.addWidget(trigger_hint)
+        trigger_layout.addStretch(1)
+        top_row.addWidget(trigger_group, 1)
+
+        biome_group = QGroupBox("Allowed Biomes")
+        biome_layout = QVBoxLayout(biome_group)
+        biome_btn_row = QHBoxLayout()
+        biome_all_btn = QPushButton("Select All")
+        biome_none_btn = QPushButton("Select None")
+        biome_all_btn.setStyleSheet(self._get_secondary_button_style())
+        biome_none_btn.setStyleSheet(self._get_secondary_button_style())
+        biome_btn_row.addWidget(biome_all_btn)
+        biome_btn_row.addWidget(biome_none_btn)
+        biome_btn_row.addStretch()
+        biome_layout.addLayout(biome_btn_row)
+        biome_list = QListWidget()
+        biome_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        biome_list.setMinimumWidth(240)
+        biome_list.setMinimumHeight(280)
+        current_biomes = {str(b).strip().upper() for b in (current.get("biomes") or []) if str(b).strip()}
+        try:
+            all_biomes = list(biome_names())
+        except Exception:
+            all_biomes = []
+        for biome in all_biomes:
+            item = QListWidgetItem(str(biome).upper())
+            biome_list.addItem(item)
+            if item.text() in current_biomes:
+                item.setSelected(True)
+        biome_all_btn.clicked.connect(lambda: biome_list.selectAll())
+        biome_none_btn.clicked.connect(lambda: biome_list.clearSelection())
+        biome_layout.addWidget(biome_list)
+
+        filter_group = QGroupBox("OCR Filter Bindings")
+        filter_layout = QVBoxLayout(filter_group)
+        filter_hint = QLabel("Choose which OCR filters will trigger this action row.")
+        filter_hint.setWordWrap(True)
+        filter_hint.setProperty("role", "hint")
+        filter_layout.addWidget(filter_hint)
+        filter_btn_row = QHBoxLayout()
+        filter_btn_row.setSpacing(8)
+        filter_all_btn = QPushButton("Select All")
+        filter_none_btn = QPushButton("Select None")
+        filter_refresh_btn = QPushButton("Refresh")
+        filter_all_btn.setStyleSheet(self._get_secondary_button_style())
+        filter_none_btn.setStyleSheet(self._get_secondary_button_style())
+        filter_refresh_btn.setStyleSheet(self._get_secondary_button_style())
+        filter_btn_row.addWidget(filter_all_btn)
+        filter_btn_row.addWidget(filter_none_btn)
+        filter_btn_row.addWidget(filter_refresh_btn)
+        filter_btn_row.addStretch()
+        filter_layout.addLayout(filter_btn_row)
+        filter_list = QListWidget()
+        filter_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        filter_list.setMinimumWidth(320)
+        filter_list.setMinimumHeight(280)
+        current_filters = {
+            str(fid).strip()
+            for fid in ((current.get("trigger") or {}).get("filter_ids", []) or [])
+            if str(fid).strip()
+        }
+        filter_refresh_initialized = False
+        filter_all_btn.clicked.connect(lambda: filter_list.selectAll())
+        filter_none_btn.clicked.connect(lambda: filter_list.clearSelection())
+        filter_layout.addWidget(filter_list)
+
+        lists_row = QHBoxLayout()
+        lists_row.setSpacing(12)
+        lists_row.addWidget(biome_group, 1)
+        lists_row.addWidget(filter_group, 1)
+        layout.addLayout(lists_row)
+
+        def _sync_repeat_count_state() -> None:
+            mode = str(repeat_combo.currentData() or "repeat")
+            is_count = mode == "count"
+            repeat_count_spin.setVisible(is_count)
+            repeat_count_blank.setVisible(not is_count)
+            if mode == "count":
+                mode_hint.setText("This row will run its sequence exactly the number of times shown above for each trigger.")
+            elif mode == "once_per_pid":
+                mode_hint.setText("This row will only run once for each detected Roblox PID until the process changes.")
+            else:
+                mode_hint.setText("This row can keep firing whenever its trigger conditions are met and cooldown permits it.")
+
+        def _sync_trigger_state() -> None:
+            is_ocr = str(trigger_combo.currentData() or "normal") == "ocr_filter"
+            has_filters = bool(filters)
+            filter_list.setEnabled(is_ocr and has_filters)
+            filter_all_btn.setEnabled(is_ocr and has_filters)
+            filter_none_btn.setEnabled(is_ocr and has_filters)
+            if not has_filters:
+                filter_hint.setText("No OCR filters are available yet. Configure OCR filters first, then bind them here.")
+            elif is_ocr:
+                filter_hint.setText("Choose which OCR filters will trigger this action row.")
+            else:
+                filter_hint.setText("Normal mode ignores OCR filters and runs when cooldown and biome checks allow it.")
+            trigger_hint.setText(
+                "Normal mode runs on its own cooldown. OCR filter mode waits for any bound OCR filter to fire."
+            )
+
+        def _refresh_filter_bindings() -> None:
+            nonlocal filters, filter_refresh_initialized
+            selected_ids = {
+                str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                for item in filter_list.selectedItems()
+                if str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            }
+            if not selected_ids and not filter_refresh_initialized:
+                selected_ids = set(current_filters)
+
+            filters = self._auto_item_filter_catalog()
+            filter_list.clear()
+            if not filters:
+                empty_item = QListWidgetItem("No OCR filters configured yet")
+                empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                filter_list.addItem(empty_item)
+            else:
+                for spec in filters:
+                    filter_id = str(spec.get("id") or "").strip()
+                    label = str(spec.get("name") or filter_id or "").strip()
+                    if not bool(spec.get("enabled", True)):
+                        label += " (disabled)"
+                    item = QListWidgetItem(label)
+                    item.setData(Qt.ItemDataRole.UserRole, filter_id)
+                    item.setToolTip(f"{label}\nID: {filter_id}")
+                    filter_list.addItem(item)
+                    if filter_id in selected_ids:
+                        item.setSelected(True)
+            filter_refresh_initialized = True
+            _sync_trigger_state()
+
+        repeat_combo.currentIndexChanged.connect(_sync_repeat_count_state)
+        trigger_combo.currentIndexChanged.connect(_sync_trigger_state)
+        filter_refresh_btn.clicked.connect(_refresh_filter_bindings)
+        _refresh_filter_bindings()
+        _sync_repeat_count_state()
+        _sync_trigger_state()
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        chosen_filters = []
+        for item in filter_list.selectedItems():
+            value = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if value and value not in chosen_filters:
+                chosen_filters.append(value)
+
+        chosen_biomes = []
+        for item in biome_list.selectedItems():
+            value = str(item.text() or "").strip().upper()
+            if value and value not in chosen_biomes:
+                chosen_biomes.append(value)
+
+        btn.setProperty(
+            "behavior",
+            {
+                "cooldown": int(cooldown_spin.value()),
+                "biomes": chosen_biomes,
+                "repeat_mode": str(repeat_combo.currentData() or "repeat"),
+                "repeat_count": int(repeat_count_spin.value()) if str(repeat_combo.currentData() or "repeat") == "count" else 1,
+                "trigger": {
+                    "type": str(trigger_combo.currentData() or "normal"),
+                    "filter_ids": chosen_filters if str(trigger_combo.currentData() or "normal") == "ocr_filter" else [],
+                },
+            },
+        )
+        self._update_behavior_btn_text(btn)
+        self._on_auto_item_ui_changed()
+
+    def _edit_auto_item_preset_dialog(self, preset: Optional[dict] = None) -> Optional[dict]:
+        current = self._normalize_auto_item_preset(preset or {}, fallback_index=0) or {
+            "id": f"preset_{uuid.uuid4().hex[:8]}",
+            "name": "New Preset",
+            "builtin": False,
+            "actions": [],
+        }
+        actions = [copy.deepcopy(a) for a in (current.get("actions") or []) if isinstance(a, dict)]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Preset")
+        dlg.resize(560, 300)
+        self._auto_item_apply_dialog_style(dlg)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+
+        intro = QLabel("Save a reusable action string that can be inserted into the table later.")
+        intro.setProperty("role", "hint")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        identity_group = QGroupBox("Preset Identity")
+        form = QFormLayout(identity_group)
+        name_le = QLineEdit(str(current.get("name") or ""))
+        name_le.setPlaceholderText("Preset name")
+        form.addRow("Preset name:", name_le)
+        layout.addWidget(identity_group)
+
+        sequence_group = QGroupBox("Sequence")
+        sequence_layout = QVBoxLayout(sequence_group)
+        summary_lbl = QLabel(self._auto_item_action_summary_text(actions))
+        summary_lbl.setProperty("role", "section")
+        summary_lbl.setToolTip(self._auto_item_actions_tooltip(actions))
+        sequence_layout.addWidget(summary_lbl)
+        sequence_hint = QLabel("Edit the underlying steps without leaving this preset dialog.")
+        sequence_hint.setProperty("role", "hint")
+        sequence_hint.setWordWrap(True)
+        sequence_layout.addWidget(sequence_hint)
+
+        edit_actions_btn = QPushButton("Edit Actions")
+        edit_actions_btn.setStyleSheet(self._get_primary_button_style())
+
+        def _edit_actions() -> None:
+            nonlocal actions
+            updated = self._edit_auto_item_actions_dialog(actions, title=f"Preset Actions - {name_le.text().strip() or 'Preset'}")
+            if updated is None:
+                return
+            actions = updated
+            summary_lbl.setText(self._auto_item_action_summary_text(actions))
+            summary_lbl.setToolTip(self._auto_item_actions_tooltip(actions))
+
+        edit_actions_btn.clicked.connect(_edit_actions)
+        sequence_layout.addWidget(edit_actions_btn)
+        layout.addWidget(sequence_group)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        return {
+            "id": str(current.get("id") or f"preset_{uuid.uuid4().hex[:8]}"),
+            "name": name_le.text().strip() or "Preset",
+            "builtin": bool(current.get("builtin", False)),
+            "actions": [copy.deepcopy(a) for a in actions],
+        }
+
+    def _open_auto_item_presets_dialog(self) -> None:
+        presets = [copy.deepcopy(p) for p in (getattr(self, "_auto_item_presets", []) or []) if isinstance(p, dict)]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Action Presets")
+        dlg.resize(980, 580)
+        self._auto_item_apply_dialog_style(dlg)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+
+        intro = QLabel(
+            "Use presets to keep common action strings reusable, exportable, and easy to drop into new rows."
+            " Save table rows from the main Auto Actions tab with the Save Selected Rows button."
+        )
+        intro.setProperty("role", "hint")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        content_row = QHBoxLayout()
+        content_row.setSpacing(12)
+        layout.addLayout(content_row, 1)
+
+        left_group = QGroupBox("Saved Presets")
+        left = QVBoxLayout(left_group)
+        left.setSpacing(10)
+        right_group = QGroupBox("Preview")
+        right = QVBoxLayout(right_group)
+        right.setSpacing(10)
+        content_row.addWidget(left_group, 1)
+        content_row.addWidget(right_group, 2)
+
+        preset_list = QListWidget()
+        preset_list.setMinimumWidth(280)
+        left.addWidget(preset_list, 1)
+
+        preview_hint = QLabel("Select a preset to inspect every step before adding it to the table.")
+        preview_hint.setProperty("role", "hint")
+        preview_hint.setWordWrap(True)
+        right.addWidget(preview_hint)
+
+        preview = QTextEdit()
+        preview.setReadOnly(True)
+        preview.setFont(QFont("Consolas", 10))
+        right.addWidget(preview, 1)
+
+        def _refresh_list(select_id: Optional[str] = None) -> None:
+            preset_list.clear()
+            target_row = 0
+            for row, preset in enumerate(presets):
+                label = str(preset.get("name") or "Preset")
+                if bool(preset.get("builtin", False)):
+                    label += " [Built-in]"
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, str(preset.get("id") or ""))
+                item.setToolTip(
+                    f"{label}\n{self._auto_item_action_summary_text(preset.get('actions') or [])}"
+                )
+                preset_list.addItem(item)
+                if select_id and str(preset.get("id") or "") == select_id:
+                    target_row = row
+            if preset_list.count():
+                preset_list.setCurrentRow(max(0, min(target_row, preset_list.count() - 1)))
+
+        def _selected_index() -> int:
+            row = preset_list.currentRow()
+            return row if 0 <= row < len(presets) else -1
+
+        def _refresh_preview() -> None:
+            row = _selected_index()
+            if row < 0:
+                preview.setPlainText("Select a preset to preview its action string.")
+                return
+            preset = presets[row]
+            preset_actions = [a for a in (preset.get("actions") or []) if isinstance(a, dict)]
+            lines = [
+                str(preset.get("name") or "Preset"),
+                "=" * max(6, len(str(preset.get("name") or "Preset"))),
+                f"Type: {'Built-in' if bool(preset.get('builtin', False)) else 'Custom'}",
+                f"Steps: {len(preset_actions)}",
+                "",
+            ]
+            if not preset_actions:
+                lines.append("No steps configured yet.")
+            for idx, action in enumerate(preset_actions):
+                kind = str(action.get("type") or "").replace("_", " ").title()
+                name = str(action.get("name") or action.get("type") or "Action")
+                lines.append(f"{idx + 1}. {name} [{kind}]")
+                if str(action.get("type") or "") == "paste":
+                    text = str(action.get("text") or "").replace("\r", " ").replace("\n", " ").strip()
+                    if len(text) > 70:
+                        text = text[:67] + "..."
+                    lines.append(f"    Paste: {text or '(empty)'}")
+                else:
+                    point = action.get("point") if isinstance(action.get("point"), dict) else None
+                    if isinstance(point, dict):
+                        lines.append(
+                            f"    Point: {float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}"
+                        )
+                    else:
+                        lines.append("    Point: not set")
+                    if str(action.get("type") or "") == "scroll":
+                        direction = "Up" if str(action.get("scroll_direction") or "down").strip().lower() == "up" else "Down"
+                        lines.append(f"    Scroll: {direction}")
+                    if str(action.get("type") or "") == "conditional_click":
+                        lines.append(
+                            f"    Match: {str(action.get('color') or '#FFFFFF')} +/- {int(action.get('tolerance', 10) or 10)}"
+                        )
+            preview.setPlainText("\n".join(lines))
+
+        def _sync_presets() -> None:
+            self._auto_item_presets = [copy.deepcopy(p) for p in presets]
+            self._on_auto_item_ui_changed()
+
+        add_to_table_btn = QPushButton("Add To Table")
+        new_btn = QPushButton("New")
+        edit_btn = QPushButton("Edit")
+        duplicate_btn = QPushButton("Duplicate")
+        remove_btn = QPushButton("Remove")
+        import_btn = QPushButton("Import")
+        export_btn = QPushButton("Export")
+        add_to_table_btn.setStyleSheet(self._get_primary_button_style())
+        for btn in (new_btn, edit_btn, duplicate_btn, remove_btn, import_btn, export_btn):
+            btn.setStyleSheet(self._get_secondary_button_style())
+
+        primary_row = QHBoxLayout()
+        primary_row.setContentsMargins(0, 2, 0, 0)
+        primary_row.setSpacing(8)
+        primary_row.addStretch()
+        primary_row.addWidget(add_to_table_btn)
+        primary_row.addWidget(new_btn)
+        primary_row.addWidget(edit_btn)
+        primary_row.addStretch()
+        left.addLayout(primary_row)
+
+        manage_row = QHBoxLayout()
+        manage_row.setContentsMargins(0, 0, 0, 0)
+        manage_row.setSpacing(8)
+        for btn in (duplicate_btn, remove_btn, import_btn, export_btn):
+            manage_row.addWidget(btn)
+        manage_row.addStretch()
+        left.addLayout(manage_row)
+
+        preset_list.currentRowChanged.connect(lambda *_args: _refresh_preview())
+
+        def _insert_preset_as_row() -> None:
+            row = _selected_index()
+            if row < 0:
+                return
+            items = self._current_auto_item_items()
+            preset = presets[row]
+            items.append(
+                {
+                    "enabled": True,
+                    "name": str(preset.get("name") or "Preset"),
+                    "actions": [copy.deepcopy(a) for a in (preset.get("actions") or [])],
+                    "behavior": self._default_auto_item_behavior(),
+                    "alert_enabled": False,
+                    "alert_webhook": "",
+                    "alert_message": "",
+                    "alert_lead_s": 15.0,
+                }
+            )
+            self._load_auto_item_items_table(items)
+            self._on_auto_item_ui_changed()
+
+        def _new_preset() -> None:
+            preset = self._edit_auto_item_preset_dialog()
+            if preset is None:
+                return
+            presets.append(preset)
+            _refresh_list(select_id=str(preset.get("id") or ""))
+            _sync_presets()
+
+        def _edit_preset() -> None:
+            row = _selected_index()
+            if row < 0:
+                return
+            updated = self._edit_auto_item_preset_dialog(presets[row])
+            if updated is None:
+                return
+            presets[row] = updated
+            _refresh_list(select_id=str(updated.get("id") or ""))
+            _sync_presets()
+
+        def _duplicate_preset() -> None:
+            row = _selected_index()
+            if row < 0:
+                return
+            dup = copy.deepcopy(presets[row])
+            dup["id"] = f"preset_{uuid.uuid4().hex[:8]}"
+            dup["name"] = f"{str(dup.get('name') or 'Preset')} Copy"
+            dup["builtin"] = False
+            presets.append(dup)
+            _refresh_list(select_id=str(dup.get("id") or ""))
+            _sync_presets()
+
+        def _remove_preset() -> None:
+            row = _selected_index()
+            if row < 0:
+                return
+            if bool(presets[row].get("builtin", False)) or str(presets[row].get("id") or "") == "item":
+                QMessageBox.information(self, "Action Presets", "The built-in Item preset cannot be removed.")
+                return
+            presets.pop(row)
+            _refresh_list()
+            _sync_presets()
+
+        def _import_presets() -> None:
+            path, _ = QFileDialog.getOpenFileName(self, "Import Action Presets", "", "JSON Files (*.json)")
+            if not path:
+                return
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except Exception as e:
+                QMessageBox.warning(self, "Import Failed", str(e))
+                return
+            raw_list = payload if isinstance(payload, list) else [payload]
+            added_id = None
+            for idx, raw in enumerate(raw_list):
+                preset = self._normalize_auto_item_preset(raw, fallback_index=idx)
+                if preset is None:
+                    continue
+                if str(preset.get("id") or "") == "item":
+                    preset["builtin"] = True
+                presets.append(preset)
+                added_id = str(preset.get("id") or "")
+            _refresh_list(select_id=added_id)
+            _sync_presets()
+
+        def _export_preset() -> None:
+            row = _selected_index()
+            if row < 0:
+                return
+            preset = presets[row]
+            suggested = re.sub(r"[^A-Za-z0-9._-]+", "_", str(preset.get("name") or "preset")).strip("_") or "preset"
+            path, _ = QFileDialog.getSaveFileName(self, "Export Action Preset", f"{suggested}.json", "JSON Files (*.json)")
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(preset, fh, indent=2)
+            except Exception as e:
+                QMessageBox.warning(self, "Export Failed", str(e))
+
+        add_to_table_btn.clicked.connect(_insert_preset_as_row)
+        new_btn.clicked.connect(_new_preset)
+        edit_btn.clicked.connect(_edit_preset)
+        duplicate_btn.clicked.connect(_duplicate_preset)
+        remove_btn.clicked.connect(_remove_preset)
+        import_btn.clicked.connect(_import_presets)
+        export_btn.clicked.connect(_export_preset)
+
+        _refresh_list()
+        _refresh_preview()
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(self._get_secondary_button_style())
+        close_btn.clicked.connect(dlg.accept)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+        dlg.exec()
+
+    def setup_auto_item_tab(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        auto_widget = QWidget()
+        scroll.setWidget(auto_widget)
+        layout = QVBoxLayout(auto_widget)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        info_group = QGroupBox("Auto Actions")
+        info_layout = QVBoxLayout(info_group)
+        info_layout.setSpacing(6)
+        desc = QLabel(
+            "Chain clicks, conditional clicks, and pastes into reusable rows."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        info_layout.addWidget(desc)
+        sub_desc = QLabel(
+            "Each row carries its own action string, OCR trigger bindings, cooldown/biome behavior, "
+            "optional user targeting, and pre-run alert settings."
+        )
+        sub_desc.setWordWrap(True)
+        sub_desc.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        info_layout.addWidget(sub_desc)
+        layout.addWidget(info_group)
+
+        settings_group = QGroupBox("Settings")
+        settings_layout = QGridLayout(settings_group)
+        settings_layout.setHorizontalSpacing(16)
+        settings_layout.setVerticalSpacing(12)
+        settings_layout.setColumnStretch(0, 0)
+        settings_layout.setColumnStretch(1, 1)
+
+        self.auto_item_enable_chk = QCheckBox("Enable Auto-Actions (while manager is running)")
+        settings_layout.addWidget(self.auto_item_enable_chk, 0, 0, 1, 2)
+
+        settings_layout.addWidget(QLabel("Tick interval (seconds):"), 1, 0)
+        self.auto_item_tick_spin = QDoubleSpinBox()
+        self.auto_item_tick_spin.setRange(0.2, 60.0)
+        self.auto_item_tick_spin.setDecimals(2)
+        self.auto_item_tick_spin.setSingleStep(0.1)
+        self.auto_item_tick_spin.setValue(1.0)
+        settings_layout.addWidget(self.auto_item_tick_spin, 1, 1)
+
+        settings_layout.addWidget(QLabel("Click/paste delay (seconds):"), 2, 0)
+        self.auto_item_delay_spin = QDoubleSpinBox()
+        self.auto_item_delay_spin.setRange(0.01, 2.0)
+        self.auto_item_delay_spin.setDecimals(2)
+        self.auto_item_delay_spin.setSingleStep(0.05)
+        self.auto_item_delay_spin.setValue(0.2)
+        settings_layout.addWidget(self.auto_item_delay_spin, 2, 1)
+
+        self.auto_item_disable_mouse_chk = QCheckBox("Disable user mouse movement during Auto-Actions")
+        settings_layout.addWidget(self.auto_item_disable_mouse_chk, 3, 0, 1, 2)
+        try:
+            self._update_auto_item_disable_mouse_tooltip()
+        except Exception:
+            pass
+
+        settings_layout.addWidget(QLabel("Toggle hotkey:"), 4, 0)
+        self.auto_item_hotkey_edit = QKeySequenceEdit()
+        self.auto_item_hotkey_edit.setToolTip("Global hotkey to toggle Auto-Actions enable/disable (default: Ctrl+Alt+Space).")
+        try:
+            self.auto_item_hotkey_edit.setKeySequence(QKeySequence("Ctrl+Alt+Space"))
+        except Exception:
+            pass
+        self.auto_item_hotkey_edit.setMinimumWidth(220)
+        settings_layout.addWidget(self.auto_item_hotkey_edit, 4, 1)
+
+        layout.addWidget(settings_group)
+
+        items_group = QGroupBox("Action Rows")
+        items_layout = QVBoxLayout(items_group)
+        items_layout.setSpacing(10)
+
+        self.auto_item_table = QTableWidget()
+        self.auto_item_table.setColumnCount(6)
+        self.auto_item_table.setHorizontalHeaderLabels(["Enabled", "Name", "Actions", "Behavior", "Users", "Alert"])
+        self.auto_item_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.auto_item_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.auto_item_table.setShowGrid(False)
+        self.auto_item_table.setAlternatingRowColors(False)
+        self.auto_item_table.setWordWrap(False)
+        self.auto_item_table.verticalHeader().setVisible(False)
+        self.auto_item_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        header = self.auto_item_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setMinimumSectionSize(72)
+        self.auto_item_table.setColumnWidth(0, 72)
+        self.auto_item_table.setMinimumHeight(280)
+        try:
+            self.auto_item_table.setColumnHidden(5, not _bm_relaxed())
+        except Exception:
+            pass
+        self._auto_item_apply_main_table_style(self.auto_item_table)
+        items_layout.addWidget(self.auto_item_table)
+
+        rows_hint = QLabel(
+            "Use presets to drop in reusable sequences."
+        )
+        rows_hint.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        rows_hint.setWordWrap(True)
+        items_layout.addWidget(rows_hint)
+
+        items_btn_row = QHBoxLayout()
+        items_btn_row.setSpacing(8)
+        add_item_btn = QPushButton("Add Action")
+        add_item_btn.clicked.connect(self._auto_item_add_item)
+        remove_item_btn = QPushButton("Remove Selected")
+        remove_item_btn.clicked.connect(self._auto_item_remove_selected_items)
+        save_rows_btn = QPushButton("Save Selected")
+        save_rows_btn.clicked.connect(self._auto_item_save_selected_rows_as_presets)
+        test_btn = QPushButton("Test Selected")
+        test_btn.clicked.connect(self._auto_item_test_once)
+        self.auto_item_test_btn = test_btn
+        up_btn = QPushButton("Move Up")
+        up_btn.clicked.connect(lambda: self._auto_item_move_selected(-1))
+        down_btn = QPushButton("Move Down")
+        down_btn.clicked.connect(lambda: self._auto_item_move_selected(1))
+        presets_btn = QPushButton("Presets")
+        presets_btn.clicked.connect(self._open_auto_item_presets_dialog)
+        for btn in (add_item_btn, remove_item_btn, save_rows_btn, test_btn, up_btn, down_btn, presets_btn):
+            items_btn_row.addWidget(btn)
+        items_btn_row.addStretch()
+        items_layout.addLayout(items_btn_row)
+
+        layout.addWidget(items_group)
+
+        users_group = QGroupBox("Users")
+        users_layout = QVBoxLayout(users_group)
+
+        users_btn_row = QHBoxLayout()
+        refresh_users_btn = QPushButton("Refresh List")
+        refresh_users_btn.clicked.connect(self._auto_item_refresh_users)
+        sel_all_btn = QPushButton("Select All")
+        sel_all_btn.clicked.connect(lambda: self._auto_item_set_all_users(True))
+        sel_none_btn = QPushButton("Select None")
+        sel_none_btn.clicked.connect(lambda: self._auto_item_set_all_users(False))
+        users_btn_row.addWidget(refresh_users_btn)
+        users_btn_row.addWidget(sel_all_btn)
+        users_btn_row.addWidget(sel_none_btn)
+        users_btn_row.addStretch()
+        users_layout.addLayout(users_btn_row)
+
+        users_hint = QLabel("These checkboxes define the available targets for rows set to run on all users.")
+        users_hint.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        users_hint.setWordWrap(True)
+        users_layout.addWidget(users_hint)
+
+        self.auto_item_users_container = QWidget()
+        self.auto_item_users_vbox = QVBoxLayout(self.auto_item_users_container)
+        self.auto_item_users_vbox.setContentsMargins(0, 0, 0, 0)
+        self.auto_item_users_vbox.setSpacing(4)
+        self.auto_item_user_checks = {}
+
+        users_scroll = QScrollArea()
+        users_scroll.setWidgetResizable(True)
+        users_scroll.setWidget(self.auto_item_users_container)
+        users_scroll.setMinimumHeight(180)
+        users_scroll.setMinimumWidth(280)
+        users_layout.addWidget(users_scroll)
+
+        log_group = QGroupBox("Auto-Actions Log")
+        log_layout = QVBoxLayout(log_group)
+        log_hint = QLabel("Runtime messages, OCR-trigger activity, and manual tests are written here.")
+        log_hint.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        log_hint.setWordWrap(True)
+        log_layout.addWidget(log_hint)
+        self.autoitem_status_box = QTextEdit()
+        self.autoitem_status_box.setReadOnly(True)
+        self.autoitem_status_box.setFont(QFont("Consolas", 10))
+        self.autoitem_status_box.setMinimumHeight(180)
+        try:
+            self.autoitem_status_box.document().setMaximumBlockCount(5000)
+        except Exception:
+            pass
+        log_layout.addWidget(self.autoitem_status_box)
+
+        lower_row = QHBoxLayout()
+        lower_row.setSpacing(14)
+        lower_row.addWidget(users_group, 1)
+        lower_row.addWidget(log_group, 2)
+        layout.addLayout(lower_row)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        reset_btn = QPushButton("Restore Auto-Actions Defaults")
+        reset_btn.clicked.connect(self._reset_auto_item_to_defaults)
+        footer.addWidget(reset_btn)
+        layout.addLayout(footer)
+        layout.addStretch()
+
+        self._auto_item_presets = []
+        self._auto_item_save_timer = QTimer(self)
+        self._auto_item_save_timer.setSingleShot(True)
+        self._auto_item_save_timer.timeout.connect(self._save_auto_item_settings)
+
+        self.auto_item_enable_chk.toggled.connect(self._on_auto_item_enabled_toggled)
+        self.auto_item_tick_spin.valueChanged.connect(self._on_auto_item_ui_changed)
+        self.auto_item_delay_spin.valueChanged.connect(self._on_auto_item_ui_changed)
+        self.auto_item_disable_mouse_chk.toggled.connect(self._on_auto_item_mouse_toggle_changed)
+        self.auto_item_hotkey_edit.keySequenceChanged.connect(self._on_auto_item_hotkey_changed)
+
+        self._auto_item_refresh_users()
+        self._load_auto_item_settings()
+        self._ensure_auto_item_engine()
+
+        self.tab_widget.addTab(scroll, "Auto Actions")
+
+    def _auto_item_add_item(self):
+        items = self._current_auto_item_items()
+        items.append(
+            {
+                "enabled": True,
+                "name": "",
+                "actions": [],
+                "behavior": self._default_auto_item_behavior(),
+                "alert_enabled": False,
+                "alert_webhook": "",
+                "alert_message": "",
+                "alert_lead_s": 15.0,
+            }
+        )
+        self._load_auto_item_items_table(items)
+        self._on_auto_item_ui_changed()
+
+    def _auto_item_save_selected_rows_as_presets(self) -> None:
+        rows = sorted({idx.row() for idx in self.auto_item_table.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "Action Presets", "Select at least one row in the Auto Actions table first.")
+            return
+
+        items = self._current_auto_item_items()
+        presets = [copy.deepcopy(p) for p in (getattr(self, "_auto_item_presets", []) or []) if isinstance(p, dict)]
+
+        if len(rows) == 1:
+            row_idx = rows[0]
+            if row_idx < 0 or row_idx >= len(items):
+                return
+            item = items[row_idx]
+            preset = self._edit_auto_item_preset_dialog(
+                {
+                    "name": str(item.get("name") or "Preset"),
+                    "actions": [copy.deepcopy(a) for a in (item.get("actions") or [])],
+                    "builtin": False,
+                }
+            )
+            if preset is None:
+                return
+            presets.append(preset)
+            self._auto_item_presets = presets
+            self._on_auto_item_ui_changed()
+            return
+
+        added = 0
+        for row_idx in rows:
+            if row_idx < 0 or row_idx >= len(items):
+                continue
+            item = items[row_idx]
+            preset = self._normalize_auto_item_preset(
+                {
+                    "id": f"preset_{uuid.uuid4().hex[:8]}",
+                    "name": str(item.get("name") or f"Preset {row_idx + 1}").strip() or f"Preset {row_idx + 1}",
+                    "builtin": False,
+                    "actions": [copy.deepcopy(a) for a in (item.get("actions") or [])],
+                },
+                fallback_index=len(presets) + added,
+            )
+            if preset is None:
+                continue
+            presets.append(preset)
+            added += 1
+
+        if added <= 0:
+            QMessageBox.information(self, "Action Presets", "No presets were created from the selected rows.")
+            return
+
+        self._auto_item_presets = presets
+        self._on_auto_item_ui_changed()
+        QMessageBox.information(self, "Action Presets", f"Saved {added} presets from the selected rows.")
+
+    def _auto_item_test_once(self):
+        self._ensure_auto_item_engine()
+        if not getattr(self, "auto_item_engine", None):
+            QMessageBox.warning(self, "Auto Actions", "Auto-Actions engine is not available.")
+            return
+        if not self._is_manager_running():
+            QMessageBox.information(self, "Auto-Actions Test", "Start the manager first so a user window can be resolved.")
+            return
+
+        uid = None
+        for key, cb in (getattr(self, "auto_item_user_checks", {}) or {}).items():
+            try:
+                if cb.isChecked():
+                    uid = str(key)
+                    break
+            except Exception:
+                continue
+        if not uid:
+            QMessageBox.information(self, "Auto-Actions Test", "Select at least one user first.")
+            return
+
+        rows = sorted({idx.row() for idx in self.auto_item_table.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "Auto-Actions Test", "Select at least one action row in the table first.")
+            return
+
+        try:
+            self.auto_item_engine.update_config(self._get_auto_item_settings_from_ui())
+        except Exception:
+            pass
+
+        try:
+            ok = bool(self.auto_item_engine.test_once(uid, row_indices=rows))
+        except Exception as e:
+            self.autoitem_log_signal.emit(f"[Auto-Actions] Test: error: {e}")
+            ok = False
+
+        if ok:
+            QMessageBox.information(self, "Auto-Actions Test", "Test run complete. Check the Auto-Actions log for details.")
+        else:
+            QMessageBox.warning(self, "Auto-Actions Test", "Test run did not complete. Check the Auto-Actions log for details.")
+
+    def _load_auto_item_items_table(self, items: List[dict]):
+        self.auto_item_table.setRowCount(0)
+
+        def _wrap_cell(w: QWidget, *, center: bool = False, margins: Tuple[int, int, int, int] = (0, 6, 0, 6)) -> QWidget:
+            holder = QWidget()
+            holder.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            holder.setStyleSheet("background: transparent;")
+            lay = QHBoxLayout(holder)
+            lay.setContentsMargins(*margins)
+            lay.setSpacing(0)
+            if center:
+                lay.addStretch(1)
+                lay.addWidget(w, 0, Qt.AlignmentFlag.AlignCenter)
+                lay.addStretch(1)
+            else:
+                lay.addWidget(w, 1, Qt.AlignmentFlag.AlignVCenter)
+            return holder
+
+        for item in (items or []):
+            row = self.auto_item_table.rowCount()
+            self.auto_item_table.insertRow(row)
+            try:
+                self.auto_item_table.setRowHeight(row, 80)
+            except Exception:
+                pass
+
+            enabled = QCheckBox()
+            enabled.setChecked(bool(item.get("enabled", True)))
+            enabled.toggled.connect(self._on_auto_item_ui_changed)
+            self.auto_item_table.setCellWidget(row, 0, _wrap_cell(enabled, center=True))
+
+            name = QLineEdit(str(item.get("name") or ""))
+            name.setPlaceholderText("Name this action row")
+            name.setMinimumWidth(180)
+            try:
+                name.setClearButtonEnabled(True)
+            except Exception:
+                pass
+            name.setToolTip("This label is used in presets, alerts, and manual tests.")
+            name.textChanged.connect(self._on_auto_item_ui_changed)
+            self.auto_item_table.setCellWidget(row, 1, _wrap_cell(name, margins=(6, 6, 6, 6)))
+
+            actions_btn = QPushButton()
+            actions_btn.setProperty("actions", [copy.deepcopy(a) for a in (item.get("actions") or []) if isinstance(a, dict)])
+            self._auto_item_apply_cell_button_style(actions_btn, accent=True)
+            self._update_actions_btn_text(actions_btn)
+            actions_btn.clicked.connect(lambda _, b=actions_btn: self._edit_item_actions(b))
+            self.auto_item_table.setCellWidget(row, 2, _wrap_cell(actions_btn, margins=(6, 6, 6, 6)))
+
+            behavior_btn = QPushButton()
+            behavior_btn.setProperty("behavior", self._normalize_auto_item_behavior(item.get("behavior"), legacy=item))
+            self._auto_item_apply_cell_button_style(behavior_btn)
+            self._update_behavior_btn_text(behavior_btn)
+            behavior_btn.clicked.connect(lambda _, b=behavior_btn: self._edit_item_behavior(b))
+            self.auto_item_table.setCellWidget(row, 3, _wrap_cell(behavior_btn, margins=(6, 6, 6, 6)))
+
+            users_btn = QPushButton()
+            raw_users = item.get("users", None)
+            users_prop = None
+            if raw_users is None:
+                users_prop = None
+            elif isinstance(raw_users, (list, tuple, set)):
+                users_list = [str(u).strip() for u in raw_users if str(u).strip()]
+                users_prop = users_list if users_list or bool(item.get("users_explicit", False)) else None
+            users_btn.setProperty("users", users_prop)
+            self._auto_item_apply_cell_button_style(users_btn)
+            self._update_users_btn_text(users_btn)
+            users_btn.clicked.connect(lambda _, b=users_btn: self._edit_item_users(b))
+            self.auto_item_table.setCellWidget(row, 4, _wrap_cell(users_btn, margins=(6, 6, 6, 6)))
+
+            alert_btn = QPushButton()
+            alert_btn.setProperty("alert_enabled", bool(item.get("alert_enabled", False)))
+            alert_btn.setProperty("alert_webhook", str(item.get("alert_webhook") or "").strip())
+            alert_btn.setProperty("alert_message", str(item.get("alert_message") or ""))
+            alert_btn.setProperty("alert_lead_s", float(item.get("alert_lead_s", 15.0) or 15.0))
+            self._auto_item_apply_cell_button_style(alert_btn)
+            self._update_alert_btn_text(alert_btn)
+            alert_btn.clicked.connect(lambda _, b=alert_btn: self._edit_item_alert(b))
+            self.auto_item_table.setCellWidget(row, 5, _wrap_cell(alert_btn, margins=(6, 6, 6, 6)))
+
+    def _current_auto_item_items(self) -> List[dict]:
+        items: List[dict] = []
+
+        def _unwrap(col_widget: QWidget, typ):
+            if col_widget is None:
+                return None
+            if isinstance(col_widget, typ):
+                return col_widget
+            try:
+                return col_widget.findChild(typ)
+            except Exception:
+                return None
+
+        for row in range(self.auto_item_table.rowCount()):
+            enabled = _unwrap(self.auto_item_table.cellWidget(row, 0), QCheckBox)
+            name = _unwrap(self.auto_item_table.cellWidget(row, 1), QLineEdit)
+            actions_btn = _unwrap(self.auto_item_table.cellWidget(row, 2), QPushButton)
+            behavior_btn = _unwrap(self.auto_item_table.cellWidget(row, 3), QPushButton)
+            users_btn = _unwrap(self.auto_item_table.cellWidget(row, 4), QPushButton)
+            alert_btn = _unwrap(self.auto_item_table.cellWidget(row, 5), QPushButton)
+
+            item = {
+                "enabled": bool(enabled.isChecked()) if isinstance(enabled, QCheckBox) else True,
+                "name": name.text().strip() if isinstance(name, QLineEdit) else "",
+                "actions": [copy.deepcopy(a) for a in ((actions_btn.property("actions") if isinstance(actions_btn, QPushButton) else []) or []) if isinstance(a, dict)],
+                "behavior": self._normalize_auto_item_behavior(behavior_btn.property("behavior") if isinstance(behavior_btn, QPushButton) else {}),
+            }
+
+            if isinstance(users_btn, QPushButton):
+                raw_users = users_btn.property("users")
+                if raw_users is None:
+                    item["users"] = None
+                    item["users_explicit"] = False
+                elif isinstance(raw_users, (list, tuple, set)):
+                    item["users"] = [str(u).strip() for u in raw_users if str(u).strip()]
+                    item["users_explicit"] = True
+
+            if isinstance(alert_btn, QPushButton):
+                item["alert_enabled"] = bool(alert_btn.property("alert_enabled"))
+                item["alert_webhook"] = str(alert_btn.property("alert_webhook") or "").strip()
+                item["alert_message"] = str(alert_btn.property("alert_message") or "")
+                item["alert_lead_s"] = float(alert_btn.property("alert_lead_s") or 15.0)
+
+            items.append(item)
+
+        return items
+
+    def _get_auto_item_settings_from_ui(self) -> dict:
+        users = [str(uid).strip() for uid, cb in (self.auto_item_user_checks or {}).items() if cb.isChecked() and str(uid).strip()]
+        return {
+            "enabled": bool(self.auto_item_enable_chk.isChecked()),
+            "tick_interval": float(self.auto_item_tick_spin.value()),
+            "click_delay": float(self.auto_item_delay_spin.value()),
+            "disable_mouse_move": bool(getattr(self, "auto_item_disable_mouse_chk", None) and self.auto_item_disable_mouse_chk.isChecked()),
+            "toggle_hotkey": (self.auto_item_hotkey_edit.keySequence().toString().strip() if getattr(self, "auto_item_hotkey_edit", None) else ""),
+            "users": users,
+            "presets": [copy.deepcopy(p) for p in (getattr(self, "_auto_item_presets", []) or []) if isinstance(p, dict)],
+            "items": self._current_auto_item_items(),
+        }
+
+    def _get_auto_item_cfg_from_disk(self) -> dict:
+        try:
+            settings = self.config_manager.load_settings() or {}
+        except Exception:
+            settings = {}
+        return self._normalize_auto_item_cfg(settings.get("auto_item", {}) or {})
+
+    def _load_auto_item_settings(self):
+        cfg = self._get_auto_item_cfg_from_disk()
+        defaults = self._normalize_auto_item_cfg(self.config_manager.default_settings.get("auto_item", {}) or {})
+        merged = {**defaults, **cfg}
+        hk = str(merged.get("toggle_hotkey", "Ctrl+Alt+Space") or "Ctrl+Alt+Space").strip()
+
+        self._loading_autoitem_settings = True
+        try:
+            self.auto_item_enable_chk.setChecked(bool(merged.get("enabled", False)))
+            self.auto_item_tick_spin.setValue(float(merged.get("tick_interval", 1.0) or 1.0))
+            self.auto_item_delay_spin.setValue(float(merged.get("click_delay", 0.2) or 0.2))
+            self.auto_item_disable_mouse_chk.setChecked(bool(merged.get("disable_mouse_move", False)))
+            self._update_auto_item_disable_mouse_tooltip()
+            try:
+                self.auto_item_hotkey_edit.setKeySequence(QKeySequence(hk))
+            except Exception:
+                pass
+            self._auto_item_presets = [copy.deepcopy(p) for p in (merged.get("presets") or []) if isinstance(p, dict)]
+            self._load_auto_item_items_table(merged.get("items", []) or [])
+            self._apply_auto_item_users_to_ui(merged.get("users", []) or [])
+        finally:
+            self._loading_autoitem_settings = False
+
+        try:
+            self._apply_auto_item_hotkey(hk, quiet=True)
+        except Exception:
+            pass
+
+        try:
+            if self.auto_item_engine is not None:
+                self.auto_item_engine.update_config(self._get_auto_item_settings_from_ui())
+        except Exception:
+            pass
+
+    def _reset_auto_item_to_defaults(self):
+        defaults = self._normalize_auto_item_cfg(self.config_manager.default_settings.get("auto_item", {}) or {})
+        hk = str(defaults.get("toggle_hotkey", "Ctrl+Alt+Space") or "Ctrl+Alt+Space").strip()
+        self._loading_autoitem_settings = True
+        try:
+            self.auto_item_enable_chk.setChecked(bool(defaults.get("enabled", False)))
+            self.auto_item_tick_spin.setValue(float(defaults.get("tick_interval", 1.0) or 1.0))
+            self.auto_item_delay_spin.setValue(float(defaults.get("click_delay", 0.2) or 0.2))
+            self.auto_item_disable_mouse_chk.setChecked(bool(defaults.get("disable_mouse_move", False)))
+            self._update_auto_item_disable_mouse_tooltip()
+            try:
+                self.auto_item_hotkey_edit.setKeySequence(QKeySequence(hk))
+            except Exception:
+                pass
+            self._auto_item_presets = [copy.deepcopy(p) for p in (defaults.get("presets") or []) if isinstance(p, dict)]
+            self._load_auto_item_items_table(defaults.get("items", []) or [])
             self._auto_item_set_all_users(False)
         finally:
             self._loading_autoitem_settings = False
@@ -12467,7 +15077,649 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             self._bes_update_status("Status: Error", warning=True)
 
-    def _add_filter_row(self, name: str = "Blank", r: int = 255, g: int = 255, b: int = 255, tol: int = 40, enabled: bool = True, locked_name: bool = False):
+    def _ocr_empty_roi_cfg(self) -> dict:
+        return {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+
+    def _ocr_default_shared_areas(self) -> List[dict]:
+        defaults = (self.config_manager.default_settings.get("ocr", {}) or {}).get("shared_areas", [])
+        if isinstance(defaults, list):
+            return self._merge_ocr_shared_areas(defaults)
+        return []
+
+    def _ocr_filter_presets_catalog(self) -> Dict[str, List[dict]]:
+        return copy.deepcopy(
+            {
+                "Egg Hunt": [
+                    {
+                        "name": "Sky Festival",
+                        "r": 190,
+                        "g": 134,
+                        "b": 223,
+                        "tol": 40,
+                        "enabled": True,
+                        "target_text": "[Egg Spawned]: 'Wait. am I still dreaming?'",
+                        "cooldown_seconds": 600.0,
+                        "use_shared_area": True,
+                        "shared_area_id": "chat",
+                        "roi": self._ocr_empty_roi_cfg(),
+                        "webhook_url": "",
+                        "webhook_message": "",
+                        "send_screenshot": False,
+                        "user_ids": None,
+                        "behavior": "webhook",
+                    },
+                    {
+                        "name": "Y.O.L.K.E.G.G",
+                        "r": 139,
+                        "g": 103,
+                        "b": 166,
+                        "tol": 40,
+                        "enabled": True,
+                        "target_text": "[Egg Spawned]: Preparing Protocol. 'Do you want to be my friend?'",
+                        "cooldown_seconds": 600.0,
+                        "use_shared_area": True,
+                        "shared_area_id": "chat",
+                        "roi": self._ocr_empty_roi_cfg(),
+                        "webhook_url": "",
+                        "webhook_message": "",
+                        "send_screenshot": False,
+                        "user_ids": None,
+                        "behavior": "webhook",
+                    },
+                    {
+                        "name": "Eggis",
+                        "r": 160,
+                        "g": 245,
+                        "b": 154,
+                        "tol": 40,
+                        "enabled": True,
+                        "target_text": "[Egg Spawned]: Scanning. Egg cannon charging 2000%.",
+                        "cooldown_seconds": 600.0,
+                        "use_shared_area": True,
+                        "shared_area_id": "chat",
+                        "roi": self._ocr_empty_roi_cfg(),
+                        "webhook_url": "",
+                        "webhook_message": "",
+                        "send_screenshot": False,
+                        "user_ids": None,
+                        "behavior": "webhook",
+                    },
+                    {
+                        "name": "Eostre",
+                        "r": 176,
+                        "g": 197,
+                        "b": 183,
+                        "tol": 40,
+                        "enabled": True,
+                        "target_text": "[Egg Spawned]: 'Let's have an egg hunt here!'",
+                        "cooldown_seconds": 600.0,
+                        "use_shared_area": True,
+                        "shared_area_id": "chat",
+                        "roi": self._ocr_empty_roi_cfg(),
+                        "webhook_url": "",
+                        "webhook_message": "",
+                        "send_screenshot": False,
+                        "user_ids": None,
+                        "behavior": "webhook",
+                    },
+                    {
+                        "name": "Eggore",
+                        "r": 232,
+                        "g": 33,
+                        "b": 121,
+                        "tol": 40,
+                        "enabled": True,
+                        "target_text": "[Egg Spawned]: Don't forget to water the 'small plant'.",
+                        "cooldown_seconds": 600.0,
+                        "use_shared_area": True,
+                        "shared_area_id": "chat",
+                        "roi": self._ocr_empty_roi_cfg(),
+                        "webhook_url": "",
+                        "webhook_message": "",
+                        "send_screenshot": False,
+                        "user_ids": None,
+                        "behavior": "webhook",
+                    },
+                    {
+                        "name": "REVIVE",
+                        "r": 225,
+                        "g": 151,
+                        "b": 110,
+                        "tol": 40,
+                        "enabled": True,
+                        "target_text": "[Egg Spawned]: 'Holy Eggsus'",
+                        "cooldown_seconds": 600.0,
+                        "use_shared_area": True,
+                        "shared_area_id": "chat",
+                        "roi": self._ocr_empty_roi_cfg(),
+                        "webhook_url": "",
+                        "webhook_message": "",
+                        "send_screenshot": False,
+                        "user_ids": None,
+                        "behavior": "webhook",
+                    },
+                    {
+                        "name": "Eggsistance",
+                        "r": 255,
+                        "g": 255,
+                        "b": 255,
+                        "tol": 40,
+                        "enabled": True,
+                        "target_text": "[Egg Spawned]: 'Am I in spaaaace right now?!'",
+                        "cooldown_seconds": 600.0,
+                        "use_shared_area": True,
+                        "shared_area_id": "chat",
+                        "roi": self._ocr_empty_roi_cfg(),
+                        "webhook_url": "",
+                        "webhook_message": "",
+                        "send_screenshot": False,
+                        "user_ids": None,
+                        "behavior": "webhook",
+                    },
+                    {
+                        "name": "Emperor",
+                        "r": 228,
+                        "g": 107,
+                        "b": 84,
+                        "tol": 40,
+                        "enabled": True,
+                        "target_text": "[Egg Spawned]: A special egg has spawned.",
+                        "cooldown_seconds": 600.0,
+                        "use_shared_area": True,
+                        "shared_area_id": "chat",
+                        "roi": self._ocr_empty_roi_cfg(),
+                        "webhook_url": "",
+                        "webhook_message": "",
+                        "send_screenshot": False,
+                        "user_ids": None,
+                        "behavior": "webhook",
+                    },
+                    {
+                        "name": "Hatchwarden",
+                        "r": 58,
+                        "g": 221,
+                        "b": 98,
+                        "tol": 40,
+                        "enabled": True,
+                        "target_text": "[Egg Spawned]: A special egg has spawned.",
+                        "cooldown_seconds": 600.0,
+                        "use_shared_area": True,
+                        "shared_area_id": "chat",
+                        "roi": self._ocr_empty_roi_cfg(),
+                        "webhook_url": "",
+                        "webhook_message": "",
+                        "send_screenshot": False,
+                        "user_ids": None,
+                        "behavior": "webhook",
+                    },
+                ]
+            }
+        )
+
+    def _ocr_default_filters(self) -> List[dict]:
+        defaults = (self.config_manager.default_settings.get("ocr", {}) or {}).get("filters", [])
+        if isinstance(defaults, list) and defaults:
+            return copy.deepcopy(defaults)
+        return copy.deepcopy(get_default_ocr_filters())
+
+    def _ocr_default_filter_map(self) -> Dict[str, dict]:
+        return {str(item.get("id") or ""): item for item in self._ocr_default_filters()}
+
+    def _ocr_default_filter_ids(self) -> Set[str]:
+        return set(self._ocr_default_filter_map().keys())
+
+    def _ocr_merchant_filter_ids(self) -> Set[str]:
+        return {"merchant_jester", "merchant_mari", "merchant_rin"}
+
+    def _ocr_normalize_filter_name(self, raw: str) -> str:
+        name = str(raw or "").strip()
+        lower = name.lower()
+        if lower == "white_text":
+            return "Mari"
+        if lower == "purple_text":
+            return "Jester"
+        if lower == "orange_text":
+            return "Rin"
+        if lower in ("verification", "verification_check", "verification check"):
+            return "Verification Check"
+        return name
+
+    def _ocr_known_filter_id(self, name: str) -> str:
+        lower = self._ocr_normalize_filter_name(name).lower()
+        if lower == "jester":
+            return "merchant_jester"
+        if lower == "mari":
+            return "merchant_mari"
+        if lower == "rin":
+            return "merchant_rin"
+        if lower == "verification check":
+            return "verification_check"
+        return ""
+
+    def _ocr_filter_behavior(self, filter_id: str, name: str, raw_behavior: str = "") -> str:
+        behavior = str(raw_behavior or "").strip().lower()
+        if behavior in ("merchant", "verification_cap", "webhook"):
+            return behavior
+        if filter_id in self._ocr_merchant_filter_ids():
+            return "merchant"
+        if filter_id == "verification_check" or self._ocr_normalize_filter_name(name).lower() == "verification check":
+            return "verification_cap"
+        return "webhook"
+
+    def _ocr_slugify_filter_id(self, raw: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "_", str(raw or "").strip().lower()).strip("_")
+        return slug or "filter"
+
+    def _generate_unique_ocr_filter_id(
+        self,
+        name: str,
+        *,
+        preferred_id: str = "",
+        existing_ids: Optional[Set[str]] = None,
+    ) -> str:
+        used_ids = {str(v).strip() for v in (existing_ids or set()) if str(v).strip()}
+        candidate = str(preferred_id or "").strip()
+        if candidate and candidate not in used_ids:
+            return candidate
+
+        reserved_ids = set(self._ocr_default_filter_ids()) | used_ids
+        slug = self._ocr_slugify_filter_id(name or "filter")
+        base = f"custom_{slug}"
+        candidate = base
+        suffix = 1
+        while candidate in reserved_ids:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    def _dedupe_ocr_filter_spec_id(self, spec: Optional[dict], existing_ids: Optional[Set[str]] = None) -> dict:
+        out = copy.deepcopy(spec or {})
+        current_id = str(out.get("id") or out.get("filter_id") or "").strip()
+        unique_id = self._generate_unique_ocr_filter_id(
+            str(out.get("name") or "").strip(),
+            preferred_id=current_id,
+            existing_ids=existing_ids,
+        )
+        if unique_id != current_id:
+            out["id"] = unique_id
+            cooldown_group = str(out.get("cooldown_group", "") or "").strip()
+            behavior = str(out.get("behavior", "") or "").strip().lower()
+            if not cooldown_group or cooldown_group == current_id:
+                out["cooldown_group"] = "merchant_filters" if behavior == "merchant" else unique_id
+        return out
+
+    def _ocr_filter_ids_in_table(self, *, exclude_row: Optional[int] = None) -> Set[str]:
+        ids: Set[str] = set()
+        table = getattr(self, "ocr_filter_table", None)
+        if table is None:
+            return ids
+        try:
+            row_count = int(table.rowCount())
+        except Exception:
+            row_count = 0
+        for row in range(max(0, row_count)):
+            if exclude_row is not None and row == int(exclude_row):
+                continue
+            btn = self._ocr_unwrap_table_widget(table.cellWidget(row, 6), QPushButton)
+            if not isinstance(btn, QPushButton):
+                continue
+            spec = self._get_ocr_filter_button_meta(btn)
+            filter_id = str(spec.get("id") or spec.get("filter_id") or "").strip()
+            if filter_id:
+                ids.add(filter_id)
+        return ids
+
+    def _ocr_slugify_shared_area_id(self, raw: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "_", str(raw or "").strip().lower()).strip("_")
+        return slug or "area"
+
+    def _normalize_ocr_filter_user_ids(self, raw: Any) -> Optional[List[str]]:
+        if raw is None:
+            return None
+        if not isinstance(raw, (list, tuple, set)):
+            return None
+        cleaned: List[str] = []
+        seen: Set[str] = set()
+        for uid in raw:
+            uid_s = str(uid or "").strip()
+            if not uid_s or uid_s in seen:
+                continue
+            seen.add(uid_s)
+            cleaned.append(uid_s)
+        return cleaned
+
+    def _normalize_ocr_shared_area_spec(self, raw: Optional[dict], *, fallback_index: int = 0) -> dict:
+        base = raw or {}
+        name = str(base.get("name", "") or "").strip() or f"Shared Area {fallback_index + 1}"
+        area_id = str(base.get("id") or base.get("area_id") or "").strip()
+        if not area_id or area_id.lower() == "chat":
+            slug = self._ocr_slugify_shared_area_id(name or uuid.uuid4().hex[:8])
+            area_id = f"shared_{fallback_index}_{slug}"
+        roi_cfg = base.get("roi") if isinstance(base.get("roi"), dict) else {}
+        return {
+            "id": area_id,
+            "name": name,
+            "roi": {
+                "x": float((roi_cfg or {}).get("x", 0.0) or 0.0),
+                "y": float((roi_cfg or {}).get("y", 0.0) or 0.0),
+                "w": float((roi_cfg or {}).get("w", 0.0) or 0.0),
+                "h": float((roi_cfg or {}).get("h", 0.0) or 0.0),
+            },
+        }
+
+    def _merge_ocr_shared_areas(self, areas: List[dict]) -> List[dict]:
+        normalized: List[dict] = []
+        seen_ids: Set[str] = set()
+        for idx, raw in enumerate(areas or []):
+            if not isinstance(raw, dict):
+                continue
+            spec = self._normalize_ocr_shared_area_spec(raw, fallback_index=idx)
+            area_id = str(spec.get("id") or "").strip()
+            if not area_id or area_id in seen_ids or area_id.lower() == "chat":
+                continue
+            seen_ids.add(area_id)
+            normalized.append(spec)
+        return normalized
+
+    def _ocr_shared_areas_from_cfg(self, cfg: Optional[dict]) -> List[dict]:
+        raw_areas = (cfg or {}).get("shared_areas")
+        if isinstance(raw_areas, list):
+            return self._merge_ocr_shared_areas(raw_areas)
+        return self._ocr_default_shared_areas()
+
+    def _ocr_chat_area_as_spec(
+        self,
+        *,
+        chat_roi: Optional[Tuple[float, float, float, float]] = None,
+    ) -> dict:
+        roi = chat_roi if chat_roi is not None else self.ocr_roi
+        if roi is None:
+            roi_cfg = self._ocr_empty_roi_cfg()
+        else:
+            roi_cfg = {"x": float(roi[0]), "y": float(roi[1]), "w": float(roi[2]), "h": float(roi[3])}
+        return {"id": "chat", "name": "Chat Area", "roi": roi_cfg}
+
+    def _ocr_shared_area_choices(
+        self,
+        *,
+        shared_areas: Optional[List[dict]] = None,
+        chat_roi: Optional[Tuple[float, float, float, float]] = None,
+    ) -> List[dict]:
+        out = [self._ocr_chat_area_as_spec(chat_roi=chat_roi)]
+        areas = self.ocr_shared_areas if shared_areas is None else shared_areas
+        out.extend(self._merge_ocr_shared_areas(areas or []))
+        return out
+
+    def _ocr_shared_area_by_id(
+        self,
+        area_id: str,
+        *,
+        shared_areas: Optional[List[dict]] = None,
+        chat_roi: Optional[Tuple[float, float, float, float]] = None,
+    ) -> Optional[dict]:
+        wanted = str(area_id or "").strip()
+        for spec in self._ocr_shared_area_choices(shared_areas=shared_areas, chat_roi=chat_roi):
+            if str(spec.get("id") or "").strip() == wanted:
+                return copy.deepcopy(spec)
+        return None
+
+    def _ocr_filter_shared_area_id(self, filter_cfg: Optional[dict]) -> str:
+        spec = filter_cfg or {}
+        use_shared_area = bool(spec.get("use_shared_area", spec.get("use_chat_area", False)))
+        if not use_shared_area:
+            return ""
+        area_id = str(spec.get("shared_area_id") or "").strip()
+        if not area_id and bool(spec.get("use_chat_area", False)):
+            area_id = "chat"
+        return area_id or "chat"
+
+    def _ocr_filter_uses_chat_area(self, filter_cfg: Optional[dict]) -> bool:
+        return self._ocr_filter_shared_area_id(filter_cfg) == "chat"
+
+    def _ocr_shared_area_roi(
+        self,
+        area_id: str,
+        *,
+        shared_areas: Optional[List[dict]] = None,
+        chat_roi: Optional[Tuple[float, float, float, float]] = None,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        area = self._ocr_shared_area_by_id(area_id, shared_areas=shared_areas, chat_roi=chat_roi)
+        if not isinstance(area, dict):
+            return None
+        roi_cfg = area.get("roi") if isinstance(area.get("roi"), dict) else {}
+        try:
+            rx = float(roi_cfg.get("x", 0.0) or 0.0)
+            ry = float(roi_cfg.get("y", 0.0) or 0.0)
+            rw = float(roi_cfg.get("w", 0.0) or 0.0)
+            rh = float(roi_cfg.get("h", 0.0) or 0.0)
+        except Exception:
+            return None
+        if rw <= 0 or rh <= 0:
+            return None
+        return (rx, ry, rw, rh)
+
+    def _ocr_shared_area_summary_text(self, area_cfg: Optional[dict]) -> str:
+        spec = self._normalize_ocr_shared_area_spec(area_cfg or {})
+        roi = self._ocr_shared_area_roi(str(spec.get("id") or ""))
+        if roi:
+            x, y, w, h = roi
+            return f"{spec.get('name', 'Shared Area')}: x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}"
+        return f"{spec.get('name', 'Shared Area')}: not calibrated"
+
+    def _normalize_ocr_filter_spec(self, raw: dict, *, fallback_index: int = 0) -> dict:
+        base = raw or {}
+        default_map = self._ocr_default_filter_map()
+        name = self._ocr_normalize_filter_name(str(base.get("name", "")).strip())
+        filter_id = str(base.get("id") or base.get("filter_id") or "").strip()
+        if not filter_id:
+            filter_id = self._ocr_known_filter_id(name)
+        if not filter_id:
+            filter_id = self._generate_unique_ocr_filter_id(
+                name or f"Filter {fallback_index + 1}",
+                existing_ids=set(),
+            )
+        default_spec = default_map.get(filter_id, {})
+        behavior = self._ocr_filter_behavior(filter_id, name, str(base.get("behavior", default_spec.get("behavior", "")) or ""))
+        use_shared_area = bool(
+            base.get(
+                "use_shared_area",
+                base.get(
+                    "use_chat_area",
+                    default_spec.get("use_shared_area", default_spec.get("use_chat_area", behavior == "merchant")),
+                ),
+            )
+        )
+        shared_area_id = str(
+            base.get(
+                "shared_area_id",
+                default_spec.get("shared_area_id", "chat" if use_shared_area else ""),
+            )
+            or ""
+        ).strip()
+        if not shared_area_id and bool(base.get("use_chat_area", False)):
+            shared_area_id = "chat"
+        if behavior == "merchant":
+            use_shared_area = True
+            shared_area_id = "chat"
+        if not use_shared_area:
+            shared_area_id = ""
+        roi_cfg = base.get("roi") if isinstance(base.get("roi"), dict) else default_spec.get("roi", self._ocr_empty_roi_cfg())
+        cooldown_group = str(base.get("cooldown_group", default_spec.get("cooldown_group", "")) or "").strip()
+        if not cooldown_group:
+            cooldown_group = "merchant_filters" if behavior == "merchant" else filter_id
+        return {
+            "id": filter_id,
+            "name": name or str(default_spec.get("name") or filter_id),
+            "r": int(base.get("r", default_spec.get("r", 255)) or 0),
+            "g": int(base.get("g", default_spec.get("g", 255)) or 0),
+            "b": int(base.get("b", default_spec.get("b", 255)) or 0),
+            "tol": int(base.get("tol", default_spec.get("tol", 60)) or 0),
+            "enabled": bool(base.get("enabled", default_spec.get("enabled", True))),
+            "target_text": str(base.get("target_text", default_spec.get("target_text", name)) or "").strip(),
+            "cooldown_seconds": float(base.get("cooldown_seconds", default_spec.get("cooldown_seconds", 600)) or 0.0),
+            "use_shared_area": bool(use_shared_area),
+            "shared_area_id": shared_area_id,
+            "roi": {
+                "x": float((roi_cfg or {}).get("x", 0.0) or 0.0),
+                "y": float((roi_cfg or {}).get("y", 0.0) or 0.0),
+                "w": float((roi_cfg or {}).get("w", 0.0) or 0.0),
+                "h": float((roi_cfg or {}).get("h", 0.0) or 0.0),
+            },
+            "webhook_url": str(base.get("webhook_url", "") or "").strip(),
+            "webhook_message": str(base.get("webhook_message", "") or ""),
+            "send_screenshot": bool(base.get("send_screenshot", default_spec.get("send_screenshot", behavior == "merchant"))),
+            "repeat_alert_sound": bool(base.get("repeat_alert_sound", default_spec.get("repeat_alert_sound", False))),
+            "user_ids": self._normalize_ocr_filter_user_ids(base.get("user_ids", default_spec.get("user_ids"))),
+            "behavior": behavior,
+            "cooldown_group": cooldown_group,
+            "locked": bool(filter_id in default_map),
+        }
+
+    def _merge_ocr_filters_with_defaults(self, filters: List[dict]) -> List[dict]:
+        normalized: List[dict] = []
+        seen_ids: Set[str] = set()
+        for idx, raw in enumerate(filters or []):
+            if not isinstance(raw, dict):
+                continue
+            spec = self._normalize_ocr_filter_spec(raw, fallback_index=idx)
+            spec = self._dedupe_ocr_filter_spec_id(spec, seen_ids)
+            filter_id = str(spec.get("id") or "").strip()
+            if not filter_id:
+                continue
+            seen_ids.add(filter_id)
+            normalized.append(spec)
+
+        by_id = {str(spec.get("id") or ""): spec for spec in normalized}
+        out: List[dict] = []
+        for default_spec in self._ocr_default_filters():
+            fid = str(default_spec.get("id") or "").strip()
+            out.append(by_id.pop(fid, self._normalize_ocr_filter_spec(default_spec)))
+        out.extend(spec for spec in normalized if str(spec.get("id") or "").strip() in by_id)
+        return out
+
+    def _ocr_filters_from_cfg(self, cfg: dict) -> List[dict]:
+        raw_filters = cfg.get("filters")
+        if isinstance(raw_filters, list) and raw_filters:
+            return self._merge_ocr_filters_with_defaults(raw_filters)
+
+        legacy_filters = cfg.get("color_filters")
+        if isinstance(legacy_filters, list) and legacy_filters:
+            try:
+                legacy_cooldown = float(cfg.get("cooldown_seconds", 600) or 600)
+            except Exception:
+                legacy_cooldown = 600.0
+            verification_roi = cfg.get("verification_roi") if isinstance(cfg.get("verification_roi"), dict) else self._ocr_empty_roi_cfg()
+            migrated: List[dict] = []
+            for idx, raw in enumerate(legacy_filters):
+                if not isinstance(raw, dict):
+                    continue
+                name = self._ocr_normalize_filter_name(str(raw.get("name", "")).strip())
+                filter_id = self._ocr_known_filter_id(name)
+                default_spec = self._ocr_default_filter_map().get(filter_id, {})
+                behavior = self._ocr_filter_behavior(filter_id, name)
+                migrated.append(
+                    {
+                        "id": filter_id,
+                        "name": name,
+                        "r": int(raw.get("r", default_spec.get("r", 255)) or 0),
+                        "g": int(raw.get("g", default_spec.get("g", 255)) or 0),
+                        "b": int(raw.get("b", default_spec.get("b", 255)) or 0),
+                        "tol": int(raw.get("tol", default_spec.get("tol", 60)) or 0),
+                        "enabled": bool(raw.get("enabled", True)),
+                        "target_text": str(default_spec.get("target_text") or name or "").strip(),
+                        "cooldown_seconds": float(legacy_cooldown),
+                        "use_shared_area": bool(behavior == "merchant"),
+                        "shared_area_id": "chat" if behavior == "merchant" else "",
+                        "roi": copy.deepcopy(verification_roi if filter_id == "verification_check" else self._ocr_empty_roi_cfg()),
+                        "webhook_url": "",
+                        "webhook_message": "",
+                        "send_screenshot": bool(behavior == "merchant"),
+                        "repeat_alert_sound": False,
+                        "user_ids": None,
+                        "behavior": behavior,
+                        "cooldown_group": "merchant_filters" if behavior == "merchant" else (filter_id or f"legacy_{idx}"),
+                    }
+                )
+            return self._merge_ocr_filters_with_defaults(migrated)
+
+        return self._ocr_default_filters()
+
+    def _ocr_unwrap_table_widget(self, col_widget: QWidget, typ):
+        if col_widget is None:
+            return None
+        if isinstance(col_widget, typ):
+            return col_widget
+        try:
+            return col_widget.findChild(typ)
+        except Exception:
+            return None
+
+    def _ocr_wrap_table_cell(
+        self,
+        widget: QWidget,
+        *,
+        center: bool = False,
+        margins: Tuple[int, int, int, int] = (0, 6, 0, 6),
+    ) -> QWidget:
+        holder = QWidget()
+        holder.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        holder.setStyleSheet("background: transparent;")
+        lay = QHBoxLayout(holder)
+        lay.setContentsMargins(*margins)
+        lay.setSpacing(0)
+        if center:
+            lay.addStretch(1)
+            lay.addWidget(widget, 0, Qt.AlignmentFlag.AlignCenter)
+            lay.addStretch(1)
+        else:
+            lay.addWidget(widget, 1, Qt.AlignmentFlag.AlignVCenter)
+        return holder
+
+    def _ocr_make_rgb_spin(self, value: int, *, maximum: int = 255) -> QSpinBox:
+        sb = _AutoItemSpinBox()
+        sb.setRange(0, int(maximum))
+        sb.setValue(max(0, min(int(maximum), int(value or 0))))
+        sb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        try:
+            sb.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+        except Exception:
+            pass
+        sb.setMinimumWidth(90)
+        sb.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        sb.valueChanged.connect(self._on_ocr_settings_changed)
+        return sb
+
+    def _set_ocr_filter_button_meta(self, btn: QPushButton, meta: dict) -> None:
+        setattr(btn, "_ocr_filter_meta", copy.deepcopy(meta or {}))
+
+    def _get_ocr_filter_button_meta(self, btn: QPushButton) -> dict:
+        try:
+            meta = getattr(btn, "_ocr_filter_meta", {}) or {}
+        except Exception:
+            meta = {}
+        return copy.deepcopy(meta)
+
+    def _add_filter_row(self, filter_cfg: Optional[dict] = None):
+        base_cfg = filter_cfg or {
+            "name": "Blank",
+            "r": 255,
+            "g": 255,
+            "b": 255,
+            "tol": 40,
+            "enabled": True,
+            "target_text": "",
+            "cooldown_seconds": 600,
+            "use_shared_area": False,
+            "shared_area_id": "",
+            "roi": self._ocr_empty_roi_cfg(),
+            "webhook_url": "",
+            "webhook_message": "",
+            "repeat_alert_sound": False,
+            "user_ids": None,
+            "behavior": "webhook",
+        }
+        spec = self._normalize_ocr_filter_spec(base_cfg, fallback_index=self.ocr_filter_table.rowCount())
+        spec = self._dedupe_ocr_filter_spec_id(spec, self._ocr_filter_ids_in_table())
         row = self.ocr_filter_table.rowCount()
         self.ocr_filter_table.insertRow(row)
         try:
@@ -12475,218 +15727,1065 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             pass
 
-        def _wrap_cell(w: QWidget, *, center: bool = False, margins: Tuple[int, int, int, int] = (0, 6, 0, 6)) -> QWidget:
-            holder = QWidget()
-            holder.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-            holder.setStyleSheet("background: transparent;")
-            lay = QHBoxLayout(holder)
-            lay.setContentsMargins(*margins)
-            lay.setSpacing(0)
-            if center:
-                lay.addStretch(1)
-                lay.addWidget(w, 0, Qt.AlignmentFlag.AlignCenter)
-                lay.addStretch(1)
-            else:
-                lay.addWidget(w, 1, Qt.AlignmentFlag.AlignVCenter)
-            return holder
-
         en = QCheckBox()
-        en.setChecked(bool(enabled))
+        en.setChecked(bool(spec.get("enabled", True)))
         en.setStyleSheet("background: transparent;")
         en.toggled.connect(self._on_ocr_settings_changed)
-        self.ocr_filter_table.setCellWidget(row, 0, _wrap_cell(en, center=True))
+        self.ocr_filter_table.setCellWidget(row, 0, self._ocr_wrap_table_cell(en, center=True))
 
-        name_le = QLineEdit(str(name or ""))
+        name_le = QLineEdit(str(spec.get("name", "") or ""))
         name_le.setPlaceholderText("Filter name")
         name_le.textChanged.connect(self._on_ocr_settings_changed)
         name_le.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        if locked_name:
+        if bool(spec.get("locked", False)):
             name_le.setReadOnly(True)
             name_le.setProperty("ocr_default_filter", True)
-        self.ocr_filter_table.setCellWidget(row, 1, _wrap_cell(name_le, center=False, margins=(6, 6, 6, 6)))
+        self.ocr_filter_table.setCellWidget(row, 1, self._ocr_wrap_table_cell(name_le, center=False, margins=(6, 6, 6, 6)))
 
-        def _mk_rgb_spin(value: int, *, maximum: int = 255) -> QSpinBox:
-            sb = _AutoItemSpinBox()
-            sb.setRange(0, int(maximum))
-            sb.setValue(max(0, min(int(maximum), int(value or 0))))
-            sb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            try:
-                sb.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
-            except Exception:
-                pass
-            sb.setMinimumWidth(90)
-            sb.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-            sb.valueChanged.connect(self._on_ocr_settings_changed)
-            return sb
+        r_sb = self._ocr_make_rgb_spin(int(spec.get("r", 255) or 0), maximum=255)
+        g_sb = self._ocr_make_rgb_spin(int(spec.get("g", 255) or 0), maximum=255)
+        b_sb = self._ocr_make_rgb_spin(int(spec.get("b", 255) or 0), maximum=255)
+        tol_sb = self._ocr_make_rgb_spin(int(spec.get("tol", 60) or 0), maximum=255)
 
-        r_sb = _mk_rgb_spin(r, maximum=255)
-        g_sb = _mk_rgb_spin(g, maximum=255)
-        b_sb = _mk_rgb_spin(b, maximum=255)
-        tol_sb = _mk_rgb_spin(tol, maximum=255)
+        self.ocr_filter_table.setCellWidget(row, 2, self._ocr_wrap_table_cell(r_sb, center=True))
+        self.ocr_filter_table.setCellWidget(row, 3, self._ocr_wrap_table_cell(g_sb, center=True))
+        self.ocr_filter_table.setCellWidget(row, 4, self._ocr_wrap_table_cell(b_sb, center=True))
+        self.ocr_filter_table.setCellWidget(row, 5, self._ocr_wrap_table_cell(tol_sb, center=True))
 
-        self.ocr_filter_table.setCellWidget(row, 2, _wrap_cell(r_sb, center=True))
-        self.ocr_filter_table.setCellWidget(row, 3, _wrap_cell(g_sb, center=True))
-        self.ocr_filter_table.setCellWidget(row, 4, _wrap_cell(b_sb, center=True))
-        self.ocr_filter_table.setCellWidget(row, 5, _wrap_cell(tol_sb, center=True))
+        settings_btn = QPushButton("Edit")
+        settings_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {ModernStyle.PRIMARY};
+                color: {ModernStyle.TEXT_PRIMARY};
+                border: none;
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-weight: 500;
+                min-width: 80px;
+                min-height: 28px;
+            }}
+
+            QPushButton:hover {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+            }}
+
+            QPushButton:disabled {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_SECONDARY};
+            }}
+            """
+        )
+        settings_btn.clicked.connect(lambda _checked=False, btn=settings_btn: self._open_ocr_filter_settings_dialog(btn))
+        self._set_ocr_filter_button_meta(settings_btn, spec)
+        settings_btn.setToolTip(self._ocr_filter_assignment_summary(spec))
+        self.ocr_filter_table.setCellWidget(row, 6, self._ocr_wrap_table_cell(settings_btn, center=True))
 
     def _remove_selected_filter_rows(self):
         rows = sorted({idx.row() for idx in self.ocr_filter_table.selectedIndexes()}, reverse=True)
-        default_filters = (self.config_manager.default_settings.get("ocr", {}) or {}).get("color_filters", [])
-        default_names = {str(f.get("name", "")).strip() for f in default_filters if str(f.get("name", "")).strip()}
-        def _unwrap(col_widget: QWidget, typ):
-            if col_widget is None:
-                return None
-            if isinstance(col_widget, typ):
-                return col_widget
-            try:
-                return col_widget.findChild(typ)
-            except Exception:
-                return None
         for r in rows:
-            name_w = _unwrap(self.ocr_filter_table.cellWidget(r, 1), QLineEdit)
-            name = name_w.text().strip() if isinstance(name_w, QLineEdit) else ""
-            locked = False
-            if isinstance(name_w, QLineEdit) and name_w.property("ocr_default_filter"):
-                locked = True
-            if name and name in default_names:
-                locked = True
-            if locked:
+            spec = self._ocr_filter_row_data(r) or {}
+            if bool(spec.get("locked", False)):
                 continue
             self.ocr_filter_table.removeRow(r)
 
     def _load_color_filters_table(self, filters: List[dict]):
         self.ocr_filter_table.setRowCount(0)
-        def _rename_filter_name(raw: str) -> str:
-            name = raw.strip()
-            lower = name.lower()
-            if lower == "white_text":
-                return "Mari"
-            if lower == "purple_text":
-                return "Jester"
-            if lower == "orange_text":
-                return "Rin"
-            if lower in ("verification_check", "verification"):
-                return "Verification Check"
-            return name
-        defaults = (self.config_manager.default_settings.get("ocr", {}) or {}).get("color_filters", [])
-        default_names = [_rename_filter_name(str(f.get("name", "")).strip()) for f in defaults if str(f.get("name", "")).strip()]
-        default_set = set(default_names)
-        effective_filters = filters or defaults or []
-        # Keep Rin above Verification Check, including older configs that predate Rin.
-        if filters and isinstance(effective_filters, list):
-            normalized = [f for f in effective_filters if isinstance(f, dict)]
-            names = [_rename_filter_name(str((f or {}).get("name", "")).strip()) for f in normalized]
-            try:
-                ver_idx = names.index("Verification Check")
-            except ValueError:
-                ver_idx = -1
-            try:
-                rin_idx = names.index("Rin")
-            except ValueError:
-                rin_idx = -1
+        merged = self._ocr_filters_from_cfg({"filters": filters or []} if filters else {})
+        for spec in merged:
+            self._add_filter_row(spec)
 
-            if ver_idx != -1:
-                if rin_idx == -1:
-                    rin_default = None
-                    for d in defaults:
-                        if _rename_filter_name(str((d or {}).get("name", "")).strip()) == "Rin":
-                            rin_default = d
-                            break
-                    if isinstance(rin_default, dict):
-                        normalized.insert(ver_idx, dict(rin_default))
-                elif rin_idx > ver_idx:
-                    rin_row = normalized.pop(rin_idx)
-                    normalized.insert(ver_idx, rin_row)
-            effective_filters = normalized
-        seen_defaults = set()
-        for f in effective_filters:
-            if not isinstance(f, dict):
-                continue
-            name = _rename_filter_name(str(f.get("name", "")).strip())
-            locked = bool(name and name in default_set)
-            if locked:
-                seen_defaults.add(name)
-            self._add_filter_row(
-                name or "",
-                int(f.get("r", 0)),
-                int(f.get("g", 0)),
-                int(f.get("b", 0)),
-                int(f.get("tol", 0)),
-                bool(f.get("enabled", True)),
-                locked_name=locked,
-            )
-
-        for d in defaults:
-            name = _rename_filter_name(str(d.get("name", "")).strip())
-            if not name or name in seen_defaults:
-                continue
-            self._add_filter_row(
-                name,
-                int(d.get("r", 0)),
-                int(d.get("g", 0)),
-                int(d.get("b", 0)),
-                int(d.get("tol", 0)),
-                bool(d.get("enabled", True)),
-                locked_name=True,
-            )
-
-    def _current_color_filters(self, as_dataclass: bool = False):
-        filters = []
+    def _row_for_filter_settings_button(self, btn: QPushButton) -> int:
         rows = self.ocr_filter_table.rowCount()
+        for row in range(rows):
+            holder = self.ocr_filter_table.cellWidget(row, 6)
+            found = self._ocr_unwrap_table_widget(holder, QPushButton)
+            if found is btn:
+                return row
+        return -1
 
-        for r in range(rows):
-            def _unwrap(col_widget: QWidget, typ):
-                if col_widget is None:
-                    return None
-                if isinstance(col_widget, typ):
-                    return col_widget
-                try:
-                    return col_widget.findChild(typ)
-                except Exception:
-                    return None
+    def _ocr_filter_row_data(self, row: int) -> Optional[dict]:
+        if row < 0 or row >= self.ocr_filter_table.rowCount():
+            return None
+        en = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, 0), QCheckBox)
+        name_w = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, 1), QLineEdit)
+        r_w = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, 2), QSpinBox)
+        g_w = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, 3), QSpinBox)
+        b_w = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, 4), QSpinBox)
+        tol_w = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, 5), QSpinBox)
+        btn = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, 6), QPushButton)
+        spec = self._get_ocr_filter_button_meta(btn) if isinstance(btn, QPushButton) else {}
+        spec["enabled"] = bool(en.isChecked()) if isinstance(en, QCheckBox) else True
+        spec["name"] = name_w.text().strip() if isinstance(name_w, QLineEdit) else str(spec.get("name", "") or "")
+        spec["r"] = int(r_w.value()) if isinstance(r_w, QSpinBox) else int(spec.get("r", 0) or 0)
+        spec["g"] = int(g_w.value()) if isinstance(g_w, QSpinBox) else int(spec.get("g", 0) or 0)
+        spec["b"] = int(b_w.value()) if isinstance(b_w, QSpinBox) else int(spec.get("b", 0) or 0)
+        spec["tol"] = int(tol_w.value()) if isinstance(tol_w, QSpinBox) else int(spec.get("tol", 0) or 0)
+        return self._normalize_ocr_filter_spec(spec, fallback_index=row)
 
-            en = _unwrap(self.ocr_filter_table.cellWidget(r, 0), QCheckBox)
-            name_w = _unwrap(self.ocr_filter_table.cellWidget(r, 1), QLineEdit)
-            r_w = _unwrap(self.ocr_filter_table.cellWidget(r, 2), QSpinBox)
-            g_w = _unwrap(self.ocr_filter_table.cellWidget(r, 3), QSpinBox)
-            b_w = _unwrap(self.ocr_filter_table.cellWidget(r, 4), QSpinBox)
-            tol_w = _unwrap(self.ocr_filter_table.cellWidget(r, 5), QSpinBox)
-
-            enabled = bool(en.isChecked()) if isinstance(en, QCheckBox) else True
-            name = name_w.text().strip() if isinstance(name_w, QLineEdit) else ""
-            rv = int(r_w.value()) if isinstance(r_w, QSpinBox) else 0
-            gv = int(g_w.value()) if isinstance(g_w, QSpinBox) else 0
-            bv = int(b_w.value()) if isinstance(b_w, QSpinBox) else 0
-            tol = int(tol_w.value()) if isinstance(tol_w, QSpinBox) else 0
-
+    def _current_color_filters(self, as_dataclass: bool = False, *, chat_only: bool = False):
+        filters = []
+        seen_ids: Set[str] = set()
+        for r in range(self.ocr_filter_table.rowCount()):
+            spec = self._ocr_filter_row_data(r)
+            if not isinstance(spec, dict):
+                continue
+            unique_spec = self._dedupe_ocr_filter_spec_id(spec, seen_ids)
+            if str(unique_spec.get("id") or "").strip() != str(spec.get("id") or "").strip():
+                btn = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(r, 6), QPushButton)
+                if isinstance(btn, QPushButton):
+                    self._set_ocr_filter_button_meta(btn, unique_spec)
+                    try:
+                        btn.setToolTip(self._ocr_filter_assignment_summary(unique_spec))
+                    except Exception:
+                        pass
+                spec = unique_spec
+            filter_id = str(spec.get("id") or "").strip()
+            if not filter_id or filter_id in seen_ids:
+                continue
+            seen_ids.add(filter_id)
+            if chat_only and not self._ocr_filter_uses_chat_area(spec):
+                continue
             if as_dataclass:
-                filters.append(ColorFilter(name, rv, gv, bv, tol, enabled))
+                filters.append(
+                    ColorFilter(
+                        str(spec.get("name", "") or "").strip(),
+                        int(spec.get("r", 0) or 0),
+                        int(spec.get("g", 0) or 0),
+                        int(spec.get("b", 0) or 0),
+                        int(spec.get("tol", 0) or 0),
+                        bool(spec.get("enabled", True)),
+                    )
+                )
             else:
-                filters.append({"name": name, "r": rv, "g": gv, "b": bv, "tol": tol, "enabled": enabled})
+                filters.append(spec)
         return filters
+
+    def _capture_ocr_reference_image(self) -> Optional[Tuple[Any, Image.Image]]:
+        windows = enum_roblox_windows()
+        if not windows:
+            QMessageBox.warning(self, "No Roblox windows", "No visible Roblox windows were found.")
+            return None
+        win = windows[0]
+        img = capture_window_image(win.hwnd)
+        if img is None:
+            QMessageBox.warning(self, "Capture failed", f"Could not capture window '{win.title}'.")
+            return None
+        return win, img
+
+    def _show_pil_preview_dialog(self, title: str, img: Image.Image) -> None:
+        pm = pil_to_pixmap(img)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        v = QVBoxLayout(dlg)
+        lbl = QLabel()
+        lbl.setPixmap(pm)
+        v.addWidget(lbl)
+        dlg.resize(pm.width(), pm.height())
+        dlg.exec()
+
+    def _ocr_effective_filter_roi(self, filter_cfg: dict) -> Optional[Tuple[float, float, float, float]]:
+        area_id = self._ocr_filter_shared_area_id(filter_cfg)
+        if area_id:
+            return self._ocr_shared_area_roi(area_id)
+        roi_cfg = filter_cfg.get("roi") if isinstance(filter_cfg.get("roi"), dict) else {}
+        try:
+            rx = float(roi_cfg.get("x", 0.0) or 0.0)
+            ry = float(roi_cfg.get("y", 0.0) or 0.0)
+            rw = float(roi_cfg.get("w", 0.0) or 0.0)
+            rh = float(roi_cfg.get("h", 0.0) or 0.0)
+        except Exception:
+            return None
+        if rw <= 0 or rh <= 0:
+            return None
+        return (rx, ry, rw, rh)
+
+    def _ocr_filter_roi_summary(self, filter_cfg: dict) -> str:
+        area_id = self._ocr_filter_shared_area_id(filter_cfg)
+        if area_id:
+            area = self._ocr_shared_area_by_id(area_id)
+            area_name = str((area or {}).get("name") or "Shared Area").strip() or "Shared Area"
+            roi = self._ocr_shared_area_roi(area_id)
+            if roi:
+                x, y, w, h = roi
+                return f"Using shared area '{area_name}': x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}"
+            return f"Using shared area '{area_name}': not calibrated"
+        roi = self._ocr_effective_filter_roi(filter_cfg)
+        if roi:
+            x, y, w, h = roi
+            return f"Custom ROI: x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}"
+        return "Custom ROI: not calibrated"
+
+    def _preview_ocr_filter_area(self, filter_cfg: dict) -> None:
+        roi = self._ocr_effective_filter_roi(filter_cfg)
+        if roi is None:
+            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the selected area first.")
+            return
+        windows = enum_roblox_windows()
+        if not windows:
+            QMessageBox.warning(self, "No Roblox windows", "No visible Roblox windows were found.")
+            return
+        win = windows[0]
+        img = capture_window_image(win.hwnd, roi)
+        if img is None:
+            QMessageBox.warning(self, "Capture failed", f"Could not capture window '{win.title}'.")
+            return
+        if self.ocr_preprocess_chk.isChecked():
+            img_to_show = preprocess_for_ocr(
+                img,
+                [
+                    ColorFilter(
+                        str(filter_cfg.get("name", "") or ""),
+                        int(filter_cfg.get("r", 0) or 0),
+                        int(filter_cfg.get("g", 0) or 0),
+                        int(filter_cfg.get("b", 0) or 0),
+                        int(filter_cfg.get("tol", 0) or 0),
+                        True,
+                    )
+                ],
+            )
+        else:
+            img_to_show = img
+        self._show_pil_preview_dialog(f"{str(filter_cfg.get('name') or 'Filter')} Preview", img_to_show)
+
+    def _pick_ocr_filter_color(self) -> Optional[Tuple[int, int, int]]:
+        captured = self._capture_ocr_reference_image()
+        if not captured:
+            return None
+        _win, img = captured
+        dlg = PointPickDialog(pil_to_pixmap(img), "Pick OCR Color", parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        picked = dlg.selected_point()
+        if not picked:
+            return None
+        _xf, _yf, px, py = picked
+        rgb = img.convert("RGB")
+        try:
+            r, g, b = rgb.getpixel((int(px), int(py)))[:3]
+        except Exception:
+            return None
+        return int(r), int(g), int(b)
+
+    def _pick_ocr_filter_roi(self, title: str) -> Optional[dict]:
+        captured = self._capture_ocr_reference_image()
+        if not captured:
+            return None
+        _win, img = captured
+        dlg = ROICropDialog(pil_to_pixmap(img), self, title=title, hint="Drag to draw the OCR area. Release to save.")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        roi = dlg.selected_roi()
+        if not roi:
+            return None
+        return {"x": float(roi[0]), "y": float(roi[1]), "w": float(roi[2]), "h": float(roi[3])}
+
+    def _preview_ocr_shared_area(self, area_cfg: Optional[dict]) -> None:
+        spec = self._normalize_ocr_shared_area_spec(area_cfg or {})
+        roi = self._ocr_shared_area_roi(str(spec.get("id") or ""), shared_areas=[spec])
+        if roi is None:
+            QMessageBox.warning(self, "Shared Area", "Please calibrate the shared area first.")
+            return
+        windows = enum_roblox_windows()
+        if not windows:
+            QMessageBox.warning(self, "No Roblox windows", "No visible Roblox windows were found.")
+            return
+        win = windows[0]
+        img = capture_window_image(win.hwnd, roi)
+        if img is None:
+            QMessageBox.warning(self, "Capture failed", f"Could not capture window '{win.title}'.")
+            return
+        self._show_pil_preview_dialog(f"{str(spec.get('name') or 'Shared Area')} Preview", img)
+
+    def _open_ocr_shared_area_editor_dialog(self, area_cfg: Optional[dict] = None, *, fallback_index: int = 0) -> Optional[dict]:
+        base = self._normalize_ocr_shared_area_spec(area_cfg or {}, fallback_index=fallback_index)
+        current_roi = copy.deepcopy(base.get("roi") or self._ocr_empty_roi_cfg())
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Shared Area")
+        dlg.resize(520, 220)
+        layout = QVBoxLayout(dlg)
+
+        form = QFormLayout()
+        name_le = QLineEdit(str(base.get("name", "") or ""))
+        name_le.setPlaceholderText("Area name")
+        form.addRow("Name:", name_le)
+
+        area_row = QWidget()
+        area_layout = QHBoxLayout(area_row)
+        area_layout.setContentsMargins(0, 0, 0, 0)
+        area_layout.setSpacing(8)
+        area_btn = QPushButton("Calibrate Area")
+        preview_btn = QPushButton("Preview Area")
+        area_layout.addWidget(area_btn)
+        area_layout.addWidget(preview_btn)
+        area_layout.addStretch()
+        form.addRow("Area:", area_row)
+
+        area_label = QLabel()
+        area_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        form.addRow("", area_label)
+        layout.addLayout(form)
+
+        def _current_area_spec() -> dict:
+            popup_spec = copy.deepcopy(base)
+            popup_spec["name"] = name_le.text().strip()
+            popup_spec["roi"] = copy.deepcopy(current_roi)
+            return self._normalize_ocr_shared_area_spec(popup_spec, fallback_index=fallback_index)
+
+        def _refresh_area_state() -> None:
+            popup_spec = _current_area_spec()
+            area_label.setText(self._ocr_shared_area_summary_text(popup_spec))
+            preview_btn.setEnabled(self._ocr_shared_area_roi(str(popup_spec.get("id") or ""), shared_areas=[popup_spec]) is not None)
+
+        def _pick_area() -> None:
+            nonlocal current_roi
+            roi_cfg = self._pick_ocr_filter_roi(f"Select {str(name_le.text().strip() or base.get('name') or 'Shared Area')} Area")
+            if roi_cfg:
+                current_roi = roi_cfg
+                _refresh_area_state()
+
+        def _preview_area() -> None:
+            self._preview_ocr_shared_area(_current_area_spec())
+
+        name_le.textChanged.connect(_refresh_area_state)
+        area_btn.clicked.connect(_pick_area)
+        preview_btn.clicked.connect(_preview_area)
+        _refresh_area_state()
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        saved = _current_area_spec()
+        if not str(saved.get("name", "") or "").strip():
+            QMessageBox.warning(self, "Shared Area", "Please enter a name for the shared area.")
+            return None
+        if self._ocr_shared_area_roi(str(saved.get("id") or ""), shared_areas=[saved]) is None:
+            QMessageBox.warning(self, "Shared Area", "Please calibrate the shared area before saving.")
+            return None
+        return saved
+
+    def _open_ocr_shared_areas_dialog(self) -> None:
+        areas = self._merge_ocr_shared_areas(self.ocr_shared_areas)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Shared OCR Areas")
+        dlg.resize(620, 420)
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel("Create reusable OCR areas here. Filters can then use a shared area instead of storing their own ROI.")
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(info)
+
+        area_list = QListWidget()
+        detail_label = QLabel("Select a shared area to view its bounds.")
+        detail_label.setWordWrap(True)
+        detail_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(area_list)
+        layout.addWidget(detail_label)
+
+        def _refresh_list(selected_id: str = "") -> None:
+            area_list.clear()
+            chosen_row = -1
+            for idx, area in enumerate(areas):
+                item = QListWidgetItem(str(area.get("name", "Shared Area") or "Shared Area"))
+                item.setData(Qt.ItemDataRole.UserRole, str(area.get("id") or "").strip())
+                item.setToolTip(self._ocr_shared_area_summary_text(area))
+                area_list.addItem(item)
+                if selected_id and str(area.get("id") or "").strip() == selected_id:
+                    chosen_row = idx
+            if chosen_row >= 0:
+                area_list.setCurrentRow(chosen_row)
+            elif area_list.count() > 0:
+                area_list.setCurrentRow(0)
+            else:
+                detail_label.setText("Select a shared area to view its bounds.")
+
+        def _selected_area_index() -> int:
+            row = area_list.currentRow()
+            if row < 0 or row >= len(areas):
+                return -1
+            return row
+
+        def _update_detail() -> None:
+            idx = _selected_area_index()
+            if idx < 0:
+                detail_label.setText("Select a shared area to view its bounds.")
+                return
+            detail_label.setText(self._ocr_shared_area_summary_text(areas[idx]))
+
+        def _add_area() -> None:
+            saved = self._open_ocr_shared_area_editor_dialog(None, fallback_index=len(areas))
+            if not saved:
+                return
+            areas.append(saved)
+            selected_id = str(saved.get("id") or "").strip()
+            _refresh_list(selected_id)
+            _update_detail()
+
+        def _edit_area() -> None:
+            idx = _selected_area_index()
+            if idx < 0:
+                QMessageBox.information(dlg, "Shared Areas", "Select a shared area to edit.")
+                return
+            saved = self._open_ocr_shared_area_editor_dialog(areas[idx], fallback_index=idx)
+            if not saved:
+                return
+            areas[idx] = saved
+            _refresh_list(str(saved.get("id") or "").strip())
+            _update_detail()
+
+        def _remove_area() -> None:
+            idx = _selected_area_index()
+            if idx < 0:
+                QMessageBox.information(dlg, "Shared Areas", "Select a shared area to remove.")
+                return
+            name = str(areas[idx].get("name", "Shared Area") or "Shared Area")
+            answer = QMessageBox.question(
+                dlg,
+                "Remove Shared Area",
+                f"Remove shared area '{name}'?\nFilters using it will need to be updated manually.",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            del areas[idx]
+            _refresh_list()
+            _update_detail()
+
+        def _preview_selected() -> None:
+            idx = _selected_area_index()
+            if idx < 0:
+                QMessageBox.information(dlg, "Shared Areas", "Select a shared area to preview.")
+                return
+            self._preview_ocr_shared_area(areas[idx])
+
+        area_list.currentRowChanged.connect(lambda _row: _update_detail())
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add Area")
+        edit_btn = QPushButton("Edit Area")
+        remove_btn = QPushButton("Remove Area")
+        preview_btn = QPushButton("Preview Area")
+        add_btn.clicked.connect(_add_area)
+        edit_btn.clicked.connect(_edit_area)
+        remove_btn.clicked.connect(_remove_area)
+        preview_btn.clicked.connect(_preview_selected)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(edit_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addWidget(preview_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        _refresh_list()
+        _update_detail()
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self.ocr_shared_areas = self._merge_ocr_shared_areas(areas)
+        self._on_ocr_settings_changed()
+
+    def _ocr_filter_assignment_summary(self, spec: Optional[dict], user_map: Optional[dict] = None) -> str:
+        clean_ids = self._normalize_ocr_filter_user_ids((spec or {}).get("user_ids", None))
+        if clean_ids is None:
+            return "All users."
+        if not clean_ids:
+            return "No users selected."
+        if user_map is None:
+            try:
+                user_map = self.config_manager.load_users() or {}
+            except Exception:
+                user_map = {}
+        names: List[str] = []
+        for uid in clean_ids:
+            info = user_map.get(uid, {}) if isinstance(user_map, dict) else {}
+            names.append(str(info.get("username") or uid))
+        preview = ", ".join(names[:4])
+        suffix = "..." if len(names) > 4 else ""
+        return f"Users: {preview}{suffix}"
+
+    def _apply_ocr_filter_user_ids_to_row(self, row: int, user_ids: Optional[List[str]]) -> None:
+        btn = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, 6), QPushButton)
+        if not isinstance(btn, QPushButton):
+            return
+        spec = self._get_ocr_filter_button_meta(btn)
+        spec["user_ids"] = self._normalize_ocr_filter_user_ids(user_ids)
+        self._set_ocr_filter_button_meta(btn, spec)
+        tip = self._ocr_filter_assignment_summary(spec)
+        try:
+            btn.setToolTip(tip)
+        except Exception:
+            pass
+
+    def _open_ocr_filter_user_assignments_dialog(self) -> None:
+        rows = self.ocr_filter_table.rowCount()
+        if rows <= 0:
+            QMessageBox.information(self, "OCR Filter Users", "Add a filter before assigning users.")
+            return
+
+        try:
+            users_cfg = self.config_manager.load_users() or {}
+        except Exception:
+            users_cfg = {}
+
+        user_choices = [
+            {
+                "id": str(uid).strip(),
+                "username": str(info.get("username", uid)).strip(),
+            }
+            for uid, info in (users_cfg.items() if isinstance(users_cfg, dict) else [])
+            if str(uid).strip()
+        ]
+        user_choices.sort(key=lambda item: item["username"].lower())
+        choice_ids = [u["id"] for u in user_choices]
+        choice_set = set(choice_ids)
+
+        entries: List[dict] = []
+        for row in range(rows):
+            spec = self._ocr_filter_row_data(row) or {}
+            filter_id = str(spec.get("id") or "").strip()
+            filter_name = str(spec.get("name") or filter_id or f"Filter {row + 1}").strip()
+            raw_selected = self._normalize_ocr_filter_user_ids(spec.get("user_ids", None))
+            if raw_selected is None:
+                selected = set(choice_ids)
+                explicit = False
+            else:
+                selected = set(raw_selected)
+                explicit = True
+            entries.append(
+                {
+                    "row": row,
+                    "id": filter_id,
+                    "name": filter_name,
+                    "selected": selected,
+                    "explicit": explicit,
+                }
+            )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("OCR Filter Users")
+        dlg.resize(760, 540)
+
+        outer = QVBoxLayout(dlg)
+        only_mapped_chk = QCheckBox("Only search mapped PIDs")
+        only_mapped_chk.setChecked(bool(getattr(self, "ocr_only_mapped_pids", False)))
+        only_mapped_chk.setToolTip("When enabled, OCR skips Roblox processes that are not mapped to a known user.")
+        outer.addWidget(only_mapped_chk)
+
+        h = QHBoxLayout()
+        outer.addLayout(h)
+
+        left_col = QVBoxLayout()
+        filter_list = QListWidget()
+        filter_list.setMinimumWidth(260)
+        for entry in entries:
+            item = QListWidgetItem(entry["name"])
+            item.setToolTip(self._ocr_filter_assignment_summary({"user_ids": None if not entry["explicit"] else sorted(entry["selected"])}, users_cfg))
+            filter_list.addItem(item)
+        left_col.addWidget(filter_list)
+        left_col.addStretch()
+        h.addLayout(left_col)
+
+        right = QVBoxLayout()
+        h.addLayout(right)
+        right.addWidget(QLabel("Choose which users each OCR filter applies to:"))
+
+        btn_row = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        deselect_all_btn = QPushButton("Deselect All")
+        right.addLayout(btn_row)
+        btn_row.addWidget(select_all_btn)
+        btn_row.addWidget(deselect_all_btn)
+        btn_row.addStretch()
+
+        user_scroll = QScrollArea()
+        user_scroll.setWidgetResizable(True)
+        user_container = QWidget()
+        user_layout = QVBoxLayout(user_container)
+        user_layout.setContentsMargins(6, 6, 6, 6)
+        user_scroll.setWidget(user_container)
+        right.addWidget(user_scroll)
+
+        helper_label = QLabel()
+        helper_label.setWordWrap(True)
+        helper_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        right.addWidget(helper_label)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        right.addWidget(btn_box)
+
+        current_checks: List[QCheckBox] = []
+
+        def _clear_user_layout() -> None:
+            nonlocal current_checks
+            current_checks = []
+            while user_layout.count():
+                item = user_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+
+        def _entry_summary(entry: dict) -> str:
+            if not entry.get("explicit", False):
+                return "All users."
+            selected = sorted({str(uid).strip() for uid in (entry.get("selected") or set()) if str(uid).strip()})
+            return self._ocr_filter_assignment_summary({"user_ids": selected}, users_cfg)
+
+        def _refresh_filter_list_labels() -> None:
+            for idx, entry in enumerate(entries):
+                item = filter_list.item(idx)
+                if item is None:
+                    continue
+                item.setToolTip(_entry_summary(entry))
+
+        def _current_entry() -> Optional[dict]:
+            idx = filter_list.currentRow()
+            if idx < 0 or idx >= len(entries):
+                return None
+            return entries[idx]
+
+        def _recompute_entry_from_checks() -> None:
+            entry = _current_entry()
+            if entry is None:
+                return
+            selected = {str(cb.property("user_id") or "").strip() for cb in current_checks if cb.isChecked() and str(cb.property("user_id") or "").strip()}
+            entry["selected"] = selected
+            entry["explicit"] = selected != choice_set
+            _refresh_filter_list_labels()
+            helper_label.setText(_entry_summary(entry))
+
+        def _build_user_checks(_idx: int) -> None:
+            _clear_user_layout()
+            entry = _current_entry()
+            if entry is None:
+                helper_label.setText("Select a filter to edit.")
+                return
+
+            selected = set(entry.get("selected") or set())
+            if not user_choices:
+                user_layout.addWidget(QLabel("No users are available in users.json."))
+                helper_label.setText("No users available.")
+                return
+
+            extra_ids = sorted(selected - choice_set)
+            full_choices = list(user_choices)
+            for uid in extra_ids:
+                full_choices.append({"id": uid, "username": f"{uid} (not in users.json)"})
+
+            for user in full_choices:
+                uid = str(user["id"]).strip()
+                cb = QCheckBox(f"{user['username']} [{uid}]")
+                cb.setChecked(uid in selected)
+                cb.setProperty("user_id", uid)
+                cb.toggled.connect(lambda _checked=False: _recompute_entry_from_checks())
+                current_checks.append(cb)
+                user_layout.addWidget(cb)
+            user_layout.addStretch()
+            helper_label.setText(_entry_summary(entry))
+
+        def _set_all_checks(state: bool) -> None:
+            for cb in current_checks:
+                cb.setChecked(bool(state))
+            _recompute_entry_from_checks()
+
+        filter_list.currentRowChanged.connect(_build_user_checks)
+        select_all_btn.clicked.connect(lambda: _set_all_checks(True))
+        deselect_all_btn.clicked.connect(lambda: _set_all_checks(False))
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        filter_list.setCurrentRow(0 if entries else -1)
+        _refresh_filter_list_labels()
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self.ocr_only_mapped_pids = bool(only_mapped_chk.isChecked())
+        for entry in entries:
+            normalized = None if not entry.get("explicit", False) else sorted(
+                {str(uid).strip() for uid in (entry.get("selected") or set()) if str(uid).strip()}
+            )
+            self._apply_ocr_filter_user_ids_to_row(int(entry.get("row", -1)), normalized)
+        self._on_ocr_settings_changed()
+
+    def _open_ocr_filter_presets_dialog(self) -> None:
+        catalog = self._ocr_filter_presets_catalog()
+        if not catalog:
+            QMessageBox.information(self, "OCR Filter Presets", "No OCR filter presets are available.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("OCR Filter Presets")
+        dlg.resize(780, 575)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        info = QLabel(
+            "Choose a preset category, then select one or more presets to add to the OCR filters table. "
+            "The webhook settings below will be copied into each added preset."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        info.setContentsMargins(0, 0, 0, 2)
+        layout.addWidget(info)
+
+        category_row = QHBoxLayout()
+        category_row.setContentsMargins(0, 0, 0, 0)
+        category_row.setSpacing(6)
+        category_row.addWidget(QLabel("Category:"))
+        category_combo = QComboBox()
+        for category_name in catalog.keys():
+            category_combo.addItem(category_name)
+        category_row.addWidget(category_combo, 1)
+        layout.addLayout(category_row)
+
+        preset_list = QListWidget()
+        preset_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        layout.addWidget(preset_list, 1)
+
+        detail_label = QLabel("Select a preset to preview its text and color settings.")
+        detail_label.setWordWrap(True)
+        detail_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        detail_label.setMaximumHeight(52)
+        detail_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        layout.addWidget(detail_label)
+
+        webhook_group = QGroupBox("Webhook For Added Presets")
+        webhook_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        webhook_form = QFormLayout(webhook_group)
+        webhook_form.setContentsMargins(8, 8, 8, 8)
+        webhook_form.setSpacing(6)
+
+        preset_hook_le = QLineEdit()
+        preset_hook_le.setPlaceholderText("https://discord.com/api/webhooks/…")
+        webhook_form.addRow("Webhook URL:", preset_hook_le)
+
+        preset_msg_le = QLineEdit()
+        preset_msg_le.setPlaceholderText("{filter} detected in {username} (PID {pid})")
+        preset_msg_le.setToolTip(
+            "Available placeholders: {filter}, {username}, {owner}, "
+            "{server_label}, {pid}, {ps_link}, {user_id}"
+        )
+        webhook_form.addRow("Message:", preset_msg_le)
+
+        layout.addWidget(webhook_group)
+
+        footer_row = QHBoxLayout()
+        footer_row.setContentsMargins(0, 0, 0, 0)
+        footer_row.setSpacing(6)
+        add_selected_btn = QPushButton("Add Selected")
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.reject)
+        footer_row.addWidget(add_selected_btn)
+        footer_row.addStretch()
+        footer_row.addWidget(close_btn)
+        layout.addLayout(footer_row)
+
+        def _current_presets() -> List[dict]:
+            return list(catalog.get(str(category_combo.currentText() or "").strip(), []) or [])
+
+        def _refresh_preset_list() -> None:
+            preset_list.clear()
+            for idx, preset in enumerate(_current_presets()):
+                item = QListWidgetItem(str(preset.get("name", f"Preset {idx + 1}") or f"Preset {idx + 1}"))
+                item.setData(Qt.ItemDataRole.UserRole, idx)
+                item.setToolTip(str(preset.get("target_text", "") or ""))
+                preset_list.addItem(item)
+            if preset_list.count() > 0:
+                preset_list.setCurrentRow(0)
+            else:
+                detail_label.setText("No presets are available in this category.")
+
+        def _update_detail() -> None:
+            selected_items = preset_list.selectedItems()
+            presets = _current_presets()
+            if len(selected_items) != 1:
+                if selected_items:
+                    detail_label.setText(f"{len(selected_items)} presets selected.")
+                else:
+                    detail_label.setText("Select a preset to preview its text and color settings.")
+                return
+            try:
+                idx = int(selected_items[0].data(Qt.ItemDataRole.UserRole))
+                preset = presets[idx]
+            except Exception:
+                detail_label.setText("Select a preset to preview its text and color settings.")
+                return
+            detail_label.setText(
+                f"Name: {str(preset.get('name') or '').strip()}\n"
+                f"Text: {str(preset.get('target_text') or '').strip()}\n"
+                f"Color: R={int(preset.get('r', 0) or 0)}, G={int(preset.get('g', 0) or 0)}, "
+                f"B={int(preset.get('b', 0) or 0)}, Tol={int(preset.get('tol', 0) or 0)}"
+            )
+
+        def _add_selected_presets() -> None:
+            selected_items = preset_list.selectedItems()
+            if not selected_items:
+                QMessageBox.information(dlg, "OCR Filter Presets", "Select at least one preset to add.")
+                return
+            presets = _current_presets()
+            webhook_url = preset_hook_le.text().strip()
+            webhook_message = preset_msg_le.text()
+            for item in selected_items:
+                try:
+                    idx = int(item.data(Qt.ItemDataRole.UserRole))
+                    preset_cfg = copy.deepcopy(presets[idx])
+                except Exception:
+                    continue
+                preset_cfg["webhook_url"] = webhook_url
+                preset_cfg["webhook_message"] = webhook_message
+                self._add_filter_row(preset_cfg)
+            self._on_ocr_settings_changed()
+            dlg.accept()
+
+        category_combo.currentIndexChanged.connect(lambda _idx: _refresh_preset_list())
+        preset_list.itemSelectionChanged.connect(_update_detail)
+        add_selected_btn.clicked.connect(_add_selected_presets)
+        _refresh_preset_list()
+        _update_detail()
+        dlg.exec()
+
+    def _open_ocr_filter_settings_dialog(self, btn: QPushButton) -> None:
+        row = self._row_for_filter_settings_button(btn)
+        spec = self._ocr_filter_row_data(row)
+        if not isinstance(spec, dict):
+            return
+
+        is_locked = bool(spec.get("locked", False))
+        is_merchant = str(spec.get("id") or "") in self._ocr_merchant_filter_ids() or str(spec.get("behavior") or "") == "merchant"
+        current_roi = copy.deepcopy(spec.get("roi") or self._ocr_empty_roi_cfg())
+        current_shared_area_id = self._ocr_filter_shared_area_id(spec) or "chat"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Filter Settings - {spec.get('name', 'Filter')}")
+        dlg.resize(560, 520)
+        layout = QVBoxLayout(dlg)
+
+        form = QFormLayout()
+
+        cooldown_spin = _AutoItemSpinBox()
+        cooldown_spin.setRange(0, 86400)
+        cooldown_spin.setSuffix(" s")
+        cooldown_spin.setValue(max(0, int(float(spec.get("cooldown_seconds", 600) or 0))))
+        form.addRow("Cooldown:", cooldown_spin)
+
+        target_text = QTextEdit()
+        target_text.setPlainText(str(spec.get("target_text", "") or ""))
+        target_text.setMinimumHeight(72)
+        target_text.setMaximumHeight(110)
+        form.addRow("Text to detect:", target_text)
+
+        hook_le = QLineEdit(str(spec.get("webhook_url", "") or ""))
+        hook_le.setPlaceholderText("https://discord.com/api/webhooks/…")
+        form.addRow("Webhook URL:", hook_le)
+
+        msg_te = QTextEdit()
+        msg_te.setPlainText(str(spec.get("webhook_message", "") or ""))
+        msg_te.setMinimumHeight(72)
+        msg_te.setMaximumHeight(120)
+        msg_te.setToolTip("Available placeholders: {filter}, {username}, {owner}, {server_label}, {pid}, {ps_link}, {user_id}")
+        form.addRow("Message:", msg_te)
+
+        send_screenshot_chk = QCheckBox("Attach screenshot to webhook")
+        send_screenshot_chk.setChecked(bool(spec.get("send_screenshot", False)))
+        if is_merchant:
+            send_screenshot_chk.setEnabled(False)
+            send_screenshot_chk.setToolTip("Merchant filters already attach the screenshot through the built-in merchant webhook system.")
+        else:
+            form.addRow("", send_screenshot_chk)
+
+        repeat_alert_chk = QCheckBox("Repeat alert sound on match")
+        repeat_alert_chk.setChecked(bool(spec.get("repeat_alert_sound", False)))
+        repeat_alert_chk.setToolTip("Plays the same repeating alert sound used by Anti-AFK until stopped.")
+        form.addRow("", repeat_alert_chk)
+
+        color_row = QWidget()
+        color_layout = QHBoxLayout(color_row)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.setSpacing(8)
+        r_sb = self._ocr_make_rgb_spin(int(spec.get("r", 0) or 0), maximum=255)
+        g_sb = self._ocr_make_rgb_spin(int(spec.get("g", 0) or 0), maximum=255)
+        b_sb = self._ocr_make_rgb_spin(int(spec.get("b", 0) or 0), maximum=255)
+        tol_sb = self._ocr_make_rgb_spin(int(spec.get("tol", 0) or 0), maximum=255)
+        pick_color_btn = QPushButton("Pick Color")
+        color_layout.addWidget(QLabel("R"))
+        color_layout.addWidget(r_sb)
+        color_layout.addWidget(QLabel("G"))
+        color_layout.addWidget(g_sb)
+        color_layout.addWidget(QLabel("B"))
+        color_layout.addWidget(b_sb)
+        color_layout.addWidget(QLabel("Tol"))
+        color_layout.addWidget(tol_sb)
+        color_layout.addWidget(pick_color_btn)
+        form.addRow("Color:", color_row)
+
+        use_shared_chk = QCheckBox("Use shared area")
+        use_shared_chk.setChecked(bool(spec.get("use_shared_area", spec.get("use_chat_area", False))))
+        form.addRow("", use_shared_chk)
+
+        shared_area_combo = QComboBox()
+        last_shared_area_id = current_shared_area_id
+        form.addRow("Shared area:", shared_area_combo)
+
+        area_row = QWidget()
+        area_layout = QHBoxLayout(area_row)
+        area_layout.setContentsMargins(0, 0, 0, 0)
+        area_layout.setSpacing(8)
+        area_btn = QPushButton("Calibrate Area")
+        preview_btn = QPushButton("Preview Area")
+        area_layout.addWidget(area_btn)
+        area_layout.addWidget(preview_btn)
+        area_layout.addStretch()
+        form.addRow("Area:", area_row)
+
+        area_label = QLabel()
+        area_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        form.addRow("", area_label)
+
+        layout.addLayout(form)
+
+        if is_merchant:
+            hook_le.setEnabled(False)
+            msg_te.setEnabled(False)
+            use_shared_chk.setChecked(True)
+            use_shared_chk.setEnabled(False)
+            hook_le.setToolTip("Merchant filters continue using the built-in merchant webhook system.")
+            msg_te.setToolTip("Merchant filters continue using the built-in merchant webhook system.")
+
+        def _populate_shared_area_combo(selected_id: str = "") -> None:
+            target_id = str(selected_id or "").strip() or "chat"
+            try:
+                shared_area_combo.blockSignals(True)
+                shared_area_combo.clear()
+                if not use_shared_chk.isChecked() and not is_merchant:
+                    return
+                for area in self._ocr_shared_area_choices():
+                    shared_area_combo.addItem(str(area.get("name", "Shared Area") or "Shared Area"), str(area.get("id") or ""))
+                combo_idx = shared_area_combo.findData(target_id)
+                if combo_idx < 0:
+                    combo_idx = shared_area_combo.findData("chat")
+                if combo_idx >= 0:
+                    shared_area_combo.setCurrentIndex(combo_idx)
+            finally:
+                shared_area_combo.blockSignals(False)
+
+        _populate_shared_area_combo(current_shared_area_id)
+
+        def _current_popup_spec() -> dict:
+            popup_spec = copy.deepcopy(spec)
+            popup_spec["cooldown_seconds"] = float(cooldown_spin.value())
+            popup_spec["target_text"] = target_text.toPlainText().strip()
+            popup_spec["webhook_url"] = hook_le.text().strip()
+            popup_spec["webhook_message"] = msg_te.toPlainText()
+            popup_spec["send_screenshot"] = bool(send_screenshot_chk.isChecked()) if not is_merchant else bool(spec.get("send_screenshot", True))
+            popup_spec["repeat_alert_sound"] = bool(repeat_alert_chk.isChecked())
+            popup_spec["r"] = int(r_sb.value())
+            popup_spec["g"] = int(g_sb.value())
+            popup_spec["b"] = int(b_sb.value())
+            popup_spec["tol"] = int(tol_sb.value())
+            popup_spec["use_shared_area"] = bool(use_shared_chk.isChecked()) if not is_merchant else True
+            popup_spec["shared_area_id"] = str(shared_area_combo.currentData() or "").strip() if popup_spec["use_shared_area"] else ""
+            popup_spec["roi"] = copy.deepcopy(current_roi)
+            return popup_spec
+
+        def _refresh_area_controls() -> None:
+            nonlocal last_shared_area_id
+            current_data = str(shared_area_combo.currentData() or "").strip()
+            if current_data:
+                last_shared_area_id = current_data
+            _populate_shared_area_combo(last_shared_area_id)
+            popup_spec = _current_popup_spec()
+            area_btn.setEnabled(not popup_spec.get("use_shared_area", False))
+            shared_area_combo.setEnabled(bool(popup_spec.get("use_shared_area", False)) and not is_merchant)
+            preview_btn.setEnabled(self._ocr_effective_filter_roi(popup_spec) is not None)
+            area_label.setText(self._ocr_filter_roi_summary(popup_spec))
+
+        def _shared_area_changed(_idx: int) -> None:
+            nonlocal last_shared_area_id
+            current_data = str(shared_area_combo.currentData() or "").strip()
+            if current_data:
+                last_shared_area_id = current_data
+            _refresh_area_controls()
+
+        use_shared_chk.toggled.connect(_refresh_area_controls)
+        shared_area_combo.currentIndexChanged.connect(_shared_area_changed)
+
+        def _pick_color() -> None:
+            picked = self._pick_ocr_filter_color()
+            if not picked:
+                return
+            rv, gv, bv = picked
+            r_sb.setValue(rv)
+            g_sb.setValue(gv)
+            b_sb.setValue(bv)
+
+        def _pick_area() -> None:
+            nonlocal current_roi
+            roi_cfg = self._pick_ocr_filter_roi(f"Select {str(spec.get('name') or 'Filter')} Area")
+            if roi_cfg:
+                current_roi = roi_cfg
+                _refresh_area_controls()
+
+        def _preview_area() -> None:
+            self._preview_ocr_filter_area(_current_popup_spec())
+
+        pick_color_btn.clicked.connect(_pick_color)
+        area_btn.clicked.connect(_pick_area)
+        preview_btn.clicked.connect(_preview_area)
+        _refresh_area_controls()
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        saved = self._normalize_ocr_filter_spec(_current_popup_spec(), fallback_index=row)
+        name_w = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, 1), QLineEdit)
+        if isinstance(name_w, QLineEdit):
+            name_w.setText(str(saved.get("name", "") or ""))
+        for col, key in ((2, "r"), (3, "g"), (4, "b"), (5, "tol")):
+            sb = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, col), QSpinBox)
+            if isinstance(sb, QSpinBox):
+                sb.setValue(int(saved.get(key, 0) or 0))
+        self._set_ocr_filter_button_meta(btn, saved)
+        self._on_ocr_settings_changed()
 
     def _get_ocr_settings_from_ui(self) -> dict:
         roi = self.ocr_roi or (0.0, 0.0, 0.0, 0.0)
-        verification_roi = self.ocr_verification_roi or (0.0, 0.0, 0.0, 0.0)
+        filters = []
+        for spec in self._current_color_filters(as_dataclass=False):
+            clean = dict(spec or {})
+            clean.pop("locked", None)
+            filters.append(clean)
         return {
             "enabled": bool(self.ocr_enable_chk.isChecked()),
+            "only_mapped_pids": bool(getattr(self, "ocr_only_mapped_pids", False)),
             "workers": self.ocr_workers_spin.value(),
             "max_captures_per_second": self.ocr_max_caps_spin.value(),
             "batch_delay_seconds": float(self.ocr_batch_delay_spin.value()),
-            "cooldown_seconds": self.ocr_cooldown_spin.value(),
             "use_preprocess": bool(self.ocr_preprocess_chk.isChecked()),
             "frame_diff_tolerance": int(self.ocr_frame_diff_tol_spin.value()),
             "log_ocr_text": bool(getattr(self, "ocr_log_text_chk", None) and self.ocr_log_text_chk.isChecked()),
             "log_loop": bool(getattr(self, "ocr_loop_logs_chk", None) and self.ocr_loop_logs_chk.isChecked()),
             "device_id": self.ocr_device_combo.currentData() if hasattr(self, "ocr_device_combo") else None,
             "roi": {"x": roi[0], "y": roi[1], "w": roi[2], "h": roi[3]},
-            "verification_roi": {
-                "x": verification_roi[0],
-                "y": verification_roi[1],
-                "w": verification_roi[2],
-                "h": verification_roi[3],
-            },
-            "color_filters": self._current_color_filters(as_dataclass=False),
+            "shared_areas": self._merge_ocr_shared_areas(self.ocr_shared_areas),
+            "filters": filters,
         }
 
     def _apply_ocr_settings_to_ui(self, cfg: dict):
@@ -12696,11 +16795,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         try:
             target_enabled = bool(cfg.get("enabled", False))
             self.ocr_enable_chk.setChecked(target_enabled)
+            self.ocr_only_mapped_pids = bool(cfg.get("only_mapped_pids", defaults.get("only_mapped_pids", False)))
 
             self.ocr_workers_spin.setValue(int(cfg.get("workers", defaults.get("workers", 1))))
             self.ocr_max_caps_spin.setValue(int(cfg.get("max_captures_per_second", defaults.get("max_captures_per_second", 20))))
             self.ocr_batch_delay_spin.setValue(float(cfg.get("batch_delay_seconds", defaults.get("batch_delay_seconds", 1.0))))
-            self.ocr_cooldown_spin.setValue(int(cfg.get("cooldown_seconds", defaults.get("cooldown_seconds", 600))))
             self.ocr_preprocess_chk.setChecked(bool(cfg.get("use_preprocess", defaults.get("use_preprocess", True))))
             self.ocr_frame_diff_tol_spin.setValue(int(cfg.get("frame_diff_tolerance", defaults.get("frame_diff_tolerance", 2))))
             if hasattr(self, "ocr_log_text_chk"):
@@ -12718,22 +16817,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 fx = fy = fw = fh = 0.0
             self.ocr_roi = (fx, fy, fw, fh) if fw > 0 and fh > 0 else None
+            self.ocr_shared_areas = self._ocr_shared_areas_from_cfg(cfg)
             self._update_ocr_roi_label()
-            vroi_cfg = cfg.get("verification_roi") or defaults.get("verification_roi", {}) or {}
-            vrx, vry, vrw, vrh = (
-                vroi_cfg.get("x", 0.0),
-                vroi_cfg.get("y", 0.0),
-                vroi_cfg.get("w", 0.0),
-                vroi_cfg.get("h", 0.0),
-            )
-            try:
-                vfx, vfy, vfw, vfh = float(vrx), float(vry), float(vrw), float(vrh)
-            except Exception:
-                vfx = vfy = vfw = vfh = 0.0
-            self.ocr_verification_roi = (vfx, vfy, vfw, vfh) if vfw > 0 and vfh > 0 else None
-            self._update_ocr_verification_roi_label()
-
-            self._load_color_filters_table(cfg.get("color_filters") or defaults.get("color_filters", []))
+            self._load_color_filters_table(self._ocr_filters_from_cfg(cfg))
         finally:
             self._loading_ocr_settings = False
 
@@ -12749,15 +16835,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.ocr_roi_label.setText(f"Chat ROI: x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}")
         else:
             self.ocr_roi_label.setText("Chat ROI: not calibrated")
-
-    def _update_ocr_verification_roi_label(self):
-        if self.ocr_verification_roi:
-            x, y, w, h = self.ocr_verification_roi
-            self.ocr_verification_roi_label.setText(
-                f"Verification ROI: x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}"
-            )
-        else:
-            self.ocr_verification_roi_label.setText("Verification ROI: not calibrated")
 
     def _update_ocr_device_label(self):
         """Update the OCR device label with current OCR runtime status."""
@@ -12840,6 +16917,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.config_manager.save_settings(settings)
         except Exception:
             pass
+        try:
+            if self.worker_thread and self.worker_thread.isRunning():
+                self.worker_thread.refresh_multiscope_settings(settings)
+        except Exception:
+            pass
 
     def _sync_ocr_worker_settings(self):
         if self.ocr_worker and self.ocr_worker.isRunning():
@@ -12862,6 +16944,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.config_manager.save_settings(settings)
         except Exception:
             pass
+        try:
+            if self.worker_thread and self.worker_thread.isRunning():
+                self.worker_thread.refresh_multiscope_settings(settings)
+        except Exception:
+            pass
         # Live-apply to worker if running (restart to apply device changes)
         if device_changed and self.ocr_worker and self.ocr_worker.isRunning():
             self._stop_ocr_worker()
@@ -12871,16 +16958,46 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self._sync_ocr_worker_settings()
         self._last_ocr_device_id = device_id
 
+    def _ocr_has_usable_filters(self, ocr_cfg: Optional[dict] = None) -> bool:
+        cfg = ocr_cfg or self._get_ocr_settings_from_ui()
+        roi_cfg = cfg.get("roi") if isinstance(cfg.get("roi"), dict) else {}
+        try:
+            chat_roi = (
+                float(roi_cfg.get("x", 0.0) or 0.0),
+                float(roi_cfg.get("y", 0.0) or 0.0),
+                float(roi_cfg.get("w", 0.0) or 0.0),
+                float(roi_cfg.get("h", 0.0) or 0.0),
+            )
+        except Exception:
+            chat_roi = (0.0, 0.0, 0.0, 0.0)
+        usable_chat_roi = chat_roi if chat_roi[2] > 0 and chat_roi[3] > 0 else None
+        shared_areas = self._ocr_shared_areas_from_cfg(cfg)
+
+        for spec in self._ocr_filters_from_cfg(cfg):
+            if not bool(spec.get("enabled", True)):
+                continue
+            if self._ocr_filter_shared_area_id(spec):
+                roi = self._ocr_shared_area_roi(
+                    self._ocr_filter_shared_area_id(spec),
+                    shared_areas=shared_areas,
+                    chat_roi=usable_chat_roi,
+                )
+            else:
+                roi = self._ocr_effective_filter_roi(spec)
+            if roi is not None:
+                return True
+        return False
+
     def _reset_ocr_to_defaults(self):
         """Reset only the OCR tab to its default config and live-apply."""
         defaults = self.config_manager.default_settings.get("ocr", {}) or {}
         self._loading_ocr_settings = True
         try:
             self.ocr_enable_chk.setChecked(bool(defaults.get("enabled", False)))
+            self.ocr_only_mapped_pids = bool(defaults.get("only_mapped_pids", False))
             self.ocr_workers_spin.setValue(int(defaults.get("workers", 1)))
             self.ocr_max_caps_spin.setValue(int(defaults.get("max_captures_per_second", 20)))
             self.ocr_batch_delay_spin.setValue(float(defaults.get("batch_delay_seconds", 1.0)))
-            self.ocr_cooldown_spin.setValue(int(defaults.get("cooldown_seconds", 600)))
             self.ocr_preprocess_chk.setChecked(bool(defaults.get("use_preprocess", True)))
             self.ocr_frame_diff_tol_spin.setValue(int(defaults.get("frame_diff_tolerance", 2)))
             if hasattr(self, "ocr_log_text_chk"):
@@ -12897,21 +17014,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 fx = fy = fw = fh = 0.0
             self.ocr_roi = (fx, fy, fw, fh) if fw > 0 and fh > 0 else None
+            self.ocr_shared_areas = self._ocr_shared_areas_from_cfg(defaults)
             self._update_ocr_roi_label()
-            vroi_cfg = defaults.get("verification_roi") or {}
-            vrx, vry, vrw, vrh = (
-                vroi_cfg.get("x", 0.0),
-                vroi_cfg.get("y", 0.0),
-                vroi_cfg.get("w", 0.0),
-                vroi_cfg.get("h", 0.0),
-            )
-            try:
-                vfx, vfy, vfw, vfh = float(vrx), float(vry), float(vrw), float(vrh)
-            except Exception:
-                vfx = vfy = vfw = vfh = 0.0
-            self.ocr_verification_roi = (vfx, vfy, vfw, vfh) if vfw > 0 and vfh > 0 else None
-            self._update_ocr_verification_roi_label()
-            self._load_color_filters_table(defaults.get("color_filters", []))
+            self._load_color_filters_table(defaults.get("filters", []))
         finally:
             self._loading_ocr_settings = False
 
@@ -12925,12 +17030,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
         if self.ocr_worker and self.ocr_worker.isRunning():
             return
-        if not self.ocr_roi:
-            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the chat area before enabling OCR.")
+        ocr_cfg = self._get_ocr_settings_from_ui()
+        if not self._ocr_has_usable_filters(ocr_cfg):
+            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the chat area or at least one enabled filter area before enabling OCR.")
             self.ocr_enable_chk.setChecked(False)
             return
 
-        ocr_cfg = self._get_ocr_settings_from_ui()
         ms_cfg = self._ms_settings_from_ui()
 
         self.ocr_worker = OCRWorker(
@@ -12942,6 +17047,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.ocr_worker.status_signal.connect(self._handle_ocr_status)
         self.ocr_worker.merchant_signal.connect(self._handle_ocr_merchant)
         self.ocr_worker.verification_cap_signal.connect(self._handle_ocr_verification_cap)
+        self.ocr_worker.filter_alert_signal.connect(
+            self._handle_ocr_filter_alert,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.ocr_worker.filter_match_signal.connect(
+            self._handle_ocr_filter_match_for_auto_actions,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self.ocr_worker.start()
         self._handle_ocr_status("running")
 
@@ -12951,6 +17064,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def _stop_ocr_worker_with_timeout(self, *, timeout_ms: int = 3000) -> None:
         worker = getattr(self, "ocr_worker", None)
+        self._stop_ocr_filter_alert()
         if not worker:
             return
 
@@ -13066,6 +17180,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             ms["enable_mari"] = bool(self.ms_enable_mari.isChecked())
         if hasattr(self, "ms_enable_rin"):
             ms["enable_rin"] = bool(self.ms_enable_rin.isChecked())
+        if hasattr(self, "ms_merchant_detection_mode"):
+            ms["merchant_detection_mode"] = str(self.ms_merchant_detection_mode.currentData() or "asset_id")
         if hasattr(self, "ms_jester_type") and hasattr(self, "ms_jester_id"):
             ms["jester_ping_type"] = self.ms_jester_type.currentText()
             ms["jester_ping_id"] = self.ms_jester_id.text().strip()
@@ -13123,25 +17239,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 self._on_ocr_settings_changed()
 
     def calibrate_ocr_verification_roi(self):
-        windows = enum_roblox_windows()
-        if not windows:
-            QMessageBox.warning(self, "No Roblox windows", "No visible Roblox windows were found.")
-            return
-        ref_win = windows[0]
-        img = capture_window_image(ref_win.hwnd)
-        if img is None:
-            QMessageBox.warning(self, "Capture failed", f"Could not capture window '{ref_win.title}'.")
-            return
-
-        pixmap = pil_to_pixmap(img)
-        dlg = ROICropDialog(pixmap, self)
-        if dlg.exec():
-            roi = dlg.selected_roi()
-            if roi:
-                self.ocr_verification_roi = roi
-                self._update_ocr_verification_roi_label()
-                # Persist new ROI + live-apply
-                self._on_ocr_settings_changed()
+        QMessageBox.information(self, "OCR Filters", "Verification areas are now configured from each filter's Edit popup.")
 
     def show_ocr_preview(self):
         """
@@ -13167,7 +17265,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if self.ocr_preprocess_chk.isChecked():
                 img_to_show = preprocess_for_ocr(
                     img,
-                    self._current_color_filters(as_dataclass=True),
+                    self._current_color_filters(as_dataclass=True, chat_only=True),
                 )
             else:
                 img_to_show = img
@@ -13200,62 +17298,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             )
 
     def show_ocr_verification_preview(self):
-        """
-        Capture the calibrated verification area from a Roblox window and show
-        what OCR preprocessing would see for verification checks.
-        """
-        if not self.ocr_verification_roi:
-            QMessageBox.warning(self, "Calibrate OCR", "Please calibrate the verification area first.")
-            return
-        windows = enum_roblox_windows()
-        if not windows:
-            QMessageBox.warning(self, "No Roblox windows", "No visible Roblox windows were found.")
-            return
-
-        try:
-            win = windows[0]
-            img = capture_window_image(win.hwnd, self.ocr_verification_roi)
-            if img is None:
-                QMessageBox.warning(self, "Capture failed", f"Could not capture window '{win.title}'.")
-                return
-
-            if self.ocr_preprocess_chk.isChecked():
-                all_filters = self._current_color_filters(as_dataclass=True)
-                verification_filters = []
-                for cf in all_filters:
-                    name = str(getattr(cf, "name", "") or "").strip().lower()
-                    if name in ("verification check", "verification", "verification_check"):
-                        verification_filters.append(cf)
-                if not verification_filters:
-                    verification_filters = [ColorFilter("Verification Check", 255, 255, 255, 60, True)]
-                img_to_show = preprocess_for_ocr(img, verification_filters)
-            else:
-                img_to_show = img
-
-            pm = pil_to_pixmap(img_to_show)
-
-            dlg = QDialog(self)
-            dlg.setWindowTitle("Verification OCR Preview")
-            v = QVBoxLayout(dlg)
-            lbl = QLabel()
-            lbl.setPixmap(pm)
-            v.addWidget(lbl)
-            dlg.resize(pm.width(), pm.height())
-            dlg.exec()
-        except Exception as e:
-            msg = f"[Verification Preview] Error: {e}"
-            try:
-                self._handle_ocr_log(msg)
-            except Exception:
-                try:
-                    print(msg)
-                except Exception:
-                    pass
-            QMessageBox.critical(
-                self,
-                "Verification Preview Error",
-                f"An unexpected error occurred while generating the verification preview:\n{e}",
-            )
+        QMessageBox.information(self, "OCR Filters", "Verification previews are now available from each filter's Edit popup.")
 
     def test_ocr_frame_compare(self):
         """
@@ -13279,7 +17322,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         try:
             if self.ocr_preprocess_chk.isChecked():
-                img_for_compare = preprocess_for_ocr(img, self._current_color_filters(as_dataclass=True))
+                img_for_compare = preprocess_for_ocr(img, self._current_color_filters(as_dataclass=True, chat_only=True))
             else:
                 img_for_compare = img
 
@@ -13323,6 +17366,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         )
 
     def _resolve_pid_context(self, pid: int) -> Dict[str, Any]:
+        try:
+            pid_i = int(pid)
+        except Exception:
+            pid_i = 0
         ctx: Dict[str, Any] = {
             "user_id": "",
             "username": "",
@@ -13335,7 +17382,25 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         wt = self.worker_thread
         if wt and wt.manager:
             tracker = wt.manager.process_tracker
-            uid = tracker.process_owners.get(pid)
+            uid = tracker.process_owners.get(pid_i) or tracker.process_owners.get(str(pid_i))
+            if not uid:
+                try:
+                    for cand_uid, pids in (tracker.user_processes or {}).items():
+                        if not isinstance(pids, (list, tuple, set)):
+                            pids = [pids]
+                        found = False
+                        for p in pids:
+                            try:
+                                if int(p) == pid_i:
+                                    uid = str(cand_uid)
+                                    found = True
+                                    break
+                            except Exception:
+                                continue
+                        if found:
+                            break
+                except Exception:
+                    pass
             if uid:
                 ctx["user_id"] = uid
                 info = wt.manager.settings.get(uid, {}) or {}
@@ -13353,8 +17418,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     except Exception:
                         ctx["owner"] = ctx["username"]
 
-        if (not ctx.get("username")) and pid in self.process_data:
-            data = self.process_data.get(pid, {})
+        pdata = None
+        try:
+            pdata = self.process_data.get(pid_i, None)
+            if pdata is None:
+                pdata = self.process_data.get(str(pid_i), None)
+        except Exception:
+            pdata = None
+
+        if (not ctx.get("username")) and isinstance(pdata, dict):
+            data = pdata
             uid = data.get("user_id", "")
             ctx["user_id"] = uid
             users_cfg = self.config_manager.peek_users()
@@ -13392,13 +17465,38 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pass
 
     def _handle_ocr_merchant(self, uid: str, merchant: str) -> None:
+        uid_s = str(uid or "").strip()
+        merch_s = str(merchant or "").strip()
+        if not uid_s or not merch_s:
+            try:
+                self.add_log(
+                    f"[OCR->FoundStats] Skipped merchant update (uid='{uid_s or '-'}', merchant='{merch_s or '-'}')."
+                )
+            except Exception:
+                pass
+            return
         try:
             wt = self.worker_thread
             ms = getattr(wt, "ms", None) if wt else None
-            if ms:
-                ms.record_ocr_merchant(uid, merchant)
-        except Exception:
-            pass
+            if not ms:
+                try:
+                    self.add_log("[OCR->FoundStats] MultiScope is unavailable; merchant not recorded.")
+                except Exception:
+                    pass
+                return
+            fn = getattr(ms, "record_ocr_merchant", None)
+            if not callable(fn):
+                try:
+                    self.add_log("[OCR->FoundStats] MultiScope proxy lacks record_ocr_merchant; merchant not recorded.")
+                except Exception:
+                    pass
+                return
+            fn(uid_s, merch_s)
+        except Exception as e:
+            try:
+                self.add_log(f"[OCR->FoundStats] Failed to record OCR merchant: {e}")
+            except Exception:
+                pass
 
     def _handle_ocr_verification_cap(self, uid: str) -> None:
         uid = str(uid or "").strip()
@@ -13454,6 +17552,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.ocr_status_label.setStyleSheet(f"color:{ModernStyle.SECONDARY}; font-weight: bold;")
             self._refresh_ocr_device_label()
         else:
+            self._stop_ocr_filter_alert()
             self.ocr_status_label.setText("Status: Stopped")
             self.ocr_status_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY}; font-weight: bold;")
     def setup_settings_tab(self):
@@ -13620,12 +17719,34 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "When enabled, webhook messages are suppressed if the owner or private server is unknown."
         )
         misc_layout.addRow(self.misc_skip_unknown_webhook_chk)
+        self.misc_disable_log_merchants_when_ocr_active_chk = QCheckBox(
+            "Disable log merchant detection while OCR merchant filters are active"
+        )
+        self.misc_disable_log_merchants_when_ocr_active_chk.setToolTip(
+            "When enabled, MultiScope ignores merchant log lines whenever OCR is on and at least one OCR merchant filter is enabled."
+        )
+        misc_layout.addRow(self.misc_disable_log_merchants_when_ocr_active_chk)
         self.misc_log_confirmed_launch_mode_chk = QCheckBox("Launch only after previous fully launched")
         self.misc_log_confirmed_launch_mode_chk.setToolTip(
             "When enabled, launch delays are treated as minimums and the next account will launch only after "
             "the latest launched account's username is found in logs (Finished Verification)."
         )
         misc_layout.addRow(self.misc_log_confirmed_launch_mode_chk)
+        self.misc_disable_manager_bad_marking_chk = QCheckBox("Disable manager auto-BAD marking")
+        self.misc_disable_manager_bad_marking_chk.setToolTip(
+            "When enabled, launch/auth failures will no longer automatically mark accounts as BAD.\n"
+            "Warning: invalid cookies may keep retrying Roblox auth requests and can hit rate limits."
+        )
+        self.misc_disable_manager_bad_marking_chk.toggled.connect(self._sync_misc_disable_bad_marking_warning)
+        self.misc_disable_manager_bad_marking_chk.clicked.connect(self._warn_misc_disable_bad_marking_enabled)
+        misc_layout.addRow(self.misc_disable_manager_bad_marking_chk)
+        self.misc_disable_manager_bad_marking_warn_lbl = QLabel(
+            "Warning: invalid cookies may keep retrying Roblox auth requests and can trigger rate limiting."
+        )
+        self.misc_disable_manager_bad_marking_warn_lbl.setWordWrap(True)
+        self.misc_disable_manager_bad_marking_warn_lbl.setStyleSheet(f"color: {ModernStyle.WARNING};")
+        self.misc_disable_manager_bad_marking_warn_lbl.setVisible(False)
+        misc_layout.addRow(self.misc_disable_manager_bad_marking_warn_lbl)
         self.misc_msedgewebview2_limiter_enabled_chk = QCheckBox("Enable msedgewebview2 Limiter")
         self.misc_msedgewebview2_limiter_enabled_chk.setToolTip(
             "When enabled, msedgewebview2.exe processes are killed after launch log confirmation. (May interfere with Edge Browser)"
@@ -13635,7 +17756,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         content_layout.addWidget(misc_box)
 
         # ── Webhooks (Per-webhook biome filters) ─────────────────────────────────
-        webhooks_group = QGroupBox("Webhooks (Per-Webhook Biome Filters)")
+        webhooks_group = QGroupBox("Biome Webhooks")
         webhooks_v = QVBoxLayout(webhooks_group)
 
         info_lbl = QLabel("Each row is a webhook. Choose how each biome should notify.")
@@ -13659,6 +17780,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         vh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         vh.setDefaultSectionSize(62)   # match Auto Item table sizing
         vh.setMinimumSectionSize(62)   # prevents squeeze below readable height
+        visible_webhook_rows = 4
+        table_frame = self.webhooks_table.frameWidth() * 2
+        header_height = self.webhooks_table.horizontalHeader().sizeHint().height()
+        row_height = vh.defaultSectionSize() * visible_webhook_rows
+        scrollbar_height = self.webhooks_table.horizontalScrollBar().sizeHint().height()
+        self.webhooks_table.setMinimumHeight(table_frame + header_height + row_height + scrollbar_height)
         # Keep the existing dropdown behavior; just remove gridlines/fit row height above.
 
         for c in range(2, 2 + len(GUI_BIOME_NAMES)):
@@ -14195,7 +18322,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         content_layout.addWidget(webhooks_group)
 
         # --- Multiscope — Merchant & Pings (simple, no custom helpers) ---
-        ms_box = QGroupBox("Multiscope — Merchant Pings")
+        ms_box = QGroupBox("Merchant Webhook & Pings")
         ms_form = QFormLayout(ms_box)
 
         self.ms_merchant_webhook_input = QLineEdit()
@@ -14204,6 +18331,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.ms_enable_jester = QCheckBox("Enable Jester pings")
         self.ms_enable_mari   = QCheckBox("Enable Mari pings")
         self.ms_enable_rin    = QCheckBox("Enable Rin pings")
+        self.ms_merchant_detection_mode = QComboBox()
+        self.ms_merchant_detection_mode.addItem("Asset ID (Default)", "asset_id")
+        self.ms_merchant_detection_mode.addItem("Legacy Chat Line", "legacy_chat")
 
         type_opts = ["None", "User ID", "Role ID"]
 
@@ -14225,6 +18355,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         rin_h.addWidget(self.ms_rin_type); rin_h.addWidget(self.ms_rin_id)
 
         ms_form.addRow("Merchant Webhook URL", self.ms_merchant_webhook_input)
+        ms_form.addRow("Merchant Detection Mode", self.ms_merchant_detection_mode)
         ms_form.addRow(self.ms_enable_jester)
         ms_form.addRow("Jester ping type / ID", jester_row)
         ms_form.addRow(self.ms_enable_mari)
@@ -14517,8 +18648,30 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 background-color: 
             }}
         """)
-        placeholder_btn.clicked.connect(lambda: self.open_url("https://example.com"))
+        placeholder_btn.clicked.connect(lambda: self.open_url("https://github.com/0vm/RAM-Limiter"))
         support_layout2.addWidget(placeholder_btn)
+
+        multiscope_fix_label = QLabel("MultiScope Merchant Fix")
+        multiscope_fix_label.setStyleSheet(f"color: {ModernStyle.TEXT_PRIMARY}; font-weight: bold; margin-top: 10px; margin-bottom: 5px;")
+        support_layout2.addWidget(multiscope_fix_label)
+
+        multiscope_fix_btn = QPushButton("https://github.com/ManasAarohi1/MultiScope-Fix")
+        multiscope_fix_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: 
+                color: white;
+                border: none;
+                padding: 12px 20px;
+                border-radius: 6px;
+                font-weight: bold;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background-color: 
+            }}
+        """)
+        multiscope_fix_btn.clicked.connect(lambda: self.open_url("https://github.com/ManasAarohi1/MultiScope-Fix"))
+        support_layout2.addWidget(multiscope_fix_btn)
 
         content_layout.addWidget(support_group2)
         
@@ -16078,6 +20231,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "enable_jester": bool(self.ms_enable_jester.isChecked()) if hasattr(self, "ms_enable_jester") else True,
                 "enable_mari": bool(self.ms_enable_mari.isChecked()) if hasattr(self, "ms_enable_mari") else True,
                 "enable_rin": bool(self.ms_enable_rin.isChecked()) if hasattr(self, "ms_enable_rin") else True,
+                "merchant_detection_mode": str(self.ms_merchant_detection_mode.currentData() or "asset_id") if hasattr(self, "ms_merchant_detection_mode") else "asset_id",
                 "jester_ping_type": str(self.ms_jester_type.currentText()) if hasattr(self, "ms_jester_type") else "None",
                 "jester_ping_id": str(self.ms_jester_id.text().strip()) if hasattr(self, "ms_jester_id") else "",
                 "mari_ping_type": str(self.ms_mari_type.currentText()) if hasattr(self, "ms_mari_type") else "None",
@@ -16089,9 +20243,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "skip_webhook_unknown_context": bool(
                     self.misc_skip_unknown_webhook_chk.isChecked()
                 ) if hasattr(self, "misc_skip_unknown_webhook_chk") else False,
+                "disable_log_based_merchant_detection_when_ocr_merchants_enabled": bool(
+                    self.misc_disable_log_merchants_when_ocr_active_chk.isChecked()
+                ) if hasattr(self, "misc_disable_log_merchants_when_ocr_active_chk") else True,
                 "log_confirmed_launch_mode": bool(
                     self.misc_log_confirmed_launch_mode_chk.isChecked()
                 ) if hasattr(self, "misc_log_confirmed_launch_mode_chk") else False,
+                "disable_manager_bad_marking": bool(
+                    self.misc_disable_manager_bad_marking_chk.isChecked()
+                ) if hasattr(self, "misc_disable_manager_bad_marking_chk") else False,
                 "msedgewebview2_limiter_enabled": bool(
                     self.misc_msedgewebview2_limiter_enabled_chk.isChecked()
                 ) if hasattr(self, "misc_msedgewebview2_limiter_enabled_chk") else True,
@@ -16347,6 +20507,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.ms_enable_mari.setChecked(bool(ms.get("enable_mari", True)))
         if hasattr(self, "ms_enable_rin"):
             self.ms_enable_rin.setChecked(bool(ms.get("enable_rin", True)))
+        if hasattr(self, "ms_merchant_detection_mode"):
+            mode = str(ms.get("merchant_detection_mode", "asset_id") or "asset_id").strip().lower()
+            if mode in {"legacy", "chat", "merchant", "merchant_chat"}:
+                mode = "legacy_chat"
+            idx = self.ms_merchant_detection_mode.findData(mode)
+            if idx < 0:
+                idx = self.ms_merchant_detection_mode.findData("asset_id")
+            if idx >= 0:
+                self.ms_merchant_detection_mode.setCurrentIndex(idx)
 
         if hasattr(self, "ms_jester_type"):
             self.ms_jester_type.setCurrentText(ms.get("jester_ping_type", "None"))
@@ -16365,12 +20534,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         # ---------- Misc ----------
         misc = settings.get("misc", {}) or {}
         skip_unknown = None
+        disable_log_merchants_when_ocr_active = None
         log_confirmed_launch_mode = None
+        disable_manager_bad_marking = None
         msedge_limiter_enabled = None
         if isinstance(misc, dict) and "skip_webhook_unknown_context" in misc:
             skip_unknown = bool(misc.get("skip_webhook_unknown_context", False))
+        if isinstance(misc, dict) and MISC_DISABLE_LOG_MERCHANTS_WHEN_OCR_ACTIVE_KEY in misc:
+            disable_log_merchants_when_ocr_active = bool(
+                misc.get(MISC_DISABLE_LOG_MERCHANTS_WHEN_OCR_ACTIVE_KEY, True)
+            )
         if isinstance(misc, dict) and "log_confirmed_launch_mode" in misc:
             log_confirmed_launch_mode = bool(misc.get("log_confirmed_launch_mode", False))
+        if isinstance(misc, dict) and "disable_manager_bad_marking" in misc:
+            disable_manager_bad_marking = bool(misc.get("disable_manager_bad_marking", False))
         if isinstance(misc, dict) and "msedgewebview2_limiter_enabled" in misc:
             msedge_limiter_enabled = bool(misc.get("msedgewebview2_limiter_enabled", True))
         if skip_unknown is None:
@@ -16381,9 +20558,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             skip_unknown = bool(
                 self.config_manager.default_settings.get("misc", {}).get("skip_webhook_unknown_context", False)
             )
+        if disable_log_merchants_when_ocr_active is None:
+            disable_log_merchants_when_ocr_active = bool(
+                self.config_manager.default_settings.get("misc", {}).get(
+                    MISC_DISABLE_LOG_MERCHANTS_WHEN_OCR_ACTIVE_KEY,
+                    True,
+                )
+            )
         if log_confirmed_launch_mode is None:
             log_confirmed_launch_mode = bool(
                 self.config_manager.default_settings.get("misc", {}).get("log_confirmed_launch_mode", False)
+            )
+        if disable_manager_bad_marking is None:
+            disable_manager_bad_marking = bool(
+                self.config_manager.default_settings.get("misc", {}).get("disable_manager_bad_marking", False)
             )
         if msedge_limiter_enabled is None:
             msedge_limiter_enabled = bool(
@@ -16391,8 +20579,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             )
         if hasattr(self, "misc_skip_unknown_webhook_chk"):
             self.misc_skip_unknown_webhook_chk.setChecked(bool(skip_unknown))
+        if hasattr(self, "misc_disable_log_merchants_when_ocr_active_chk"):
+            self.misc_disable_log_merchants_when_ocr_active_chk.setChecked(
+                bool(disable_log_merchants_when_ocr_active)
+            )
         if hasattr(self, "misc_log_confirmed_launch_mode_chk"):
             self.misc_log_confirmed_launch_mode_chk.setChecked(bool(log_confirmed_launch_mode))
+        if hasattr(self, "misc_disable_manager_bad_marking_chk"):
+            self.misc_disable_manager_bad_marking_chk.setChecked(bool(disable_manager_bad_marking))
+            self._sync_misc_disable_bad_marking_warning(
+                self.misc_disable_manager_bad_marking_chk.isChecked()
+            )
         if hasattr(self, "misc_msedgewebview2_limiter_enabled_chk"):
             self.misc_msedgewebview2_limiter_enabled_chk.setChecked(bool(msedge_limiter_enabled))
 
@@ -16427,6 +20624,22 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.rbwin_geom_status_lbl.setText(f"Recorded: x={x}, y={y}, w={w}, h={h}")
         else:
             self.rbwin_geom_status_lbl.setText("Recorded: none")
+
+    def _sync_misc_disable_bad_marking_warning(self, checked: bool) -> None:
+        try:
+            self.misc_disable_manager_bad_marking_warn_lbl.setVisible(bool(checked))
+        except Exception:
+            pass
+
+    def _warn_misc_disable_bad_marking_enabled(self, checked: bool) -> None:
+        if not checked:
+            return
+        QMessageBox.warning(
+            self,
+            "Rate Limit Warning",
+            "Disabling manager auto-BAD marking can cause invalid cookies to keep retrying "
+            "Roblox authentication requests, which may trigger rate limiting.",
+        )
 
     def _record_roblox_window_geometry(self) -> None:
         try:
@@ -16625,6 +20838,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             ms["enable_mari"]   = bool(self.ms_enable_mari.isChecked())
         if hasattr(self, "ms_enable_rin"):
             ms["enable_rin"]    = bool(self.ms_enable_rin.isChecked())
+        if hasattr(self, "ms_merchant_detection_mode"):
+            ms["merchant_detection_mode"] = str(self.ms_merchant_detection_mode.currentData() or "asset_id")
 
         if hasattr(self, "ms_jester_type"):
             ms["jester_ping_type"] = self.ms_jester_type.currentText()
@@ -16645,8 +20860,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             misc = {}
         if hasattr(self, "misc_skip_unknown_webhook_chk"):
             misc["skip_webhook_unknown_context"] = bool(self.misc_skip_unknown_webhook_chk.isChecked())
+        if hasattr(self, "misc_disable_log_merchants_when_ocr_active_chk"):
+            misc[MISC_DISABLE_LOG_MERCHANTS_WHEN_OCR_ACTIVE_KEY] = bool(
+                self.misc_disable_log_merchants_when_ocr_active_chk.isChecked()
+            )
         if hasattr(self, "misc_log_confirmed_launch_mode_chk"):
             misc["log_confirmed_launch_mode"] = bool(self.misc_log_confirmed_launch_mode_chk.isChecked())
+        if hasattr(self, "misc_disable_manager_bad_marking_chk"):
+            misc["disable_manager_bad_marking"] = bool(
+                self.misc_disable_manager_bad_marking_chk.isChecked()
+            )
         if hasattr(self, "misc_msedgewebview2_limiter_enabled_chk"):
             misc["msedgewebview2_limiter_enabled"] = bool(
                 self.misc_msedgewebview2_limiter_enabled_chk.isChecked()
@@ -16795,9 +21018,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.misc_skip_unknown_webhook_chk.setChecked(
                 bool(defaults.get("misc", {}).get("skip_webhook_unknown_context", False))
             )
+        if hasattr(self, "misc_disable_log_merchants_when_ocr_active_chk"):
+            self.misc_disable_log_merchants_when_ocr_active_chk.setChecked(
+                bool(defaults.get("misc", {}).get(MISC_DISABLE_LOG_MERCHANTS_WHEN_OCR_ACTIVE_KEY, True))
+            )
         if hasattr(self, "misc_log_confirmed_launch_mode_chk"):
             self.misc_log_confirmed_launch_mode_chk.setChecked(
                 bool(defaults.get("misc", {}).get("log_confirmed_launch_mode", False))
+            )
+        if hasattr(self, "misc_disable_manager_bad_marking_chk"):
+            self.misc_disable_manager_bad_marking_chk.setChecked(
+                bool(defaults.get("misc", {}).get("disable_manager_bad_marking", False))
+            )
+            self._sync_misc_disable_bad_marking_warning(
+                self.misc_disable_manager_bad_marking_chk.isChecked()
             )
         if hasattr(self, "misc_msedgewebview2_limiter_enabled_chk"):
             self.misc_msedgewebview2_limiter_enabled_chk.setChecked(

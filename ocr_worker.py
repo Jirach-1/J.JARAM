@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import re
@@ -556,40 +557,62 @@ def _pool_read_text(img_bytes: bytes) -> str:
     return _rapidocr_text_only(_POOL_ENGINE, np.array(img))
 
 
+def _prepare_filter_ocr_image(image: Image.Image, filter_specs: List[Dict[str, Any]]) -> Image.Image:
+    colors = [_filter_color_from_spec(spec) for spec in (filter_specs or []) if bool((spec or {}).get("enabled", True))]
+    if not colors:
+        return preprocess_for_ocr(image, [])
+
+    try:
+        w, h = image.size
+        work = image.convert("RGB")
+        if max(w, h) > 800:
+            scale = 800.0 / float(max(w, h))
+            work = work.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR)
+        return preprocess_for_ocr(work, colors)
+    except Exception as e:
+        raise RuntimeError(f"OCR preprocessing failed: {e}") from e
+
+
 def _ocr_pool_task(
     preprocessed_bytes: bytes,
     raw_bytes: bytes,
-    filters: List["ColorFilter"],
+    filters: List[Dict[str, Any]],
     use_preprocess: bool,
 ) -> Dict[str, Any]:
     """
-    Run OCR inside a process worker and return the detected merchant (if any).
+    Run OCR inside a process worker and return all verified filter matches.
     """
     try:
-        text = _pool_read_text(preprocessed_bytes)
-        merchant_type = detect_merchant_type(text)
+        broad_bytes = preprocessed_bytes if use_preprocess else raw_bytes
+        text = _pool_read_text(broad_bytes)
+        ranked = _rank_filter_candidates(text, filters)
+        if not ranked:
+            return {"matches": [], "text": text}
 
-        if merchant_type == "jester":
-            # Secondary confirmation using only purple filters to reduce false positives.
-            purple_filters: List[ColorFilter] = []
-            saw_purple = False
-            for cf in filters:
-                name = (cf.name or "").strip().lower()
-                enabled = name in ("jester", "purple_text")
-                if enabled:
-                    saw_purple = True
-                purple_filters.append(ColorFilter(cf.name, cf.r, cf.g, cf.b, cf.tol, enabled))
+        raw_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        matches: List[Dict[str, Any]] = []
+        for score, spec in ranked:
+            if use_preprocess:
+                verify_img = _prepare_filter_ocr_image(raw_img, [spec])
+                verify_text = _pool_read_text(_image_bytes(verify_img))
+            else:
+                verify_text = text
+            verify_score = _score_text_against_target(verify_text, str(spec.get("target_text", "") or ""))
+            if verify_score >= DEFAULT_OCR_MATCH_THRESHOLD:
+                matches.append(
+                    {
+                        "id": str(spec.get("id") or ""),
+                        "name": str(spec.get("name") or ""),
+                        "behavior": str(spec.get("behavior") or ""),
+                        "cooldown_group": str(spec.get("cooldown_group") or ""),
+                        "score": float(score),
+                        "verify_score": float(verify_score),
+                    }
+                )
 
-            if saw_purple:
-                raw_img = Image.open(io.BytesIO(raw_bytes))
-                purple_img = preprocess_for_ocr(raw_img, purple_filters)
-                purple_text = _pool_read_text(_image_bytes(purple_img))
-                if not contains_jester_message(purple_text):
-                    merchant_type = None
-
-        return {"merchant": merchant_type, "text": text}
+        return {"matches": matches, "text": text}
     except Exception as e:
-        return {"merchant": None, "error": f"{e.__class__.__name__}: {e}"}
+        return {"matches": [], "error": f"{e.__class__.__name__}: {e}"}
 
 
 # -----------------------------
@@ -620,6 +643,95 @@ MERCHANT_LINES = {
     "rin": "[Merchant]: Rin has arrived on the island!!",
 }
 START_PUZZLE_RE = re.compile(r"start\W*puzzle", re.IGNORECASE)
+DEFAULT_OCR_MATCH_THRESHOLD = 0.80
+DEFAULT_OCR_MATCH_LOOKAHEAD = 4
+MERCHANT_FILTER_IDS = {
+    "merchant_jester": "jester",
+    "merchant_mari": "mari",
+    "merchant_rin": "rin",
+}
+DEFAULT_OCR_FILTERS: List[Dict[str, Any]] = [
+    {
+        "id": "merchant_jester",
+        "name": "Jester",
+        "r": 145,
+        "g": 67,
+        "b": 255,
+        "tol": 60,
+        "enabled": True,
+        "target_text": MERCHANT_LINES["jester"],
+        "cooldown_seconds": 900,
+        "use_shared_area": True,
+        "shared_area_id": "chat",
+        "roi": {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
+        "webhook_url": "",
+        "webhook_message": "",
+        "send_screenshot": True,
+        "behavior": "merchant",
+        "cooldown_group": "merchant_filters",
+    },
+    {
+        "id": "merchant_mari",
+        "name": "Mari",
+        "r": 255,
+        "g": 255,
+        "b": 255,
+        "tol": 60,
+        "enabled": True,
+        "target_text": MERCHANT_LINES["mari"],
+        "cooldown_seconds": 900,
+        "use_shared_area": True,
+        "shared_area_id": "chat",
+        "roi": {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
+        "webhook_url": "",
+        "webhook_message": "",
+        "send_screenshot": True,
+        "behavior": "merchant",
+        "cooldown_group": "merchant_filters",
+    },
+    {
+        "id": "merchant_rin",
+        "name": "Rin",
+        "r": 255,
+        "g": 138,
+        "b": 68,
+        "tol": 60,
+        "enabled": True,
+        "target_text": MERCHANT_LINES["rin"],
+        "cooldown_seconds": 900,
+        "use_shared_area": True,
+        "shared_area_id": "chat",
+        "roi": {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
+        "webhook_url": "",
+        "webhook_message": "",
+        "send_screenshot": True,
+        "behavior": "merchant",
+        "cooldown_group": "merchant_filters",
+    },
+    {
+        "id": "verification_check",
+        "name": "Verification Check",
+        "r": 255,
+        "g": 255,
+        "b": 255,
+        "tol": 60,
+        "enabled": True,
+        "target_text": "Start Puzzle",
+        "cooldown_seconds": 600,
+        "use_shared_area": False,
+        "shared_area_id": "",
+        "roi": {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
+        "webhook_url": "",
+        "webhook_message": "",
+        "send_screenshot": False,
+        "behavior": "verification_cap",
+        "cooldown_group": "verification_check",
+    },
+]
+
+
+def get_default_ocr_filters() -> List[Dict[str, Any]]:
+    return copy.deepcopy(DEFAULT_OCR_FILTERS)
 
 
 def _normalize_text(s: str) -> str:
@@ -636,6 +748,350 @@ def _fuzzy_ratio(line: str, target: str) -> float:
 
 def _fuzzy_match(line: str, target: str, threshold: float = 0.7) -> bool:
     return _fuzzy_ratio(line, target) >= threshold
+
+
+def _normalize_filter_name(raw: str) -> str:
+    name = str(raw or "").strip()
+    lower = name.lower()
+    if lower == "white_text":
+        return "Mari"
+    if lower == "purple_text":
+        return "Jester"
+    if lower == "orange_text":
+        return "Rin"
+    if lower in ("verification", "verification_check", "verification check"):
+        return "Verification Check"
+    return name
+
+
+def _slugify_filter_id(raw: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(raw or "").strip().lower()).strip("_")
+    return slug or "filter"
+
+
+def _known_filter_id(name: str) -> str:
+    lower = _normalize_filter_name(name).strip().lower()
+    if lower == "jester":
+        return "merchant_jester"
+    if lower == "mari":
+        return "merchant_mari"
+    if lower == "rin":
+        return "merchant_rin"
+    if lower == "verification check":
+        return "verification_check"
+    return ""
+
+
+def _filter_behavior(filter_id: str, name: str, raw_behavior: Any = None) -> str:
+    behavior = str(raw_behavior or "").strip().lower()
+    if behavior in ("merchant", "verification_cap", "webhook"):
+        return behavior
+    if filter_id in MERCHANT_FILTER_IDS:
+        return "merchant"
+    if filter_id == "verification_check" or _normalize_filter_name(name).strip().lower() == "verification check":
+        return "verification_cap"
+    return "webhook"
+
+
+def _cooldown_group_for_filter(filter_id: str, behavior: str, raw_group: Any = None) -> str:
+    group = str(raw_group or "").strip()
+    if group:
+        return group
+    if behavior == "merchant":
+        return "merchant_filters"
+    return filter_id or behavior or "filter"
+
+
+def _empty_roi_dict() -> Dict[str, float]:
+    return {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+
+
+def _normalize_shared_area_spec(raw: Dict[str, Any], *, fallback_index: int = 0) -> Dict[str, Any]:
+    base = raw or {}
+    name = str(base.get("name", "") or "").strip() or f"Shared Area {fallback_index + 1}"
+    area_id = str(base.get("id") or base.get("area_id") or "").strip()
+    if not area_id or area_id.lower() == "chat":
+        area_id = f"shared_{fallback_index}_{_slugify_filter_id(name)}"
+
+    roi_cfg = base.get("roi") if isinstance(base.get("roi"), dict) else {}
+    return {
+        "id": area_id,
+        "name": name,
+        "roi": {
+            "x": float((roi_cfg or {}).get("x", 0.0) or 0.0),
+            "y": float((roi_cfg or {}).get("y", 0.0) or 0.0),
+            "w": float((roi_cfg or {}).get("w", 0.0) or 0.0),
+            "h": float((roi_cfg or {}).get("h", 0.0) or 0.0),
+        },
+    }
+
+
+def _merge_shared_areas(areas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, raw in enumerate(areas or []):
+        if not isinstance(raw, dict):
+            continue
+        spec = _normalize_shared_area_spec(raw, fallback_index=idx)
+        area_id = str(spec.get("id") or "").strip()
+        if not area_id or area_id in seen_ids or area_id.lower() == "chat":
+            continue
+        seen_ids.add(area_id)
+        normalized.append(spec)
+    return normalized
+
+
+def _shared_areas_from_cfg(ocr_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_areas = ocr_cfg.get("shared_areas")
+    if isinstance(raw_areas, list):
+        return _merge_shared_areas(raw_areas)
+    return []
+
+
+def _filter_shared_area_id(spec: Dict[str, Any]) -> str:
+    base = spec or {}
+    use_shared_area = bool(base.get("use_shared_area", base.get("use_chat_area", False)))
+    if not use_shared_area:
+        return ""
+    area_id = str(base.get("shared_area_id") or "").strip()
+    if not area_id and bool(base.get("use_chat_area", False)):
+        area_id = "chat"
+    return area_id or "chat"
+
+
+def _filter_uses_chat_area(spec: Dict[str, Any]) -> bool:
+    return _filter_shared_area_id(spec) == "chat"
+
+
+def _normalize_filter_user_ids(raw: Any) -> Optional[List[str]]:
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple, set)):
+        return None
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for uid in raw:
+        uid_s = str(uid or "").strip()
+        if not uid_s or uid_s in seen:
+            continue
+        seen.add(uid_s)
+        cleaned.append(uid_s)
+    return cleaned
+
+
+def _normalize_filter_spec(raw: Dict[str, Any], *, fallback_index: int = 0) -> Dict[str, Any]:
+    base = raw or {}
+    name = _normalize_filter_name(str(base.get("name", "")).strip())
+    filter_id = str(base.get("id") or base.get("filter_id") or "").strip()
+    if not filter_id:
+        filter_id = _known_filter_id(name)
+    if not filter_id:
+        filter_id = f"custom_{fallback_index}_{_slugify_filter_id(name)}"
+
+    default_map = {str(item.get("id") or ""): item for item in DEFAULT_OCR_FILTERS}
+    default_spec = default_map.get(filter_id, {})
+    behavior = _filter_behavior(filter_id, name, base.get("behavior", default_spec.get("behavior")))
+    use_shared_area = bool(
+        base.get(
+            "use_shared_area",
+            base.get(
+                "use_chat_area",
+                default_spec.get("use_shared_area", default_spec.get("use_chat_area", behavior == "merchant")),
+            ),
+        )
+    )
+    shared_area_id = str(
+        base.get("shared_area_id", default_spec.get("shared_area_id", "chat" if use_shared_area else "")) or ""
+    ).strip()
+    if not shared_area_id and bool(base.get("use_chat_area", False)):
+        shared_area_id = "chat"
+    if behavior == "merchant":
+        use_shared_area = True
+        shared_area_id = "chat"
+    if not use_shared_area:
+        shared_area_id = ""
+
+    roi_cfg = base.get("roi") if isinstance(base.get("roi"), dict) else default_spec.get("roi", _empty_roi_dict())
+    roi_dict = {
+        "x": float((roi_cfg or {}).get("x", 0.0) or 0.0),
+        "y": float((roi_cfg or {}).get("y", 0.0) or 0.0),
+        "w": float((roi_cfg or {}).get("w", 0.0) or 0.0),
+        "h": float((roi_cfg or {}).get("h", 0.0) or 0.0),
+    }
+
+    return {
+        "id": filter_id,
+        "name": name or str(default_spec.get("name") or filter_id),
+        "r": int(base.get("r", default_spec.get("r", 255)) or 0),
+        "g": int(base.get("g", default_spec.get("g", 255)) or 0),
+        "b": int(base.get("b", default_spec.get("b", 255)) or 0),
+        "tol": int(base.get("tol", default_spec.get("tol", 60)) or 0),
+        "enabled": bool(base.get("enabled", default_spec.get("enabled", True))),
+        "target_text": str(base.get("target_text", default_spec.get("target_text", name)) or "").strip(),
+        "cooldown_seconds": float(base.get("cooldown_seconds", default_spec.get("cooldown_seconds", 600)) or 0.0),
+        "use_shared_area": bool(use_shared_area),
+        "shared_area_id": shared_area_id,
+        "roi": roi_dict,
+        "webhook_url": str(base.get("webhook_url", "") or "").strip(),
+        "webhook_message": str(base.get("webhook_message", "") or ""),
+        "send_screenshot": bool(base.get("send_screenshot", default_spec.get("send_screenshot", behavior == "merchant"))),
+        "repeat_alert_sound": bool(base.get("repeat_alert_sound", default_spec.get("repeat_alert_sound", False))),
+        "user_ids": _normalize_filter_user_ids(base.get("user_ids", default_spec.get("user_ids"))),
+        "behavior": behavior,
+        "cooldown_group": _cooldown_group_for_filter(
+            filter_id,
+            behavior,
+            base.get("cooldown_group", default_spec.get("cooldown_group")),
+        ),
+    }
+
+
+def _merge_filters_with_defaults(filters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, raw in enumerate(filters or []):
+        if not isinstance(raw, dict):
+            continue
+        spec = _normalize_filter_spec(raw, fallback_index=idx)
+        filter_id = str(spec.get("id") or "").strip()
+        if not filter_id or filter_id in seen_ids:
+            continue
+        seen_ids.add(filter_id)
+        normalized.append(spec)
+
+    by_id = {str(spec.get("id") or ""): spec for spec in normalized}
+    out: List[Dict[str, Any]] = []
+    for default_spec in get_default_ocr_filters():
+        filter_id = str(default_spec.get("id") or "").strip()
+        out.append(by_id.pop(filter_id, _normalize_filter_spec(default_spec)))
+    out.extend(spec for spec in normalized if str(spec.get("id") or "").strip() in by_id)
+    return out
+
+
+def _migrate_legacy_filters(
+    raw_filters: List[Dict[str, Any]],
+    *,
+    legacy_verification_roi: Optional[Dict[str, Any]] = None,
+    legacy_cooldown_seconds: float = 600.0,
+) -> List[Dict[str, Any]]:
+    migrated: List[Dict[str, Any]] = []
+    legacy_roi = legacy_verification_roi if isinstance(legacy_verification_roi, dict) else _empty_roi_dict()
+    for idx, raw in enumerate(raw_filters or []):
+        if not isinstance(raw, dict):
+            continue
+        name = _normalize_filter_name(str(raw.get("name", "")).strip())
+        filter_id = _known_filter_id(name)
+        default_spec = next((item for item in DEFAULT_OCR_FILTERS if str(item.get("id") or "") == filter_id), {})
+        behavior = _filter_behavior(filter_id, name)
+        use_shared_area = behavior == "merchant"
+        migrated.append(
+            {
+                "id": filter_id or "",
+                "name": name,
+                "r": int(raw.get("r", default_spec.get("r", 255)) or 0),
+                "g": int(raw.get("g", default_spec.get("g", 255)) or 0),
+                "b": int(raw.get("b", default_spec.get("b", 255)) or 0),
+                "tol": int(raw.get("tol", default_spec.get("tol", 60)) or 0),
+                "enabled": bool(raw.get("enabled", True)),
+                "target_text": str(default_spec.get("target_text") or name or "").strip(),
+                "cooldown_seconds": float(legacy_cooldown_seconds or default_spec.get("cooldown_seconds", 600) or 600),
+                "use_shared_area": bool(use_shared_area),
+                "shared_area_id": "chat" if use_shared_area else "",
+                "roi": copy.deepcopy(legacy_roi if filter_id == "verification_check" else _empty_roi_dict()),
+                "webhook_url": "",
+                "webhook_message": "",
+                "send_screenshot": bool(behavior == "merchant"),
+                "repeat_alert_sound": False,
+                "user_ids": None,
+                "behavior": behavior,
+                "cooldown_group": _cooldown_group_for_filter(filter_id, behavior),
+            }
+        )
+    return _merge_filters_with_defaults(migrated)
+
+
+def _filters_from_cfg(ocr_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_filters = ocr_cfg.get("filters")
+    if isinstance(raw_filters, list) and raw_filters:
+        return _merge_filters_with_defaults(raw_filters)
+
+    legacy_filters = ocr_cfg.get("color_filters")
+    if isinstance(legacy_filters, list) and legacy_filters:
+        try:
+            legacy_cooldown = float(ocr_cfg.get("cooldown_seconds", 600) or 600)
+        except Exception:
+            legacy_cooldown = 600.0
+        return _migrate_legacy_filters(
+            legacy_filters,
+            legacy_verification_roi=ocr_cfg.get("verification_roi"),
+            legacy_cooldown_seconds=legacy_cooldown,
+        )
+
+    return get_default_ocr_filters()
+
+
+def _filter_color_from_spec(spec: Dict[str, Any], *, enabled: Optional[bool] = None) -> ColorFilter:
+    return ColorFilter(
+        str(spec.get("name", "") or "").strip(),
+        int(spec.get("r", 0) or 0),
+        int(spec.get("g", 0) or 0),
+        int(spec.get("b", 0) or 0),
+        int(spec.get("tol", 0) or 0),
+        bool(spec.get("enabled", True) if enabled is None else enabled),
+    )
+
+
+def _compact_text(raw: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(raw or "").lower())
+
+
+def _score_text_against_target(text: str, target: str) -> float:
+    raw_text = str(text or "")
+    raw_target = str(target or "")
+    if not raw_text.strip() or not raw_target.strip():
+        return 0.0
+
+    best = _fuzzy_ratio(raw_text, raw_target)
+    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+    target_lines = [ln.strip() for ln in raw_target.splitlines() if ln.strip()]
+    compact_target = _compact_text(raw_target)
+    max_lookahead = max(
+        1,
+        min(
+            DEFAULT_OCR_MATCH_LOOKAHEAD,
+            max(1, len(target_lines)) + 1,
+            len(lines) if lines else 1,
+        ),
+    )
+
+    if not lines:
+        compact_text = _compact_text(raw_text)
+        if compact_target and compact_target in compact_text:
+            return 1.0
+        return best
+
+    for start in range(len(lines)):
+        for lookahead in range(1, min(max_lookahead, len(lines) - start) + 1):
+            block = " ".join(lines[start : start + lookahead])
+            score = _fuzzy_ratio(block, raw_target)
+            if compact_target and compact_target in _compact_text(block):
+                score = max(score, 1.0)
+            if score > best:
+                best = score
+    return best
+
+
+def _rank_filter_candidates(text: str, filters: List[Dict[str, Any]]) -> List[Tuple[float, Dict[str, Any]]]:
+    ranked: List[Tuple[float, Dict[str, Any]]] = []
+    for spec in filters or []:
+        target_text = str(spec.get("target_text", "") or "").strip()
+        if not target_text:
+            continue
+        score = _score_text_against_target(text, target_text)
+        if score >= DEFAULT_OCR_MATCH_THRESHOLD:
+            ranked.append((score, spec))
+    ranked.sort(key=lambda item: (-item[0], str(item[1].get("name", "")).lower()))
+    return ranked
 
 
 def detect_merchant_type(text: str) -> Optional[str]:
@@ -874,72 +1330,14 @@ def preprocess_for_ocr(image: Image.Image, color_filters: List[ColorFilter]) -> 
     gray = text_only.convert("L")
     return _finalize_gray(gray)
 
-
-
-def _filters_from_cfg(raw_filters: List[Dict[str, Any]]) -> List[ColorFilter]:
-    filters: List[ColorFilter] = []
-    for f in raw_filters or []:
+def _active_color_filters_from_specs(filter_specs: List[Dict[str, Any]]) -> List[ColorFilter]:
+    colors: List[ColorFilter] = []
+    for spec in filter_specs or []:
         try:
-            name = str(f.get("name", "")).strip()
-            lower = name.lower()
-            if lower == "white_text":
-                name = "Mari"
-            elif lower == "purple_text":
-                name = "Jester"
-            elif lower == "orange_text":
-                name = "Rin"
-            elif lower in ("verification check", "verification_check", "verification"):
-                # Verification filter is used only for the verification ROI flow.
-                continue
-            filters.append(
-                ColorFilter(
-                    name,
-                    int(f.get("r", 0)),
-                    int(f.get("g", 0)),
-                    int(f.get("b", 0)),
-                    int(f.get("tol", 0)),
-                    bool(f.get("enabled", True)),
-                )
-            )
+            colors.append(_filter_color_from_spec(spec))
         except Exception:
             continue
-    if not filters:
-        filters = [
-            ColorFilter("Mari", 255, 255, 255, 40, True),
-            ColorFilter("Jester", 145, 67, 255, 40, True),
-            ColorFilter("Rin", 255, 138, 68, 60, True),
-        ]
-    else:
-        # Backfill Rin for older settings files that only had Mari/Jester filters.
-        names = {(cf.name or "").strip().lower() for cf in filters if (cf.name or "").strip()}
-        if "rin" not in names:
-            filters.append(ColorFilter("Rin", 255, 138, 68, 60, True))
-    return filters
-
-
-def _verification_filters_from_cfg(raw_filters: List[Dict[str, Any]]) -> List[ColorFilter]:
-    filters: List[ColorFilter] = []
-    for f in raw_filters or []:
-        try:
-            name = str(f.get("name", "")).strip()
-            lower = name.lower()
-            if lower not in ("verification check", "verification_check", "verification"):
-                continue
-            filters.append(
-                ColorFilter(
-                    "Verification Check",
-                    int(f.get("r", 255)),
-                    int(f.get("g", 255)),
-                    int(f.get("b", 255)),
-                    int(f.get("tol", 60)),
-                    bool(f.get("enabled", True)),
-                )
-            )
-        except Exception:
-            continue
-    if not filters:
-        filters = [ColorFilter("Verification Check", 255, 255, 255, 60, True)]
-    return filters
+    return colors
 
 
 def _roi_from_cfg(roi_cfg: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
@@ -989,6 +1387,8 @@ class OCRWorker(QThread):
     status_signal = Signal(str)
     merchant_signal = Signal(str, str)  # (user_id, merchant)
     verification_cap_signal = Signal(str)  # user_id to mark CAP
+    filter_alert_signal = Signal(str)  # filter name
+    filter_match_signal = Signal(int, str, str)  # pid, filter_id, filter_name
 
     def __init__(
         self,
@@ -1002,7 +1402,7 @@ class OCRWorker(QThread):
         self._ms_cfg = ms_settings or {}
         self._context_provider = context_provider
 
-        self._cooldowns: Dict[int, float] = {}
+        self._cooldowns: Dict[int, Dict[str, float]] = {}
         self._capture_rr_index = 0
         self._stop_event = threading.Event()
         self._last_log: Optional[str] = None
@@ -1011,9 +1411,7 @@ class OCRWorker(QThread):
         self._mp_ctx = get_context("spawn")
         self._frame_hash_size = _FRAME_HASH_SIZE
         self._frame_diff_tolerance = 0.0
-        self._last_frame_hash_by_pid: Dict[int, int] = {}
-        self._verification_next_check_by_pid: Dict[int, float] = {}
-        self._verification_check_interval = 2.0
+        self._last_frame_hash_by_key: Dict[str, int] = {}
 
         self._send_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr-send")
 
@@ -1034,10 +1432,6 @@ class OCRWorker(QThread):
             if ort is None:
                 missing.append(f"onnxruntime ({_ORT_IMPORT_ERROR})")
             self._log(f"[OCR] RapidOCR/ONNX Runtime not available: {', '.join(missing)}")
-            return
-
-        if not self._roi:
-            self._log("OCR worker did not start: calibrate the chat area first.")
             return
 
         self._stop_event.clear()
@@ -1078,119 +1472,118 @@ class OCRWorker(QThread):
                     work_list = self._select_windows(windows)
                     self._log(f"[Loop {loop_idx}] Selected {len(work_list)} window(s) for capture.")
                     if work_list:
-                        try:
-                            self._run_verification_checks(work_list)
-                        except Exception as e:
-                            self._log(f"[Verification] check error: {e}")
-
-                        # Capture raw images first so we can preprocess in batch
-                        captured: List[Tuple[Any, Optional[Image.Image]]] = []
-                        for win in work_list:
-                            if self._stop_event.is_set():
-                                break
-                            raw_img = capture_window_image(win.hwnd, self._roi)
-                            captured.append((win, raw_img))
-                        self._log(f"[Loop {loop_idx}] Captured {len(captured)} window(s).")
-
-                        # Preprocess in batch for windows that captured successfully
-                        valid_pairs = [(w, img) for w, img in captured if img is not None]
-                        preprocessed: List[Image.Image] = []
-                        if valid_pairs:
-                            imgs_only = [img for _, img in valid_pairs]
-                            try:
-                                preprocessed = self._preprocess_batch(imgs_only)
-                            except Exception as e:
-                                self._log(f"[OCR] Preprocess batch failed: {e}")
-                                self._log(traceback.format_exc())
-                                preprocessed = imgs_only
-                        self._log(
-                            f"[Loop {loop_idx}] Preprocessed {len(preprocessed)} image(s) (valid captures: {len(valid_pairs)})."
-                        )
-
+                        remaining_slots = max(1, int(getattr(self, "_max_captures_per_second", 1) or 1))
                         processed_count = 0
                         skipped_similar = 0
-                        if valid_pairs and preprocessed:
-                            if len(preprocessed) != len(valid_pairs):
-                                self._log(f"[Loop {loop_idx}] Preprocess/result length mismatch; trimming to smallest set.")
-                                valid_pairs = valid_pairs[: len(preprocessed)]
+                        captured_count = 0
+                        future_map = {}
 
-                            to_ocr: List[Tuple[Any, Image.Image, Image.Image]] = []
-                            for (win, raw_img), prep_img in zip(valid_pairs, preprocessed):
-                                skip, _diff_pct = self._skip_ocr_for_similar_frame(win.pid, prep_img)
+                        for win in work_list:
+                            if self._stop_event.is_set() or remaining_slots <= 0:
+                                break
+                            groups = self._build_capture_groups(int(getattr(win, "pid", 0) or 0))
+                            if not groups:
+                                continue
+                            for group in groups:
+                                if self._stop_event.is_set() or remaining_slots <= 0:
+                                    break
+                                raw_img = capture_window_image(win.hwnd, group["roi"])
+                                remaining_slots -= 1
+                                if raw_img is None:
+                                    continue
+                                captured_count += 1
+                                try:
+                                    prep_img = self._preprocess_image(raw_img, group["filters"])
+                                except Exception as e:
+                                    self._log(f"[OCR] Preprocess failed for PID {win.pid}: {e}")
+                                    self._log(traceback.format_exc())
+                                    prep_img = raw_img
+
+                                skip, _diff_pct = self._skip_ocr_for_similar_frame(
+                                    self._frame_cache_key(int(win.pid), str(group["cache_key"])),
+                                    prep_img,
+                                )
                                 if skip:
                                     skipped_similar += 1
                                     continue
-                                to_ocr.append((win, raw_img, prep_img))
 
-                            if self._ocr_pool:
-                                future_map = {}
-                                for win, raw_img, prep_img in to_ocr:
+                                if self._ocr_pool:
                                     try:
                                         fut = self._ocr_pool.submit(
                                             _ocr_pool_task,
                                             _image_bytes(prep_img),
                                             _image_bytes(raw_img),
-                                            self._filters,
+                                            group["filters"],
                                             self._use_preprocess,
                                         )
-                                        future_map[fut] = (win, raw_img)
+                                        future_map[fut] = {
+                                            "win": win,
+                                            "raw_img": raw_img,
+                                            "group": group,
+                                        }
                                     except Exception as e:
                                         self._log(f"[OCR] Failed to dispatch process task for PID {win.pid}: {e}")
-
-                                # IMPORTANT: `as_completed()` without a timeout can block forever if the
-                                # pool workers are busy/hung, which prevents a clean shutdown and can
-                                # leave background processes after closing JARAM. Use a short wait loop
-                                # so `stop()` is responsive.
-                                pending = set(future_map.keys())
-                                while pending:
-                                    if self._stop_event.is_set():
-                                        for fut in list(pending):
-                                            try:
-                                                fut.cancel()
-                                            except Exception:
-                                                pass
-                                        break
-
-                                    done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
-                                    if not done:
-                                        continue
-
-                                    for fut in done:
-                                        win, raw_img = future_map.get(fut, (None, None))
-                                        if win is None:
-                                            continue
-                                        if self._stop_event.is_set():
-                                            break
-                                        try:
-                                            result = fut.result()
-                                        except Exception as e:
-                                            self._log(f"[OCR] Worker process error for PID {win.pid}: {e}")
-                                            continue
-
-                                    if not isinstance(result, dict):
-                                        continue
-                                    if result.get("error"):
-                                        self._log(f"[OCR] Worker reported error for PID {win.pid}: {result['error']}")
-                                        continue
-
-                                    if getattr(self, "_log_ocr_text", False):
-                                        text = str(result.get("text") or "").strip()
-                                        if text:
-                                            self._log(f"[OCR TEXT] PID {win.pid}:\n{text}")
-
-                                    merchant_type = result.get("merchant")
-                                    if merchant_type in ("jester", "mari", "rin"):
-                                        self._handle_detection(merchant_type, win.pid, raw_img)
-                                        self._set_pid_cooldown(win.pid)
-                                    processed_count += 1
-                            else:
-                                # Fallback to in-process OCR if the pool is unavailable.
-                                for win, raw_img, prep_img in to_ocr:
+                                else:
                                     try:
-                                        self._process_window_preprocessed(win, raw_img, prep_img)
+                                        self._process_group_preprocessed(win, raw_img, prep_img, group["filters"], group["label"])
                                         processed_count += 1
                                     except Exception as e:
-                                        self._log(f"[OCR] Worker error: {e}")
+                                        self._log(f"[OCR] Worker error for PID {win.pid}: {e}")
+
+                        self._log(f"[Loop {loop_idx}] Captured {captured_count} ROI image(s).")
+
+                        pending = set(future_map.keys())
+                        while pending:
+                            if self._stop_event.is_set():
+                                for fut in list(pending):
+                                    try:
+                                        fut.cancel()
+                                    except Exception:
+                                        pass
+                                break
+
+                            done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                            if not done:
+                                continue
+
+                            for fut in done:
+                                meta = future_map.get(fut) or {}
+                                win = meta.get("win")
+                                raw_img = meta.get("raw_img")
+                                group = meta.get("group") or {}
+                                if win is None or raw_img is None:
+                                    continue
+                                if self._stop_event.is_set():
+                                    break
+                                try:
+                                    result = fut.result()
+                                except Exception as e:
+                                    self._log(f"[OCR] Worker process error for PID {win.pid}: {e}")
+                                    continue
+
+                                if not isinstance(result, dict):
+                                    continue
+                                if result.get("error"):
+                                    self._log(f"[OCR] Worker reported error for PID {win.pid}: {result['error']}")
+                                    continue
+
+                                if getattr(self, "_log_ocr_text", False):
+                                    text = str(result.get("text") or "").strip()
+                                    if text:
+                                        self._log(f"[OCR TEXT] PID {win.pid} [{group.get('label') or 'group'}]:\n{text}")
+
+                                matches = result.get("matches")
+                                if not isinstance(matches, list):
+                                    legacy_match = result.get("match")
+                                    matches = [legacy_match] if isinstance(legacy_match, dict) else []
+                                for match in matches:
+                                    if not isinstance(match, dict):
+                                        continue
+                                    spec = self._filter_spec_by_id(str(match.get("id") or ""))
+                                    if spec:
+                                        if self._handle_filter_match(spec, win.pid, raw_img):
+                                            self._set_filter_cooldown(win.pid, spec)
+                                processed_count += 1
 
                         self._log(
                             f"[Loop {loop_idx}] Completed OCR for {processed_count} image(s) (skipped {skipped_similar} similar)."
@@ -1216,22 +1609,23 @@ class OCRWorker(QThread):
             self._shutdown_send_pool()
 
     # ---------------------- detection helpers ---------------------
-    def _process_window(self, win) -> None:
-        if self._stop_event.is_set():
-            return
+    def _preprocess_image(self, image: Image.Image, filter_specs: List[Dict[str, Any]]) -> Image.Image:
+        if not self._use_preprocess:
+            return image
 
-        raw_img = capture_window_image(win.hwnd, self._roi)
-        if raw_img is None:
-            return
+        return _prepare_filter_ocr_image(image, filter_specs)
 
-        img_for_ocr = preprocess_for_ocr(raw_img, self._filters) if self._use_preprocess else raw_img
-
-        self._process_window_preprocessed(win, raw_img, img_for_ocr)
-
-    def _process_window_preprocessed(self, win, raw_img: Image.Image, img_for_ocr: Image.Image) -> None:
-        """Process a window when you already have raw + preprocessed images."""
+    def _process_group_preprocessed(
+        self,
+        win,
+        raw_img: Image.Image,
+        img_for_ocr: Image.Image,
+        filters: List[Dict[str, Any]],
+        label: str,
+    ) -> None:
         try:
-            text = _rapidocr_text_only(self._reader, np.array(img_for_ocr))
+            source_img = img_for_ocr if self._use_preprocess else raw_img
+            text = _rapidocr_text_only(self._reader, np.array(source_img))
         except Exception as e:
             self._log(f"[OCR error pid {win.pid}] {e}")
             return
@@ -1239,46 +1633,24 @@ class OCRWorker(QThread):
         if getattr(self, "_log_ocr_text", False):
             clean_text = str(text or "").strip()
             if clean_text:
-                self._log(f"[OCR TEXT] PID {win.pid}:\n{clean_text}")
+                self._log(f"[OCR TEXT] PID {win.pid} [{label}]:\n{clean_text}")
 
-        merchant_type = detect_merchant_type(text)
-        if merchant_type == "jester" and not self._confirm_jester_with_purple(raw_img):
-            merchant_type = None
+        ranked = _rank_filter_candidates(text, filters)
+        if not ranked:
+            return
 
-        if merchant_type in ("jester", "mari", "rin"):
-            self._handle_detection(merchant_type, win.pid, raw_img)
-            self._set_pid_cooldown(win.pid)
+        for _score, spec in ranked:
+            try:
+                verify_img = self._preprocess_image(raw_img, [spec]) if self._use_preprocess else raw_img
+                verify_text = _rapidocr_text_only(self._reader, np.array(verify_img))
+            except Exception as e:
+                self._log(f"[OCR verify pid {win.pid}] {e}")
+                continue
 
-    def _preprocess_batch(self, images: List[Image.Image]) -> List[Image.Image]:
-        """Batch preprocess using PIL to cut per-image overhead."""
-        if not images:
-            return []
-
-        # No preprocessing requested
-        if not self._use_preprocess:
-            return images
-
-        # If no filters are enabled, fall back to simple grayscale path.
-        # This is an explicit user choice and does not require GPU.
-        if not self._filters:
-            return [preprocess_for_ocr(img, []) for img in images]
-
-        try:
-            # Optionally downscale before masking to reduce work
-            def _maybe_downscale(img: Image.Image) -> Image.Image:
-                w, h = img.size
-                if max(w, h) <= 800:
-                    return img
-                # scale down to ~800px max dimension
-                scale = 800.0 / float(max(w, h))
-                new_w = max(1, int(w * scale))
-                new_h = max(1, int(h * scale))
-                return img.resize((new_w, new_h), Image.BILINEAR)
-
-            downs = [_maybe_downscale(img.convert("RGB")) for img in images]
-            return [preprocess_for_ocr(img, self._filters) for img in downs]
-        except Exception as e:
-            raise RuntimeError(f"OCR preprocessing failed: {e}") from e
+            verify_score = _score_text_against_target(verify_text, str(spec.get("target_text", "") or ""))
+            if verify_score >= DEFAULT_OCR_MATCH_THRESHOLD:
+                if self._handle_filter_match(spec, win.pid, raw_img):
+                    self._set_filter_cooldown(win.pid, spec)
 
     def _handle_detection(self, merchant: str, pid: int, raw_img: Image.Image) -> None:
         ctx = self._context_provider(pid) if self._context_provider else {}
@@ -1286,6 +1658,10 @@ class OCRWorker(QThread):
             uid = str(ctx.get("user_id") or "").strip()
             if uid and merchant:
                 self.merchant_signal.emit(uid, str(merchant))
+            elif merchant:
+                self._log(
+                    f"[OCR->FoundStats] {merchant.upper()} detected in PID {pid}, but PID could not be mapped to user_id."
+                )
         except Exception:
             pass
         username = ctx.get("username") or f"PID {pid}"
@@ -1369,32 +1745,6 @@ class OCRWorker(QThread):
 
         self._send_pool.submit(_send)
 
-    def _confirm_jester_with_purple(self, raw_img: Image.Image) -> bool:
-        purple_filters: List[ColorFilter] = []
-        saw_purple = False
-        for cf in self._filters:
-            name = (cf.name or "").strip().lower()
-            enabled = name in ("jester", "purple_text")
-            if enabled:
-                saw_purple = True
-            purple_filters.append(ColorFilter(cf.name, cf.r, cf.g, cf.b, cf.tol, enabled))
-
-        if not saw_purple:
-            return True
-
-        img_purple = preprocess_for_ocr(raw_img, purple_filters)
-        try:
-            text = _rapidocr_text_only(self._reader, np.array(img_purple))
-        except Exception as e:
-            self._log(f"[Jester verify] OCR error: {e}")
-            return False
-
-        if contains_jester_message(text):
-            return True
-
-        self._log("[Jester verify] Candidate rejected by purple-only check.")
-        return False
-
     @staticmethod
     def _is_truthy(value: Any) -> bool:
         if isinstance(value, bool):
@@ -1409,74 +1759,109 @@ class OCRWorker(QThread):
                 return False
         return bool(value)
 
-    @staticmethod
-    def _contains_start_puzzle_text(text: str) -> bool:
-        raw = str(text or "")
-        if not raw:
-            return False
-        if START_PUZZLE_RE.search(raw):
-            return True
-        squashed = re.sub(r"[^a-z0-9]+", "", raw.lower())
-        return "startpuzzle" in squashed
+    def _format_filter_message(self, spec: Dict[str, Any], pid: int, ctx: Dict[str, Any]) -> str:
+        template = str(spec.get("webhook_message", "") or "").strip()
+        if not template:
+            template = "{filter} detected in {username} (PID {pid})"
 
-    def _run_verification_checks(self, windows: List[Any]) -> None:
-        if not self._verification_roi:
+        values = {
+            "filter": str(spec.get("name", "") or "").strip(),
+            "pid": int(pid),
+            "user_id": str((ctx or {}).get("user_id") or "").strip(),
+            "username": str((ctx or {}).get("username") or f"PID {pid}"),
+            "owner": str((ctx or {}).get("owner") or "").strip(),
+            "server_label": str((ctx or {}).get("server_label") or "").strip(),
+            "ps_link": str((ctx or {}).get("ps_link") or "").strip(),
+        }
+
+        class _SafeFormatDict(dict):
+            def __missing__(self, key):
+                return "{" + str(key) + "}"
+
+        try:
+            return template.format_map(_SafeFormatDict(values))
+        except Exception:
+            return template
+
+    def _send_custom_filter_webhook(
+        self,
+        spec: Dict[str, Any],
+        pid: int,
+        ctx: Dict[str, Any],
+        raw_img: Optional[Image.Image] = None,
+    ) -> None:
+        url = str(spec.get("webhook_url", "") or "").strip()
+        if not url:
+            self._log(f"[Webhook] Filter '{spec.get('name', '')}' detected in PID {pid}, but no webhook URL is configured.")
             return
-        enabled_filters = [cf for cf in (self._verification_filters or []) if cf.enabled]
-        if not enabled_filters:
-            return
-        if self._reader is None:
-            return
 
-        now = time.time()
-        for win in windows:
-            if self._stop_event.is_set():
-                return
-            pid = int(getattr(win, "pid", 0) or 0)
-            if pid <= 0:
-                continue
+        payload = {"content": self._format_filter_message(spec, pid, ctx)}
+        send_screenshot = bool(spec.get("send_screenshot", False))
 
-            next_allowed = float(self._verification_next_check_by_pid.get(pid, 0.0) or 0.0)
-            if now < next_allowed:
-                continue
-
-            ctx = self._context_provider(pid) if self._context_provider else {}
-            uid = str((ctx or {}).get("user_id") or "").strip()
-            if not uid:
-                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
-                continue
-
-            if self._is_truthy((ctx or {}).get("is_cap")):
-                self._verification_next_check_by_pid[pid] = now + 30.0
-                continue
-
-            if self._is_truthy((ctx or {}).get("has_user_log")):
-                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
-                continue
-
-            img = capture_window_image(win.hwnd, self._verification_roi)
-            if img is None:
-                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
-                continue
-
+        def _send() -> None:
             try:
-                img_for_ocr = preprocess_for_ocr(img, enabled_filters) if self._use_preprocess else img
-                text = _rapidocr_text_only(self._reader, np.array(img_for_ocr))
+                if send_screenshot and raw_img is not None:
+                    files = {
+                        "chat.png": ("chat.png", _image_bytes(raw_img), "image/png"),
+                    }
+                    requests.post(url, data={"payload_json": json.dumps(payload)}, files=files, timeout=10)
+                else:
+                    requests.post(url, json=payload, timeout=10)
             except Exception as e:
-                self._log(f"[Verification] OCR error for PID {pid}: {e}")
-                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
-                continue
+                self._log(f"[Webhook] Error posting filter detection: {e}")
 
-            if self._contains_start_puzzle_text(text):
-                username = str((ctx or {}).get("username") or uid)
-                self._log(f"[Verification] Start Puzzle found in PID {pid} ({username}); marking CAP.")
-                self._verification_next_check_by_pid[pid] = now + 30.0
-                try:
-                    self.verification_cap_signal.emit(uid)
-                except Exception:
-                    pass
-            else:
-                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+        self._send_pool.submit(_send)
+
+    def _emit_filter_alert(self, spec: Dict[str, Any], filter_name: str) -> None:
+        if not bool((spec or {}).get("repeat_alert_sound", False)):
+            return
+        try:
+            self.filter_alert_signal.emit(str(filter_name or str(spec.get("name") or "Filter")))
+        except Exception:
+            pass
+
+    def _handle_filter_match(self, spec: Dict[str, Any], pid: int, raw_img: Image.Image) -> bool:
+        behavior = str(spec.get("behavior", "") or "").strip().lower()
+        filter_name = str(spec.get("name", "") or "").strip() or str(spec.get("id", "") or "Filter")
+        filter_id = str(spec.get("id", "") or "").strip()
+        ctx = self._context_provider(pid) if self._context_provider else {}
+
+        try:
+            self.filter_match_signal.emit(int(pid), filter_id, filter_name)
+        except Exception:
+            pass
+
+        if behavior == "merchant":
+            merchant = MERCHANT_FILTER_IDS.get(str(spec.get("id") or "").strip(), filter_name.lower())
+            self._handle_detection(merchant, pid, raw_img)
+            self._emit_filter_alert(spec, filter_name)
+            return True
+
+        if behavior == "verification_cap":
+            uid = str((ctx or {}).get("user_id") or "").strip()
+            username = str((ctx or {}).get("username") or uid or f"PID {pid}")
+            if not uid:
+                self._log(f"[Verification] {filter_name} matched in PID {pid} ({username}), but the PID is not mapped to a user.")
+                return False
+            if self._is_truthy((ctx or {}).get("is_cap")):
+                return False
+            if self._is_truthy((ctx or {}).get("has_user_log")):
+                return False
+            self._log(f"[Verification] {filter_name} matched in PID {pid} ({username}); marking CAP.")
+            try:
+                self.verification_cap_signal.emit(uid)
+            except Exception:
+                pass
+            if str(spec.get("webhook_url", "") or "").strip():
+                self._send_custom_filter_webhook(spec, pid, ctx, raw_img)
+            self._emit_filter_alert(spec, filter_name)
+            return True
+
+        username = str((ctx or {}).get("username") or f"PID {pid}")
+        self._log(f"[DETECT] {filter_name} detected in PID {pid} ({username}).")
+        self._send_custom_filter_webhook(spec, pid, ctx, raw_img)
+        self._emit_filter_alert(spec, filter_name)
+        return True
 
     # ------------------------- scheduling -------------------------
     def _select_windows(self, windows) -> List[Any]:
@@ -1484,15 +1869,14 @@ class OCRWorker(QThread):
         if total == 0:
             return []
 
-        limit = min(self._max_captures_per_second, total)
         start_idx = self._capture_rr_index % total
         idx = start_idx
         seen = 0
-        work_list = []
+        work_list: List[Any] = []
 
-        while seen < total and len(work_list) < limit:
+        while seen < total:
             win = windows[idx]
-            if not self._pid_on_cooldown(win.pid):
+            if self._pid_has_eligible_filters(int(getattr(win, "pid", 0) or 0)):
                 work_list.append(win)
             idx = (idx + 1) % total
             seen += 1
@@ -1500,16 +1884,115 @@ class OCRWorker(QThread):
         self._capture_rr_index = idx
         return work_list
 
-    def _pid_on_cooldown(self, pid: int) -> bool:
-        next_allowed = self._cooldowns.get(pid)
+    def _filter_spec_by_id(self, filter_id: str) -> Optional[Dict[str, Any]]:
+        fid = str(filter_id or "").strip()
+        for spec in self._filters or []:
+            if str(spec.get("id") or "").strip() == fid:
+                return spec
+        return None
+
+    def _shared_area_roi(self, area_id: str) -> Optional[Tuple[float, float, float, float]]:
+        wanted = str(area_id or "").strip()
+        if not wanted:
+            return None
+        if wanted == "chat":
+            return self._roi
+        area = (getattr(self, "_shared_area_map", None) or {}).get(wanted) or {}
+        return _roi_from_cfg(area.get("roi") or {})
+
+    def _effective_filter_roi(self, spec: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+        area_id = _filter_shared_area_id(spec)
+        if area_id:
+            return self._shared_area_roi(area_id)
+        return _roi_from_cfg(spec.get("roi") or {})
+
+    def _pid_context(self, pid: int) -> Dict[str, Any]:
+        if not self._context_provider:
+            return {}
+        try:
+            return self._context_provider(int(pid or 0)) or {}
+        except Exception:
+            return {}
+
+    def _filter_targets_pid(self, pid: int, spec: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> bool:
+        ctx = ctx or self._pid_context(pid)
+        uid = str((ctx or {}).get("user_id") or "").strip()
+        if bool(getattr(self, "_only_mapped_pids", False)) and not uid:
+            return False
+
+        allowed_user_ids = _normalize_filter_user_ids((spec or {}).get("user_ids", None))
+        if allowed_user_ids is None:
+            return True
+        if not allowed_user_ids:
+            return False
+        return bool(uid) and uid in set(allowed_user_ids)
+
+    def _pid_has_eligible_filters(self, pid: int) -> bool:
+        return bool(self._build_capture_groups(pid))
+
+    def _build_capture_groups(self, pid: int) -> List[Dict[str, Any]]:
+        groups: Dict[str, Dict[str, Any]] = {}
+        ctx = self._pid_context(pid)
+        for spec in self._filters or []:
+            if not bool(spec.get("enabled", True)):
+                continue
+            if not self._filter_targets_pid(pid, spec, ctx):
+                continue
+            if self._filter_on_cooldown(pid, spec):
+                continue
+            roi = self._effective_filter_roi(spec)
+            if roi is None:
+                continue
+            cache_key = self._roi_cache_key(roi, use_chat_area=_filter_uses_chat_area(spec))
+            group = groups.setdefault(
+                cache_key,
+                {
+                    "roi": roi,
+                    "filters": [],
+                    "cache_key": cache_key,
+                },
+            )
+            group["filters"].append(spec)
+
+        out: List[Dict[str, Any]] = []
+        for group in groups.values():
+            names = [str(spec.get("name", "") or "").strip() for spec in group.get("filters", [])]
+            group["label"] = ", ".join(name for name in names if name) or "filters"
+            out.append(group)
+        out.sort(key=lambda item: str(item.get("label", "")).lower())
+        return out
+
+    def _filter_group_key(self, spec: Dict[str, Any]) -> str:
+        return str(spec.get("cooldown_group") or spec.get("id") or spec.get("name") or "filter").strip()
+
+    def _filter_on_cooldown(self, pid: int, spec: Dict[str, Any]) -> bool:
+        pid_key = int(pid or 0)
+        group_key = self._filter_group_key(spec)
+        next_allowed = (self._cooldowns.get(pid_key) or {}).get(group_key)
         return bool(next_allowed and time.time() < next_allowed)
 
-    def _set_pid_cooldown(self, pid: int) -> None:
-        self._cooldowns[pid] = time.time() + self._cooldown_seconds
+    def _set_filter_cooldown(self, pid: int, spec: Dict[str, Any]) -> None:
+        pid_key = int(pid or 0)
+        group_key = self._filter_group_key(spec)
+        try:
+            cooldown = max(0.0, float(spec.get("cooldown_seconds", 600) or 0.0))
+        except Exception:
+            cooldown = 600.0
+        self._cooldowns.setdefault(pid_key, {})[group_key] = time.time() + cooldown
 
-    def _skip_ocr_for_similar_frame(self, pid: int, img_for_ocr: Image.Image) -> Tuple[bool, Optional[float]]:
+    @staticmethod
+    def _roi_cache_key(roi: Tuple[float, float, float, float], *, use_chat_area: bool = False) -> str:
+        rx, ry, rw, rh = roi
+        prefix = "chat" if use_chat_area else "roi"
+        return f"{prefix}:{rx:.5f}:{ry:.5f}:{rw:.5f}:{rh:.5f}"
+
+    @staticmethod
+    def _frame_cache_key(pid: int, group_key: str) -> str:
+        return f"{int(pid or 0)}:{group_key}"
+
+    def _skip_ocr_for_similar_frame(self, cache_key: str, img_for_ocr: Image.Image) -> Tuple[bool, Optional[float]]:
         """
-        Compare the current OCR frame to the last frame for this PID.
+        Compare the current OCR frame to the last frame for this capture group.
         Returns (skip, diff_percent). The internal last-frame cache is updated
         regardless so consecutive frames are compared.
         """
@@ -1522,8 +2005,8 @@ class OCRWorker(QThread):
         except Exception:
             return False, None
 
-        last_hash = self._last_frame_hash_by_pid.get(int(pid))
-        self._last_frame_hash_by_pid[int(pid)] = current_hash
+        last_hash = self._last_frame_hash_by_key.get(str(cache_key))
+        self._last_frame_hash_by_key[str(cache_key)] = current_hash
         if last_hash is None:
             return False, None
 
@@ -1537,27 +2020,22 @@ class OCRWorker(QThread):
 
         prev_filters = getattr(self, "_filters", None)
         prev_roi = getattr(self, "_roi", None)
-        prev_verification_roi = getattr(self, "_verification_roi", None)
-        prev_verification_filters = getattr(self, "_verification_filters", None)
+        prev_shared_areas = getattr(self, "_shared_areas", None)
         prev_use_preprocess = getattr(self, "_use_preprocess", None)
         prev_device_id = getattr(self, "_device_id", None)
         prev_force_cpu = getattr(self, "_force_cpu", None)
 
-        self._filters = _filters_from_cfg(self._ocr_cfg.get("color_filters") or [])
+        self._filters = _filters_from_cfg(self._ocr_cfg)
         self._roi = _roi_from_cfg(self._ocr_cfg.get("roi") or {})
-        self._verification_roi = _roi_from_cfg(self._ocr_cfg.get("verification_roi") or {})
-        self._verification_filters = _verification_filters_from_cfg(self._ocr_cfg.get("color_filters") or [])
+        self._shared_areas = _shared_areas_from_cfg(self._ocr_cfg)
+        self._shared_area_map = {str(item.get("id") or "").strip(): item for item in self._shared_areas}
+        self._only_mapped_pids = bool(self._ocr_cfg.get("only_mapped_pids", False))
         self._workers = max(1, int(self._ocr_cfg.get("workers", 1) or 1))
         self._max_captures_per_second = max(1, int(self._ocr_cfg.get("max_captures_per_second", 20) or 1))
         try:
             self._batch_delay_seconds = max(0.0, float(self._ocr_cfg.get("batch_delay_seconds", 1.0)))
         except Exception:
             self._batch_delay_seconds = 1.0
-        try:
-            self._verification_check_interval = max(0.5, float(self._ocr_cfg.get("verification_check_interval", 2.0)))
-        except Exception:
-            self._verification_check_interval = 2.0
-        self._cooldown_seconds = float(self._ocr_cfg.get("cooldown_seconds", 600) or 600)
         self._use_preprocess = bool(self._ocr_cfg.get("use_preprocess", True))
         self._device_id, self._force_cpu = _parse_device_id(self._ocr_cfg.get("device_id"))
         self._log_ocr_text = bool(self._ocr_cfg.get("log_ocr_text", False))
@@ -1575,14 +2053,14 @@ class OCRWorker(QThread):
             tol = 2.0
         self._frame_diff_tolerance = max(0.0, min(100.0, tol))
 
-        if prev_filters != self._filters or prev_roi != self._roi or prev_use_preprocess != self._use_preprocess:
+        if (
+            prev_filters != self._filters
+            or prev_roi != self._roi
+            or prev_shared_areas != self._shared_areas
+            or prev_use_preprocess != self._use_preprocess
+        ):
             try:
-                self._last_frame_hash_by_pid.clear()
-            except Exception:
-                pass
-        if prev_verification_roi != self._verification_roi or prev_verification_filters != self._verification_filters:
-            try:
-                self._verification_next_check_by_pid.clear()
+                self._last_frame_hash_by_key.clear()
             except Exception:
                 pass
         if (

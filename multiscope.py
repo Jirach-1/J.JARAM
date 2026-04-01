@@ -177,8 +177,18 @@ def _extract_in_menu_from_rpc(rpc: dict) -> Optional[bool]:
 
 
 
-# Merchant lines - flexible but precise; timestamp anchored
-# Merchant lines - tolerant to optional colon after [Merchant] and variable ms precision
+# Merchant detection modes.
+MERCHANT_MODE_ASSET_ID = "asset_id"
+MERCHANT_MODE_LEGACY_CHAT = "legacy_chat"
+
+MERCHANT_ASSET_IDS = {
+    "18247420806": "Jester",
+    "18247165978": "Mari",
+    "97148159887178": "Rin",
+}
+
+# Legacy merchant chat lines - tolerant to optional colon after [Merchant]
+# and variable ms precision.
 MERCHANT_RE = re.compile(
     r"^(?P<full_line>"
     r"(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{0,6})?Z),"  # allow 0-6 ms digits
@@ -189,6 +199,61 @@ MERCHANT_RE = re.compile(
     r")$",
     re.IGNORECASE | re.MULTILINE
 )
+
+# Merchant asset-id lines - only the animation asset ID matters; the
+# Workspace.Map.* segment is intentionally ignored because it is random.
+MERCHANT_ASSET_RE = re.compile(
+    r"^(?P<full_line>"
+    r"(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{0,6})?Z),"
+    r"[^\n]*?rbxassetid://(?P<asset_id>97148159887178|18247420806|18247165978)"
+    r"[^\n]*"
+    r")$",
+    re.IGNORECASE | re.MULTILINE
+)
+
+MERCHANT_ASSET_PREFILTERS = tuple(f"rbxassetid://{asset_id}".lower() for asset_id in MERCHANT_ASSET_IDS)
+MERCHANT_LEGACY_PREFILTERS = ("[merchant]", "[merchants]")
+
+
+def _normalize_merchant_detection_mode(mode: object) -> str:
+    raw = str(mode or "").strip().lower()
+    if raw in {"legacy", "chat", "merchant", "merchant_chat", MERCHANT_MODE_LEGACY_CHAT}:
+        return MERCHANT_MODE_LEGACY_CHAT
+    return MERCHANT_MODE_ASSET_ID
+
+
+def _merchant_prefilters_for_mode(mode: object) -> tuple[str, ...]:
+    if _normalize_merchant_detection_mode(mode) == MERCHANT_MODE_LEGACY_CHAT:
+        return MERCHANT_LEGACY_PREFILTERS
+    return MERCHANT_ASSET_PREFILTERS
+
+
+def _iter_merchant_matches(text: str, mode: object) -> List[dict]:
+    normalized_mode = _normalize_merchant_detection_mode(mode)
+    if normalized_mode == MERCHANT_MODE_LEGACY_CHAT:
+        return [
+            {
+                "full_line": m.group("full_line"),
+                "timestamp": m.group("timestamp"),
+                "merchant_name": m.group("merchant_name").title(),
+            }
+            for m in MERCHANT_RE.finditer(text)
+        ]
+
+    out: List[dict] = []
+    for m in MERCHANT_ASSET_RE.finditer(text):
+        asset_id = str(m.group("asset_id") or "").strip()
+        who = MERCHANT_ASSET_IDS.get(asset_id)
+        if not who:
+            continue
+        out.append(
+            {
+                "full_line": m.group("full_line"),
+                "timestamp": m.group("timestamp"),
+                "merchant_name": who,
+            }
+        )
+    return out
 
 # Biome RPC lines - anchor timestamp exactly like merchants
 BIOME_RPC_RE = re.compile(
@@ -657,6 +722,8 @@ class MultiScopeEngine:
         self._merchant_hook: str = ""
         self._merchant_filters = {"Jester": True, "Mari": True, "Rin": True}
         self._ping_map = {"Jester": "", "Mari": "", "Rin": ""}
+        self._merchant_detection_mode = MERCHANT_MODE_ASSET_ID
+        self._disable_log_based_merchant_detection = False
 
         # Merchant dedupe per uid -> merchant -> last full line  (legacy; no longer used)
         self._first_merchant_scan_done: Set[str] = set()
@@ -760,6 +827,8 @@ class MultiScopeEngine:
         jester_ping: str = "",
         mari_ping: str = "",
         rin_ping: str = "",
+        merchant_detection_mode: str = MERCHANT_MODE_ASSET_ID,
+        disable_log_based_merchant_detection: bool = False,
         merchant_rate_limit: float = 15.0,   # kept for backward-compat; ignored
         biome_min_interval: float = 2.0,
         # NEW:
@@ -822,6 +891,8 @@ class MultiScopeEngine:
             "Rin": bool(enable_rin),
         }
         self._ping_map = {"Jester": jester_ping or "", "Mari": mari_ping or "", "Rin": rin_ping or ""}
+        self._merchant_detection_mode = _normalize_merchant_detection_mode(merchant_detection_mode)
+        self._disable_log_based_merchant_detection = bool(disable_log_based_merchant_detection)
         # --- ignore merchant_rate_limit entirely (no cooldown)
         self._biome_min_interval = float(biome_min_interval or 2.0)
         self._biome_modes = base_modes
@@ -1504,19 +1575,22 @@ class MultiScopeEngine:
             disconnect_hit = False
 
         # merchant seed (no notify) +' seed *scope* timestamps to avoid retro spam across users
-        matches = list(MERCHANT_RE.finditer(chunk))
-        if matches:
-            scope_key = self._server_key_for(uid)
-            self._last_merchant_ts_by_scope.setdefault(scope_key, {})
-            for m in matches:
-                try:
-                    ts = datetime.fromisoformat(m.group("timestamp").replace("Z", "+00:00"))
-                except Exception:
-                    continue
-                name = m.group("merchant_name").title()
-                self._last_merchant_ts_by_scope[scope_key][name] = ts.timestamp()
+        if not self._disable_log_based_merchant_detection:
+            matches = _iter_merchant_matches(chunk, self._merchant_detection_mode)
+            if matches:
+                scope_key = self._server_key_for(uid)
+                self._last_merchant_ts_by_scope.setdefault(scope_key, {})
+                for m in matches:
+                    try:
+                        ts = datetime.fromisoformat(str(m.get("timestamp") or "").replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                    name = str(m.get("merchant_name") or "").title()
+                    if not name:
+                        continue
+                    self._last_merchant_ts_by_scope[scope_key][name] = ts.timestamp()
 
-        # mark this user as warmstarted so its first live read doesn?t post old lines
+        # mark this user as warmstarted so its first live read doesn't post old lines
         self._first_merchant_scan_done.add(uid)
 
         # seed last biome for scope (no notify) + do NOT set scope.last_biome,
@@ -1965,6 +2039,8 @@ class MultiScopeEngine:
 
 
     def _emit_merchant(self, uid: str, who: str, event_time_utc: datetime, full_line: str) -> None:
+        if self._disable_log_based_merchant_detection:
+            return
         try:
             self._record_found_merchant(who, ts_epoch=event_time_utc.timestamp())
         except Exception:
@@ -2179,21 +2255,27 @@ class MultiScopeEngine:
         cur.carry = text[nl + 1:]
 
         # -- Cheap token prefilters before heavy regex -------------------------
-        has_merchant = ("[Merchant]" in parse_text) or ("[Merchants]" in parse_text)
+        parse_text_lower = parse_text.lower()
+        has_merchant = (
+            (not self._disable_log_based_merchant_detection)
+            and any(token in parse_text_lower for token in _merchant_prefilters_for_mode(self._merchant_detection_mode))
+        )
         has_rpc      = ("[BloxstrapRPC]" in parse_text)
 
         # Merchants (scope-level dedupe by timestamp window)
         if has_merchant:
-            matches = list(MERCHANT_RE.finditer(parse_text))
+            matches = _iter_merchant_matches(parse_text, self._merchant_detection_mode)
             if matches:
                 latest: Dict[str, dict] = {}
                 for m in matches:
                     try:
-                        ts = datetime.fromisoformat(m.group("timestamp").replace("Z", "+00:00"))
+                        ts = datetime.fromisoformat(str(m.get("timestamp") or "").replace("Z", "+00:00"))
                     except Exception:
                         continue
-                    name = m.group("merchant_name").title()
-                    latest[name] = {"ts": ts, "line": m.group("full_line")}
+                    name = str(m.get("merchant_name") or "").title()
+                    if not name:
+                        continue
+                    latest[name] = {"ts": ts, "line": str(m.get("full_line") or "")}
 
                 scope_key = self._server_key_for(uid)
                 self._scopes.setdefault(scope_key, ServerScope(scope_key)).users.add(uid)

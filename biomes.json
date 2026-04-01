@@ -87,6 +87,11 @@
         "color": "0X3299a8",
         "thumbnail_url": "https://images.stockcake.com/public/b/d/3/bd3769ca-18e5-4d66-9722-6f9dc8aa64de_medium/aurora-over-mountains-stockcake.jpg",
         "Timer": "600"
+    },
+    "Eggland": {
+        "color": "0Xf5f5dc",
+        "thumbnail_url": "https://cdn-icons-png.freepik.com/256/14400/14400227.png?semt=ais_white_label",
+        "Timer": "600"
     }
 
 }

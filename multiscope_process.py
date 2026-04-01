@@ -19,6 +19,7 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
     engine = None
     pending_update_users: Optional[List[str]] = None
     pending_configure_webhooks: Optional[dict] = None
+    pending_record_ocr_merchants: List[tuple[str, str]] = []
 
     def _send(msg: dict) -> None:
         try:
@@ -114,6 +115,12 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                             jester_ping=str(pending_configure_webhooks.get("jester_ping") or ""),
                             mari_ping=str(pending_configure_webhooks.get("mari_ping") or ""),
                             rin_ping=str(pending_configure_webhooks.get("rin_ping") or ""),
+                            merchant_detection_mode=str(
+                                pending_configure_webhooks.get("merchant_detection_mode") or "asset_id"
+                            ),
+                            disable_log_based_merchant_detection=bool(
+                                pending_configure_webhooks.get("disable_log_based_merchant_detection", False)
+                            ),
                             merchant_rate_limit=float(pending_configure_webhooks.get("merchant_rate_limit", 15.0) or 15.0),
                             biome_min_interval=float(pending_configure_webhooks.get("biome_min_interval", 2.0) or 2.0),
                             biome_modes=pending_configure_webhooks.get("biome_modes"),
@@ -127,6 +134,13 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                 try:
                     if pending_update_users:
                         engine.update_users([str(u) for u in pending_update_users])
+                except Exception:
+                    pass
+                try:
+                    if pending_record_ocr_merchants:
+                        for uid, merchant in pending_record_ocr_merchants:
+                            engine.record_ocr_merchant(str(uid or ""), str(merchant or ""))
+                        pending_record_ocr_merchants.clear()
                 except Exception:
                     pass
 
@@ -155,6 +169,10 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                     jester_ping=str(cmd.get("jester_ping") or ""),
                     mari_ping=str(cmd.get("mari_ping") or ""),
                     rin_ping=str(cmd.get("rin_ping") or ""),
+                    merchant_detection_mode=str(cmd.get("merchant_detection_mode") or "asset_id"),
+                    disable_log_based_merchant_detection=bool(
+                        cmd.get("disable_log_based_merchant_detection", False)
+                    ),
                     merchant_rate_limit=float(cmd.get("merchant_rate_limit", 15.0) or 15.0),
                     biome_min_interval=float(cmd.get("biome_min_interval", 2.0) or 2.0),
                     biome_modes=cmd.get("biome_modes"),
@@ -170,6 +188,17 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                 if engine is None:
                     continue
                 engine.complete_handoff(str(cmd.get("donor_uid") or ""))
+
+            elif ctype == "record_ocr_merchant":
+                if engine is None:
+                    pending_record_ocr_merchants.append(
+                        (str(cmd.get("uid") or ""), str(cmd.get("merchant") or ""))
+                    )
+                    continue
+                engine.record_ocr_merchant(
+                    str(cmd.get("uid") or ""),
+                    str(cmd.get("merchant") or ""),
+                )
 
             elif ctype == "tick":
                 if engine is None:
@@ -361,6 +390,8 @@ class MultiScopeProcessProxy:
         jester_ping: str = "",
         mari_ping: str = "",
         rin_ping: str = "",
+        merchant_detection_mode: str = "asset_id",
+        disable_log_based_merchant_detection: bool = False,
         merchant_rate_limit: float = 15.0,
         biome_min_interval: float = 2.0,
         biome_modes: Optional[Dict[str, str]] = None,
@@ -378,6 +409,8 @@ class MultiScopeProcessProxy:
                 "jester_ping": jester_ping or "",
                 "mari_ping": mari_ping or "",
                 "rin_ping": rin_ping or "",
+                "merchant_detection_mode": str(merchant_detection_mode or "asset_id"),
+                "disable_log_based_merchant_detection": bool(disable_log_based_merchant_detection),
                 "merchant_rate_limit": float(merchant_rate_limit or 0.0),
                 "biome_min_interval": float(biome_min_interval or 0.0),
                 "biome_modes": biome_modes,
@@ -392,6 +425,14 @@ class MultiScopeProcessProxy:
     def complete_handoff(self, donor_uid: str) -> None:
         self._drain_out_queue()
         self._send_cmd({"type": "complete_handoff", "donor_uid": donor_uid})
+
+    def record_ocr_merchant(self, uid: str, merchant: str) -> None:
+        self._drain_out_queue()
+        uid_s = str(uid or "").strip()
+        merchant_s = str(merchant or "").strip()
+        if not uid_s or not merchant_s:
+            return
+        self._send_cmd({"type": "record_ocr_merchant", "uid": uid_s, "merchant": merchant_s})
 
     def tick(self, status_by_uid: Dict[str, dict]) -> None:
         self._drain_out_queue()

@@ -364,6 +364,7 @@ class AuthenticationHandler:
             except Exception:
                 cookie = str(cookie or "").strip()
         session = requests.Session()
+        auth_meta = {"mark_bad": False, "failure_reason": "no_response"}
         session.headers.update(
             {
                 "Referer": "https://www.roblox.com/",
@@ -395,36 +396,45 @@ class AuthenticationHandler:
 
         try:
             response = session.post("https://auth.roblox.com/v1/authentication-ticket", timeout=5)
-            _maybe_update_cookie(response)
-
-            try:
-                ticket = response.headers.get("rbx-authentication-ticket")
-            except Exception:
-                ticket = None
-            if ticket:
-                return ticket, cookie
-
-            if response.status_code == 403:
-                csrf_token = response.headers.get("x-csrf-token") or response.headers.get("X-CSRF-TOKEN")
-                if csrf_token:
-                    session.headers.update(
-                        {
-                            "X-CSRF-TOKEN": csrf_token,
-                            "Content-Type": "application/json",
-                        }
-                    )
-                    second_response = session.post("https://auth.roblox.com/v1/authentication-ticket", timeout=5)
-                    _maybe_update_cookie(second_response)
-                    try:
-                        ticket = second_response.headers.get("rbx-authentication-ticket")
-                    except Exception:
-                        ticket = None
-                    if ticket:
-                        return ticket, cookie
         except Exception:
-            pass
+            return None, cookie, auth_meta
 
-        return None, cookie
+        _maybe_update_cookie(response)
+
+        try:
+            ticket = response.headers.get("rbx-authentication-ticket")
+        except Exception:
+            ticket = None
+        if ticket:
+            return ticket, cookie, {"mark_bad": False, "failure_reason": ""}
+
+        if response.status_code == 403:
+            csrf_token = response.headers.get("x-csrf-token") or response.headers.get("X-CSRF-TOKEN")
+            if csrf_token:
+                session.headers.update(
+                    {
+                        "X-CSRF-TOKEN": csrf_token,
+                        "Content-Type": "application/json",
+                    }
+                )
+                try:
+                    response = session.post("https://auth.roblox.com/v1/authentication-ticket", timeout=5)
+                except Exception:
+                    return None, cookie, auth_meta
+                _maybe_update_cookie(response)
+                try:
+                    ticket = response.headers.get("rbx-authentication-ticket")
+                except Exception:
+                    ticket = None
+                if ticket:
+                    return ticket, cookie, {"mark_bad": False, "failure_reason": ""}
+
+        status_code = getattr(response, "status_code", None)
+        auth_meta = {
+            "mark_bad": status_code in (401, 403),
+            "failure_reason": f"http_{status_code}" if status_code is not None else "no_response",
+        }
+        return None, cookie, auth_meta
 
 # ──────────────────────────────────────────────────────────────
 # 1-B. presence monitor class – delete the whole class
@@ -1461,7 +1471,7 @@ class GameLauncher:
             if private_code:
                 game_url += f"&linkCode={private_code}"
         else:
-            auth_ticket, new_cookie = self.auth_handler.obtain_auth_ticket(cookie)
+            auth_ticket, new_cookie, auth_meta = self.auth_handler.obtain_auth_ticket(cookie)
             if new_cookie and cookie and new_cookie != cookie:
                 cookie = new_cookie
                 if persist_updated_cookie is not None and original_cookie and cookie != original_cookie:
@@ -1471,9 +1481,21 @@ class GameLauncher:
                     except Exception:
                         pass
             if not auth_ticket:
-                self.log(f"[LAUNCH FAIL] uid={user_id} label={server_label} reason=no_auth_ticket")
-                self.cfg.mark_bad_cookie(user_id, True)
-                if user_info is not None:
+                auth_meta = auth_meta or {}
+                failure_reason = str(auth_meta.get("failure_reason") or "no_response")
+                should_mark_bad = bool(auth_meta.get("mark_bad", False))
+                if should_mark_bad:
+                    try:
+                        should_mark_bad = bool(self.cfg.auto_bad_marking_enabled())
+                    except Exception:
+                        should_mark_bad = True
+                self.log(
+                    f"[LAUNCH FAIL] uid={user_id} label={server_label} "
+                    f"reason=no_auth_ticket auth={failure_reason}"
+                )
+                if should_mark_bad:
+                    self.cfg.mark_bad_cookie(user_id, True)
+                if user_info is not None and should_mark_bad:
                     user_info["bad"] = True
                     user_info["inactive_since"] = time.time()
                 return False
