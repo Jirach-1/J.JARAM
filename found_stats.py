@@ -455,6 +455,14 @@ class FoundStatsMixin:
         P_NX = _stable_u32("nx")
         P_NSP = _stable_u32("nsp")
         P_NY = _stable_u32("ny")
+        P_EGX = _stable_u32("egx")
+        P_EGY = _stable_u32("egy")
+        P_EGSP = _stable_u32("egsp")
+        P_EGD = _stable_u32("egd")
+        P_EGW = _stable_u32("egw")
+        P_EGH = _stable_u32("egh")
+        P_EGC = _stable_u32("egc")
+        P_EGS = _stable_u32("egs")
 
         P_M = _stable_u32("m")
         P_RS = _stable_u32("rs")
@@ -633,6 +641,7 @@ class FoundStatsMixin:
                 is_pumpkin = biome_key == "PUMPKIN MOON"
                 is_blood = biome_key == "BLOOD RAIN"
                 is_aurora = biome_key == "AURORA"
+                is_eggland = biome_key == "EGGLAND"
 
                 is_void = is_null or is_corruption
                 is_celestial = is_starfall or is_aurora or is_heaven
@@ -712,6 +721,12 @@ class FoundStatsMixin:
                     hue_amp = 0.14
                     shimmer = 1.00
                     glow_alpha = 125
+                elif is_eggland:
+                    speed *= 0.86
+                    amp *= 1.05
+                    hue_amp = 0.08
+                    shimmer = 0.95
+                    glow_alpha = 120
                 elif is_cyber:
                     speed *= 1.10
                     amp *= 0.85
@@ -1016,6 +1031,35 @@ class FoundStatsMixin:
                             painter.drawEllipse(QPointF(x0, y0), r, r)
                         painter.setBrush(Qt.BrushStyle.NoBrush)
 
+                    if is_eggland:
+                        painter.setPen(QColor(0, 0, 0, 0))
+                        egg_palette = (
+                            QColor(255, 214, 224, 110),
+                            QColor(255, 241, 188, 110),
+                            QColor(205, 234, 255, 110),
+                            QColor(216, 245, 216, 110),
+                        )
+                        for k in range(14):
+                            egg = QColor(egg_palette[int(_u32(P_EGC, k) % len(egg_palette))])
+                            tw = 0.5 + 0.5 * math.sin(t * 1.15 + k + phase0)
+                            egg.setAlpha(65 + int(85 * tw))
+                            painter.setBrush(egg)
+                            x0 = rx0 + rw0 * _r01(P_EGX, k)
+                            sp = 8.0 + 14.0 * _r01(P_EGSP, k)
+                            y0 = (t * sp + (rh0 + 26.0) * _r01(P_EGY, k)) % (rh0 + 26.0) - 12.0
+                            drift = math.sin(t * 0.92 + k * 1.24 + phase0) * (1.8 + 1.7 * _r01(P_EGD, k))
+                            ew = 2.0 + 2.5 * _r01(P_EGW, k)
+                            eh = 3.2 + 2.8 * _r01(P_EGH, k)
+                            cx = x0 + drift
+                            cy = ry0 + y0
+                            painter.drawEllipse(QPointF(cx, cy), ew, eh)
+                            if (k % 3) == 0:
+                                stripe = QColor(255, 255, 255, 45 + int(70 * _r01(P_EGS, k)))
+                                painter.setBrush(stripe)
+                                painter.drawEllipse(QPointF(cx, cy - 0.8), max(0.8, ew * 0.45), max(0.7, eh * 0.22))
+                                painter.setBrush(egg)
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+
                     if is_heaven:
                         # Falling light blocks that pulse outward, then dissolve at the bottom.
                         travel = rh0 + 60.0
@@ -1154,6 +1198,9 @@ class FoundStatsMixin:
                     global_dy *= 0.75
                 if is_pumpkin:
                     global_dy += abs(math.sin(t * 1.60 + phase0)) * 0.9
+                if is_eggland:
+                    global_dx += math.sin(t * 0.95 + phase0) * 0.9
+                    global_dy += math.sin(t * 1.20 + phase0) * 0.45
                 if is_glitch:
                     # Fast whole-word shake (doesn't change per-letter spacing).
                     global_dx += math.sin(t * 6.20 + phase0) * 0.9
@@ -1306,6 +1353,11 @@ class FoundStatsMixin:
                         # Keep the wavy motion for DREAMSPACE, but floatier.
                         dx += math.sin(t * 1.10 + i * 0.35 + phase0) * 1.1
                         dy += math.sin(t * 0.85 + i * 0.28 + phase0) * 1.2
+                    elif is_eggland:
+                        # Pastel hop: light buoyant bounce.
+                        hop = 0.5 - 0.5 * math.cos(t * 1.85 + ph)
+                        dy -= hop * (amp * 0.80)
+                        dx += math.sin(t * 1.00 + ph) * (amp * 0.26)
                     elif is_corruption:
                         # Corrupted crawl + occasional snap (no wave).
                         frame = int(t * 10.0)
@@ -1363,6 +1415,8 @@ class FoundStatsMixin:
                         hue_grad = pos * 0.08
                     elif is_starfall:
                         hue_grad = pos * 0.05
+                    elif is_eggland:
+                        hue_grad = pos * 0.09
 
                     hue_phase = (math.pi * 2.0) * _r01(P_HP, i)
                     hue = hue0 + hue_grad + hue_bias + (hue_amp * math.sin(t * 1.10 + hue_phase + (phase0 * 0.15)))
@@ -1408,6 +1462,11 @@ class FoundStatsMixin:
                             hue -= 1.0
                         sat = _clamp01(max(sat, 0.55))
                         val = _clamp01(val * (1.02 + 0.10 * mix))
+                    if is_eggland:
+                        tone = _r01(P_EGC, i)
+                        hue = (0.05 + (0.38 * tone) + (0.04 * math.sin(t * 1.25 + phase0 + i * 0.18))) % 1.0
+                        sat = _clamp01(sat * 0.58)
+                        val = _clamp01(val * 1.15)
                     if is_glitch:
                         # Hard swap between RGB primaries + white (no hue drifting).
                         rgb_frame = int(t * 8.0)
@@ -1424,7 +1483,7 @@ class FoundStatsMixin:
 
                     # Highlight/sweep (stars, aurora ribbon, cyber scanline, sun flare).
                     hi = 0.0
-                    if is_starfall or is_aurora or is_heaven or is_cyber or is_blazing:
+                    if is_starfall or is_aurora or is_heaven or is_cyber or is_blazing or is_eggland:
                         radius = 3.0
                         if is_aurora:
                             radius = 4.6
@@ -1432,6 +1491,8 @@ class FoundStatsMixin:
                             radius = 3.8
                         elif is_cyber:
                             radius = 2.2
+                        elif is_eggland:
+                            radius = 4.0
                         dist = abs(float(i) - float(sweep_pos))
                         hi = max(0.0, 1.0 - dist / radius)
                         hi *= hi
@@ -1483,6 +1544,11 @@ class FoundStatsMixin:
                         painter.drawText(pt, draw_ch)
                         pt.setX(px + 2.0); pt.setY(py + 1.0)
                         painter.drawText(pt, draw_ch)
+                    if is_eggland and hi > 0.25:
+                        spark_col.setRgb(255, 255, 255, min(180, 70 + int(120.0 * hi)))
+                        painter.setPen(spark_col)
+                        p0.setX(px + (w * 0.50)); p0.setY(py - 4.0)
+                        painter.drawPoint(p0)
 
                     # Glitched: chromatic split.
                     if is_glitch:
@@ -1567,7 +1633,7 @@ class FoundStatsMixin:
                                 f"[BiomePaintSpike] biome={biome_key} row={index.row()} dt={dt_ms:.1f}ms "
                                 f"rect={cell_rect.width()}x{cell_rect.height()} text_len={len(text)} "
                                 f"glitch={is_glitch} cyber={is_cyber} rainy={is_rainy} snowy={is_snowy} "
-                                f"hell={is_hell} blazing={is_blazing} starfall={is_starfall}"
+                                f"hell={is_hell} blazing={is_blazing} starfall={is_starfall} eggland={is_eggland}"
                             )
                     # accumulate stats for summary printing
                     self._dbg_acc_ms = getattr(self, "_dbg_acc_ms", 0.0) + dt_ms
