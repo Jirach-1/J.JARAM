@@ -1412,6 +1412,8 @@ class OCRWorker(QThread):
         self._frame_hash_size = _FRAME_HASH_SIZE
         self._frame_diff_tolerance = 0.0
         self._last_frame_hash_by_key: Dict[str, int] = {}
+        self._verification_next_check_by_pid: Dict[int, float] = {}
+        self._verification_check_interval = 2.0
 
         self._send_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr-send")
 
@@ -1472,63 +1474,84 @@ class OCRWorker(QThread):
                     work_list = self._select_windows(windows)
                     self._log(f"[Loop {loop_idx}] Selected {len(work_list)} window(s) for capture.")
                     if work_list:
+                        try:
+                            self._run_verification_checks(work_list)
+                        except Exception as e:
+                            self._log(f"[Verification] check error: {e}")
+
                         remaining_slots = max(1, int(getattr(self, "_max_captures_per_second", 1) or 1))
                         processed_count = 0
                         skipped_similar = 0
                         captured_count = 0
                         future_map = {}
 
+                        pending_groups: List[Dict[str, Any]] = []
                         for win in work_list:
-                            if self._stop_event.is_set() or remaining_slots <= 0:
-                                break
                             groups = self._build_capture_groups(int(getattr(win, "pid", 0) or 0))
-                            if not groups:
-                                continue
-                            for group in groups:
+                            if groups:
+                                pending_groups.append({"win": win, "groups": list(groups)})
+
+                        while pending_groups and not self._stop_event.is_set() and remaining_slots > 0:
+                            next_round: List[Dict[str, Any]] = []
+                            for entry in pending_groups:
                                 if self._stop_event.is_set() or remaining_slots <= 0:
                                     break
+
+                                win = entry.get("win")
+                                groups = list(entry.get("groups") or [])
+                                if win is None or not groups:
+                                    continue
+
+                                group = groups.pop(0)
                                 raw_img = capture_window_image(win.hwnd, group["roi"])
                                 remaining_slots -= 1
-                                if raw_img is None:
-                                    continue
-                                captured_count += 1
-                                try:
-                                    prep_img = self._preprocess_image(raw_img, group["filters"])
-                                except Exception as e:
-                                    self._log(f"[OCR] Preprocess failed for PID {win.pid}: {e}")
-                                    self._log(traceback.format_exc())
-                                    prep_img = raw_img
-
-                                skip, _diff_pct = self._skip_ocr_for_similar_frame(
-                                    self._frame_cache_key(int(win.pid), str(group["cache_key"])),
-                                    prep_img,
-                                )
-                                if skip:
-                                    skipped_similar += 1
-                                    continue
-
-                                if self._ocr_pool:
+                                if raw_img is not None:
+                                    captured_count += 1
                                     try:
-                                        fut = self._ocr_pool.submit(
-                                            _ocr_pool_task,
-                                            _image_bytes(prep_img),
-                                            _image_bytes(raw_img),
-                                            group["filters"],
-                                            self._use_preprocess,
-                                        )
-                                        future_map[fut] = {
-                                            "win": win,
-                                            "raw_img": raw_img,
-                                            "group": group,
-                                        }
+                                        prep_img = self._preprocess_image(raw_img, group["filters"])
                                     except Exception as e:
-                                        self._log(f"[OCR] Failed to dispatch process task for PID {win.pid}: {e}")
-                                else:
-                                    try:
-                                        self._process_group_preprocessed(win, raw_img, prep_img, group["filters"], group["label"])
-                                        processed_count += 1
-                                    except Exception as e:
-                                        self._log(f"[OCR] Worker error for PID {win.pid}: {e}")
+                                        self._log(f"[OCR] Preprocess failed for PID {win.pid}: {e}")
+                                        self._log(traceback.format_exc())
+                                        prep_img = raw_img
+
+                                    skip, _diff_pct = self._skip_ocr_for_similar_frame(
+                                        self._frame_cache_key(int(win.pid), str(group["cache_key"])),
+                                        prep_img,
+                                    )
+                                    if skip:
+                                        skipped_similar += 1
+                                    elif self._ocr_pool:
+                                        try:
+                                            fut = self._ocr_pool.submit(
+                                                _ocr_pool_task,
+                                                _image_bytes(prep_img),
+                                                _image_bytes(raw_img),
+                                                group["filters"],
+                                                self._use_preprocess,
+                                            )
+                                            future_map[fut] = {
+                                                "win": win,
+                                                "raw_img": raw_img,
+                                                "group": group,
+                                            }
+                                        except Exception as e:
+                                            self._log(f"[OCR] Failed to dispatch process task for PID {win.pid}: {e}")
+                                    else:
+                                        try:
+                                            self._process_group_preprocessed(
+                                                win,
+                                                raw_img,
+                                                prep_img,
+                                                group["filters"],
+                                                group["label"],
+                                            )
+                                            processed_count += 1
+                                        except Exception as e:
+                                            self._log(f"[OCR] Worker error for PID {win.pid}: {e}")
+
+                                if groups:
+                                    next_round.append({"win": win, "groups": groups})
+                            pending_groups = next_round
 
                         self._log(f"[Loop {loop_idx}] Captured {captured_count} ROI image(s).")
 
@@ -1826,12 +1849,8 @@ class OCRWorker(QThread):
         filter_id = str(spec.get("id", "") or "").strip()
         ctx = self._context_provider(pid) if self._context_provider else {}
 
-        try:
-            self.filter_match_signal.emit(int(pid), filter_id, filter_name)
-        except Exception:
-            pass
-
         if behavior == "merchant":
+            self._emit_filter_match_signal(pid, filter_id, filter_name)
             merchant = MERCHANT_FILTER_IDS.get(str(spec.get("id") or "").strip(), filter_name.lower())
             self._handle_detection(merchant, pid, raw_img)
             self._emit_filter_alert(spec, filter_name)
@@ -1852,6 +1871,7 @@ class OCRWorker(QThread):
                 self.verification_cap_signal.emit(uid)
             except Exception:
                 pass
+            self._emit_filter_match_signal(pid, filter_id, filter_name)
             if str(spec.get("webhook_url", "") or "").strip():
                 self._send_custom_filter_webhook(spec, pid, ctx, raw_img)
             self._emit_filter_alert(spec, filter_name)
@@ -1859,6 +1879,7 @@ class OCRWorker(QThread):
 
         username = str((ctx or {}).get("username") or f"PID {pid}")
         self._log(f"[DETECT] {filter_name} detected in PID {pid} ({username}).")
+        self._emit_filter_match_signal(pid, filter_id, filter_name)
         self._send_custom_filter_webhook(spec, pid, ctx, raw_img)
         self._emit_filter_alert(spec, filter_name)
         return True
@@ -1869,14 +1890,16 @@ class OCRWorker(QThread):
         if total == 0:
             return []
 
+        limit = min(self._max_captures_per_second, total)
         start_idx = self._capture_rr_index % total
         idx = start_idx
         seen = 0
         work_list: List[Any] = []
 
-        while seen < total:
+        while seen < total and len(work_list) < limit:
             win = windows[idx]
-            if self._pid_has_eligible_filters(int(getattr(win, "pid", 0) or 0)):
+            pid = int(getattr(win, "pid", 0) or 0)
+            if self._pid_has_eligible_filters(pid) or self._pid_has_eligible_verification_filters(pid):
                 work_list.append(win)
             idx = (idx + 1) % total
             seen += 1
@@ -1930,11 +1953,36 @@ class OCRWorker(QThread):
     def _pid_has_eligible_filters(self, pid: int) -> bool:
         return bool(self._build_capture_groups(pid))
 
+    def _verification_filter_specs(
+        self,
+        pid: int,
+        ctx: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        ctx = ctx or self._pid_context(pid)
+        specs: List[Dict[str, Any]] = []
+        for spec in self._filters or []:
+            if not bool(spec.get("enabled", True)):
+                continue
+            if str(spec.get("behavior", "") or "").strip().lower() != "verification_cap":
+                continue
+            if not self._filter_targets_pid(pid, spec, ctx):
+                continue
+            if self._effective_filter_roi(spec) is None:
+                continue
+            specs.append(spec)
+        specs.sort(key=lambda item: str(item.get("name", "")).lower())
+        return specs
+
+    def _pid_has_eligible_verification_filters(self, pid: int) -> bool:
+        return bool(self._verification_filter_specs(pid))
+
     def _build_capture_groups(self, pid: int) -> List[Dict[str, Any]]:
         groups: Dict[str, Dict[str, Any]] = {}
         ctx = self._pid_context(pid)
         for spec in self._filters or []:
             if not bool(spec.get("enabled", True)):
+                continue
+            if str(spec.get("behavior", "") or "").strip().lower() == "verification_cap":
                 continue
             if not self._filter_targets_pid(pid, spec, ctx):
                 continue
@@ -2024,6 +2072,7 @@ class OCRWorker(QThread):
         prev_use_preprocess = getattr(self, "_use_preprocess", None)
         prev_device_id = getattr(self, "_device_id", None)
         prev_force_cpu = getattr(self, "_force_cpu", None)
+        prev_verification_interval = getattr(self, "_verification_check_interval", None)
 
         self._filters = _filters_from_cfg(self._ocr_cfg)
         self._roi = _roi_from_cfg(self._ocr_cfg.get("roi") or {})
@@ -2036,6 +2085,13 @@ class OCRWorker(QThread):
             self._batch_delay_seconds = max(0.0, float(self._ocr_cfg.get("batch_delay_seconds", 1.0)))
         except Exception:
             self._batch_delay_seconds = 1.0
+        try:
+            self._verification_check_interval = max(
+                0.5,
+                float(self._ocr_cfg.get("verification_check_interval", 2.0)),
+            )
+        except Exception:
+            self._verification_check_interval = 2.0
         self._use_preprocess = bool(self._ocr_cfg.get("use_preprocess", True))
         self._device_id, self._force_cpu = _parse_device_id(self._ocr_cfg.get("device_id"))
         self._log_ocr_text = bool(self._ocr_cfg.get("log_ocr_text", False))
@@ -2061,6 +2117,15 @@ class OCRWorker(QThread):
         ):
             try:
                 self._last_frame_hash_by_key.clear()
+            except Exception:
+                pass
+        if (
+            prev_filters != self._filters
+            or prev_shared_areas != self._shared_areas
+            or prev_verification_interval != self._verification_check_interval
+        ):
+            try:
+                self._verification_next_check_by_pid.clear()
             except Exception:
                 pass
         if (
@@ -2120,6 +2185,93 @@ class OCRWorker(QThread):
             self._send_pool = None
         except Exception:
             pass
+
+    def _emit_filter_match_signal(self, pid: int, filter_id: str, filter_name: str) -> None:
+        try:
+            self.filter_match_signal.emit(int(pid), str(filter_id or "").strip(), str(filter_name or "").strip())
+        except Exception:
+            pass
+
+    @staticmethod
+    def _contains_start_puzzle_text(text: str) -> bool:
+        raw = str(text or "")
+        if not raw:
+            return False
+        if START_PUZZLE_RE.search(raw):
+            return True
+        squashed = re.sub(r"[^a-z0-9]+", "", raw.lower())
+        return "startpuzzle" in squashed
+
+    def _run_verification_checks(self, windows: List[Any]) -> None:
+        if self._reader is None:
+            return
+
+        now = time.time()
+        for win in windows:
+            if self._stop_event.is_set():
+                return
+
+            pid = int(getattr(win, "pid", 0) or 0)
+            if pid <= 0:
+                continue
+
+            next_allowed = float(self._verification_next_check_by_pid.get(pid, 0.0) or 0.0)
+            if now < next_allowed:
+                continue
+
+            ctx = self._pid_context(pid)
+            uid = str((ctx or {}).get("user_id") or "").strip()
+            if not uid:
+                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+                continue
+
+            if self._is_truthy((ctx or {}).get("is_cap")):
+                self._verification_next_check_by_pid[pid] = now + 30.0
+                continue
+
+            if self._is_truthy((ctx or {}).get("has_user_log")):
+                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+                continue
+
+            verification_specs = self._verification_filter_specs(pid, ctx)
+            if not verification_specs:
+                continue
+
+            matched = False
+            for spec in verification_specs:
+                if self._stop_event.is_set():
+                    return
+
+                roi = self._effective_filter_roi(spec)
+                if roi is None:
+                    continue
+
+                img = capture_window_image(win.hwnd, roi)
+                if img is None:
+                    continue
+
+                try:
+                    img_for_ocr = self._preprocess_image(img, [spec]) if self._use_preprocess else img
+                    text = _rapidocr_text_only(self._reader, np.array(img_for_ocr))
+                except Exception as e:
+                    self._log(f"[Verification] OCR error for PID {pid}: {e}")
+                    continue
+
+                target_text = str(spec.get("target_text", "") or "").strip()
+                score = _score_text_against_target(text, target_text) if target_text else 0.0
+                if self._contains_start_puzzle_text(text):
+                    score = max(score, 1.0)
+
+                if score < DEFAULT_OCR_MATCH_THRESHOLD:
+                    continue
+
+                if self._handle_filter_match(spec, pid, img):
+                    self._verification_next_check_by_pid[pid] = now + 30.0
+                    matched = True
+                    break
+
+            if not matched:
+                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
 
     # ---------------------------- misc ----------------------------
     def _log(self, msg: str) -> None:
