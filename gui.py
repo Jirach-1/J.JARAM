@@ -9,6 +9,7 @@ import shutil
 import uuid
 import requests
 import re
+import queue
 import threading
 from collections import deque
 from typing import Any, Dict, Set, List, Tuple, Optional
@@ -468,6 +469,7 @@ from log_utils import find_log_for_username, refresh_username_log_map
 from biomes import biome_names, biome_meta, biome_duration
 from utilities_tab import build_utilities_widget
 from trimmer import setup_TRIMMER_tab
+from discord_account_control import DiscordBotService, format_discord_ids, normalize_discord_ids
 from found_stats import FoundStatsMixin
 # Exclude NORMAL from the Settings table (still exists internally, we just don't offer it as a toggle)
 GUI_BIOME_NAMES = [b for b in biome_names() if str(b).upper() != "NORMAL"]
@@ -722,6 +724,7 @@ class ConfigManager:
         self.config_dir = self._get_config_directory()
         self.users_file = self.config_dir / "users.json"
         self.settings_file = self.config_dir / "settings.json"
+        self.manager_pause_state_file = self.config_dir / "manager_pause_state.json"
         self.backup_dir = self.config_dir / "backups"
         
 
@@ -750,6 +753,13 @@ class ConfigManager:
                 "bad_message": "",
                 "hourly_users_report_enabled": False,
                 "hourly_users_report_interval_hours": 1,
+            },
+            "discord_control": {
+                "enabled": False,
+                "token": "",
+                "admin_user_ids": [],
+                "admin_role_ids": [],
+                "allow_discord_admin_permission": True,
             },
             "multiscope": {
                 "webhooks": [],   # ← NEW
@@ -870,6 +880,7 @@ class ConfigManager:
             "disabled": False,
             "alternate_launch": False,
             "skip_reconnect_on_log_disconnect": False,
+            "discord_user_ids": [],
         }
 
         # Re-entrant because some cache update paths call helper methods that
@@ -2004,6 +2015,33 @@ class ConfigManager:
         except Exception as e:
             return False
 
+    def load_manager_pause_state(self) -> Optional[dict]:
+        try:
+            if not self.manager_pause_state_file.exists():
+                return None
+            with open(self.manager_pause_state_file, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            return loaded if isinstance(loaded, dict) else None
+        except Exception:
+            return None
+
+    def save_manager_pause_state(self, pause_state: Optional[dict]) -> bool:
+        try:
+            if not isinstance(pause_state, dict) or not pause_state:
+                return False
+            self._safe_write_json(self.manager_pause_state_file, pause_state)
+            return True
+        except Exception:
+            return False
+
+    def clear_manager_pause_state(self) -> bool:
+        try:
+            if self.manager_pause_state_file.exists():
+                self.manager_pause_state_file.unlink()
+            return True
+        except Exception:
+            return False
+
     def _migrate_old_config(self):
         old_config_path = Path("config.json")
         if old_config_path.exists():
@@ -2034,6 +2072,7 @@ class ConfigManager:
                     "cap": False,
                     "alternate_launch": False,
                     "skip_reconnect_on_log_disconnect": False,
+                    "discord_user_ids": [],
                 }
             else:
 
@@ -2087,6 +2126,7 @@ class ConfigManager:
                     "description": "",
                     "alternate_launch": False,
                     "skip_reconnect_on_log_disconnect": False,
+                    "discord_user_ids": [],
                 }
             elif isinstance(user_info, dict):
                 private_link = user_info.get("private_server_link", "")
@@ -2111,6 +2151,7 @@ class ConfigManager:
                     "description": str(user_info.get("description", "") or ""),
                     "alternate_launch": _is_alternate_launch(user_info),
                     "skip_reconnect_on_log_disconnect": _skip_reconnect_on_log_disconnect(user_info),
+                    "discord_user_ids": normalize_discord_ids(user_info.get("discord_user_ids")),
                 }
             else:
 
@@ -2126,6 +2167,7 @@ class ConfigManager:
                     "description": "",
                     "alternate_launch": False,
                     "skip_reconnect_on_log_disconnect": False,
+                    "discord_user_ids": [],
                 }
 
         # Enforce: at most one account may have alternate launch enabled.
@@ -2206,14 +2248,32 @@ class ConfigManager:
             _post()
         return True
 
+    def _linked_discord_ping_text_for_user(self, user_id: str) -> str:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return ""
+        try:
+            users = self.load_users()
+            info = users.get(uid) if isinstance(users, dict) else None
+            if not isinstance(info, dict):
+                return ""
+            discord_ids = normalize_discord_ids(info.get("discord_user_ids"))
+        except Exception:
+            discord_ids = []
+        return " ".join(f"<@{discord_id}>" for discord_id in discord_ids if discord_id)
+
     def _build_user_alert_message(self, template: str, user_id: str, username: str = "") -> str:
         uid = str(user_id)
         uname = str(username or "").strip() or uid
+        discord_ping = self._linked_discord_ping_text_for_user(uid)
         return (
             str(template or "")
             .replace("{username}", uname)
             .replace("{uid}", uid)
             .replace("{user_id}", uid)
+            .replace("{discord_ping}", discord_ping)
+            .replace("{discord_user_ping}", discord_ping)
+            .replace("{discord_mention}", discord_ping)
             .strip()
         )
 
@@ -2273,7 +2333,7 @@ class ConfigManager:
         except Exception:
             settings = {}
         webhook_url = self._resolve_alert_webhook_url(settings)
-        msg = f"Hourly user report: Total Users = {int(total_users)}, Active Users = {int(active_users)}."
+        msg = f"User report: Total Users = {int(total_users)}, Active Users = {int(active_users)}."
         return self._dispatch_alert_message(webhook_url, msg)
 
     def mark_cap_flag(self, user_id: str, state: bool) -> None:
@@ -2316,6 +2376,7 @@ class ConfigManager:
                     "disabled": False,
                     "alternate_launch": False,
                     "skip_reconnect_on_log_disconnect": False,
+                    "discord_user_ids": [],
                 }
         return manager_format
 
@@ -3012,6 +3073,54 @@ class WorkerThread(QThread):
         except Exception:
             pass
 
+    def _maybe_recover_multiscope_user_log(self, uid: str, *, strict_log_seen: bool) -> None:
+        uid_s = str(uid or "").strip()
+        if not uid_s:
+            return
+
+        st = self.user_states.get(uid_s, {})
+        if not isinstance(st, dict):
+            return
+
+        if not strict_log_seen:
+            st["multiscope_log_recovered"] = False
+            st["multiscope_log_recover_retry_after"] = 0.0
+            return
+
+        if bool(st.get("multiscope_log_recovered", False)):
+            return
+
+        try:
+            now_t = float(time.time())
+        except Exception:
+            now_t = 0.0
+        try:
+            retry_after = float(st.get("multiscope_log_recover_retry_after", 0.0) or 0.0)
+        except Exception:
+            retry_after = 0.0
+        if retry_after > 0.0 and now_t < retry_after:
+            return
+
+        ms = getattr(self, "ms", None)
+        fn = getattr(ms, "recover_user_log_tracking", None)
+        if not callable(fn):
+            return
+
+        try:
+            st["multiscope_log_recover_retry_after"] = now_t + 1.5
+        except Exception:
+            pass
+
+        ok = False
+        try:
+            ok = bool(fn(uid_s))
+        except Exception:
+            ok = False
+
+        if ok:
+            st["multiscope_log_recovered"] = True
+            st["multiscope_log_recover_retry_after"] = 0.0
+
     def _all_live_users_in_menu_false(
         self,
         *,
@@ -3634,6 +3743,72 @@ class WorkerThread(QThread):
 
         target_place = str(place_id or place or self.manager.target_place)
         return (f"{(code or '')[:10]}" if code else f"Public:{target_place}")
+
+    @staticmethod
+    def _is_disconnected_like_server_label(label: str) -> bool:
+        u = str(label or "").strip().upper()
+        return u.startswith("DISCONNECTED") or u.startswith("OFFLINE")
+
+    def _restore_live_user_server_label(self, uid: str, info: Optional[dict] = None) -> str:
+        """
+        Repair stale tracker labels after a reconnect. MultiScope treats
+        DISCONNECTED/OFFLINE as authoritative and will drop log tracking, so if
+        a live Roblox PID exists we rebuild the launch label from tracker cache
+        (preferred) or from launch settings.
+        """
+        tracker = getattr(self.manager, "process_tracker", None)
+        if tracker is None:
+            return ""
+
+        uid_s = str(uid)
+        try:
+            current = str((tracker.user_server or {}).get(uid_s, "") or "").strip()
+        except Exception:
+            current = ""
+        if current and not self._is_disconnected_like_server_label(current):
+            return current
+
+        info_dict = info if isinstance(info, dict) else {}
+        label = ""
+
+        try:
+            code = str((getattr(tracker, "user_ps_code", {}) or {}).get(uid_s, "") or "").strip()
+        except Exception:
+            code = ""
+        try:
+            place = str((getattr(tracker, "user_ps_place", {}) or {}).get(uid_s, "") or "").strip()
+        except Exception:
+            place = ""
+
+        if code:
+            label = code[:10]
+        elif place:
+            label = f"Public:{place}"
+        else:
+            try:
+                label = str(self._compute_server_label_gui(info_dict) or "").strip()
+            except Exception:
+                label = ""
+
+        if not label or self._is_disconnected_like_server_label(label):
+            return current
+
+        try:
+            tracker.user_server[uid_s] = label
+        except Exception:
+            return current
+
+        if current != label:
+            try:
+                uname = str(info_dict.get("username", uid_s) or uid_s)
+            except Exception:
+                uname = uid_s
+            try:
+                self._log(f"[ServerLabel] Restored {uname} server label: {current or 'empty'} -> {label}")
+            except Exception:
+                pass
+
+        return label
 
     def _normal_launch_conflict(self, uid: str, info: dict) -> tuple[bool, str, str]:
         """
@@ -4547,6 +4722,11 @@ class WorkerThread(QThread):
                     live = [pid for pid in self.manager.process_tracker.user_processes.get(uid, [])
                             if self.process_mgr.verify_process_active(pid)]
                     live_by_uid[uid] = bool(live)
+                    if live:
+                        try:
+                            self._restore_live_user_server_label(uid, info)
+                        except Exception:
+                            pass
                     
                     # --- NEW: pre-connect watchdog -------------------------------------------
                     # If this account has live processes but we still don't have a strict log
@@ -4562,9 +4742,11 @@ class WorkerThread(QThread):
                         if log_path:
                             st["log_miss_streak"] = 0
                             self._mark_user_log_confirmed(uid)
+                            self._maybe_recover_multiscope_user_log(uid, strict_log_seen=True)
                             self._maybe_trigger_msedge_kill_for_user(uid, strict_log_seen=True)
 
                         if not log_path:
+                            self._maybe_recover_multiscope_user_log(uid, strict_log_seen=False)
                             # oldest process start for this user. If per-PID create times are
                             # missing, fall back to this user's last launch timestamp so the
                             # preconnect watchdog still advances.
@@ -4620,6 +4802,7 @@ class WorkerThread(QThread):
                                 live = []
                                 live_by_uid[uid] = False
                     else:
+                        self._maybe_recover_multiscope_user_log(uid, strict_log_seen=False)
                         strict_log_matches[uid] = False
 
                     # --- end pre-connect watchdog ---
@@ -5604,6 +5787,10 @@ class UserManagementDialogLegacy(QDialog):
             self.cookie_input.setFocus()
             return
 
+        existing = self.original_config.get(user_id, {})
+        if not isinstance(existing, dict):
+            existing = {}
+
         self.original_config[user_id] = {
             "username": username,
             "private_server_link": private_server_link,
@@ -5611,6 +5798,7 @@ class UserManagementDialogLegacy(QDialog):
             "cookie": cookie,
             "bad": False,
             "cap": False,
+            "discord_user_ids": normalize_discord_ids(existing.get("discord_user_ids")),
         }
 
         self.refresh_user_list()
@@ -5731,6 +5919,7 @@ class UserManagementDialogLegacy(QDialog):
                 "cookie": cookie,
                 "bad": False,
                 "cap": False,
+                "discord_user_ids": [],
             }
 
             self.user_id_input.clear()
@@ -6893,6 +7082,7 @@ class UserManagementDialog(QDialog):
             "disabled": disabled,
             "alternate_launch": alternate,
             "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
+            "discord_user_ids": [],
         }
 
         self.refresh_user_list()
@@ -6974,6 +7164,7 @@ class UserManagementDialog(QDialog):
                 "disabled": disabled,
                 "alternate_launch": alternate,
                 "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
+                "discord_user_ids": normalize_discord_ids(existing.get("discord_user_ids")),
             }
         )
         self.original_config[user_id] = updated
@@ -7658,6 +7849,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     autoitem_mouse_block_signal = Signal(bool)
     bes_log_signal = Signal(str)
     ocr_filter_alert_ui_signal = Signal(str)
+    discord_control_log_signal = Signal(str)
+    discord_control_state_signal = Signal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -7712,6 +7905,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._antiafk_log_queue = deque()
         self._autoitem_log_queue = deque()
         self._bes_log_queue = deque()
+        self._discord_control_action_queue: "queue.Queue[dict]" = queue.Queue()
+        self._discord_control_log_lines: deque[str] = deque(maxlen=250)
         self.config_manager = ConfigManager()
         self.cookie_extractor = CookieExtractor(self)
         self.skip_account_private_link_warning = False
@@ -7820,6 +8015,21 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._auto_item_hotkey_id: int = 0xA117
         self._auto_item_hotkey_hwnd: int = 0
         self._auto_item_hotkey_registered: bool = False
+        self.discord_control_service: Optional[DiscordBotService] = None
+        self.discord_control_tab_index: Optional[int] = None
+        self.discord_control_status_label: Optional[QLabel] = None
+        self.discord_control_status_detail_label: Optional[QLabel] = None
+        self.discord_control_links_summary_label: Optional[QLabel] = None
+        self.discord_control_editor_summary_label: Optional[QLabel] = None
+        self.discord_control_log_box: Optional[QTextEdit] = None
+        self.discord_control_help_box: Optional[QTextEdit] = None
+        self.discord_control_links_table: Optional[QTableWidget] = None
+        self.discord_control_accounts_picker: Optional[QListWidget] = None
+        self.discord_control_discord_user_id_input: Optional[QLineEdit] = None
+        self.discord_control_selected_account_label: Optional[QLabel] = None
+        self.discord_control_selected_discord_user_id: Optional[str] = None
+        self._discord_control_action_timer: Optional[QTimer] = None
+        self._ensure_discord_control_service()
 
         # Connect Anti-AFK cross-thread signals
         self.antiafk_log_signal.connect(self._on_antiafk_status)
@@ -7833,6 +8043,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self._handle_ocr_filter_alert_ui,
             Qt.ConnectionType.QueuedConnection,
         )
+        self.discord_control_log_signal.connect(self._on_discord_control_log)
+        self.discord_control_state_signal.connect(self._on_discord_control_state_changed)
 
         self.setup_ui()
         try:
@@ -7851,10 +8063,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         # NEW: add the Multiscope tab
         self.setup_multiscope_tab()
         self.setup_timers()
+        self._setup_discord_control_bridge()
         self._last_tab_index = self.tab_widget.currentIndex()
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
         self._settings_prompt_ready = True
         QTimer.singleShot(0, self._maybe_prompt_cookie_encryption)
+        QTimer.singleShot(0, self._maybe_autostart_discord_control_bot)
+        self._restore_paused_manager_state_from_disk()
 
 
     def eventFilter(self, obj, event):
@@ -7973,6 +8188,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.setup_bes_tab()
         setup_TRIMMER_tab(self)
         self.setup_settings_tab()
+        if _bm_relaxed():
+            self.setup_discord_control_tab()
         self.setup_credits_tab()
 
         self.setup_menu_bar()
@@ -15200,9 +15417,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     },
                     {
                         "name": "Eggsistance",
-                        "r": 255,
-                        "g": 255,
-                        "b": 255,
+                        "r": 57,
+                        "g": 44,
+                        "b": 130,
                         "tol": 40,
                         "enabled": True,
                         "target_text": "[Egg Spawned]: 'Am I in spaaaace right now?!'",
@@ -17671,11 +17888,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.cap_msg_input.setPlaceholderText("This message is sent whenever a user is marked for captcha. Leave this empty if not interested. — Supports {username} and {uid}")
         self.cap_msg_input.setToolTip("Sent when a user is marked CAP. Example Message: User {username} has disconnected, User ID = {uid}.")
         alerts_layout.addRow("CAP Ping:", self.cap_msg_input)
+        self.cap_msg_input.setPlaceholderText("Sent when a user is marked CAP. Supports {username}, {uid}, and {discord_ping}")
+        self.cap_msg_input.setToolTip("Sent when a user is marked CAP. Example: {discord_ping} User {username} has disconnected, User ID = {uid}.")
 
         self.bad_msg_input = QLineEdit()
         self.bad_msg_input.setPlaceholderText("This message is sent whenever a user is marked BAD. Leave this empty if not interested. - Supports {username} and {uid}")
         self.bad_msg_input.setToolTip("Sent when a user is marked BAD. Example Message: User {username} has a bad cookie, User ID = {uid}.")
         alerts_layout.addRow("BAD Ping:", self.bad_msg_input)
+        self.bad_msg_input.setPlaceholderText("Sent when a user is marked BAD. Supports {username}, {uid}, and {discord_ping}")
+        self.bad_msg_input.setToolTip("Sent when a user is marked BAD. Example: {discord_ping} User {username} has a bad cookie, User ID = {uid}.")
 
         self.hourly_users_report_chk = QCheckBox("")
         self.hourly_users_report_chk.setToolTip(
@@ -18805,6 +19026,1353 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             prompt=f"This will open your browser to:\n\n{placeholder_url}\n\nContinue?",
         )
 
+    # ---------------- Discord Control ----------------
+    def _ensure_discord_control_service(self) -> None:
+        if self.discord_control_service is not None:
+            return
+        self.discord_control_service = DiscordBotService(
+            request_handler=self._submit_discord_control_request,
+            log_callback=self.discord_control_log_signal.emit,
+            state_callback=self.discord_control_state_signal.emit,
+        )
+
+    def _setup_discord_control_bridge(self) -> None:
+        if self._discord_control_action_timer is not None:
+            return
+        self._discord_control_action_timer = QTimer(self)
+        self._discord_control_action_timer.setInterval(100)
+        self._discord_control_action_timer.timeout.connect(self._process_discord_control_requests)
+        self._discord_control_action_timer.start()
+
+    def _normalize_discord_control_settings(self, raw: Optional[dict]) -> dict:
+        raw = raw if isinstance(raw, dict) else {}
+        defaults = self.config_manager.default_settings.get("discord_control", {}) or {}
+        return {
+            "enabled": bool(raw.get("enabled", defaults.get("enabled", False))),
+            "token": str(raw.get("token", defaults.get("token", "")) or "").strip(),
+            "admin_user_ids": normalize_discord_ids(raw.get("admin_user_ids", defaults.get("admin_user_ids", []))),
+            "admin_role_ids": normalize_discord_ids(raw.get("admin_role_ids", defaults.get("admin_role_ids", []))),
+            "allow_discord_admin_permission": bool(
+                raw.get(
+                    "allow_discord_admin_permission",
+                    defaults.get("allow_discord_admin_permission", True),
+                )
+            ),
+        }
+
+    def _load_discord_control_config(self) -> dict:
+        try:
+            settings = self.config_manager.load_settings() or {}
+        except Exception:
+            settings = {}
+        return self._normalize_discord_control_settings((settings or {}).get("discord_control"))
+
+    def _save_discord_control_config(self, config: dict) -> bool:
+        clean = self._normalize_discord_control_settings(config)
+        try:
+            settings = self.config_manager.load_settings() or {}
+        except Exception:
+            settings = copy.deepcopy(self.config_manager.default_settings)
+        if not isinstance(settings, dict):
+            settings = copy.deepcopy(self.config_manager.default_settings)
+        settings["discord_control"] = clean
+        return bool(self.config_manager.save_settings(settings))
+
+    def _discord_control_config_from_ui(self) -> dict:
+        return self._normalize_discord_control_settings(
+            {
+                "enabled": bool(
+                    getattr(self, "discord_control_enabled_chk", None)
+                    and self.discord_control_enabled_chk.isChecked()
+                ),
+                "token": str(
+                    getattr(self, "discord_control_token_input", None).text()
+                    if getattr(self, "discord_control_token_input", None) is not None
+                    else ""
+                ).strip(),
+                "admin_user_ids": (
+                    getattr(self, "discord_control_admin_users_input", None).toPlainText()
+                    if getattr(self, "discord_control_admin_users_input", None) is not None
+                    else ""
+                ),
+                "admin_role_ids": (
+                    getattr(self, "discord_control_admin_roles_input", None).toPlainText()
+                    if getattr(self, "discord_control_admin_roles_input", None) is not None
+                    else ""
+                ),
+                "allow_discord_admin_permission": bool(
+                    getattr(self, "discord_control_allow_admin_perm_chk", None)
+                    and self.discord_control_allow_admin_perm_chk.isChecked()
+                ),
+            }
+        )
+
+    def _refresh_discord_control_command_docs(self) -> None:
+        doc = getattr(self, "discord_control_help_box", None)
+        if doc is None:
+            return
+        doc.setPlainText(
+            "Commands\n"
+            "/jaram help\n"
+            "/jaram list\n"
+            "/jaram status <account>\n"
+            "/jaram enable <account>\n"
+            "/jaram disable <account>\n\n"
+            "/jaramadmin help\n"
+            "/jaramadmin status <account>\n"
+            "/jaramadmin enable <account>\n"
+            "/jaramadmin disable <account>\n"
+            "/jaramadmin clearflags <account>\n\n"
+            "Notes\n"
+            "- <account> can be a JARAM user ID or exact username.\n"
+            "- User commands only work when the target account is attached to your Discord user ID.\n"
+            "- Admin commands allow Discord administrators by default, plus any explicit admin user IDs / role IDs.\n"
+            "- Account parameters use slash-command autocomplete and narrow results as you type.\n"
+            "- Slash commands require the bot invite to include both the bot and applications.commands scopes.\n"
+            "- Message Content Intent is not needed for slash commands.\n"
+            "- The bot token is stored in settings.json. Use a dedicated bot token."
+        )
+
+    def _get_discord_control_tab_style(self) -> str:
+        return f"""
+            QLabel[discordRole="muted"] {{
+                color: {ModernStyle.TEXT_SECONDARY};
+                background: transparent;
+            }}
+            QLabel[discordRole="sectionTitle"] {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                font-size: 13px;
+                font-weight: 700;
+                background: transparent;
+            }}
+            QLabel[discordRole="panelNote"] {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                border: 1px solid {ModernStyle.BORDER};
+                border-radius: 8px;
+                padding: 8px 10px;
+                color: {ModernStyle.TEXT_SECONDARY};
+            }}
+            QLabel[discordRole="badge"] {{
+                border-radius: 14px;
+                padding: 8px 14px;
+                font-weight: 700;
+            }}
+            QSplitter::handle {{
+                background-color: {ModernStyle.BORDER};
+            }}
+        """
+
+    def _get_discord_control_table_style(self) -> str:
+        return f"""
+            QTableWidget {{
+                background-color: {ModernStyle.SURFACE};
+                border: 1px solid {ModernStyle.BORDER};
+                border-radius: 8px;
+                gridline-color: {ModernStyle.BORDER};
+                selection-background-color: {ModernStyle.PRIMARY_VARIANT};
+                alternate-background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            QTableWidget::item {{
+                padding: 8px;
+                border-bottom: 1px solid {ModernStyle.BORDER};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            QTableWidget::item:selected {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            QHeaderView::section {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+                padding: 8px 10px;
+                border: none;
+                border-right: 1px solid {ModernStyle.BORDER};
+                font-weight: 600;
+            }}
+        """
+
+    def _get_discord_control_picker_style(self) -> str:
+        return f"""
+            QListWidget {{
+                background-color: {ModernStyle.SURFACE};
+                border: 1px solid {ModernStyle.BORDER};
+                border-radius: 8px;
+                color: {ModernStyle.TEXT_PRIMARY};
+                outline: none;
+                alternate-background-color: {ModernStyle.SURFACE_VARIANT};
+            }}
+            QListWidget::item {{
+                padding: 8px 10px;
+                border-bottom: 1px solid {ModernStyle.BORDER};
+                color: {ModernStyle.TEXT_PRIMARY};
+                background-color: transparent;
+            }}
+            QListWidget::item:hover {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+            }}
+            QListWidget::item:selected {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            QListWidget::item:selected:!active {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+        """
+
+    def _get_discord_control_danger_button_style(self) -> str:
+        return f"""
+            QPushButton {{
+                background-color: {ModernStyle.ERROR};
+                color: {ModernStyle.TEXT_PRIMARY};
+                border: none;
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-weight: 500;
+                font-size: 13px;
+                min-width: 80px;
+                min-height: 28px;
+            }}
+            QPushButton:hover {{
+                background-color: #dc2626;
+            }}
+            QPushButton:pressed {{
+                background-color: #b91c1c;
+            }}
+            QPushButton:disabled {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_SECONDARY};
+            }}
+        """
+
+    def _update_discord_control_editor_state(
+        self,
+        discord_uid: str,
+        entries: Optional[List[Tuple[str, str]]] = None,
+        *,
+        total_accounts: int = 0,
+    ) -> None:
+        label = getattr(self, "discord_control_selected_account_label", None)
+        summary = getattr(self, "discord_control_editor_summary_label", None)
+        uid_text = str(discord_uid or "").strip()
+        attached_count = len(entries or [])
+
+        if label is not None:
+            label.setText(
+                f"Editing Discord User ID: {uid_text}"
+                if uid_text
+                else "Editing Discord User ID: None"
+            )
+
+        if summary is not None:
+            if uid_text:
+                summary.setText(
+                    f"{attached_count} account(s) currently attached. "
+                    f"{max(int(total_accounts), 0)} JARAM account(s) are available to link below."
+                )
+            else:
+                summary.setText(
+                    f"{max(int(total_accounts), 0)} JARAM account(s) available. "
+                    "Select a Discord user from the table or paste an ID below to create a new mapping."
+                )
+
+    def _set_discord_control_accounts_picker_selection(self, selected: bool) -> None:
+        picker = getattr(self, "discord_control_accounts_picker", None)
+        if picker is None:
+            return
+        picker.blockSignals(True)
+        try:
+            for row in range(picker.count()):
+                item = picker.item(row)
+                if item is not None:
+                    item.setSelected(selected)
+        finally:
+            picker.blockSignals(False)
+
+    def setup_discord_control_tab(self):
+        self._ensure_discord_control_service()
+
+        tab = QWidget()
+        tab.setStyleSheet(self._get_discord_control_tab_style())
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(14)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(12)
+
+        header = QLabel("Discord Control")
+        header.setStyleSheet(
+            f"font-size: 18px; font-weight: bold; color: {ModernStyle.TEXT_PRIMARY}; padding: 10px 0;"
+        )
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+
+        self.discord_control_status_label = QLabel("Stopped")
+        self.discord_control_status_label.setProperty("discordRole", "badge")
+        self.discord_control_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.discord_control_status_label.setMinimumWidth(148)
+        header_row.addWidget(self.discord_control_status_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(header_row)
+
+        sub = QLabel(
+            "Connect a Discord bot that can manage account enable and disable state from slash commands. "
+            "Admin commands can also clear flags, while linked Discord users are limited to the accounts assigned here."
+        )
+        sub.setWordWrap(True)
+        sub.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(sub)
+
+        self.discord_control_status_detail_label = QLabel("Discord bot is stopped.")
+        self.discord_control_status_detail_label.setStyleSheet(
+            f"color: {ModernStyle.TEXT_SECONDARY}; font-weight: bold;"
+        )
+        self.discord_control_status_detail_label.setWordWrap(True)
+        layout.addWidget(self.discord_control_status_detail_label)
+
+        config_box = QGroupBox("Bot Configuration")
+        config_layout = QVBoxLayout(config_box)
+        config_layout.setSpacing(12)
+
+        config_intro = QLabel(
+            "Store the bot token locally, define Discord admins, and control whether the bot starts when JARAM opens."
+        )
+        config_intro.setWordWrap(True)
+        config_intro.setProperty("discordRole", "muted")
+        config_layout.addWidget(config_intro)
+
+        config_form = QFormLayout()
+        config_form.setContentsMargins(0, 0, 0, 0)
+        config_form.setHorizontalSpacing(12)
+        config_form.setVerticalSpacing(10)
+        config_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+
+        self.discord_control_enabled_chk = QCheckBox("Auto-start bot when JARAM opens")
+        config_form.addRow(self.discord_control_enabled_chk)
+
+        self.discord_control_token_input = QLineEdit()
+        self.discord_control_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.discord_control_token_input.setPlaceholderText("Discord bot token")
+        config_form.addRow("Bot Token:", self.discord_control_token_input)
+
+        self.discord_control_admin_users_input = QTextEdit()
+        self.discord_control_admin_users_input.setMaximumHeight(58)
+        self.discord_control_admin_users_input.setPlaceholderText("Comma or newline separated Discord user IDs")
+        config_form.addRow("Admin User IDs:", self.discord_control_admin_users_input)
+
+        self.discord_control_admin_roles_input = QTextEdit()
+        self.discord_control_admin_roles_input.setMaximumHeight(58)
+        self.discord_control_admin_roles_input.setPlaceholderText("Comma or newline separated Discord role IDs")
+        config_form.addRow("Admin Role IDs:", self.discord_control_admin_roles_input)
+
+        self.discord_control_allow_admin_perm_chk = QCheckBox("Allow members with Discord Administrator permission")
+        self.discord_control_allow_admin_perm_chk.setChecked(True)
+        config_form.addRow(self.discord_control_allow_admin_perm_chk)
+
+        config_layout.addLayout(config_form)
+
+        btn_row = QHBoxLayout()
+        self.discord_control_save_btn = QPushButton("Save Config")
+        self.discord_control_save_btn.setStyleSheet(self._get_secondary_button_style())
+        self.discord_control_save_btn.clicked.connect(self._save_discord_control_config_from_ui)
+        btn_row.addWidget(self.discord_control_save_btn)
+
+        self.discord_control_start_btn = QPushButton("Start Bot")
+        self.discord_control_start_btn.setStyleSheet(self._get_primary_button_style())
+        self.discord_control_start_btn.clicked.connect(self._start_discord_control_bot_from_ui)
+        btn_row.addWidget(self.discord_control_start_btn)
+
+        self.discord_control_stop_btn = QPushButton("Stop Bot")
+        self.discord_control_stop_btn.setStyleSheet(self._get_discord_control_danger_button_style())
+        self.discord_control_stop_btn.clicked.connect(self._stop_discord_control_bot_from_ui)
+        btn_row.addWidget(self.discord_control_stop_btn)
+        btn_row.addStretch(1)
+        config_layout.addLayout(btn_row)
+
+        dep_msg = ""
+        try:
+            dep_msg = self.discord_control_service.dependency_error() if self.discord_control_service else ""
+        except Exception:
+            dep_msg = ""
+        if dep_msg:
+            dep_label = QLabel(dep_msg)
+            dep_label.setWordWrap(True)
+            dep_label.setStyleSheet(f"color: {ModernStyle.WARNING}; font-weight: 600;")
+            config_layout.addWidget(dep_label)
+
+        layout.addWidget(config_box)
+
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(12)
+
+        accounts_box = QGroupBox("Linked Discord Users")
+        accounts_layout = QVBoxLayout(accounts_box)
+        accounts_layout.setSpacing(10)
+
+        accounts_header = QHBoxLayout()
+        self.discord_control_links_summary_label = QLabel("No Discord users linked yet.")
+        self.discord_control_links_summary_label.setProperty("discordRole", "panelNote")
+        self.discord_control_links_summary_label.setWordWrap(True)
+        accounts_header.addWidget(self.discord_control_links_summary_label, 1)
+
+        self.discord_control_refresh_links_btn = QPushButton("Refresh Links")
+        self.discord_control_refresh_links_btn.setStyleSheet(self._get_secondary_button_style())
+        self.discord_control_refresh_links_btn.clicked.connect(self._refresh_discord_control_accounts_table)
+        accounts_header.addWidget(self.discord_control_refresh_links_btn)
+        accounts_layout.addLayout(accounts_header)
+
+        self.discord_control_links_table = QTableWidget()
+        self.discord_control_links_table.setColumnCount(3)
+        self.discord_control_links_table.setHorizontalHeaderLabels(
+            ["Discord User ID", "Attached Accounts", "Count"]
+        )
+        self.discord_control_links_table.setStyleSheet(self._get_discord_control_table_style())
+        self.discord_control_links_table.setAlternatingRowColors(True)
+        self.discord_control_links_table.verticalHeader().setVisible(False)
+        self.discord_control_links_table.setShowGrid(False)
+        self.discord_control_links_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        try:
+            self.discord_control_links_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.discord_control_links_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        except Exception:
+            pass
+        dheader = self.discord_control_links_table.horizontalHeader()
+        dheader.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        dheader.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        dheader.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.discord_control_links_table.itemSelectionChanged.connect(
+            self._on_discord_control_discord_user_selection_changed
+        )
+        accounts_layout.addWidget(self.discord_control_links_table)
+        left_layout.addWidget(accounts_box)
+        main_splitter.addWidget(left_panel)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(12)
+
+        editor_box = QGroupBox("Link Editor")
+        editor_layout = QVBoxLayout(editor_box)
+        editor_layout.setSpacing(10)
+
+        self.discord_control_editor_summary_label = QLabel(
+            "Select a Discord user from the table or paste an ID below to create a new mapping."
+        )
+        self.discord_control_editor_summary_label.setProperty("discordRole", "panelNote")
+        self.discord_control_editor_summary_label.setWordWrap(True)
+        editor_layout.addWidget(self.discord_control_editor_summary_label)
+
+        self.discord_control_selected_account_label = QLabel("Editing Discord User ID: None")
+        self.discord_control_selected_account_label.setProperty("discordRole", "sectionTitle")
+        editor_layout.addWidget(self.discord_control_selected_account_label)
+
+        self.discord_control_discord_user_id_input = QLineEdit()
+        self.discord_control_discord_user_id_input.setPlaceholderText(
+            "Discord user ID to edit or create"
+        )
+        editor_layout.addWidget(self.discord_control_discord_user_id_input)
+
+        picker_hint = QLabel("Select the JARAM accounts attached to this Discord user ID.")
+        picker_hint.setProperty("discordRole", "muted")
+        editor_layout.addWidget(picker_hint)
+
+        picker_header = QHBoxLayout()
+        picker_title = QLabel("Attached JARAM Accounts")
+        picker_title.setProperty("discordRole", "sectionTitle")
+        picker_header.addWidget(picker_title)
+        picker_header.addStretch(1)
+
+        picker_select_all_btn = QPushButton("Select All")
+        picker_select_all_btn.setStyleSheet(self._get_secondary_button_style())
+        picker_select_all_btn.clicked.connect(
+            lambda: self._set_discord_control_accounts_picker_selection(True)
+        )
+        picker_header.addWidget(picker_select_all_btn)
+
+        picker_select_none_btn = QPushButton("Select None")
+        picker_select_none_btn.setStyleSheet(self._get_secondary_button_style())
+        picker_select_none_btn.clicked.connect(
+            lambda: self._set_discord_control_accounts_picker_selection(False)
+        )
+        picker_header.addWidget(picker_select_none_btn)
+        editor_layout.addLayout(picker_header)
+
+        self.discord_control_accounts_picker = QListWidget()
+        try:
+            self.discord_control_accounts_picker.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        except Exception:
+            pass
+        self.discord_control_accounts_picker.setStyleSheet(self._get_discord_control_picker_style())
+        self.discord_control_accounts_picker.setMinimumHeight(220)
+        self.discord_control_accounts_picker.setAlternatingRowColors(False)
+        editor_layout.addWidget(self.discord_control_accounts_picker)
+
+        links_btn_row = QHBoxLayout()
+        self.discord_control_save_links_btn = QPushButton("Save Attached Accounts")
+        self.discord_control_save_links_btn.setStyleSheet(self._get_primary_button_style())
+        self.discord_control_save_links_btn.clicked.connect(self._save_selected_discord_control_links)
+        links_btn_row.addWidget(self.discord_control_save_links_btn)
+        self.discord_control_clear_links_btn = QPushButton("Clear Attached Accounts")
+        self.discord_control_clear_links_btn.setStyleSheet(self._get_discord_control_danger_button_style())
+        self.discord_control_clear_links_btn.clicked.connect(self._clear_selected_discord_control_links)
+        links_btn_row.addWidget(self.discord_control_clear_links_btn)
+        links_btn_row.addStretch(1)
+        editor_layout.addLayout(links_btn_row)
+        right_layout.addWidget(editor_box, 3)
+
+        commands_box = QGroupBox("Slash Command Reference")
+        commands_layout = QVBoxLayout(commands_box)
+        self.discord_control_help_box = QTextEdit()
+        self.discord_control_help_box.setReadOnly(True)
+        self.discord_control_help_box.setFont(QFont("Consolas", 9))
+        self.discord_control_help_box.setMaximumHeight(220)
+        commands_layout.addWidget(self.discord_control_help_box)
+        right_layout.addWidget(commands_box, 2)
+
+        log_box = QGroupBox("Discord Control Log")
+        log_layout = QVBoxLayout(log_box)
+        self.discord_control_log_box = QTextEdit()
+        self.discord_control_log_box.setReadOnly(True)
+        self.discord_control_log_box.setFont(QFont("Consolas", 9))
+        self.discord_control_log_box.setMinimumHeight(180)
+        try:
+            self.discord_control_log_box.document().setMaximumBlockCount(250)
+        except Exception:
+            pass
+        log_layout.addWidget(self.discord_control_log_box)
+        right_layout.addWidget(log_box, 3)
+        main_splitter.addWidget(right_panel)
+
+        main_splitter.setStretchFactor(0, 6)
+        main_splitter.setStretchFactor(1, 5)
+        main_splitter.setSizes([780, 560])
+        layout.addWidget(main_splitter, 1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(tab)
+        self.discord_control_tab_index = self.tab_widget.addTab(scroll, "Discord")
+
+        config = self._load_discord_control_config()
+        self.discord_control_enabled_chk.setChecked(bool(config.get("enabled", False)))
+        self.discord_control_token_input.setText(str(config.get("token") or ""))
+        self.discord_control_admin_users_input.setPlainText("\n".join(config.get("admin_user_ids", [])))
+        self.discord_control_admin_roles_input.setPlainText("\n".join(config.get("admin_role_ids", [])))
+        self.discord_control_allow_admin_perm_chk.setChecked(
+            bool(config.get("allow_discord_admin_permission", True))
+        )
+        self._refresh_discord_control_command_docs()
+        self._refresh_discord_control_accounts_table()
+        self._on_discord_control_state_changed("stopped", "Discord bot is stopped.")
+
+    def _save_discord_control_config_from_ui(self) -> None:
+        config = self._discord_control_config_from_ui()
+        if not self._save_discord_control_config(config):
+            QMessageBox.critical(self, "Discord Control", "Failed to save Discord control settings.")
+            return
+
+        running = bool(self.discord_control_service and self.discord_control_service.is_running())
+        if running:
+            stop_ok, stop_msg = self.discord_control_service.stop()
+            if not stop_ok:
+                QMessageBox.warning(self, "Discord Control", stop_msg)
+                return
+            if str(config.get("token") or "").strip():
+                start_ok, start_msg = self.discord_control_service.start(config)
+                if not start_ok:
+                    QMessageBox.warning(self, "Discord Control", start_msg)
+                    return
+
+        QMessageBox.information(self, "Discord Control", "Discord control settings saved.")
+
+    def _start_discord_control_bot_from_ui(self) -> None:
+        config = self._discord_control_config_from_ui()
+        if not self._save_discord_control_config(config):
+            QMessageBox.critical(self, "Discord Control", "Failed to save Discord control settings.")
+            return
+        if self.discord_control_service is None:
+            QMessageBox.warning(self, "Discord Control", "Discord control service is unavailable.")
+            return
+        if self.discord_control_service.is_running():
+            stop_ok, stop_msg = self.discord_control_service.stop()
+            if not stop_ok:
+                QMessageBox.warning(self, "Discord Control", stop_msg)
+                return
+        ok, msg = self.discord_control_service.start(config)
+        if not ok:
+            QMessageBox.warning(self, "Discord Control", msg)
+
+    def _stop_discord_control_bot_from_ui(self) -> None:
+        if self.discord_control_service is None:
+            QMessageBox.information(self, "Discord Control", "Discord bot is not running.")
+            return
+        ok, msg = self.discord_control_service.stop()
+        if not ok:
+            QMessageBox.warning(self, "Discord Control", msg)
+
+    def _maybe_autostart_discord_control_bot(self) -> None:
+        if not _bm_relaxed():
+            return
+        if self.discord_control_service is None:
+            return
+        if self.discord_control_service.is_running():
+            return
+        config = self._load_discord_control_config()
+        if not bool(config.get("enabled", False)):
+            return
+        if not str(config.get("token") or "").strip():
+            return
+        self.discord_control_service.start(config)
+
+    def _on_discord_control_log(self, message: str) -> None:
+        text = str(message or "").rstrip()
+        if not text:
+            return
+        self._discord_control_log_lines.append(text)
+        self.add_log(text)
+        box = getattr(self, "discord_control_log_box", None)
+        if box is not None:
+            box.append(text)
+            try:
+                box.moveCursor(QTextCursor.MoveOperation.End)
+            except Exception:
+                pass
+
+    def _on_discord_control_state_changed(self, state: str, message: str) -> None:
+        label = getattr(self, "discord_control_status_label", None)
+        detail_label = getattr(self, "discord_control_status_detail_label", None)
+        key = str(state or "").strip().lower()
+        if label is not None:
+            colour = ModernStyle.TEXT_SECONDARY
+            border = ModernStyle.BORDER
+            display = "Stopped"
+            background = ModernStyle.SURFACE_VARIANT
+            if key == "running":
+                colour = ModernStyle.SECONDARY
+                border = ModernStyle.SECONDARY
+                background = ModernStyle.SURFACE
+                display = "Bot Online"
+            elif key == "starting":
+                colour = ModernStyle.WARNING
+                border = ModernStyle.WARNING
+                background = ModernStyle.SURFACE
+                display = "Connecting"
+            elif key == "error":
+                colour = ModernStyle.ERROR
+                border = ModernStyle.ERROR
+                background = ModernStyle.SURFACE
+                display = "Attention Required"
+            label.setText(display)
+            label.setToolTip(str(message or display))
+            label.setStyleSheet(
+                f"background-color: {background}; "
+                f"color: {colour}; "
+                f"border: 1px solid {border}; "
+                f"border-radius: 14px; "
+                f"padding: 8px 14px; "
+                f"font-weight: 700;"
+            )
+
+        if detail_label is not None:
+            detail_label.setText(str(message or "Discord bot is stopped."))
+
+        running_like = key in {"running", "starting"}
+        start_btn = getattr(self, "discord_control_start_btn", None)
+        stop_btn = getattr(self, "discord_control_stop_btn", None)
+        if start_btn is not None:
+            start_btn.setEnabled(not running_like)
+        if stop_btn is not None:
+            stop_btn.setEnabled(running_like)
+
+    def _build_discord_control_link_index(self, users: Optional[dict] = None) -> Dict[str, List[Tuple[str, str]]]:
+        if users is None:
+            users = self.config_manager.load_users() or {}
+        if not isinstance(users, dict):
+            return {}
+
+        def _uid_sort_key(value: str) -> Tuple[int, object]:
+            text = str(value or "").strip()
+            if text.isdigit():
+                try:
+                    return (0, int(text))
+                except Exception:
+                    return (0, text)
+            return (1, text.lower())
+
+        index: Dict[str, List[Tuple[str, str]]] = {}
+        for uid, info in users.items():
+            if not isinstance(info, dict):
+                continue
+            uid_s = str(uid)
+            username = str(info.get("username") or f"User_{uid_s}")
+            for discord_uid in normalize_discord_ids(info.get("discord_user_ids")):
+                index.setdefault(discord_uid, []).append((uid_s, username))
+
+        for discord_uid, entries in index.items():
+            index[discord_uid] = sorted(entries, key=lambda item: _uid_sort_key(item[0]))
+
+        ordered_keys = sorted(index.keys(), key=_uid_sort_key)
+        return {key: index[key] for key in ordered_keys}
+
+    def _normalize_single_discord_user_id(self, raw: object) -> str:
+        ids = normalize_discord_ids(raw)
+        return ids[0] if len(ids) == 1 else ""
+
+    def _format_discord_control_link_summary(self, entries: List[Tuple[str, str]]) -> str:
+        parts = []
+        for uid, username in entries:
+            uname = str(username or uid).strip() or uid
+            parts.append(f"{uname} ({uid})")
+        return ", ".join(parts)
+
+    def _populate_discord_control_accounts_picker(
+        self,
+        users: dict,
+        *,
+        selected_account_ids: Optional[Set[str]] = None,
+    ) -> None:
+        picker = getattr(self, "discord_control_accounts_picker", None)
+        if picker is None:
+            return
+        selected_account_ids = {str(uid) for uid in (selected_account_ids or set())}
+
+        def _uid_sort_key(value: str) -> Tuple[int, object]:
+            text = str(value or "").strip()
+            if text.isdigit():
+                try:
+                    return (0, int(text))
+                except Exception:
+                    return (0, text)
+            return (1, text.lower())
+
+        picker.blockSignals(True)
+        try:
+            picker.clear()
+            if not isinstance(users, dict):
+                return
+            rows: List[Tuple[str, str]] = []
+            for uid, info in users.items():
+                uid_s = str(uid)
+                if isinstance(info, dict):
+                    username = str(info.get("username") or f"User_{uid_s}")
+                else:
+                    username = f"User_{uid_s}"
+                rows.append((uid_s, username))
+            rows.sort(key=lambda item: _uid_sort_key(item[0]))
+            for uid_s, username in rows:
+                item = QListWidgetItem(f"{username} ({uid_s})")
+                item.setData(Qt.ItemDataRole.UserRole, uid_s)
+                picker.addItem(item)
+                if uid_s in selected_account_ids:
+                    item.setSelected(True)
+        finally:
+            picker.blockSignals(False)
+
+    def _refresh_discord_control_accounts_table(self) -> None:
+        table = getattr(self, "discord_control_links_table", None)
+        if table is None:
+            return
+
+        input_box = getattr(self, "discord_control_discord_user_id_input", None)
+        picker = getattr(self, "discord_control_accounts_picker", None)
+        summary_label = getattr(self, "discord_control_links_summary_label", None)
+        selected_uid = str(getattr(self, "discord_control_selected_discord_user_id", "") or "").strip()
+        if not selected_uid and input_box is not None:
+            selected_uid = self._normalize_single_discord_user_id(input_box.text())
+
+        users = self.config_manager.load_users() or {}
+        link_index = self._build_discord_control_link_index(users)
+        total_accounts = len(users) if isinstance(users, dict) else 0
+        total_attachments = sum(len(entries) for entries in link_index.values())
+        if summary_label is not None:
+            if link_index:
+                summary_label.setText(
+                    f"{len(link_index)} Discord user(s) linked across {total_attachments} account attachment(s)."
+                )
+            else:
+                summary_label.setText(
+                    "No Discord user links saved yet. Use the editor on the right to attach accounts."
+                )
+        table.setRowCount(len(link_index))
+        row_to_select = -1
+        for row, (discord_uid, entries) in enumerate(link_index.items()):
+            summary = self._format_discord_control_link_summary(entries)
+            table.setItem(row, 0, QTableWidgetItem(discord_uid))
+            accounts_item = QTableWidgetItem(summary or "None")
+            if summary:
+                accounts_item.setToolTip(summary)
+            table.setItem(row, 1, accounts_item)
+            table.setItem(row, 2, QTableWidgetItem(str(len(entries))))
+            if selected_uid and discord_uid == selected_uid:
+                row_to_select = row
+        if row_to_select >= 0:
+            try:
+                table.selectRow(row_to_select)
+            except Exception:
+                pass
+        else:
+            self.discord_control_selected_discord_user_id = None
+            current_uid = ""
+            if input_box is not None:
+                current_uid = self._normalize_single_discord_user_id(input_box.text())
+            current_entries = link_index.get(current_uid, []) if current_uid else []
+            self._update_discord_control_editor_state(
+                current_uid,
+                current_entries,
+                total_accounts=total_accounts,
+            )
+            if picker is not None:
+                self._populate_discord_control_accounts_picker(users, selected_account_ids=set())
+
+        if picker is not None and selected_uid:
+            entries = link_index.get(selected_uid, [])
+            self._populate_discord_control_accounts_picker(
+                users,
+                selected_account_ids={uid for uid, _username in entries},
+            )
+            self._update_discord_control_editor_state(
+                selected_uid,
+                entries,
+                total_accounts=total_accounts,
+            )
+        elif picker is not None and not selected_uid:
+            self._populate_discord_control_accounts_picker(users, selected_account_ids=set())
+            self._update_discord_control_editor_state("", [], total_accounts=total_accounts)
+
+    def _on_discord_control_discord_user_selection_changed(self) -> None:
+        table = getattr(self, "discord_control_links_table", None)
+        picker = getattr(self, "discord_control_accounts_picker", None)
+        input_box = getattr(self, "discord_control_discord_user_id_input", None)
+        if table is None or picker is None or input_box is None:
+            return
+        users = self.config_manager.load_users() or {}
+        total_accounts = len(users) if isinstance(users, dict) else 0
+        rows = table.selectionModel().selectedRows() if table.selectionModel() else []
+        if not rows:
+            self.discord_control_selected_discord_user_id = None
+            current_uid = self._normalize_single_discord_user_id(input_box.text())
+            if current_uid:
+                link_index = self._build_discord_control_link_index(users)
+                entries = link_index.get(current_uid, [])
+                self._populate_discord_control_accounts_picker(
+                    users,
+                    selected_account_ids={uid for uid, _username in entries},
+                )
+                self._update_discord_control_editor_state(
+                    current_uid,
+                    entries,
+                    total_accounts=total_accounts,
+                )
+            else:
+                self._populate_discord_control_accounts_picker(users, selected_account_ids=set())
+                self._update_discord_control_editor_state("", [], total_accounts=total_accounts)
+            return
+        row = rows[0].row()
+        item = table.item(row, 0)
+        discord_uid = str(item.text()).strip() if item is not None else ""
+        if not discord_uid:
+            return
+        link_index = self._build_discord_control_link_index(users)
+        entries = link_index.get(discord_uid, [])
+        self.discord_control_selected_discord_user_id = discord_uid
+        input_box.setText(discord_uid)
+        self._update_discord_control_editor_state(
+            discord_uid,
+            entries,
+            total_accounts=total_accounts,
+        )
+        self._populate_discord_control_accounts_picker(
+            users,
+            selected_account_ids={uid for uid, _username in entries},
+        )
+
+    def _save_selected_discord_control_links(self) -> None:
+        input_box = getattr(self, "discord_control_discord_user_id_input", None)
+        picker = getattr(self, "discord_control_accounts_picker", None)
+        if input_box is None or picker is None:
+            return
+
+        discord_uid = self._normalize_single_discord_user_id(input_box.text())
+        if not discord_uid:
+            QMessageBox.information(self, "Discord Control", "Enter or select one Discord user ID first.")
+            return
+
+        users = self.config_manager.load_users() or {}
+        if not isinstance(users, dict):
+            users = {}
+
+        desired_account_ids: List[str] = []
+        seen_ids = set()
+        for item in picker.selectedItems():
+            account_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if not account_id or account_id in seen_ids:
+                continue
+            seen_ids.add(account_id)
+            desired_account_ids.append(account_id)
+
+        desired_set = set(desired_account_ids)
+        changed = 0
+        for account_id, info in users.items():
+            if not isinstance(info, dict):
+                continue
+            linked_ids = normalize_discord_ids(info.get("discord_user_ids"))
+            has_link = discord_uid in linked_ids
+            wants_link = str(account_id) in desired_set
+            if wants_link and not has_link:
+                linked_ids.append(discord_uid)
+                info["discord_user_ids"] = normalize_discord_ids(linked_ids)
+                changed += 1
+            elif has_link and not wants_link:
+                info["discord_user_ids"] = [x for x in linked_ids if x != discord_uid]
+                changed += 1
+            users[str(account_id)] = info
+
+        if not self.config_manager.save_users(users):
+            err = self.config_manager.get_cookie_error()
+            QMessageBox.critical(self, "Discord Control", err or "Failed to save attached accounts.")
+            return
+
+        self.discord_control_selected_discord_user_id = discord_uid
+        self._refresh_discord_control_accounts_table()
+        self.add_log(
+            f"[Discord Control] Updated attached accounts for Discord user {discord_uid} "
+            f"({len(desired_account_ids)} account(s), changed={changed})."
+        )
+
+    def _clear_selected_discord_control_links(self) -> None:
+        input_box = getattr(self, "discord_control_discord_user_id_input", None)
+        picker = getattr(self, "discord_control_accounts_picker", None)
+        if input_box is None or picker is None:
+            return
+        discord_uid = self._normalize_single_discord_user_id(input_box.text())
+        if not discord_uid:
+            QMessageBox.information(self, "Discord Control", "Enter or select one Discord user ID first.")
+            return
+
+        users = self.config_manager.load_users() or {}
+        changed = 0
+        for account_id, info in users.items():
+            if not isinstance(info, dict):
+                continue
+            linked_ids = normalize_discord_ids(info.get("discord_user_ids"))
+            if discord_uid not in linked_ids:
+                continue
+            info["discord_user_ids"] = [x for x in linked_ids if x != discord_uid]
+            users[str(account_id)] = info
+            changed += 1
+
+        if not self.config_manager.save_users(users):
+            err = self.config_manager.get_cookie_error()
+            QMessageBox.critical(self, "Discord Control", err or "Failed to clear attached accounts.")
+            return
+
+        self.discord_control_selected_discord_user_id = discord_uid
+        try:
+            picker.clearSelection()
+        except Exception:
+            pass
+        self._refresh_discord_control_accounts_table()
+        self.add_log(
+            f"[Discord Control] Cleared attached accounts for Discord user {discord_uid} "
+            f"(removed from {changed} account(s))."
+        )
+
+    def _submit_discord_control_request(self, payload: dict, timeout: float = 15.0) -> dict:
+        envelope = {
+            "payload": dict(payload or {}),
+            "event": threading.Event(),
+            "response": None,
+        }
+        self._discord_control_action_queue.put(envelope)
+        if not envelope["event"].wait(timeout=max(0.1, float(timeout))):
+            return {"ok": False, "message": "JARAM timed out while processing the Discord command."}
+        response = envelope.get("response")
+        return response if isinstance(response, dict) else {"ok": False, "message": "No response was returned."}
+
+    def _process_discord_control_requests(self) -> None:
+        handled = 0
+        while handled < 8:
+            try:
+                envelope = self._discord_control_action_queue.get_nowait()
+            except queue.Empty:
+                break
+            handled += 1
+            try:
+                payload = envelope.get("payload", {})
+                response = self._handle_discord_control_request(payload)
+            except Exception as exc:
+                response = {"ok": False, "message": f"Discord command failed: {exc}"}
+            envelope["response"] = response
+            try:
+                event = envelope.get("event")
+                if event is not None:
+                    event.set()
+            except Exception:
+                pass
+
+    def _discord_control_account_flags(self, info: object) -> List[str]:
+        if not isinstance(info, dict):
+            return []
+        flags: List[str] = []
+        if bool(info.get("bad", False)):
+            flags.append("bad")
+        if bool(info.get("cap", False)):
+            flags.append("CAP")
+        return flags
+
+    def _discord_control_account_status_text(self, uid: str, info: object) -> str:
+        info = info if isinstance(info, dict) else {}
+        username = str(info.get("username") or uid)
+        state = "Disabled" if bool(info.get("disabled", False)) else "Enabled"
+        flags = self._discord_control_account_flags(info)
+        if flags:
+            state += f" with flags: {'/'.join(flags)}"
+        linked = normalize_discord_ids(info.get("discord_user_ids"))
+        if linked:
+            state += f" | linked Discord IDs: {', '.join(linked)}"
+        return f"{username} ({uid}) is {state}."
+
+    def _resolve_discord_control_account(self, users: dict, account_ref: object) -> Tuple[Optional[str], Optional[dict], str]:
+        ref = str(account_ref or "").strip()
+        if not ref:
+            return None, None, "Account is required."
+        if ref in users and isinstance(users.get(ref), dict):
+            return ref, users.get(ref), ""
+
+        ref_lc = ref.lower()
+        matches: List[Tuple[str, dict]] = []
+        for uid, info in (users or {}).items():
+            if not isinstance(info, dict):
+                continue
+            username = str(info.get("username") or "").strip().lower()
+            if username and username == ref_lc:
+                matches.append((str(uid), info))
+
+        if len(matches) == 1:
+            return matches[0][0], matches[0][1], ""
+        if len(matches) > 1:
+            return None, None, f"Multiple accounts matched '{ref}'. Use the user ID instead."
+        return None, None, f"Account '{ref}' was not found."
+
+    def _save_discord_control_users(self, users: dict, *, refresh_ui: bool = True) -> Tuple[bool, str]:
+        if not self.config_manager.save_users(users):
+            err = self.config_manager.get_cookie_error()
+            return False, err or "Failed to save users.json."
+        if refresh_ui:
+            try:
+                self.refresh_users()
+            except Exception:
+                pass
+            try:
+                self.refresh_accounts_list()
+            except Exception:
+                pass
+            try:
+                self._refresh_discord_control_accounts_table()
+            except Exception:
+                pass
+        return True, ""
+
+    def _discord_control_usage_log_path(self) -> Path:
+        try:
+            base_dir = Path(self.config_manager.config_dir)
+        except Exception:
+            base_dir = Path(os.getenv("APPDATA", Path.home())) / "JARAM"
+        logs_dir = base_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        return logs_dir / "discord_command_usage.jsonl"
+
+    def _discord_control_command_label(self, action_type: str) -> str:
+        labels = {
+            "list_linked_accounts": "/jaram list",
+            "get_linked_account_status": "/jaram status",
+            "set_linked_account_disabled": "/jaram enable/disable",
+            "get_account_status": "/jaramadmin status",
+            "set_account_disabled": "/jaramadmin enable/disable",
+            "clear_account_flags": "/jaramadmin clearflags",
+        }
+        return labels.get(str(action_type or "").strip().lower(), str(action_type or "").strip())
+
+    def _discord_control_record_command_usage(
+        self,
+        payload: dict,
+        *,
+        response: Optional[dict] = None,
+    ) -> dict:
+        payload = payload if isinstance(payload, dict) else {}
+        response = response if isinstance(response, dict) else None
+        action_type = str(payload.get("type") or "").strip().lower()
+
+        command_name = str(payload.get("command_name") or "").strip()
+        if command_name and not command_name.startswith("/"):
+            command_name = f"/{command_name}"
+        if not command_name:
+            command_name = self._discord_control_command_label(action_type)
+
+        ok_value = payload.get("ok", None)
+        if response is not None:
+            ok_value = response.get("ok", ok_value)
+
+        message = str(payload.get("message") or "").strip()
+        if response is not None:
+            message = str(response.get("message") or message).strip()
+
+        record = {
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "command": command_name,
+            "request_type": action_type,
+            "discord_user_id": str(payload.get("discord_user_id") or "").strip(),
+            "discord_user_name": str(payload.get("discord_user_name") or "").strip(),
+            "guild_id": str(payload.get("guild_id") or "").strip(),
+            "guild_name": str(payload.get("guild_name") or "").strip(),
+            "channel_id": str(payload.get("channel_id") or "").strip(),
+            "channel_name": str(payload.get("channel_name") or "").strip(),
+            "account_ref": str(payload.get("account_ref") or "").strip(),
+            "ok": bool(ok_value) if ok_value is not None else None,
+            "message": message[:1000],
+        }
+        if response is not None:
+            record["target_account_id"] = str(response.get("account_id") or "").strip()
+            record["target_username"] = str(response.get("username") or "").strip()
+            if "disabled" in response:
+                record["disabled"] = bool(response.get("disabled", False))
+            if "flags" in response:
+                record["flags"] = [str(flag) for flag in (response.get("flags") or [])]
+
+        try:
+            path = self._discord_control_usage_log_path()
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            return {"ok": True, "message": f"Command usage recorded in {path}."}
+        except Exception as exc:
+            try:
+                _logger.warning("Failed to write Discord command usage log: %s", exc)
+            except Exception:
+                pass
+            return {"ok": False, "message": f"Failed to record command usage: {exc}"}
+
+    def _handle_discord_control_request(self, payload: dict) -> dict:
+        action_type = str((payload or {}).get("type") or "").strip().lower()
+        if action_type == "record_command_usage":
+            return self._discord_control_record_command_usage(payload)
+        if action_type == "list_linked_accounts":
+            response = self._discord_control_list_linked_accounts(payload)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        if action_type == "autocomplete_linked_accounts":
+            return self._discord_control_autocomplete_accounts(payload, require_link=True)
+        if action_type == "autocomplete_accounts":
+            return self._discord_control_autocomplete_accounts(payload, require_link=False)
+        if action_type == "get_linked_account_status":
+            response = self._discord_control_get_account_status(payload, require_link=True)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        if action_type == "get_account_status":
+            response = self._discord_control_get_account_status(payload, require_link=False)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        if action_type == "set_linked_account_disabled":
+            response = self._discord_control_set_account_disabled(payload, require_link=True)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        if action_type == "set_account_disabled":
+            response = self._discord_control_set_account_disabled(payload, require_link=False)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        if action_type == "clear_account_flags":
+            response = self._discord_control_clear_account_flags(payload)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        return {"ok": False, "message": f"Unknown Discord control request: {action_type or 'missing'}"}
+
+    def _discord_control_list_linked_accounts(self, payload: dict) -> dict:
+        actor_id = str((payload or {}).get("discord_user_id") or "").strip()
+        if not actor_id:
+            return {"ok": False, "message": "Discord user ID is missing."}
+        users = self.config_manager.load_users() or {}
+        accounts: List[dict] = []
+        for uid, info in users.items():
+            if not isinstance(info, dict):
+                continue
+            if actor_id not in normalize_discord_ids(info.get("discord_user_ids")):
+                continue
+            accounts.append(
+                {
+                    "account_id": str(uid),
+                    "username": str(info.get("username") or f"User_{uid}"),
+                    "disabled": bool(info.get("disabled", False)),
+                    "flags": self._discord_control_account_flags(info),
+                }
+            )
+        accounts.sort(
+            key=lambda entry: (
+                str(entry.get("username") or "").strip().lower(),
+                str(entry.get("account_id") or "").strip(),
+            )
+        )
+        return {"ok": True, "accounts": accounts}
+
+    def _discord_control_autocomplete_accounts(self, payload: dict, *, require_link: bool) -> dict:
+        users = self.config_manager.load_users() or {}
+        if not isinstance(users, dict):
+            users = {}
+
+        actor_id = str((payload or {}).get("discord_user_id") or "").strip()
+        if require_link and not actor_id:
+            return {"ok": False, "message": "Discord user ID is missing."}
+
+        query = str((payload or {}).get("query") or "").strip().lower()
+        try:
+            limit = int((payload or {}).get("limit", 25))
+        except Exception:
+            limit = 25
+        limit = max(1, min(limit, 25))
+
+        def _match_rank(uid: str, username: str) -> Optional[Tuple[int, str, object]]:
+            uid_text = str(uid or "").strip()
+            user_text = str(username or "").strip()
+            label = f"{user_text} ({uid_text})".strip()
+            if not query:
+                return (3, user_text.lower(), int(uid_text) if uid_text.isdigit() else uid_text.lower())
+
+            uid_lc = uid_text.lower()
+            user_lc = user_text.lower()
+            label_lc = label.lower()
+
+            if uid_lc.startswith(query):
+                return (0, user_lc, int(uid_text) if uid_text.isdigit() else uid_lc)
+            if user_lc.startswith(query):
+                return (1, user_lc, int(uid_text) if uid_text.isdigit() else uid_lc)
+            if query in label_lc:
+                return (2, user_lc, int(uid_text) if uid_text.isdigit() else uid_lc)
+            return None
+
+        matches: List[Tuple[Tuple[int, str, object], dict]] = []
+        for uid, info in users.items():
+            if not isinstance(info, dict):
+                continue
+            if require_link and actor_id not in normalize_discord_ids(info.get("discord_user_ids")):
+                continue
+            uid_text = str(uid)
+            username = str(info.get("username") or f"User_{uid_text}")
+            rank = _match_rank(uid_text, username)
+            if rank is None:
+                continue
+            matches.append(
+                (
+                    rank,
+                    {
+                        "account_id": uid_text,
+                        "username": username,
+                        "disabled": bool(info.get("disabled", False)),
+                        "flags": self._discord_control_account_flags(info),
+                    },
+                )
+            )
+
+        matches.sort(key=lambda item: item[0])
+        return {"ok": True, "accounts": [entry for _rank, entry in matches[:limit]]}
+
+    def _discord_control_get_account_status(self, payload: dict, *, require_link: bool) -> dict:
+        users = self.config_manager.load_users() or {}
+        uid, info, err = self._resolve_discord_control_account(users, (payload or {}).get("account_ref"))
+        if not uid or not isinstance(info, dict):
+            return {"ok": False, "message": err or "Account not found."}
+        if require_link:
+            actor_id = str((payload or {}).get("discord_user_id") or "").strip()
+            linked_ids = normalize_discord_ids(info.get("discord_user_ids"))
+            if not actor_id or actor_id not in linked_ids:
+                return {"ok": False, "message": f"You are not linked to {info.get('username', uid)} ({uid})."}
+        return {
+            "ok": True,
+            "message": self._discord_control_account_status_text(uid, info),
+            "account_id": uid,
+            "username": str(info.get("username") or uid),
+            "disabled": bool(info.get("disabled", False)),
+            "flags": self._discord_control_account_flags(info),
+        }
+
+    def _discord_control_set_account_disabled(self, payload: dict, *, require_link: bool) -> dict:
+        users = self.config_manager.load_users() or {}
+        uid, info, err = self._resolve_discord_control_account(users, (payload or {}).get("account_ref"))
+        if not uid or not isinstance(info, dict):
+            return {"ok": False, "message": err or "Account not found."}
+
+        actor_id = str((payload or {}).get("discord_user_id") or "").strip()
+        if require_link:
+            linked_ids = normalize_discord_ids(info.get("discord_user_ids"))
+            if not actor_id or actor_id not in linked_ids:
+                return {"ok": False, "message": f"You are not linked to {info.get('username', uid)} ({uid})."}
+
+        target_disabled = bool((payload or {}).get("disabled", False))
+        previous = bool(info.get("disabled", False))
+        info["disabled"] = target_disabled
+        users[uid] = info
+        ok, err_msg = self._save_discord_control_users(users)
+        if not ok:
+            return {"ok": False, "message": err_msg}
+
+        if target_disabled and not previous and self.worker_thread and self.worker_thread.isRunning():
+            try:
+                self.worker_thread.kill_user_processes(uid)
+            except Exception:
+                pass
+
+        username = str(info.get("username") or uid)
+        flags = self._discord_control_account_flags(info)
+        message = f"{username} ({uid}) {'disabled' if target_disabled else 'enabled'}."
+        if flags:
+            message += f" Flags still set: {'/'.join(flags)}."
+
+        actor_text = f"linked user {actor_id}" if require_link else "admin command"
+        self.add_log(f"[Discord Control] {actor_text} set {username} ({uid}) disabled={target_disabled}")
+        return {
+            "ok": True,
+            "message": message,
+            "account_id": uid,
+            "username": username,
+            "disabled": target_disabled,
+            "flags": flags,
+        }
+
+    def _discord_control_clear_account_flags(self, payload: dict) -> dict:
+        users = self.config_manager.load_users() or {}
+        uid, info, err = self._resolve_discord_control_account(users, (payload or {}).get("account_ref"))
+        if not uid or not isinstance(info, dict):
+            return {"ok": False, "message": err or "Account not found."}
+
+        had_flags = bool(info.get("bad", False) or info.get("cap", False))
+        info["bad"] = False
+        info["cap"] = False
+        users[uid] = info
+        ok, err_msg = self._save_discord_control_users(users)
+        if not ok:
+            return {"ok": False, "message": err_msg}
+
+        username = str(info.get("username") or uid)
+        if had_flags:
+            self.add_log(f"[Discord Control] admin command cleared flags for {username} ({uid})")
+            return {
+                "ok": True,
+                "message": f"Cleared flags for {username} ({uid}).",
+                "account_id": uid,
+                "username": username,
+            }
+        return {
+            "ok": True,
+            "message": f"{username} ({uid}) did not have any flags set.",
+            "account_id": uid,
+            "username": username,
+        }
+
     def setup_timers(self):
 
         self.ui_timer = QTimer()
@@ -18814,6 +20382,84 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.uptime_timer = QTimer()
         self.uptime_timer.timeout.connect(self.update_uptime)
         self.uptime_timer.start(1000)
+
+    def _manager_uptime_seconds(self, *, now: Optional[float] = None) -> float:
+        if not self.start_time:
+            return 0.0
+        try:
+            ref = float(now if now is not None else (self._paused_at if self._paused_at else time.time()))
+            return max(0.0, ref - float(self.start_time))
+        except Exception:
+            return 0.0
+
+    def _persist_paused_manager_state(self) -> bool:
+        resume_state = self._paused_worker_state if isinstance(self._paused_worker_state, dict) else None
+        if not resume_state:
+            return False
+
+        paused_at = float(self._paused_at or time.time())
+        payload = {
+            "version": 1,
+            "saved_at": time.time(),
+            "paused_at": paused_at,
+            "uptime_seconds": self._manager_uptime_seconds(now=paused_at),
+            "resume_state": copy.deepcopy(resume_state),
+        }
+        return bool(self.config_manager.save_manager_pause_state(payload))
+
+    def _clear_persisted_paused_manager_state(self) -> None:
+        try:
+            self.config_manager.clear_manager_pause_state()
+        except Exception:
+            pass
+
+    def _restore_paused_manager_state_from_disk(self) -> None:
+        try:
+            payload = self.config_manager.load_manager_pause_state()
+        except Exception:
+            payload = None
+
+        if not isinstance(payload, dict) or not payload:
+            return
+
+        resume_state = payload.get("resume_state")
+        if not isinstance(resume_state, dict) or not resume_state:
+            legacy_resume_state = payload if isinstance(payload.get("user_states"), dict) else None
+            resume_state = legacy_resume_state if isinstance(legacy_resume_state, dict) else None
+
+        if not isinstance(resume_state, dict) or not resume_state:
+            self._clear_persisted_paused_manager_state()
+            return
+
+        now = time.time()
+        try:
+            uptime_seconds = max(0.0, float(payload.get("uptime_seconds", 0.0) or 0.0))
+        except Exception:
+            uptime_seconds = 0.0
+
+        self._paused_worker_state = copy.deepcopy(resume_state)
+        self._manager_paused = True
+        self._paused_at = now
+        self.start_time = (now - uptime_seconds) if uptime_seconds > 0.0 else None
+
+        try:
+            cached_rows = resume_state.get("multiscope_rows")
+            if isinstance(cached_rows, list) and cached_rows:
+                self.update_multiscope(cached_rows)
+        except Exception:
+            pass
+
+        self.start_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Resume Manager")
+        self.stop_btn.setEnabled(True)
+        self.status_label.setText("Status: Paused")
+        self.status_label.setStyleSheet(f"color: {ModernStyle.WARNING}; font-weight: bold;")
+
+        try:
+            self.add_log("[UI] Restored paused manager state from disk. Press Resume Manager to continue.")
+        except Exception:
+            pass
 
     def start_manager(self):
         if self._manager_paused and self._paused_worker_state and not (self.worker_thread and self.worker_thread.isRunning()):
@@ -18850,6 +20496,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             QMessageBox.critical(self, "Config Error", f"Error reading user configuration: {e}")
             return
 
+        self._clear_persisted_paused_manager_state()
         self.worker_thread = WorkerThread(self.config_manager)
         self.worker_thread.log_signal.connect(self.add_log)
         self.worker_thread.status_signal.connect(self.update_user_status)
@@ -18904,6 +20551,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._paused_at = None
         self._paused_worker_state = None
         self._manager_paused = False
+        self._clear_persisted_paused_manager_state()
 
     def update_uptime(self):
         if self.start_time:
@@ -18975,6 +20623,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._manager_paused = True
         self._paused_at = time.time()
 
+        if self._paused_worker_state:
+            if not self._persist_paused_manager_state():
+                self.add_log("[UI] Failed to save paused manager state to disk; closing now will lose the resume snapshot.")
+        else:
+            self._clear_persisted_paused_manager_state()
+            self.add_log("[UI] Pause snapshot was unavailable; closing now will lose the resume snapshot.")
+
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self.pause_btn.setText("Resume Manager")
@@ -19006,6 +20661,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.worker_thread.multiscope_signal.connect(self.update_multiscope)
 
         self.worker_thread.start()
+        self._clear_persisted_paused_manager_state()
 
         if self.ocr_enable_chk.isChecked():
             self._start_ocr_worker()
@@ -21121,7 +22777,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def show_about(self):
         config_info = self.config_manager.get_config_info()
         QMessageBox.about(self, "About J.JARAM",
-                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x51\n\n"
+                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x54\n\n"
                          "Advanced multi-account Roblox session manager\n"
                          "with automated log based monitoring and process management.\n\n"
                          "Built with PySide6 and modern design principles.\n\n"
@@ -21558,6 +23214,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "alternate_launch": alternate,
             "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
             "cap": False,
+            "discord_user_ids": [],
         }
         users_config[user_id] = account_data
         if self.config_manager.save_users(users_config):
@@ -21625,6 +23282,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             )
             delete_btn.clicked.connect(lambda _, uid=user_id: self.delete_account(uid))
             self.accounts_list.setCellWidget(row, 5, delete_btn)
+        try:
+            self._refresh_discord_control_accounts_table()
+        except Exception:
+            pass
 
     def edit_account(self, user_id):
         users_config = self.config_manager.load_users()
@@ -21734,6 +23395,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "cap": existing.get("cap", False),
             "alternate_launch": alternate,
             "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
+            "discord_user_ids": normalize_discord_ids(existing.get("discord_user_ids")),
         }
         users_config[user_id] = account_data
         if self.config_manager.save_users(users_config):
@@ -22179,6 +23841,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         self.trimmer_tab.shutdown()
                     except Exception:
                         pass
+                if getattr(self, "discord_control_service", None):
+                    try:
+                        self.discord_control_service.stop(timeout=5.0)
+                    except Exception:
+                        pass
                 try:
                     self._unregister_auto_item_hotkey()
                 except Exception:
@@ -22215,6 +23882,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if getattr(self, "trimmer_tab", None):
                 try:
                     self.trimmer_tab.shutdown()
+                except Exception:
+                    pass
+            if getattr(self, "discord_control_service", None):
+                try:
+                    self.discord_control_service.stop(timeout=5.0)
                 except Exception:
                     pass
             try:
@@ -22636,7 +24308,7 @@ def main():
     app = QApplication(sys.argv)
 
     app.setApplicationName("J.JARAM")
-    app.setApplicationVersion("JX 2x51")
+    app.setApplicationVersion("JX 2x54")
     app.setOrganizationName("Jirach1")
     # Qt 6 ships a Windows 11 style that can change widget visuals. Force the
     # Windows 10-era style for consistent UI across OS versions.

@@ -56,7 +56,7 @@ except Exception:
     WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
 
 
-APP_FOOTER = "J.JARAM JX 2x51"
+APP_FOOTER = "J.JARAM JX 2x54"
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
 # Helpers
@@ -1652,6 +1652,94 @@ class MultiScopeEngine:
             self._menu_unknown_log_by_uid.pop(str(uid), None)
         except Exception:
             pass
+
+    def recover_user_log_tracking(self, uid: str) -> bool:
+        """
+        Best-effort recovery path for a live user whose strict username->log match
+        has reappeared after a disconnect. This clears stale detach state and
+        immediately re-resolves/warmstarts the user's current log.
+        """
+        uid_s = str(uid or "").strip()
+        if not uid_s:
+            return False
+
+        try:
+            self._ignored_logs_by_uid.pop(uid_s, None)
+        except Exception:
+            pass
+        try:
+            self._menu_none_since_by_uid.pop(uid_s, None)
+        except Exception:
+            pass
+        try:
+            self._menu_none_disconnect_fired_by_uid.discard(uid_s)
+        except Exception:
+            pass
+        try:
+            self._last_disconnect_sig_by_uid.pop(uid_s, None)
+        except Exception:
+            pass
+        try:
+            self._clear_menu_unknown(uid_s)
+        except Exception:
+            pass
+
+        target_np = ""
+        try:
+            uname = str(self._get_username(uid_s) or "").strip().lower()
+        except Exception:
+            uname = ""
+        if uname:
+            try:
+                target_np = self._normalize_log_path(
+                    find_log_for_username(uname, allow_fallback=False)
+                )
+            except Exception:
+                target_np = ""
+
+        cur = None
+        try:
+            cur = self._cur.get(uid_s)
+        except Exception:
+            cur = None
+        try:
+            cur_np = self._normpath_by_uid.get(uid_s) or self._normalize_log_path(cur.path if cur else None)
+        except Exception:
+            cur_np = ""
+
+        already_attached = bool(
+            target_np
+            and cur_np
+            and target_np == cur_np
+            and cur
+            and cur.path
+            and os.path.isfile(cur.path)
+        )
+        if already_attached:
+            try:
+                self._watch_dir_for_path(cur.path)
+            except Exception:
+                pass
+            return True
+
+        try:
+            self._resolve_current_log(uid_s, force=True)
+        except Exception:
+            return False
+
+        try:
+            cur = self._cur.get(uid_s)
+            if not (cur and cur.path and os.path.isfile(cur.path)):
+                return False
+        except Exception:
+            return False
+
+        try:
+            self._warmstart_user_tail(uid_s)
+        except Exception:
+            pass
+
+        return True
 
     def _scan_disconnect_in_text(
         self,

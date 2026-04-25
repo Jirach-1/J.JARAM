@@ -9,6 +9,7 @@ Pillow
 pyautoit
 watchdog
 rapidocr-onnxruntime
+discord.py
 # Run these separately afterwards
 # pip uninstall onnxruntime
 # pip install onnxruntime-directML

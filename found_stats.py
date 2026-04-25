@@ -463,6 +463,9 @@ class FoundStatsMixin:
         P_EGH = _stable_u32("egh")
         P_EGC = _stable_u32("egc")
         P_EGS = _stable_u32("egs")
+        P_SGSP = _stable_u32("sgsp")
+        P_SGR = _stable_u32("sgr")
+        P_SGPH = _stable_u32("sgph")
 
         P_M = _stable_u32("m")
         P_RS = _stable_u32("rs")
@@ -642,6 +645,7 @@ class FoundStatsMixin:
                 is_blood = biome_key == "BLOOD RAIN"
                 is_aurora = biome_key == "AURORA"
                 is_eggland = biome_key == "EGGLAND"
+                is_singularity = biome_key == "SINGULARITY"
 
                 is_void = is_null or is_corruption
                 is_celestial = is_starfall or is_aurora or is_heaven
@@ -727,6 +731,12 @@ class FoundStatsMixin:
                     hue_amp = 0.08
                     shimmer = 0.95
                     glow_alpha = 120
+                elif is_singularity:
+                    speed *= 1.18
+                    amp *= 1.18
+                    hue_amp = 0.15
+                    shimmer = 1.05
+                    glow_alpha = 140
                 elif is_cyber:
                     speed *= 1.10
                     amp *= 0.85
@@ -1060,6 +1070,40 @@ class FoundStatsMixin:
                                 painter.setBrush(egg)
                         painter.setBrush(Qt.BrushStyle.NoBrush)
 
+                    if is_singularity:
+                        core_cx = rx0 + (rw0 * 0.50) + math.sin(t * 0.45 + phase0) * 4.0
+                        core_cy = ry0 + (rh0 * 0.50) + math.cos(t * 0.60 + phase0) * 1.5
+                        core_rx = max(7.0, rw0 * 0.09)
+                        core_ry = max(4.5, rh0 * 0.16)
+
+                        painter.setPen(QColor(0, 0, 0, 0))
+                        painter.setBrush(QColor(8, 12, 34, 140))
+                        painter.drawEllipse(QPointF(core_cx, core_cy), core_rx, core_ry)
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+                        for ring_idx in range(2):
+                            ring = QColor(95 + (ring_idx * 35), 150 + (ring_idx * 25), 255, 75 - (ring_idx * 20))
+                            painter.setPen(ring)
+                            ring_rx = core_rx * (1.65 + ring_idx * 0.55) + math.sin(t * (0.90 + ring_idx * 0.35) + phase0) * 1.2
+                            ring_ry = core_ry * (1.30 + ring_idx * 0.35) + math.cos(t * (0.75 + ring_idx * 0.25) + phase0) * 0.8
+                            painter.drawEllipse(QPointF(core_cx, core_cy), ring_rx, ring_ry)
+
+                        mote = QColor(170, 215, 255, 90)
+                        painter.setPen(mote)
+                        for k in range(20):
+                            ang = (t * (0.55 + 0.85 * _r01(P_SGSP, k))) + ((math.pi * 2.0) * _r01(P_SGPH, k))
+                            orbit = max(6.0, rw0 * (0.12 + 0.35 * _r01(P_SGR, k)))
+                            spiral = 0.55 + 0.45 * math.sin(t * 0.75 + k * 0.85 + phase0)
+                            ox = math.cos(ang) * orbit * spiral
+                            oy = math.sin(ang * 1.28) * max(4.0, orbit * 0.30)
+                            x0 = core_cx + ox
+                            y0 = core_cy + oy
+                            trail_x = core_cx + (ox * 0.72)
+                            trail_y = core_cy + (oy * 0.72)
+                            painter.drawLine(QPointF(x0, y0), QPointF(trail_x, trail_y))
+                            if (k % 4) == 0:
+                                painter.drawPoint(QPointF(x0, y0))
+
                     if is_heaven:
                         # Falling light blocks that pulse outward, then dissolve at the bottom.
                         travel = rh0 + 60.0
@@ -1201,6 +1245,9 @@ class FoundStatsMixin:
                 if is_eggland:
                     global_dx += math.sin(t * 0.95 + phase0) * 0.9
                     global_dy += math.sin(t * 1.20 + phase0) * 0.45
+                if is_singularity:
+                    global_dx += math.sin(t * 1.35 + phase0) * 0.85
+                    global_dy += math.cos(t * 1.05 + phase0) * 0.55
                 if is_glitch:
                     # Fast whole-word shake (doesn't change per-letter spacing).
                     global_dx += math.sin(t * 6.20 + phase0) * 0.9
@@ -1229,6 +1276,8 @@ class FoundStatsMixin:
                     sweep_speed = 2.0
                 elif is_aurora:
                     sweep_speed = 1.0
+                elif is_singularity:
+                    sweep_speed = 1.8
                 sweep_pos = ((t * sweep_speed) + float((seed >> 16) % 13)) % float(len(text) + 10) - 5.0
 
                 scan_y = ry0 + ((t * 70.0 + float(seed % 997)) % rh0)
@@ -1238,6 +1287,8 @@ class FoundStatsMixin:
                     shadow = QColor(10, 0, 20, 170)
                 if is_hell or is_blood:
                     shadow = QColor(30, 0, 0, 180)
+                if is_singularity:
+                    shadow = QColor(4, 8, 28, 185)
                 if is_cyber:
                     shadow = QColor(0, 20, 20, 170)
 
@@ -1358,6 +1409,14 @@ class FoundStatsMixin:
                         hop = 0.5 - 0.5 * math.cos(t * 1.85 + ph)
                         dy -= hop * (amp * 0.80)
                         dx += math.sin(t * 1.00 + ph) * (amp * 0.26)
+                    elif is_singularity:
+                        # Spiral orbit with a mild inward pull toward the center letters.
+                        center_offset = float(i) - (float(len(text) - 1) * 0.50)
+                        pull = max(0.0, 1.0 - (abs(center_offset) / max(1.0, float(len(text)) * 0.50)))
+                        spin = (t * 1.75) + (center_offset * 0.58) + phase0
+                        dx += math.sin(spin) * (amp * (0.30 + 0.45 * pull))
+                        dy += math.cos(spin * 1.18) * (amp * (0.55 + 0.30 * pull))
+                        dx -= center_offset * 0.14 * (0.55 + 0.45 * math.sin(t * 1.20 + ph))
                     elif is_corruption:
                         # Corrupted crawl + occasional snap (no wave).
                         frame = int(t * 10.0)
@@ -1417,6 +1476,8 @@ class FoundStatsMixin:
                         hue_grad = pos * 0.05
                     elif is_eggland:
                         hue_grad = pos * 0.09
+                    elif is_singularity:
+                        hue_grad = pos * 0.10
 
                     hue_phase = (math.pi * 2.0) * _r01(P_HP, i)
                     hue = hue0 + hue_grad + hue_bias + (hue_amp * math.sin(t * 1.10 + hue_phase + (phase0 * 0.15)))
@@ -1467,6 +1528,11 @@ class FoundStatsMixin:
                         hue = (0.05 + (0.38 * tone) + (0.04 * math.sin(t * 1.25 + phase0 + i * 0.18))) % 1.0
                         sat = _clamp01(sat * 0.58)
                         val = _clamp01(val * 1.15)
+                    if is_singularity:
+                        well = 0.5 + 0.5 * math.sin(t * 1.35 + phase0 + i * 0.20)
+                        hue = (0.58 + (0.10 * well) + (pos * 0.04)) % 1.0
+                        sat = _clamp01(max(sat * 0.95, 0.72))
+                        val = _clamp01(max(val * 0.92, 0.55 + 0.38 * well))
                     if is_glitch:
                         # Hard swap between RGB primaries + white (no hue drifting).
                         rgb_frame = int(t * 8.0)
@@ -1483,7 +1549,7 @@ class FoundStatsMixin:
 
                     # Highlight/sweep (stars, aurora ribbon, cyber scanline, sun flare).
                     hi = 0.0
-                    if is_starfall or is_aurora or is_heaven or is_cyber or is_blazing or is_eggland:
+                    if is_starfall or is_aurora or is_heaven or is_cyber or is_blazing or is_eggland or is_singularity:
                         radius = 3.0
                         if is_aurora:
                             radius = 4.6
@@ -1493,9 +1559,15 @@ class FoundStatsMixin:
                             radius = 2.2
                         elif is_eggland:
                             radius = 4.0
+                        elif is_singularity:
+                            radius = 3.6
                         dist = abs(float(i) - float(sweep_pos))
                         hi = max(0.0, 1.0 - dist / radius)
                         hi *= hi
+                    if is_singularity:
+                        center_hi = max(0.0, 1.0 - abs(pos) * 2.4)
+                        center_hi *= 0.45 + 0.55 * (0.5 + 0.5 * math.sin(t * 1.45 + phase0))
+                        hi = max(hi, center_hi)
                     if is_cyber:
                         scan_hi = max(0.0, 1.0 - abs(py - scan_y) / 5.0)
                         scan_hi *= scan_hi
@@ -1549,6 +1621,17 @@ class FoundStatsMixin:
                         painter.setPen(spark_col)
                         p0.setX(px + (w * 0.50)); p0.setY(py - 4.0)
                         painter.drawPoint(p0)
+                    if is_singularity and hi > 0.20:
+                        spark_col.setRgb(215, 235, 255, min(190, 75 + int(115.0 * hi)))
+                        painter.setPen(spark_col)
+                        cx = px + (w * 0.48)
+                        cy = py - 4.0
+                        p0.setX(cx - 1.8); p0.setY(cy)
+                        p1.setX(cx + 1.8); p1.setY(cy)
+                        painter.drawLine(p0, p1)
+                        if hi > 0.50:
+                            p0.setX(cx); p0.setY(cy - 1.6)
+                            painter.drawPoint(p0)
 
                     # Glitched: chromatic split.
                     if is_glitch:
@@ -1633,7 +1716,8 @@ class FoundStatsMixin:
                                 f"[BiomePaintSpike] biome={biome_key} row={index.row()} dt={dt_ms:.1f}ms "
                                 f"rect={cell_rect.width()}x{cell_rect.height()} text_len={len(text)} "
                                 f"glitch={is_glitch} cyber={is_cyber} rainy={is_rainy} snowy={is_snowy} "
-                                f"hell={is_hell} blazing={is_blazing} starfall={is_starfall} eggland={is_eggland}"
+                                f"hell={is_hell} blazing={is_blazing} starfall={is_starfall} eggland={is_eggland} "
+                                f"singularity={is_singularity}"
                             )
                     # accumulate stats for summary printing
                     self._dbg_acc_ms = getattr(self, "_dbg_acc_ms", 0.0) + dt_ms

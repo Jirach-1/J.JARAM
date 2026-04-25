@@ -59,6 +59,11 @@
         "thumbnail_url": "https://i.postimg.cc/rFjCcW3w/image.png",
         "Timer": "192"
     },
+    "Singularity": {
+        "color": "0x011ab7",
+        "thumbnail_url": "https://images.stockcake.com/public/1/5/a/15a57388-244b-4e36-ade9-871b031bb041_medium/cosmic-anime-vortex-stockcake.jpg",
+        "Timer": "1200"
+    },
     "NORMAL": {
         "color": "0x00ff00",
         "thumbnail_url": "https://static.wikia.nocookie.net/sol-rng/images/c/c9/Daytime_img.png/revision/latest/scale-to-width-down/1000?cb=20241116044859"
