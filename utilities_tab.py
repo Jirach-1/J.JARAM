@@ -1139,41 +1139,41 @@ class _PSLWorker(QThread):
                     if last_err: raise last_err
                     raise RuntimeError("Element not found")
 
-                def _any_present_now(selectors: List[str]) -> bool:
+                def _click_first_now(selectors: List[str]) -> bool:
                     for sel in selectors:
                         by, val = ((By.XPATH, sel) if sel.startswith("//") else (By.CSS_SELECTOR, sel))
-                        if d.find_elements(by, val):
+                        try:
+                            elements = d.find_elements(by, val)
+                        except Exception:
+                            continue
+                        for el in elements:
+                            try:
+                                if not el.is_displayed() or not el.is_enabled():
+                                    continue
+                            except Exception:
+                                pass
+                            try:
+                                d.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                            except Exception:
+                                pass
+                            try:
+                                d.execute_script("arguments[0].click();", el)
+                            except Exception:
+                                try:
+                                    el.click()
+                                except Exception:
+                                    continue
                             return True
                     return False
 
                 SELECTORS = {
-                    "create_ps": [
-                        "button.rbx-private-server-create-button",
-                        "//button[normalize-space()='Create Private Server']",
-                    ],
-                    "max_free": [
-                        "span.rbx-private-server-create-disabled-text",
-                        "//span[contains(@class,'rbx-private-server-create-disabled-text')]",
-                    ],
-                    "more_menu": [
-                        "div.link-menu.rbx-private-game-server-menu button.btn-generic-more-sm",
-                        "//div[contains(@class,'rbx-private-game-server-menu')]//button[contains(@class,'btn-generic-more-sm')]",
+                    "create_free": [
+                        "//button[.//span[normalize-space()='Create one for free']]",
+                        "//button[normalize-space(.)='Create one for free']",
                     ],
                     "configure_link": [
-                        "a.rbx-private-server-configure",
-                        "//a[contains(@class,'rbx-private-server-configure')]",
-                    ],
-                    "server_name_input": [
-                        "#private-server-name-text-box",
-                        "//input[@id='private-server-name-text-box']",
-                    ],
-                    "buy_now": [
-                        "//button[normalize-space()='Buy Now']",
-                        "button.modal-button.btn-primary-md.btn-min-width",
-                    ],
-                    "customize": [
-                        "//button[normalize-space()='Customize']",
-                        "//a[contains(. 'Customize') or contains(. 'Configure')]",
+                        "a[aria-label='Configure'][href*='/private-server/configure']",
+                        "//a[@aria-label='Configure' and contains(@href, '/private-server/configure')]",
                     ],
                     "generate_btn": [
                         "#generate-link-button",
@@ -1185,25 +1185,8 @@ class _PSLWorker(QThread):
                     ],
                 }
 
-                if _any_present_now(SELECTORS["max_free"]):
-                    _first_present(SELECTORS["more_menu"], click=True)
-                    _first_present(SELECTORS["configure_link"], click=True)
-                else:
-                    if _any_present_now(SELECTORS["create_ps"]):
-                        _first_present(SELECTORS["create_ps"], click=True)
-                        ts = int(time.time())
-                        server_name = (self.opts.name_template or "JARAM-{username}-{ts}").format(
-                            username=(username or uid), uid=uid, ts=ts
-                        )
-                        try:
-                            box = _first_present(SELECTORS["server_name_input"])
-                            box.clear(); box.send_keys(server_name); time.sleep(0.2)
-                        except Exception:
-                            pass
-                        _first_present(SELECTORS["buy_now"], click=True)
-                        _first_present(SELECTORS["customize"], click=True)
-                    else:
-                        _first_present(SELECTORS["customize"], click=True)
+                _click_first_now(SELECTORS["create_free"])
+                _first_present(SELECTORS["configure_link"], click=True)
 
                 share_el = _first_present(SELECTORS["share_input"], click=False)
                 share_url = (share_el.get_attribute("value") or share_el.get_property("value") or "").strip()

@@ -56,7 +56,8 @@ except Exception:
     WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
 
 
-APP_FOOTER = "J.JARAM JX 2x54"
+APP_FOOTER = "J.JARAM JX 2x56"
+HARD_EVERYONE_BIOMES = {"GLITCHED", "DREAMSPACE", "CYBERSPACE"}
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
 # Helpers
@@ -70,6 +71,16 @@ def _post_webhook(url: str, payload: dict) -> None:
         requests.post(url, json=payload, timeout=10)
     except Exception:
         pass
+
+def _normalize_role_ping_id(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    mention_match = re.search(r"<@&\s*(\d+)\s*>", text)
+    if mention_match:
+        return mention_match.group(1)
+    id_match = re.search(r"\d+", text)
+    return id_match.group(0) if id_match else ""
 
 # Parse [BloxstrapRPC] JSON blobs strictly
 _R_RPC_MARK = "[BloxstrapRPC]"
@@ -841,7 +852,7 @@ class MultiScopeEngine:
         base_modes: Dict[str, str] = dict(base_modes_raw)
         forced_biomes: Set[str] = set()
         if lock_enforced:
-            for hard in ("GLITCHED", "DREAMSPACE", "CYBERSPACE"):
+            for hard in HARD_EVERYONE_BIOMES:
                 base_modes[hard] = "Everyone"
                 forced_biomes.add(hard)
 
@@ -859,9 +870,19 @@ class MultiScopeEngine:
             if not allowed_biomes and modes:
                 allowed_biomes = [k for k, v in modes.items() if str(v).lower() in ("message", "everyone")]
             if not lock_disabled:
-                for hard in ("GLITCHED", "DREAMSPACE", "CYBERSPACE"):
+                for hard in HARD_EVERYONE_BIOMES:
                     if modes.get(hard) != "Everyone":
                         modes[hard] = "Everyone"
+            role_pings: Dict[str, str] = {}
+            raw_role_pings = wh.get("biome_role_pings") or wh.get("role_pings") or {}
+            if isinstance(raw_role_pings, dict):
+                for k, v in raw_role_pings.items():
+                    bkey = str(k).strip().upper()
+                    if not bkey or bkey in HARD_EVERYONE_BIOMES:
+                        continue
+                    role_id = _normalize_role_ping_id(v)
+                    if role_id:
+                        role_pings[bkey] = role_id
             # NEW: user routing
             raw_users = wh.get("users", None)
             users_explicit = bool(wh.get("users_explicit", False))
@@ -877,6 +898,7 @@ class MultiScopeEngine:
                 "name": wh.get("name", ""),
                 "biomes": allowed_biomes,
                 "biome_modes": modes,
+                "biome_role_pings": role_pings,
                 "users": users,
             }
             if users is not None:
@@ -1440,7 +1462,7 @@ class MultiScopeEngine:
         if new_np in ignored_logs:
             return
         cur_np = self._normpath_by_uid.get(uid)
-        if not force and cur_np and new_np == cur_np:
+        if cur_np and new_np == cur_np:
             if cur.path:
                 self._watch_dir_for_path(cur.path)
             return
@@ -2041,10 +2063,10 @@ class MultiScopeEngine:
             if lock_disabled and b in forced_biomes:
                 if mode is None or str(mode).lower() == "everyone":
                     mode = base_modes_user.get(b)
-            if not lock_disabled and b in ("GLITCHED", "DREAMSPACE", "CYBERSPACE"):
+            if not lock_disabled and b in HARD_EVERYONE_BIOMES:
                 return "Everyone"
             if mode is None:
-                if lock_disabled and b in ("GLITCHED", "DREAMSPACE", "CYBERSPACE"):
+                if lock_disabled and b in HARD_EVERYONE_BIOMES:
                     return "None"
                 if b == "NORMAL":
                     return "None"
@@ -2109,7 +2131,14 @@ class MultiScopeEngine:
                     include_ps_link=(event_type == "start"),
                     ts_epoch=ts_epoch,  # anchor to log line's timestamp
                 )
-            content = "@everyone" if (mode == "Everyone" and event_type == "start") else ""
+            content = ""
+            if event_type == "start":
+                if mode == "Everyone":
+                    content = "@everyone"
+                else:
+                    role_id = _normalize_role_ping_id((wh.get("biome_role_pings") or {}).get(b, ""))
+                    if role_id:
+                        content = f"<@&{role_id}>"
             payload = {"content": content, "embeds": [embed]}
             try:
                 self._send_executor.submit(_post_webhook, url, payload)
@@ -2519,7 +2548,7 @@ class MultiScopeEngine:
 
                         if biome != "NORMAL":
                             self._emit_biome_event(uid, server_key, biome, event_type="start", ts_epoch=event_ts)
-                            if biome in ("DREAMSPACE", "GLITCHED", "CYBERSPACE"):
+                            if biome in HARD_EVERYONE_BIOMES:
                                 self._maybe_start_temp_block(uid, f"Biome:{biome}")
                         else:
                             self._log(f"[MultiScope] BIOME START suppressed | biome=NORMAL | user={self._get_username(uid)} | server={server_key}")

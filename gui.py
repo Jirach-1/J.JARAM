@@ -473,6 +473,8 @@ from discord_account_control import DiscordBotService, format_discord_ids, norma
 from found_stats import FoundStatsMixin
 # Exclude NORMAL from the Settings table (still exists internally, we just don't offer it as a toggle)
 GUI_BIOME_NAMES = [b for b in biome_names() if str(b).upper() != "NORMAL"]
+HARD_EVERYONE_BIOMES = {"GLITCHED", "DREAMSPACE", "CYBERSPACE"}
+WEBHOOK_ROLE_PINGS_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 from multiscope_process import MultiScopeProcessProxy
 from antiafk import AntiAFK
 from ocr_worker import (
@@ -754,6 +756,7 @@ class ConfigManager:
                 "hourly_users_report_enabled": False,
                 "hourly_users_report_interval_hours": 1,
             },
+            "webhooks": [],
             "discord_control": {
                 "enabled": False,
                 "token": "",
@@ -946,12 +949,7 @@ class ConfigManager:
             with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
 
-            if os.name == 'nt':  
-                if file_path.exists():
-                    file_path.unlink()
-                temp_path.rename(file_path)
-            else:
-                temp_path.rename(file_path)
+            os.replace(str(temp_path), str(file_path))
 
             return True
         except Exception as e:
@@ -1809,6 +1807,12 @@ class ConfigManager:
         except Exception:
             return 0.0
 
+    def _file_size(self, file_path: Path) -> int:
+        try:
+            return int(file_path.stat().st_size)
+        except Exception:
+            return 0
+
     def get_users_mtime(self) -> float:
         return self._file_mtime(self.users_file)
 
@@ -1831,19 +1835,31 @@ class ConfigManager:
         """
         try:
             mtime = self._file_mtime(self.users_file)
+            size = self._file_size(self.users_file)
             unlock_token = self._get_cookie_unlock_token()
             with self._cache_lock:
                 if (
                     mtime == self._users_cache_mtime
                     and isinstance(self._users_cache, dict)
                     and self._users_cache_unlock_token == unlock_token
+                    and (bool(self._users_cache) or size <= 2)
                 ):
                     return self._users_cache
 
             data = self._load_users_uncached()
             # migrations may create users.json; re-sample mtime after load
             mtime2 = self._file_mtime(self.users_file)
+            size2 = self._file_size(self.users_file)
             with self._cache_lock:
+                if (
+                    not data
+                    and size2 > 2
+                    and isinstance(self._users_cache, dict)
+                    and bool(self._users_cache)
+                ):
+                    self._users_cache_mtime = mtime2
+                    self._users_cache_unlock_token = unlock_token
+                    return self._users_cache
                 self._users_cache_mtime = mtime2
                 self._users_cache = data if isinstance(data, dict) else {}
                 self._users_cache_unlock_token = unlock_token
@@ -3988,6 +4004,41 @@ class WorkerThread(QThread):
         except Exception:
             pass
 
+    def _sync_multiscope_user_list(self) -> None:
+        if not self.ms or not isinstance(getattr(self, "user_states", None), dict):
+            return
+        try:
+            user_ids = [str(uid) for uid in self.user_states.keys()]
+            usernames_by_uid: dict[str, str] = {}
+            cookies_by_uid: dict[str, str] = {}
+            settings = getattr(self.manager, "settings", {}) if self.manager else {}
+            if not isinstance(settings, dict):
+                settings = {}
+            for uid in user_ids:
+                info = settings.get(uid, {})
+                if not isinstance(info, dict):
+                    info = {}
+                usernames_by_uid[uid] = str(info.get("username") or "")
+                cookies_by_uid[uid] = str(info.get("cookie") or "")
+            sync_signature = tuple(
+                sorted((uid, usernames_by_uid.get(uid, ""), cookies_by_uid.get(uid, "")) for uid in user_ids)
+            )
+            if getattr(self, "_last_multiscope_user_sync_signature", None) == sync_signature:
+                return
+            self._last_multiscope_user_sync_signature = sync_signature
+            self.ms.update_users(
+                user_ids,
+                usernames_by_uid=usernames_by_uid,
+                cookies_by_uid=cookies_by_uid,
+            )
+        except TypeError:
+            try:
+                self.ms.update_users([str(uid) for uid in self.user_states.keys()])
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def initialize_manager(self) -> bool:
         try:
             resume_state = getattr(self, "_resume_state", None) or None
@@ -4146,7 +4197,7 @@ class WorkerThread(QThread):
 
 
             # Provide full user list AFTER user_states are built
-            self.ms.update_users(list(self.user_states.keys()))
+            self._sync_multiscope_user_list()
 
             # Load and push webhook config
             cfg = self.cfg_manager.load_settings() or {}
@@ -4574,6 +4625,10 @@ class WorkerThread(QThread):
                         self._recompute_pools()
                     except Exception as _e:
                         self._log(f"[Pools] recompute error: {_e}")
+
+                    # Keep the out-of-process MultiScope engine aware of live
+                    # users and their metadata after users.json hot reloads.
+                    self._sync_multiscope_user_list()
 
                 # housekeeping: clean dead processes
                 if 'cleanup' not in self.timing_trackers:
@@ -18019,9 +18074,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         rem_btn = QPushButton("Remove Selected")
         route_btn = QPushButton("Assign Users...")
         cols_btn = QPushButton("Biome Columns...")
+        role_ping_btn = QPushButton("Role ID Pings...")
         test_webhook_btn = QPushButton("Test Webhook")
         test_webhook_btn.clicked.connect(self.test_selected_webhook)
-        btn_row.addWidget(add_btn); btn_row.addWidget(rem_btn); btn_row.addWidget(route_btn); btn_row.addWidget(cols_btn); btn_row.addWidget(test_webhook_btn); btn_row.addStretch()
+        btn_row.addWidget(add_btn); btn_row.addWidget(rem_btn); btn_row.addWidget(route_btn); btn_row.addWidget(cols_btn); btn_row.addWidget(role_ping_btn); btn_row.addWidget(test_webhook_btn); btn_row.addStretch()
         webhooks_v.addLayout(btn_row)
 
         MODE_ITEMS = ("None", "Message", "Everyone")  # tri-mode per biome cell
@@ -18143,6 +18199,24 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if url_item:
                 url_item.setToolTip(tip)
 
+        def _row_data_item(row: int):
+            return self.webhooks_table.item(row, 0) or self.webhooks_table.item(row, 1)
+
+        def _role_pings_for_row(row: int) -> dict:
+            item = _row_data_item(row)
+            if item is None:
+                return {}
+            return self._normalize_webhook_role_pings_config(item.data(WEBHOOK_ROLE_PINGS_ROLE))
+
+        def _apply_role_pings_to_row(row: int, role_pings=None):
+            item = _row_data_item(row)
+            if item is None:
+                return
+            item.setData(
+                WEBHOOK_ROLE_PINGS_ROLE,
+                self._normalize_webhook_role_pings_config(role_pings or {}),
+            )
+
         def _mk_mode_combo(default_text: str = "None") -> QComboBox:
             cmb = QComboBox()
             cmb.addItems(("None", "Message", "Everyone"))
@@ -18183,7 +18257,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return holder
 
 
-        def add_webhook_row(name: str = "", url: str = "", allowed_biomes=None, biome_modes=None, user_ids=None):
+        def add_webhook_row(name: str = "", url: str = "", allowed_biomes=None, biome_modes=None, user_ids=None, biome_role_pings=None):
             """
             allowed_biomes: Optional[List[str]]  -> kept for backward compatibility
             biome_modes:    Optional[Dict[str, str]] per-biome: "None"|"Message"|"Everyone"
@@ -18197,6 +18271,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.webhooks_table.setItem(row, 0, name_item)
             self.webhooks_table.setItem(row, 1, url_item)
             _apply_user_filter_to_row(row, user_ids)
+            _apply_role_pings_to_row(row, biome_role_pings)
 
             allowed_set = {str(b).upper() for b in (allowed_biomes or [])}
             biome_modes = biome_modes or {}
@@ -18206,7 +18281,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 default_mode = "Message" if bkey in allowed_set else "None"
                 mode = biome_modes.get(bkey, default_mode)
                 combo = _mk_mode_combo(mode)
-                if bkey in ("GLITCHED", "DREAMSPACE", "CYBERSPACE") and _bm_lock_enforced():
+                if bkey in HARD_EVERYONE_BIOMES and _bm_lock_enforced():
                     combo.setCurrentText("Everyone")
                     combo.setEnabled(False)
                 _place_centered(self.webhooks_table, row, 2 + idx, combo)
@@ -18530,10 +18605,149 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             _build_user_checks(0 if entries else -1)
             dlg.exec()
 
+        def _open_webhook_role_ping_dialog():
+            rows = self.webhooks_table.rowCount()
+            if rows == 0:
+                QMessageBox.information(self, "No webhooks", "Add a webhook before adding role pings.")
+                return
+
+            role_biomes = [
+                str(b).strip().upper()
+                for b in GUI_BIOME_NAMES
+                if str(b).strip() and str(b).strip().upper() not in HARD_EVERYONE_BIOMES
+            ]
+            if not role_biomes:
+                QMessageBox.information(self, "Role ID Pings", "No eligible biomes are available.")
+                return
+
+            entries = []
+            for r in range(rows):
+                name_item = self.webhooks_table.item(r, 0)
+                url_item = self.webhooks_table.item(r, 1)
+                name_txt = (name_item.text().strip() if name_item else "")
+                url_txt = (url_item.text().strip() if url_item else "")
+                display = name_txt or url_txt or f"Webhook {r + 1}"
+                entries.append({
+                    "row": r,
+                    "display": display,
+                    "pings": dict(_role_pings_for_row(r)),
+                })
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Webhook Role ID Pings")
+            dlg.resize(760, 560)
+
+            h = QHBoxLayout(dlg)
+            left_col = QVBoxLayout()
+            webhook_list = QListWidget()
+            webhook_list.setMinimumWidth(240)
+            for entry in entries:
+                webhook_list.addItem(QListWidgetItem(entry["display"]))
+            left_col.addWidget(webhook_list)
+
+            clear_all_btn = QPushButton("Clear All")
+            left_col.addWidget(clear_all_btn)
+            left_col.addStretch()
+            h.addLayout(left_col)
+
+            right = QVBoxLayout()
+            h.addLayout(right)
+
+            top_row = QHBoxLayout()
+            clear_current_btn = QPushButton("Clear Current")
+            top_row.addWidget(clear_current_btn)
+            top_row.addStretch()
+            right.addLayout(top_row)
+
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            fields_widget = QWidget()
+            fields_form = QFormLayout(fields_widget)
+            fields_form.setContentsMargins(6, 6, 6, 6)
+            fields_form.setSpacing(8)
+            scroll.setWidget(fields_widget)
+            right.addWidget(scroll)
+
+            btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            right.addWidget(btn_box)
+
+            current_idx = [-1]
+            editors: dict[str, QLineEdit] = {}
+
+            def _clear_fields():
+                while fields_form.count():
+                    item = fields_form.takeAt(0)
+                    if item is None:
+                        continue
+                    w = item.widget()
+                    if w is not None:
+                        w.setParent(None)
+                        w.deleteLater()
+
+            def _save_current_fields():
+                idx = current_idx[0]
+                if idx < 0 or idx >= len(entries):
+                    return
+                cleaned = {}
+                for biome_key, edit in editors.items():
+                    role_id = self._normalize_role_id_for_ping(edit.text())
+                    if role_id:
+                        cleaned[biome_key] = role_id
+                entries[idx]["pings"] = cleaned
+
+            def _build_role_fields(idx: int):
+                _save_current_fields()
+                editors.clear()
+                _clear_fields()
+                current_idx[0] = idx
+                if idx < 0 or idx >= len(entries):
+                    fields_form.addRow(QLabel("Select a webhook to edit."))
+                    return
+
+                pings = entries[idx].get("pings", {}) or {}
+                for biome_key in role_biomes:
+                    edit = QLineEdit()
+                    edit.setPlaceholderText("Role ID")
+                    edit.setText(str(pings.get(biome_key, "") or ""))
+                    edit.setToolTip("Discord role ID. Mentions like <@&123> are accepted.")
+                    editors[biome_key] = edit
+                    fields_form.addRow(str(biome_key), edit)
+                scroll.verticalScrollBar().setValue(0)
+
+            def _clear_current():
+                idx = current_idx[0]
+                if 0 <= idx < len(entries):
+                    entries[idx]["pings"] = {}
+                for edit in editors.values():
+                    edit.clear()
+
+            def _clear_all():
+                for entry in entries:
+                    entry["pings"] = {}
+                for edit in editors.values():
+                    edit.clear()
+
+            def _apply_role_pings_and_close():
+                _save_current_fields()
+                for entry in entries:
+                    _apply_role_pings_to_row(entry["row"], entry.get("pings", {}))
+                dlg.accept()
+
+            clear_current_btn.clicked.connect(_clear_current)
+            clear_all_btn.clicked.connect(_clear_all)
+            webhook_list.currentRowChanged.connect(_build_role_fields)
+            btn_box.accepted.connect(_apply_role_pings_and_close)
+            btn_box.rejected.connect(dlg.reject)
+
+            webhook_list.setCurrentRow(0 if entries else -1)
+            _build_role_fields(0 if entries else -1)
+            dlg.exec()
+
         add_btn.clicked.connect(lambda: add_webhook_row("", ""))
         rem_btn.clicked.connect(remove_selected_rows)
         route_btn.clicked.connect(_open_webhook_user_dialog)
         cols_btn.clicked.connect(_open_webhook_columns_dialog)
+        role_ping_btn.clicked.connect(_open_webhook_role_ping_dialog)
 
         # expose helpers for load/save
         self._add_webhook_row = add_webhook_row
@@ -21660,6 +21874,48 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         suffix = "" if len(users) <= 3 else f", +{len(users) - 3} more"
         return f"{len(users)} user(s): {preview}{suffix}"
 
+    def _normalize_role_id_for_ping(self, value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        mention_match = re.search(r"<@&\s*(\d+)\s*>", text)
+        if mention_match:
+            return mention_match.group(1)
+        id_match = re.search(r"\d+", text)
+        return id_match.group(0) if id_match else ""
+
+    def _normalize_webhook_role_pings_config(self, raw: object) -> dict:
+        if not isinstance(raw, dict):
+            return {}
+
+        source = {}
+        for k, v in raw.items():
+            key = str(k).strip().upper()
+            if not key or key in HARD_EVERYONE_BIOMES:
+                continue
+            role_id = self._normalize_role_id_for_ping(v)
+            if role_id:
+                source[key] = role_id
+
+        ordered = [str(b).strip().upper() for b in GUI_BIOME_NAMES if str(b).strip()]
+        out = {}
+        for key in ordered:
+            if key in source:
+                out[key] = source[key]
+        for key in sorted(set(source.keys()) - set(out.keys())):
+            out[key] = source[key]
+        return out
+
+    def _format_webhook_role_pings_for_diff(self, pings: dict) -> str:
+        if not pings:
+            return "None"
+        ordered = [str(b).strip().upper() for b in GUI_BIOME_NAMES if str(b).strip()]
+        keys = [b for b in ordered if b in pings]
+        keys.extend(sorted(set(pings.keys()) - set(keys)))
+        parts = [f"{b} <@&{pings[b]}>" for b in keys[:3]]
+        suffix = "" if len(keys) <= 3 else f", +{len(keys) - 3} more"
+        return ", ".join(parts) + suffix
+
     def _normalize_webhook_biome_modes_for_diff(self, entry: dict) -> dict:
         modes_raw = entry.get("biome_modes", None)
         if isinstance(modes_raw, dict) and modes_raw:
@@ -21723,6 +21979,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             new_users = self._normalize_webhook_users_for_diff(new)
             if old_users != new_users:
                 segs.append(f"users {self._format_webhook_users_for_diff(old_users)} -> {self._format_webhook_users_for_diff(new_users)}")
+
+            old_role_pings = self._normalize_webhook_role_pings_config(old.get("biome_role_pings", {}))
+            new_role_pings = self._normalize_webhook_role_pings_config(new.get("biome_role_pings", {}))
+            if old_role_pings != new_role_pings:
+                segs.append(
+                    "role pings "
+                    f"{self._format_webhook_role_pings_for_diff(old_role_pings)} -> "
+                    f"{self._format_webhook_role_pings_for_diff(new_role_pings)}"
+                )
 
             old_modes = self._normalize_webhook_biome_modes_for_diff(old)
             new_modes = self._normalize_webhook_biome_modes_for_diff(new)
@@ -21817,7 +22082,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
                 if cb is not None:
                     mode = cb.currentText()
-                    if str(biome_name).upper() in ("GLITCHED", "DREAMSPACE", "CYBERSPACE") and _bm_lock_enforced():
+                    if str(biome_name).upper() in HARD_EVERYONE_BIOMES and _bm_lock_enforced():
                         mode = "Everyone"
                     biome_modes[str(biome_name).upper()] = mode
                     if mode in ("Message", "Everyone"):
@@ -21828,6 +22093,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             entry = {"name": name, "url": url, "biomes": allowed}
             if biome_modes:
                 entry["biome_modes"] = biome_modes
+            role_pings = self._normalize_webhook_role_pings_config(
+                data_item.data(WEBHOOK_ROLE_PINGS_ROLE) if data_item is not None else {}
+            )
+            if role_pings:
+                entry["biome_role_pings"] = role_pings
             if explicit_users:
                 entry["users"] = selected_users
                 entry["users_explicit"] = True
@@ -22143,12 +22413,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             url     = wh.get("url", "")
             allowed = wh.get("biomes", []) or []      # legacy list your worker already uses
             modes   = wh.get("biome_modes", {}) or {} # optional per-biome tri-state
+            role_pings = wh.get("biome_role_pings", {}) or {}
             raw_users = wh.get("users", None)
             users_explicit = bool(wh.get("users_explicit", raw_users is not None))
             users   = raw_users if users_explicit else None  # optional per-user routing
             if url:
                 try:
-                    self._add_webhook_row(name, url, allowed, modes, users)
+                    self._add_webhook_row(name, url, allowed, modes, users, role_pings)
                 except TypeError:
                     self._add_webhook_row(name, url, allowed)
 
@@ -22777,7 +23048,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def show_about(self):
         config_info = self.config_manager.get_config_info()
         QMessageBox.about(self, "About J.JARAM",
-                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x54\n\n"
+                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x56\n\n"
                          "Advanced multi-account Roblox session manager\n"
                          "with automated log based monitoring and process management.\n\n"
                          "Built with PySide6 and modern design principles.\n\n"
@@ -24308,7 +24579,7 @@ def main():
     app = QApplication(sys.argv)
 
     app.setApplicationName("J.JARAM")
-    app.setApplicationVersion("JX 2x54")
+    app.setApplicationVersion("JX 2x56")
     app.setOrganizationName("Jirach1")
     # Qt 6 ships a Windows 11 style that can change widget visuals. Force the
     # Windows 10-era style for consistent UI across OS versions.

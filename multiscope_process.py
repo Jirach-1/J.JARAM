@@ -154,7 +154,46 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                 user_ids = cmd.get("user_ids") or []
                 if not isinstance(user_ids, list):
                     user_ids = list(user_ids)
-                engine.update_users([str(u) for u in user_ids])
+                user_ids = [str(u) for u in user_ids]
+                user_ids_set = set(user_ids)
+                incoming_usernames = cmd.get("usernames")
+                incoming_cookies = cmd.get("cookies")
+                if "usernames" in cmd and isinstance(incoming_usernames, dict):
+                    usernames_by_uid.clear()
+                    usernames_by_uid.update(
+                        {
+                            str(k): str(v or "")
+                            for k, v in incoming_usernames.items()
+                            if str(k) in user_ids_set
+                        }
+                    )
+                else:
+                    for uid in list(usernames_by_uid.keys()):
+                        if uid not in user_ids_set:
+                            usernames_by_uid.pop(uid, None)
+                if "cookies" in cmd and isinstance(incoming_cookies, dict):
+                    cookies_by_uid.clear()
+                    cookies_by_uid.update(
+                        {
+                            str(k): str(v or "")
+                            for k, v in incoming_cookies.items()
+                            if str(k) in user_ids_set
+                        }
+                    )
+                else:
+                    for uid in list(cookies_by_uid.keys()):
+                        if uid not in user_ids_set:
+                            cookies_by_uid.pop(uid, None)
+                for uid in list(server_label_by_uid.keys()):
+                    if uid not in user_ids_set:
+                        server_label_by_uid.pop(uid, None)
+                for uid in list(ps_link_by_uid.keys()):
+                    if uid not in user_ids_set:
+                        ps_link_by_uid.pop(uid, None)
+                for uid in list(owner_by_uid.keys()):
+                    if uid not in user_ids_set:
+                        owner_by_uid.pop(uid, None)
+                engine.update_users(user_ids)
 
             elif ctype == "configure_webhooks":
                 if engine is None:
@@ -375,9 +414,19 @@ class MultiScopeProcessProxy:
             time.sleep(0.01)
         return self._ensure_ready()
 
-    def update_users(self, user_ids: List[str]) -> None:
+    def update_users(
+        self,
+        user_ids: List[str],
+        usernames_by_uid: Optional[Dict[str, str]] = None,
+        cookies_by_uid: Optional[Dict[str, str]] = None,
+    ) -> None:
         self._drain_out_queue()
-        self._send_cmd({"type": "update_users", "user_ids": list(user_ids or [])})
+        msg = {"type": "update_users", "user_ids": list(user_ids or [])}
+        if usernames_by_uid is not None:
+            msg["usernames"] = dict(usernames_by_uid or {})
+        if cookies_by_uid is not None:
+            msg["cookies"] = dict(cookies_by_uid or {})
+        self._send_cmd(msg)
 
     def configure_webhooks(
         self,
