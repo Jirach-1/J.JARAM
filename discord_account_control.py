@@ -157,6 +157,7 @@ class DiscordBotService:
             "admin_user_ids": normalize_discord_ids(config.get("admin_user_ids")),
             "admin_role_ids": normalize_discord_ids(config.get("admin_role_ids")),
             "allow_discord_admin_permission": bool(config.get("allow_discord_admin_permission", True)),
+            "user_account_list_visible": bool(config.get("user_account_list_visible", False)),
         }
 
     def _log(self, message: str) -> None:
@@ -222,6 +223,7 @@ class DiscordBotService:
         admin_user_ids = set(normalize_discord_ids(config.get("admin_user_ids")))
         admin_role_ids = set(normalize_discord_ids(config.get("admin_role_ids")))
         allow_admin_perm = bool(config.get("allow_discord_admin_permission", True))
+        user_account_list_visible = bool(config.get("user_account_list_visible", False))
 
         intents = discord.Intents.default()
 
@@ -322,6 +324,17 @@ class DiscordBotService:
             text = f"{username} ({account_id})"
             return text if len(text) <= 100 else f"{text[:97]}..."
 
+        def _auto_action_row_choice_name(entry: Dict[str, Any]) -> str:
+            text = str(entry.get("choice_name") or "").strip()
+            if not text:
+                try:
+                    row_number = int(entry.get("row_number", 0) or 0)
+                except Exception:
+                    row_number = 0
+                name = str(entry.get("name") or f"Action {row_number or '?'}").strip()
+                text = f"{row_number}. {name}" if row_number > 0 else name
+            return text if len(text) <= 100 else f"{text[:97]}..."
+
         async def _account_autocomplete(
             interaction: Any,
             current: str,
@@ -357,13 +370,45 @@ class DiscordBotService:
                 )
             return choices[:25]
 
-        async def _linked_account_autocomplete(interaction: Any, current: str) -> List[Any]:
-            return await _account_autocomplete(interaction, current, require_link=True)
+        async def _auto_action_row_autocomplete(interaction: Any, current: str) -> List[Any]:
+            is_admin = _author_is_admin(interaction.user)
+            payload: Dict[str, Any] = {
+                "type": "autocomplete_auto_action_rows",
+                "query": str(current or "").strip(),
+                "limit": 25,
+                "discord_user_id": str(getattr(interaction.user, "id", "") or "").strip(),
+                "require_linked_edit_enabled": not is_admin,
+            }
+
+            response = service._request(payload, timeout=5.0)
+            if not response.get("ok", False):
+                return []
+
+            choices: List[Any] = []
+            seen_values = set()
+            for entry in response.get("rows") or []:
+                if not isinstance(entry, dict):
+                    continue
+                value = str(entry.get("row_ref") or "").strip()
+                if not value or value in seen_values:
+                    continue
+                seen_values.add(value)
+                choices.append(
+                    discord.app_commands.Choice(
+                        name=_auto_action_row_choice_name(entry),
+                        value=value[:100],
+                    )
+                )
+            return choices[:25]
 
         async def _admin_account_autocomplete(interaction: Any, current: str) -> List[Any]:
             if not _author_is_admin(interaction.user):
                 return []
             return await _account_autocomplete(interaction, current, require_link=False)
+
+        async def _admin_or_linked_account_autocomplete(interaction: Any, current: str) -> List[Any]:
+            require_link = not _author_is_admin(interaction.user)
+            return await _account_autocomplete(interaction, current, require_link=require_link)
 
         @bot.event
         async def on_ready() -> None:
@@ -395,35 +440,58 @@ class DiscordBotService:
             _record_command_usage(interaction, ok=False, message=f"Command error: {error}")
             await _reply(interaction, f"Command error: {error}", ephemeral=True)
 
-        user_group = discord.app_commands.Group(
-            name="jaram",
-            description="Control your linked JARAM accounts",
-        )
-        admin_group = discord.app_commands.Group(
-            name="jaramadmin",
-            description="Admin controls for JARAM accounts",
-        )
-
-        @user_group.command(name="help", description="Show available user slash commands")
+        @bot.tree.command(name="help", description="Show available JARAM slash commands")
         async def jaram_help(interaction: Any) -> None:
+            is_admin = _author_is_admin(interaction.user)
+            lines = [
+                "JARAM slash commands:",
+                "/status <account>",
+                "/enable <account>",
+                "/disable <account>",
+                "/action <account> <action> [enabled]",
+            ]
+            if is_admin or user_account_list_visible:
+                lines.insert(1, "/list")
+            if is_admin:
+                lines.extend(
+                    [
+                        "/clearflags <account>",
+                        "/restartall",
+                        "/psl <account>",
+                        "/block <account> <target>",
+                        "/unblock <account> <target>",
+                        "",
+                        "Admin access detected: list, status, enable, disable, action, clearflags, restartall, psl, block, and unblock can use admin access.",
+                    ]
+                )
+            elif user_account_list_visible:
+                lines.extend(
+                    [
+                        "",
+                        "Non-admin users can only target accounts available to their Discord user ID.",
+                    ]
+                )
             await _reply(
                 interaction,
-                "User slash commands:\n"
-                "/jaram list\n"
-                "/jaram status <account>\n"
-                "/jaram enable <account>\n"
-                "/jaram disable <account>",
+                "\n".join(lines),
                 ephemeral=True,
             )
-            _record_command_usage(interaction, ok=True, message="Displayed user command help.")
+            _record_command_usage(interaction, ok=True, message="Displayed JARAM command help.")
 
-        @user_group.command(name="list", description="List JARAM accounts linked to your Discord user")
+        @bot.tree.command(name="list", description="Show available JARAM accounts")
         async def jaram_list(interaction: Any) -> None:
             author_id = str(getattr(interaction.user, "id", "") or "").strip()
+            is_admin = _author_is_admin(interaction.user)
+            if not is_admin and not user_account_list_visible:
+                msg = "You are not allowed to use this command."
+                await _reply(interaction, msg, ephemeral=True)
+                _record_command_usage(interaction, ok=False, message=msg)
+                return
             response = service._request(
                 {
                     "type": "list_linked_accounts",
                     "discord_user_id": author_id,
+                    "list_all": is_admin,
                     **_usage_context(interaction),
                 },
                 timeout=10.0,
@@ -431,32 +499,36 @@ class DiscordBotService:
             if not response.get("ok", False):
                 await _reply(
                     interaction,
-                    str(response.get("message") or "Failed to list linked accounts."),
+                    str(response.get("message") or "Failed to list accounts."),
                     ephemeral=True,
                 )
                 return
             accounts = response.get("accounts") or []
             if not accounts:
-                await _reply(
-                    interaction,
-                    "No JARAM accounts are linked to your Discord user ID.",
-                    ephemeral=True,
+                empty_msg = (
+                    "No JARAM accounts are configured."
+                    if is_admin
+                    else "No JARAM accounts are available for your Discord user ID."
                 )
+                await _reply(interaction, empty_msg, ephemeral=True)
                 return
-            lines = ["Linked accounts:"]
+            lines = ["All accounts:" if is_admin else "Available accounts:"]
             for entry in accounts[:25]:
                 if isinstance(entry, dict):
                     lines.append(_account_line(entry))
+            if len(accounts) > 25:
+                lines.append(f"...and {len(accounts) - 25} more.")
             await _reply(interaction, "\n".join(lines), ephemeral=True)
 
-        @user_group.command(name="status", description="Show the status of one linked account")
+        @bot.tree.command(name="status", description="Show account status")
         @discord.app_commands.describe(account="JARAM user ID or exact username")
-        @discord.app_commands.autocomplete(account=_linked_account_autocomplete)
+        @discord.app_commands.autocomplete(account=_admin_or_linked_account_autocomplete)
         async def jaram_status(interaction: Any, account: str) -> None:
             author_id = str(getattr(interaction.user, "id", "") or "").strip()
+            is_admin = _author_is_admin(interaction.user)
             response = service._request(
                 {
-                    "type": "get_linked_account_status",
+                    "type": "get_account_status" if is_admin else "get_linked_account_status",
                     "discord_user_id": author_id,
                     "account_ref": str(account or "").strip(),
                     **_usage_context(interaction, account_ref=account),
@@ -465,14 +537,15 @@ class DiscordBotService:
             )
             await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
 
-        @user_group.command(name="enable", description="Enable one linked JARAM account")
+        @bot.tree.command(name="enable", description="Enable a JARAM account")
         @discord.app_commands.describe(account="JARAM user ID or exact username")
-        @discord.app_commands.autocomplete(account=_linked_account_autocomplete)
+        @discord.app_commands.autocomplete(account=_admin_or_linked_account_autocomplete)
         async def jaram_enable(interaction: Any, account: str) -> None:
             author_id = str(getattr(interaction.user, "id", "") or "").strip()
+            is_admin = _author_is_admin(interaction.user)
             response = service._request(
                 {
-                    "type": "set_linked_account_disabled",
+                    "type": "set_account_disabled" if is_admin else "set_linked_account_disabled",
                     "discord_user_id": author_id,
                     "account_ref": str(account or "").strip(),
                     "disabled": False,
@@ -482,14 +555,15 @@ class DiscordBotService:
             )
             await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
 
-        @user_group.command(name="disable", description="Disable one linked JARAM account")
+        @bot.tree.command(name="disable", description="Disable a JARAM account")
         @discord.app_commands.describe(account="JARAM user ID or exact username")
-        @discord.app_commands.autocomplete(account=_linked_account_autocomplete)
+        @discord.app_commands.autocomplete(account=_admin_or_linked_account_autocomplete)
         async def jaram_disable(interaction: Any, account: str) -> None:
             author_id = str(getattr(interaction.user, "id", "") or "").strip()
+            is_admin = _author_is_admin(interaction.user)
             response = service._request(
                 {
-                    "type": "set_linked_account_disabled",
+                    "type": "set_account_disabled" if is_admin else "set_linked_account_disabled",
                     "discord_user_id": author_id,
                     "account_ref": str(account or "").strip(),
                     "disabled": True,
@@ -499,89 +573,43 @@ class DiscordBotService:
             )
             await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
 
-        @admin_group.command(name="help", description="Show available admin slash commands")
-        async def jaramadmin_help(interaction: Any) -> None:
-            if not _author_is_admin(interaction.user):
-                msg = "You are not allowed to use admin JARAM commands."
-                await _reply(interaction, msg, ephemeral=True)
-                _record_command_usage(interaction, ok=False, message=msg)
-                return
-            await _reply(
-                interaction,
-                "Admin slash commands:\n"
-                "/jaramadmin status <account>\n"
-                "/jaramadmin enable <account>\n"
-                "/jaramadmin disable <account>\n"
-                "/jaramadmin clearflags <account>",
-                ephemeral=True,
-            )
-            _record_command_usage(interaction, ok=True, message="Displayed admin command help.")
-
-        @admin_group.command(name="status", description="Show the status of any JARAM account")
-        @discord.app_commands.describe(account="JARAM user ID or exact username")
-        @discord.app_commands.autocomplete(account=_admin_account_autocomplete)
-        async def jaramadmin_status(interaction: Any, account: str) -> None:
-            if not _author_is_admin(interaction.user):
-                msg = "You are not allowed to use admin JARAM commands."
-                await _reply(interaction, msg, ephemeral=True)
-                _record_command_usage(interaction, account_ref=account, ok=False, message=msg)
-                return
+        @bot.tree.command(name="action", description="Enable or disable a JARAM account for an Auto Actions action")
+        @discord.app_commands.describe(
+            account="JARAM user ID or exact username",
+            action="Auto Actions action number or exact action name",
+            enabled="True enables the action for the account, false disables it, blank toggles the current state",
+        )
+        @discord.app_commands.autocomplete(
+            account=_admin_or_linked_account_autocomplete,
+            action=_auto_action_row_autocomplete,
+        )
+        async def jaram_action(
+            interaction: Any,
+            account: str,
+            action: str,
+            enabled: Optional[bool] = None,
+        ) -> None:
+            author_id = str(getattr(interaction.user, "id", "") or "").strip()
+            is_admin = _author_is_admin(interaction.user)
             response = service._request(
                 {
-                    "type": "get_account_status",
+                    "type": "set_auto_action_row_user" if is_admin else "set_linked_auto_action_row_user",
+                    "discord_user_id": author_id,
                     "account_ref": str(account or "").strip(),
-                    **_usage_context(interaction, account_ref=account),
-                },
-                timeout=10.0,
-            )
-            await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
-
-        @admin_group.command(name="enable", description="Enable any JARAM account")
-        @discord.app_commands.describe(account="JARAM user ID or exact username")
-        @discord.app_commands.autocomplete(account=_admin_account_autocomplete)
-        async def jaramadmin_enable(interaction: Any, account: str) -> None:
-            if not _author_is_admin(interaction.user):
-                msg = "You are not allowed to use admin JARAM commands."
-                await _reply(interaction, msg, ephemeral=True)
-                _record_command_usage(interaction, account_ref=account, ok=False, message=msg)
-                return
-            response = service._request(
-                {
-                    "type": "set_account_disabled",
-                    "account_ref": str(account or "").strip(),
-                    "disabled": False,
+                    "row_ref": str(action or "").strip(),
+                    "enabled": enabled,
                     **_usage_context(interaction, account_ref=account),
                 },
                 timeout=15.0,
             )
             await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
 
-        @admin_group.command(name="disable", description="Disable any JARAM account")
+        @bot.tree.command(name="clearflags", description="Clear BAD/CAP flags on a JARAM account")
         @discord.app_commands.describe(account="JARAM user ID or exact username")
         @discord.app_commands.autocomplete(account=_admin_account_autocomplete)
-        async def jaramadmin_disable(interaction: Any, account: str) -> None:
+        async def jaram_clearflags(interaction: Any, account: str) -> None:
             if not _author_is_admin(interaction.user):
-                msg = "You are not allowed to use admin JARAM commands."
-                await _reply(interaction, msg, ephemeral=True)
-                _record_command_usage(interaction, account_ref=account, ok=False, message=msg)
-                return
-            response = service._request(
-                {
-                    "type": "set_account_disabled",
-                    "account_ref": str(account or "").strip(),
-                    "disabled": True,
-                    **_usage_context(interaction, account_ref=account),
-                },
-                timeout=15.0,
-            )
-            await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
-
-        @admin_group.command(name="clearflags", description="Clear BAD/CAP flags on any JARAM account")
-        @discord.app_commands.describe(account="JARAM user ID or exact username")
-        @discord.app_commands.autocomplete(account=_admin_account_autocomplete)
-        async def jaramadmin_clearflags(interaction: Any, account: str) -> None:
-            if not _author_is_admin(interaction.user):
-                msg = "You are not allowed to use admin JARAM commands."
+                msg = "You are not allowed to use admin-only JARAM commands."
                 await _reply(interaction, msg, ephemeral=True)
                 _record_command_usage(interaction, account_ref=account, ok=False, message=msg)
                 return
@@ -595,7 +623,116 @@ class DiscordBotService:
             )
             await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
 
-        bot.tree.add_command(user_group)
-        bot.tree.add_command(admin_group)
+        @bot.tree.command(name="restartall", description="Restart all online JARAM sessions")
+        async def jaram_restartall(interaction: Any) -> None:
+            if not _author_is_admin(interaction.user):
+                msg = "You are not allowed to use admin-only JARAM commands."
+                await _reply(interaction, msg, ephemeral=True)
+                _record_command_usage(interaction, ok=False, message=msg)
+                return
+            response = service._request(
+                {
+                    "type": "restart_all_sessions",
+                    **_usage_context(interaction),
+                },
+                timeout=10.0,
+            )
+            await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
+
+        @bot.tree.command(name="psl", description="Run private server link grabber for one JARAM account")
+        @discord.app_commands.describe(
+            account="JARAM user ID or exact username",
+            game_slug="Optional Roblox game URL slug for the generated link",
+            server_name="Optional VIP server name template; supports {username}, {uid}, and {ts}",
+            estimated_value="Optional expected Robux price, usually 0",
+            only_without_private_server_link="Skip the account when it already has a private server link",
+        )
+        @discord.app_commands.autocomplete(account=_admin_account_autocomplete)
+        async def jaram_psl(
+            interaction: Any,
+            account: str,
+            game_slug: Optional[str] = None,
+            server_name: Optional[str] = None,
+            estimated_value: Optional[int] = None,
+            only_without_private_server_link: Optional[bool] = True,
+        ) -> None:
+            if not _author_is_admin(interaction.user):
+                msg = "You are not allowed to use admin-only JARAM commands."
+                await _reply(interaction, msg, ephemeral=True)
+                _record_command_usage(interaction, account_ref=account, ok=False, message=msg)
+                return
+            response = service._request(
+                {
+                    "type": "grab_private_server_link",
+                    "account_ref": str(account or "").strip(),
+                    "game_slug": str(game_slug or "").strip(),
+                    "server_name": str(server_name or "").strip(),
+                    "estimated_value": estimated_value,
+                    "only_missing": only_without_private_server_link,
+                    **_usage_context(interaction, account_ref=account),
+                },
+                timeout=10.0,
+            )
+            await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
+
+        @bot.tree.command(name="block", description="Block a Roblox user from one JARAM account")
+        @discord.app_commands.describe(
+            account="JARAM user ID or exact username",
+            target="Roblox username or user ID to block",
+            force="Attempt the block even if block_log.json already lists the target",
+        )
+        @discord.app_commands.autocomplete(account=_admin_account_autocomplete)
+        async def jaram_block(
+            interaction: Any,
+            account: str,
+            target: str,
+            force: Optional[bool] = False,
+        ) -> None:
+            if not _author_is_admin(interaction.user):
+                msg = "You are not allowed to use admin-only JARAM commands."
+                await _reply(interaction, msg, ephemeral=True)
+                _record_command_usage(interaction, account_ref=account, ok=False, message=msg)
+                return
+            response = service._request(
+                {
+                    "type": "block_user",
+                    "account_ref": str(account or "").strip(),
+                    "target": str(target or "").strip(),
+                    "force": force,
+                    **_usage_context(interaction, account_ref=account),
+                },
+                timeout=10.0,
+            )
+            await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
+
+        @bot.tree.command(name="unblock", description="Unblock a Roblox user from one JARAM account")
+        @discord.app_commands.describe(
+            account="JARAM user ID or exact username",
+            target="Roblox username or user ID to unblock",
+            force="Attempt the unblock even if block_log.json does not list the target",
+        )
+        @discord.app_commands.autocomplete(account=_admin_account_autocomplete)
+        async def jaram_unblock(
+            interaction: Any,
+            account: str,
+            target: str,
+            force: Optional[bool] = False,
+        ) -> None:
+            if not _author_is_admin(interaction.user):
+                msg = "You are not allowed to use admin-only JARAM commands."
+                await _reply(interaction, msg, ephemeral=True)
+                _record_command_usage(interaction, account_ref=account, ok=False, message=msg)
+                return
+            response = service._request(
+                {
+                    "type": "unblock_user",
+                    "account_ref": str(account or "").strip(),
+                    "target": str(target or "").strip(),
+                    "force": force,
+                    **_usage_context(interaction, account_ref=account),
+                },
+                timeout=10.0,
+            )
+            await _reply(interaction, str(response.get("message") or "Request completed."), ephemeral=True)
 
         return bot

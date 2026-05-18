@@ -156,6 +156,11 @@ def _maybe_prompt_cookie_unlock(app: QApplication, parent=None) -> None:
             QMessageBox.warning(dlg, "Password Required", "Please enter a password.")
             return
         if cfg.unlock_cookie_encryption(pwd.text()):
+            try:
+                if parent is not None and hasattr(parent, "_on_cookie_encryption_unlocked"):
+                    parent._on_cookie_encryption_unlocked()
+            except Exception:
+                pass
             dlg.accept()
         else:
             err = cfg.get_cookie_error() or "Incorrect password."

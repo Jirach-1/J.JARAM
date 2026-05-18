@@ -8,9 +8,9 @@
 #   - self.tab_widget (QTabWidget) to add the tab
 # ──────────────────────────────────────────────────────────────────────────────
 
-import os, json, time, urllib.parse as _urlparse, random, threading
+import os, json, time, urllib.parse as _urlparse, random, threading, re
 from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple, Optional, Set
+from typing import Dict, Any, List, Tuple, Optional, Set, Callable
 from collections import defaultdict
 
 import requests
@@ -18,7 +18,7 @@ from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QLineEdit,
     QPushButton, QPlainTextEdit, QCheckBox, QLabel, QScrollArea,
-    QDialog, QProgressBar
+    QDialog, QProgressBar, QSizePolicy
 )
 
 try:
@@ -92,6 +92,14 @@ def _save_users(users: Dict[str, Any]) -> bool:
             return False
     _save_json(_users_json_path(), users)
     return True
+
+
+class _DoubleClickPlainTextEdit(QPlainTextEdit):
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
 
 # ---------------- Block log schema (new) ----------------
 # {
@@ -662,62 +670,320 @@ def _api_unblock_user(session: requests.Session, cookie: str, target_user_id: st
     return f"failed ({r.status_code})" + (f" {hint}" if hint else ""), cookie
 
 # ---------------- PSL helpers ----------------
-def _game_instances_url(place_id: str, slug: str) -> str:
-    slug = slug or "Example"
-    return f"https://www.roblox.com/games/{place_id}/{slug}#!/game-instances"
+_PSL_PRIVATE_SERVERS_URL = "https://games.roblox.com/v1/games/{place_id}/private-servers"
+_PSL_UNIVERSE_URL = "https://apis.roblox.com/universes/v1/places/{place_id}/universe"
+_PSL_CREATE_URL = "https://games.roblox.com/v1/games/vip-servers/{universe_id}"
+_PSL_VIP_SERVER_URL = "https://games.roblox.com/v1/vip-servers/{vip_server_id}"
 
-def _extract_share_code(share_url: str) -> Optional[str]:
-    try:
-        parsed = _urlparse.urlparse(share_url)
-        qs = _urlparse.parse_qs(parsed.query)
-        code = qs.get("code", [None])[0]
-        if code:
-            return code
-        parts = [p for p in parsed.path.split("/") if p]
-        return parts[-1] if parts else None
-    except Exception:
-        return None
-
-def _resolve_share_code(share_code: str, cookie: str) -> Tuple[Optional[str], Optional[str], str]:
-    cookie = str(cookie or "")
-    if not share_code or not cookie:
-        return None, None, cookie
-    url = "https://apis.roblox.com/sharelinks/v1/resolve-link"
-    payload = {"linkId": share_code, "linkType": "Server"}
-    s = requests.Session()
-    _apply_session_cookies(s, cookie)
-    s.headers.update({"Content-Type": "application/json", "User-Agent": "Mozilla/5.0", "Referer": "https://www.roblox.com/"})
-    try:
-        r = s.post(url, json=payload, timeout=12)
-    except Exception:
-        return None, None, cookie
-
-    cookie = _maybe_take_updated_cookie(r, cookie, session=s)
-    _apply_session_cookies(s, cookie)
-
-    if r.status_code == 403:
-        csrf = r.headers.get("X-CSRF-TOKEN")
-        if csrf:
-            s.headers["X-CSRF-TOKEN"] = csrf
-            try:
-                r = s.post(url, json=payload, timeout=12)
-            except Exception:
-                return None, None, cookie
-            cookie = _maybe_take_updated_cookie(r, cookie, session=s)
-            _apply_session_cookies(s, cookie)
-
-    if r.status_code == 200:
-        data = r.json() or {}
-        invite = data.get("privateServerInviteData") or {}
-        place = str(invite.get("placeId") or "")
-        link_code = invite.get("linkCode")
-        if link_code:
-            return place, link_code, cookie
-    return None, None, cookie
 
 def _compose_ps_link(place_id: str, link_code: str, slug: str) -> str:
     slug = slug or "-"
     return f"https://www.roblox.com/games/{place_id}/{slug}?privateServerLinkCode={link_code}"
+
+
+def _render_psl_server_name(template: str, username: str, uid: str) -> str:
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    template = (template or "JARAM-{username}-{ts}").strip()
+    values = {
+        "username": (username or uid or "user").strip() or "user",
+        "uid": str(uid or "").strip(),
+        "ts": ts,
+    }
+    try:
+        name = template.format(**values)
+    except Exception:
+        name = template
+    name = re.sub(r"\s+", " ", str(name or "")).strip()
+    if not name:
+        name = f"JARAM-{values['username']}-{ts}"
+    return name[:50]
+
+
+def _format_api_response_for_debug(label: str, resp: Optional[requests.Response] = None, error: Optional[BaseException] = None) -> str:
+    stamp = time.strftime("%H:%M:%S")
+    if resp is None:
+        msg = str(error) if error else "No response"
+        return f"[{stamp}] {label}\nRequest failed: {msg}"
+
+    method = ""
+    try:
+        method = str(resp.request.method or "")
+    except Exception:
+        pass
+    url = str(getattr(resp, "url", "") or "")
+    status = getattr(resp, "status_code", "?")
+
+    body = ""
+    try:
+        body = json.dumps(resp.json(), indent=2, ensure_ascii=False)
+    except Exception:
+        try:
+            body = str(resp.text or "")
+        except Exception:
+            body = ""
+    body = body.strip() or "<empty body>"
+    if len(body) > 5000:
+        body = body[:5000] + "\n... <truncated>"
+
+    return f"[{stamp}] {label}\n{method} {url}\nStatus: {status}\n{body}"
+
+
+def _roblox_request(
+    session: requests.Session,
+    cookie: str,
+    method: str,
+    url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    json_payload: Optional[Dict[str, Any]] = None,
+    timeout: float = 12.0,
+    response_log: Optional[Callable[[str], None]] = None,
+    label: str = "Roblox API",
+) -> Tuple[Optional[requests.Response], str]:
+    method = str(method or "GET").upper()
+    cookie = str(cookie or "")
+    last: Optional[requests.Response] = None
+
+    for attempt in range(3):
+        if attempt:
+            time.sleep(min(0.5 * (2 ** (attempt - 1)), 3.0))
+        try:
+            r = session.request(method, url, params=params, json=json_payload, timeout=timeout)
+            last = r
+            if response_log:
+                response_log(_format_api_response_for_debug(label, r))
+        except Exception as e:
+            if response_log:
+                response_log(_format_api_response_for_debug(label, None, e))
+            continue
+
+        cookie = _maybe_take_updated_cookie(r, cookie, session=session)
+        _apply_session_cookies(session, cookie)
+
+        if r.status_code == 403:
+            tok = r.headers.get("x-csrf-token") or r.headers.get("X-CSRF-TOKEN")
+            if tok:
+                session.headers["x-csrf-token"] = tok
+                _set_cached_csrf(cookie, tok)
+                try:
+                    r = session.request(method, url, params=params, json=json_payload, timeout=timeout)
+                    last = r
+                    if response_log:
+                        response_log(_format_api_response_for_debug(f"{label} (CSRF retry)", r))
+                except Exception as e:
+                    if response_log:
+                        response_log(_format_api_response_for_debug(f"{label} (CSRF retry)", None, e))
+                    continue
+                cookie = _maybe_take_updated_cookie(r, cookie, session=session)
+                _apply_session_cookies(session, cookie)
+
+        if r.status_code == 429 and attempt < 2:
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    time.sleep(min(float(retry_after), 10.0))
+                except Exception:
+                    pass
+            continue
+
+        return r, cookie
+
+    return last, cookie
+
+
+def _response_json(resp: requests.Response, action: str) -> Dict[str, Any]:
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"{action} returned a non-JSON response ({resp.status_code}).")
+    return data if isinstance(data, dict) else {}
+
+
+def _psl_response_error(action: str, resp: Optional[requests.Response]) -> RuntimeError:
+    if resp is None:
+        return RuntimeError(f"{action} failed: no response.")
+    hint = _roblox_error_hint(resp)
+    suffix = f" {hint}" if hint else ""
+    return RuntimeError(f"{action} failed ({resp.status_code}).{suffix}")
+
+
+def _extract_vip_server_id(server: Any) -> str:
+    if not isinstance(server, dict):
+        return ""
+    for key in ("vipServerId", "vipServerID", "id"):
+        val = server.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
+def _extract_private_server_link_code(link_value: Any) -> str:
+    if isinstance(link_value, dict):
+        for key in ("joinCode", "privateServerLinkCode", "linkCode", "code", "link", "url"):
+            code = _extract_private_server_link_code(link_value.get(key))
+            if code:
+                return code
+        return ""
+
+    raw = str(link_value or "").strip()
+    if not raw:
+        return ""
+
+    try:
+        parsed = _urlparse.urlparse(raw)
+        qs = _urlparse.parse_qs(parsed.query)
+        code = (qs.get("privateServerLinkCode") or [None])[0]
+        if code:
+            return str(code).strip()
+    except Exception:
+        pass
+
+    match = re.search(r"privateServerLinkCode=([A-Za-z0-9_-]+)", raw)
+    if match:
+        return match.group(1).strip()
+
+    if re.fullmatch(r"[A-Za-z0-9_-]{6,}", raw):
+        return raw
+    return ""
+
+
+def _api_get_existing_vip_server_id(
+    session: requests.Session,
+    cookie: str,
+    place_id: str,
+    response_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, str]:
+    url = _PSL_PRIVATE_SERVERS_URL.format(place_id=place_id)
+    params = {
+        "sortOrder": "Asc",
+        "limit": 10,
+        "excludeFriendServers": "true",
+    }
+    r, cookie = _roblox_request(
+        session,
+        cookie,
+        "GET",
+        url,
+        params=params,
+        response_log=response_log,
+        label="Check existing private servers",
+    )
+    if r is None or r.status_code != 200:
+        raise _psl_response_error("Private server lookup", r)
+
+    data = _response_json(r, "Private server lookup")
+    servers = data.get("data") if isinstance(data, dict) else []
+    if not isinstance(servers, list) or not servers:
+        return "", cookie
+
+    vip_server_id = _extract_vip_server_id(servers[0])
+    if not vip_server_id:
+        raise RuntimeError("Private server lookup returned a server without vipServerId.")
+    return vip_server_id, cookie
+
+
+def _api_get_universe_id(
+    session: requests.Session,
+    cookie: str,
+    place_id: str,
+    response_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, str]:
+    url = _PSL_UNIVERSE_URL.format(place_id=place_id)
+    r, cookie = _roblox_request(
+        session,
+        cookie,
+        "GET",
+        url,
+        response_log=response_log,
+        label="Get universe id",
+    )
+    if r is None or r.status_code != 200:
+        raise _psl_response_error("Universe lookup", r)
+
+    data = _response_json(r, "Universe lookup")
+    universe_id = data.get("universeId") or data.get("universeID") or data.get("id")
+    if universe_id is None or not str(universe_id).strip():
+        raise RuntimeError("Universe lookup did not return universeId.")
+    return str(universe_id).strip(), cookie
+
+
+def _api_create_vip_server(
+    session: requests.Session,
+    cookie: str,
+    universe_id: str,
+    server_name: str,
+    expected_price: int,
+    response_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, str]:
+    url = _PSL_CREATE_URL.format(universe_id=universe_id)
+    payload = {
+        "name": server_name,
+        "expectedPrice": max(0, int(expected_price or 0)),
+    }
+    r, cookie = _roblox_request(
+        session,
+        cookie,
+        "POST",
+        url,
+        json_payload=payload,
+        response_log=response_log,
+        label="Create private server",
+    )
+    if r is None or r.status_code not in (200, 201):
+        raise _psl_response_error("Private server creation", r)
+
+    data = _response_json(r, "Private server creation")
+    vip_server_id = _extract_vip_server_id(data)
+    if not vip_server_id:
+        raise RuntimeError("Private server creation did not return vipServerId.")
+    return vip_server_id, cookie
+
+
+def _api_get_vip_server_link_code(
+    session: requests.Session,
+    cookie: str,
+    vip_server_id: str,
+    response_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, str]:
+    url = _PSL_VIP_SERVER_URL.format(vip_server_id=vip_server_id)
+    r, cookie = _roblox_request(
+        session,
+        cookie,
+        "GET",
+        url,
+        response_log=response_log,
+        label="Get VIP server joinCode",
+    )
+    if r is None or r.status_code != 200:
+        raise _psl_response_error("VIP server joinCode lookup", r)
+
+    data = _response_json(r, "VIP server joinCode lookup")
+    return _extract_private_server_link_code(data), cookie
+
+
+def _api_regenerate_vip_server_link_code(
+    session: requests.Session,
+    cookie: str,
+    vip_server_id: str,
+    response_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, str]:
+    url = _PSL_VIP_SERVER_URL.format(vip_server_id=vip_server_id)
+    r, cookie = _roblox_request(
+        session,
+        cookie,
+        "PATCH",
+        url,
+        json_payload={"newJoinCode": True},
+        response_log=response_log,
+        label="Regenerate VIP server joinCode",
+    )
+    if r is None or r.status_code not in (200, 204):
+        raise _psl_response_error("VIP server joinCode regeneration", r)
+
+    if r.status_code == 204:
+        return "", cookie
+    data = _response_json(r, "VIP server joinCode regeneration")
+    return _extract_private_server_link_code(data), cookie
 
 # ---------------- Progress dialog ----------------
 class _UtilitiesRunDialog(QDialog):
@@ -1072,27 +1338,35 @@ class _PSLOpts:
     place_id: str
     game_slug: str
     name_template: str
-    headless: bool
+    expected_price: int
     only_missing: bool
 
 class _PSLWorker(QThread):
     progress = Signal(str)
+    response_debug = Signal(str)
     tick = Signal(int, int)
     done = Signal()
 
-    def __init__(self, opts: _PSLOpts):
+    def __init__(self, opts: _PSLOpts, allowed_uids=None):
         super().__init__()
         self.opts = opts
+        if allowed_uids is None:
+            self.allowed_uids = None
+        else:
+            self.allowed_uids = {str(x) for x in allowed_uids}
         self._cancel = False
 
     def cancel(self): self._cancel = True
     def _emit(self, s: str): self.progress.emit(s)
+    def _emit_response_debug(self, s: str):
+        self.response_debug.emit(s)
 
     def run(self):
         users = _load_users()
         work = [(uid, d) for uid, d in users.items()
-                if str(d.get("cookie") or "") and not bool(d.get("bad", False))]
-        # NEW: filter to users that don't already have a private server link
+                if str(d.get("cookie") or "")
+                and not bool(d.get("bad", False))
+                and (self.allowed_uids is None or str(uid) in self.allowed_uids)]
         if self.opts.only_missing:
             work = [
                 (uid, d) for uid, d in work
@@ -1105,161 +1379,124 @@ class _PSLWorker(QThread):
         cur = 0; self.tick.emit(cur, total)
 
         any_update = False
-        for uid, data in work:
-            if self._cancel: break
+        for user_idx, (uid, data) in enumerate(work):
+            if self._cancel:
+                break
+
             cookie = str(data.get("cookie") or "")
             username = str(data.get("username") or "")
-            self._emit(f"[PSL] {uid}: session")
-            try:
-                d = _make_driver(cookie, headless=self.opts.headless)
-            except Exception as e:
-                self._emit(f"[PSL] {uid}: cookie failed auth ({e})")
-                cur += 1; self.tick.emit(cur, total)
-                continue
+            account_label = str(uid)
+            if username:
+                account_label += f" ({username})"
+
+            def _emit_user_response_debug(s: str):
+                self._emit_response_debug(f"Account: {account_label}\n{s}")
+
+            response_log = _emit_user_response_debug
+            session: Optional[requests.Session] = None
+            did_api_call = False
+
+            def _pace_api_call():
+                nonlocal did_api_call
+                if did_api_call:
+                    time.sleep(_BLOCKING_CALL_DELAY_SEC)
+                did_api_call = True
+
+            self._emit(f"[PSL] {uid}: checking private servers")
 
             try:
-                d.get(_game_instances_url(self.opts.place_id, self.opts.game_slug))
-                time.sleep(0.4)
-
-                def _first_present(selectors: List[str], timeout=12, click=False, scroll=True):
-                    last_err = None
-                    for sel in selectors:
-                        locator = (By.XPATH, sel) if sel.startswith("//") else (By.CSS_SELECTOR, sel)
-                        try:
-                            el = WebDriverWait(d, timeout).until(EC.presence_of_element_located(locator))
-                            WebDriverWait(d, timeout).until(EC.element_to_be_clickable(locator))
-                            if scroll:
-                                d.execute_script("arguments[0].scrollIntoView({block:'center'});", el); time.sleep(0.15)
-                            if click:
-                                try: d.execute_script("arguments[0].click();", el)
-                                except Exception: el.click()
-                            return el
-                        except Exception as e:
-                            last_err = e
-                    if last_err: raise last_err
-                    raise RuntimeError("Element not found")
-
-                def _click_first_now(selectors: List[str]) -> bool:
-                    for sel in selectors:
-                        by, val = ((By.XPATH, sel) if sel.startswith("//") else (By.CSS_SELECTOR, sel))
-                        try:
-                            elements = d.find_elements(by, val)
-                        except Exception:
-                            continue
-                        for el in elements:
-                            try:
-                                if not el.is_displayed() or not el.is_enabled():
-                                    continue
-                            except Exception:
-                                pass
-                            try:
-                                d.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                            except Exception:
-                                pass
-                            try:
-                                d.execute_script("arguments[0].click();", el)
-                            except Exception:
-                                try:
-                                    el.click()
-                                except Exception:
-                                    continue
-                            return True
-                    return False
-
-                SELECTORS = {
-                    "create_free": [
-                        "//button[.//span[normalize-space()='Create one for free']]",
-                        "//button[normalize-space(.)='Create one for free']",
-                    ],
-                    "configure_link": [
-                        "a[aria-label='Configure'][href*='/private-server/configure']",
-                        "//a[@aria-label='Configure' and contains(@href, '/private-server/configure')]",
-                    ],
-                    "generate_btn": [
-                        "#generate-link-button",
-                        "//button[@id='generate-link-button']",
-                    ],
-                    "share_input": [
-                        "#join-link",
-                        "//input[@id='join-link']",
-                    ],
-                }
-
-                _click_first_now(SELECTORS["create_free"])
-                _first_present(SELECTORS["configure_link"], click=True)
-
-                share_el = _first_present(SELECTORS["share_input"], click=False)
-                share_url = (share_el.get_attribute("value") or share_el.get_property("value") or "").strip()
-                if not share_url:
-                    _first_present(SELECTORS["generate_btn"], click=True)
-                    end = time.time() + 15
-                    while time.time() < end:
-                        share_url = (share_el.get_attribute("value") or share_el.get_property("value") or "").strip()
-                        if share_url:
-                            break
-                        time.sleep(0.25)
-                    if not share_url:
-                        raise TimeoutError("Share link did not populate in time.")
-
-                code = _extract_share_code(share_url)
-                if not code:
-                    raise RuntimeError(f"Could not extract share code from: {share_url}")
-
-                if extract_roblosecurity_from_selenium_driver is not None:
-                    try:
-                        browser_cookie = extract_roblosecurity_from_selenium_driver(d)
-                    except Exception:
-                        browser_cookie = None
-                    if browser_cookie and browser_cookie != cookie:
-                        cookie = browser_cookie
-                        data["cookie"] = cookie
-                        users[uid] = data
-                        any_update = True
-
-                place_from_api, link_code, new_cookie = _resolve_share_code(code, cookie)
-                if new_cookie and new_cookie != cookie:
-                    cookie = new_cookie
+                original_cookie = cookie
+                session, cookie = _make_blocking_api_session(cookie)
+                if cookie and cookie != original_cookie:
                     data["cookie"] = cookie
                     users[uid] = data
                     any_update = True
+            except Exception as e:
+                self._emit(f"[PSL] {uid}: failed to start API session ({e})")
+                cur += 1; self.tick.emit(cur, total)
+                if (not self._cancel) and user_idx < (total - 1):
+                    time.sleep(_USER_SWAP_DELAY_SEC)
+                continue
+
+            try:
+                _pace_api_call()
+                vip_server_id, cookie = _api_get_existing_vip_server_id(
+                    session, cookie, self.opts.place_id, response_log=response_log
+                )
+                if vip_server_id:
+                    self._emit(f"[PSL] {uid}: using existing VIP server {vip_server_id}")
+                else:
+                    self._emit(f"[PSL] {uid}: no private server found; creating one")
+                    _pace_api_call()
+                    universe_id, cookie = _api_get_universe_id(
+                        session, cookie, self.opts.place_id, response_log=response_log
+                    )
+                    server_name = _render_psl_server_name(self.opts.name_template, username, str(uid))
+                    _pace_api_call()
+                    vip_server_id, cookie = _api_create_vip_server(
+                        session,
+                        cookie,
+                        universe_id,
+                        server_name,
+                        self.opts.expected_price,
+                        response_log=response_log,
+                    )
+                    self._emit(f"[PSL] {uid}: created VIP server {vip_server_id}")
+
+                _pace_api_call()
+                link_code, cookie = _api_get_vip_server_link_code(
+                    session, cookie, vip_server_id, response_log=response_log
+                )
                 if not link_code:
-                    raise RuntimeError("Failed to resolve share code to privateServerLinkCode.")
+                    self._emit(f"[PSL] {uid}: joinCode was empty; requesting a new join code")
+                    _pace_api_call()
+                    link_code, cookie = _api_regenerate_vip_server_link_code(
+                        session, cookie, vip_server_id, response_log=response_log
+                    )
+                    if not link_code:
+                        _pace_api_call()
+                        link_code, cookie = _api_get_vip_server_link_code(
+                            session, cookie, vip_server_id, response_log=response_log
+                        )
 
-                final_place = place_from_api or self.opts.place_id
-                ps_link = _compose_ps_link(final_place, link_code, self.opts.game_slug)
+                if not link_code:
+                    raise RuntimeError("VIP server response did not contain joinCode.")
 
+                ps_link = _compose_ps_link(self.opts.place_id, link_code, self.opts.game_slug)
                 data["private_server_link"] = ps_link
-                data["place"] = str(final_place)
+                data["place"] = str(self.opts.place_id)
                 users[uid] = data
                 any_update = True
-                self._emit(f"[PSL] {uid}: OK → {ps_link}")
+                self._emit(f"[PSL] {uid}: OK -> {ps_link}")
 
             except Exception as e:
-                self._emit(f"[PSL] {uid}: error → {e}")
+                self._emit(f"[PSL] {uid}: error -> {e}")
             finally:
-                if extract_roblosecurity_from_selenium_driver is not None:
-                    try:
-                        browser_cookie = extract_roblosecurity_from_selenium_driver(d)
-                    except Exception:
-                        browser_cookie = None
-                    if browser_cookie and browser_cookie != cookie:
-                        cookie = browser_cookie
-                        try:
-                            data["cookie"] = cookie
-                            users[uid] = data
-                            any_update = True
-                        except Exception:
-                            pass
-                try: d.quit()
-                except Exception: pass
+                try:
+                    if cookie and cookie != str(data.get("cookie") or ""):
+                        data["cookie"] = cookie
+                        users[uid] = data
+                        any_update = True
+                except Exception:
+                    pass
+                try:
+                    if session is not None:
+                        session.close()
+                except Exception:
+                    pass
 
             cur += 1; self.tick.emit(cur, total)
+            if self._cancel:
+                break
+            if user_idx < (total - 1):
+                time.sleep(_USER_SWAP_DELAY_SEC)
 
         if any_update:
             if not _save_users(users):
                 self._emit("[PSL] Failed to save users.json")
         self._emit("[PSL] " + ("Cancelled." if self._cancel else "Done."))
         self.done.emit()
+        return
 
 # ---------------- GUI ----------------
 def build_utilities_widget(self) -> QWidget:
@@ -1268,20 +1505,20 @@ def build_utilities_widget(self) -> QWidget:
     v = QVBoxLayout(tab)
 
     # Global toggles + account selector (single row)
-    self.utilities_headless_chk = QCheckBox("Run non-headless (debug)")
-    self.utilities_headless_chk.setChecked(False)
+    self.utilities_response_log_chk = QCheckBox("Show API response log")
+    self.utilities_response_log_chk.setChecked(False)
 
     self.utilities_force_chk = QCheckBox("Force block/unblock")
     self.utilities_force_chk.setChecked(False)
 
-    # Accounts selector (applies to Blocking / Unblocking)
+    # Accounts selector (applies to Blocking / Unblocking / PSL Grabber)
     if not hasattr(self, "_utilities_selected_uids"):
         self._utilities_selected_uids = None  # None => all eligible users
 
     self.utilities_accounts_btn = QPushButton("Accounts…")
     self.utilities_accounts_label = QLabel("Accounts: All")
     top_row = QHBoxLayout()
-    top_row.addWidget(self.utilities_headless_chk)
+    top_row.addWidget(self.utilities_response_log_chk)
     top_row.addWidget(self.utilities_force_chk)
     top_row.addStretch()
     top_row.addWidget(self.utilities_accounts_label)
@@ -1331,9 +1568,11 @@ def build_utilities_widget(self) -> QWidget:
     self.psl_place_id = QLineEdit()
     self.psl_game_slug = QLineEdit()
     self.psl_name_tmpl = QLineEdit("JARAM-{username}-{ts}")
+    self.psl_expected_price = QLineEdit("0")
     psl_form.addRow("Place ID:", self.psl_place_id)
     psl_form.addRow("Game Slug:", self.psl_game_slug)
     psl_form.addRow("Server Name:", self.psl_name_tmpl)
+    psl_form.addRow("Estimated Roblox Value:", self.psl_expected_price)
     self.psl_only_missing_chk = QCheckBox("Only users without a private server link")
     self.psl_only_missing_chk.setChecked(True)  # default ON
     psl_form.addRow("", self.psl_only_missing_chk)
@@ -1344,6 +1583,17 @@ def build_utilities_widget(self) -> QWidget:
     content_v.addWidget(un_grp)
 
     content_v.addStretch()
+
+    self.utilities_api_log_label = QLabel("API Responses:")
+    self.utilities_api_log_box = _DoubleClickPlainTextEdit()
+    self.utilities_api_log_box.setReadOnly(True)
+    self.utilities_api_log_box.setMinimumHeight(180)
+    self.utilities_api_log_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    self.utilities_api_log_box.setPlaceholderText("PSL API responses will appear here while response logging is enabled.")
+    self.utilities_api_log_label.hide()
+    self.utilities_api_log_box.hide()
+    v.addWidget(self.utilities_api_log_label)
+    v.addWidget(self.utilities_api_log_box)
 
     # Load persistent block list on open
     try:
@@ -1372,8 +1622,70 @@ def build_utilities_widget(self) -> QWidget:
             b.setEnabled(not on)
         try: self.utilities_force_chk.setEnabled(not on)
         except Exception: pass
-        try: self.utilities_headless_chk.setEnabled(not on)
+        try: self.utilities_response_log_chk.setEnabled(not on)
         except Exception: pass
+
+    api_log_top_widgets = [
+        self.utilities_response_log_chk,
+        self.utilities_force_chk,
+        self.utilities_accounts_label,
+        self.utilities_accounts_btn,
+    ]
+    self._utilities_api_log_expanded = False
+
+    def _set_api_log_expanded(on: bool):
+        on = bool(on)
+        self._utilities_api_log_expanded = on
+        if on:
+            for wdg in api_log_top_widgets:
+                try: wdg.hide()
+                except Exception: pass
+            try: scroll.hide()
+            except Exception: pass
+            try: self.utilities_api_log_label.hide()
+            except Exception: pass
+            try:
+                self.utilities_api_log_box.setMinimumHeight(0)
+                self.utilities_api_log_box.show()
+            except Exception:
+                pass
+            return
+
+        for wdg in api_log_top_widgets:
+            try: wdg.show()
+            except Exception: pass
+        try: scroll.show()
+        except Exception: pass
+        show_log = bool(self.utilities_response_log_chk.isChecked())
+        try: self.utilities_api_log_label.setVisible(show_log)
+        except Exception: pass
+        try:
+            self.utilities_api_log_box.setMinimumHeight(180)
+            self.utilities_api_log_box.setVisible(show_log)
+        except Exception:
+            pass
+
+    def _set_api_log_visible(on: bool):
+        if not on and getattr(self, "_utilities_api_log_expanded", False):
+            _set_api_log_expanded(False)
+        try: self.utilities_api_log_label.setVisible(bool(on))
+        except Exception: pass
+        try: self.utilities_api_log_box.setVisible(bool(on))
+        except Exception: pass
+
+    def _append_api_response_log(s: str):
+        try:
+            box = self.utilities_api_log_box
+            if box.toPlainText():
+                box.appendPlainText("")
+            box.appendPlainText(str(s or ""))
+        except Exception:
+            pass
+
+    self.utilities_response_log_chk.toggled.connect(_set_api_log_visible)
+    self.utilities_api_log_box.doubleClicked.connect(
+        lambda: _set_api_log_expanded(not getattr(self, "_utilities_api_log_expanded", False))
+    )
 
     # ---- helpers ----
     def _is_eligible_user(uid: str, data: dict) -> bool:
@@ -1418,12 +1730,12 @@ def build_utilities_widget(self) -> QWidget:
 
         users_now = _load_users() or {}
         dlg = QDialog(self)
-        dlg.setWindowTitle("Select Accounts (Blocking/Unblocking)")
+        dlg.setWindowTitle("Select Accounts")
         dlg.setModal(True)
         dlg.setMinimumWidth(520)
 
         vbox = QVBoxLayout(dlg)
-        vbox.addWidget(QLabel("Choose which accounts will run Blocking/Unblocking.\n(Only accounts with a valid cookie are selectable.)"))
+        vbox.addWidget(QLabel("Choose which accounts will run Utilities actions.\n(Only accounts with a valid cookie are selectable.)"))
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1557,7 +1869,7 @@ def build_utilities_widget(self) -> QWidget:
             self.append_log("[Utilities] A job is already running.")
             return
         _save_blocklist()
-        headless = not self.utilities_headless_chk.isChecked()
+        headless = True
         targets_text = self.block_persistent_box.toPlainText()
 
         w = _BlockWorker(
@@ -1583,7 +1895,7 @@ def build_utilities_widget(self) -> QWidget:
         if self._util_busy:
             self.append_log("[Utilities] A job is already running.")
             return
-        headless = not self.utilities_headless_chk.isChecked()
+        headless = True
         w = _UnblockWorker(
             headless=headless,
             unblock_text=self.unblock_box.toPlainText(),
@@ -1609,23 +1921,35 @@ def build_utilities_widget(self) -> QWidget:
         if self._util_busy:
             self.append_log("[Utilities] A job is already running.")
             return
-        headless = not self.utilities_headless_chk.isChecked()
+        expected_price_text = self.psl_expected_price.text().strip() or "0"
+        try:
+            expected_price = int(expected_price_text)
+            if expected_price < 0:
+                raise ValueError()
+        except Exception:
+            self.append_log("[PSL] Estimated Roblox Value must be a non-negative integer.")
+            self.psl_expected_price.setFocus()
+            return
         opts = _PSLOpts(
             place_id=self.psl_place_id.text().strip(),
             game_slug=self.psl_game_slug.text().strip(),
             name_template=self.psl_name_tmpl.text().strip() or "JARAM-{username}-{ts}",
-            headless=headless,
+            expected_price=expected_price,
             only_missing=self.psl_only_missing_chk.isChecked(),
         )
         if not opts.place_id:
             self.append_log("[PSL] PLACE_ID is required.")
             return
 
-        w = _PSLWorker(opts)
+        w = _PSLWorker(
+            opts,
+            allowed_uids=getattr(self, "_utilities_selected_uids", None),
+        )
         dlg = _UtilitiesRunDialog(self, "PSL Grabber…")
         _set_util_busy(True)
 
         w.progress.connect(lambda s: (self.append_log(s), dlg.set_status(s)))
+        w.response_debug.connect(_append_api_response_log)
         w.tick.connect(lambda cur, tot: (dlg.set_total(tot), dlg.set_value(cur)))
         w.done.connect(lambda: (self.append_log("[Utilities] PSL run complete."),
                                 dlg.accept(), _set_util_busy(False)))

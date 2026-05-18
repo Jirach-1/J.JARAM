@@ -879,6 +879,13 @@ def _normalize_filter_user_ids(raw: Any) -> Optional[List[str]]:
     return cleaned
 
 
+def _normalize_user_filter_mode(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if value in {"blacklist", "blocklist", "exclude", "denylist", "deny"}:
+        return "blacklist"
+    return "whitelist"
+
+
 def _normalize_filter_spec(raw: Dict[str, Any], *, fallback_index: int = 0) -> Dict[str, Any]:
     base = raw or {}
     name = _normalize_filter_name(str(base.get("name", "")).strip())
@@ -937,6 +944,7 @@ def _normalize_filter_spec(raw: Dict[str, Any], *, fallback_index: int = 0) -> D
         "send_screenshot": bool(base.get("send_screenshot", default_spec.get("send_screenshot", behavior == "merchant"))),
         "repeat_alert_sound": bool(base.get("repeat_alert_sound", default_spec.get("repeat_alert_sound", False))),
         "user_ids": _normalize_filter_user_ids(base.get("user_ids", default_spec.get("user_ids"))),
+        "user_filter_mode": _normalize_user_filter_mode(base.get("user_filter_mode", default_spec.get("user_filter_mode", "whitelist"))),
         "behavior": behavior,
         "cooldown_group": _cooldown_group_for_filter(
             filter_id,
@@ -1003,6 +1011,7 @@ def _migrate_legacy_filters(
                 "send_screenshot": bool(behavior == "merchant"),
                 "repeat_alert_sound": False,
                 "user_ids": None,
+                "user_filter_mode": "whitelist",
                 "behavior": behavior,
                 "cooldown_group": _cooldown_group_for_filter(filter_id, behavior),
             }
@@ -1375,6 +1384,91 @@ def _parse_device_id(raw: Any) -> Tuple[Optional[int], bool]:
     if device_id < 0:
         return None, True
     return device_id, False
+
+
+_ON_DEMAND_OCR_LOCK = threading.Lock()
+_ON_DEMAND_OCR_READER = None
+_ON_DEMAND_OCR_KEY: Optional[Tuple[Optional[int], bool]] = None
+
+
+def _on_demand_ocr_reader(device_id: Optional[int], force_cpu: bool):
+    global _ON_DEMAND_OCR_READER, _ON_DEMAND_OCR_KEY
+    key = (device_id, bool(force_cpu))
+    if _ON_DEMAND_OCR_READER is None or _ON_DEMAND_OCR_KEY != key:
+        _ON_DEMAND_OCR_READER = _init_rapidocr_engine(
+            require_dml=not bool(force_cpu),
+            device_id=device_id,
+            force_cpu=bool(force_cpu),
+        )
+        _ON_DEMAND_OCR_KEY = key
+    return _ON_DEMAND_OCR_READER
+
+
+def read_window_ocr_text_once(
+    hwnd: int,
+    *,
+    roi: Optional[Dict[str, Any]] = None,
+    ocr_settings: Optional[Dict[str, Any]] = None,
+    filter_ids: Optional[List[str]] = None,
+    color_filters: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """
+    Capture one window/ROI and run OCR using the same RapidOCR/preprocess stack as OCRWorker.
+
+    This is used by Auto Actions OCR conditionals, which need an immediate read at the
+    exact step where the condition is evaluated instead of waiting for the background
+    OCR batch loop.
+    """
+    cfg = ocr_settings or {}
+    if RapidOCR is None:
+        raise RuntimeError(f"rapidocr_onnxruntime is not available: {_RAPIDOCR_IMPORT_ERROR}")
+    if ort is None:
+        raise RuntimeError(f"onnxruntime is not available: {_ORT_IMPORT_ERROR}")
+
+    roi_tuple = _roi_from_cfg(roi or {}) if isinstance(roi, dict) else None
+    if roi_tuple is None and isinstance(cfg.get("roi"), dict):
+        roi_tuple = _roi_from_cfg(cfg.get("roi") or {})
+
+    raw_img = capture_window_image(int(hwnd), roi_tuple)
+    if raw_img is None:
+        raise RuntimeError("window capture failed")
+
+    filters: List[Dict[str, Any]] = []
+    if isinstance(color_filters, list) and color_filters:
+        for idx, raw in enumerate(color_filters):
+            if not isinstance(raw, dict) or not bool(raw.get("enabled", True)):
+                continue
+            try:
+                filters.append(
+                    {
+                        "id": f"auto_action_condition_{idx}",
+                        "name": str(raw.get("name") or f"Condition Color {idx + 1}"),
+                        "r": int(raw.get("r", 255) or 0),
+                        "g": int(raw.get("g", 255) or 0),
+                        "b": int(raw.get("b", 255) or 0),
+                        "tol": int(raw.get("tol", raw.get("tolerance", 40)) or 0),
+                        "enabled": True,
+                    }
+                )
+            except Exception:
+                continue
+
+    wanted = {str(fid or "").strip() for fid in (filter_ids or []) if str(fid or "").strip()}
+    if wanted and not filters:
+        for spec in _filters_from_cfg(cfg):
+            if str(spec.get("id") or "").strip() in wanted and bool(spec.get("enabled", True)):
+                filters.append(spec)
+
+    use_preprocess = bool(cfg.get("use_preprocess", True))
+    try:
+        img_for_ocr = _prepare_filter_ocr_image(raw_img, filters) if use_preprocess else raw_img
+    except Exception:
+        img_for_ocr = raw_img
+
+    device_id, force_cpu = _parse_device_id(cfg.get("device_id"))
+    with _ON_DEMAND_OCR_LOCK:
+        reader = _on_demand_ocr_reader(device_id, force_cpu)
+        return _rapidocr_text_only(reader, np.array(img_for_ocr))
 
 
 class OCRWorker(QThread):
@@ -1946,9 +2040,14 @@ class OCRWorker(QThread):
         allowed_user_ids = _normalize_filter_user_ids((spec or {}).get("user_ids", None))
         if allowed_user_ids is None:
             return True
-        if not allowed_user_ids:
+        user_set = set(allowed_user_ids)
+        if _normalize_user_filter_mode((spec or {}).get("user_filter_mode", "whitelist")) == "blacklist":
+            if not user_set:
+                return True
+            return not (bool(uid) and uid in user_set)
+        if not user_set:
             return False
-        return bool(uid) and uid in set(allowed_user_ids)
+        return bool(uid) and uid in user_set
 
     def _pid_has_eligible_filters(self, pid: int) -> bool:
         return bool(self._build_capture_groups(pid))

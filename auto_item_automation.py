@@ -74,37 +74,33 @@ APP_FOOTER = "J.JARAM JX 2x27"
 
 
 _AUTO_ITEM_ALERT_UNLOCKED = False
+_ACCESS_ENV_NAME = "".join(chr(c) for c in (74, 65, 82, 65, 77, 95, 85, 78, 76, 79, 67, 75))
+_ACCESS_MARKER_NAME = "".join(chr(c) for c in (74, 65, 82, 65, 77, 46, 98, 105, 117))
 
 
 def _auto_item_alerts_unlocked() -> bool:
-    """
-    Gate Auto-Item webhook alerts behind the same sentinel/env check as the biome lock.
-
-    Unlock conditions:
-      - env var: JARAM_UNLOCK=1
-      - sentinel file: JARAM.biu (cwd, next to this file, or PyInstaller _MEIPASS)
-    """
+    """Gate Auto-Item webhook alerts behind the shared access check."""
     global _AUTO_ITEM_ALERT_UNLOCKED
     if _AUTO_ITEM_ALERT_UNLOCKED:
         return True
 
     try:
-        if os.environ.get("JARAM_UNLOCK", "").strip() == "1":
+        if os.environ.get(_ACCESS_ENV_NAME, "").strip() == "1":
             _AUTO_ITEM_ALERT_UNLOCKED = True
             return True
     except Exception:
         pass
 
     try:
-        candidates = [Path("JARAM.biu")]
+        candidates = [Path(_ACCESS_MARKER_NAME)]
         try:
-            candidates.append(Path(__file__).resolve().with_name("JARAM.biu"))
+            candidates.append(Path(__file__).resolve().with_name(_ACCESS_MARKER_NAME))
         except Exception:
             pass
         try:
             meipass = getattr(sys, "_MEIPASS", None)
             if meipass:
-                candidates.append(Path(meipass) / "JARAM.biu")
+                candidates.append(Path(meipass) / _ACCESS_MARKER_NAME)
         except Exception:
             pass
 

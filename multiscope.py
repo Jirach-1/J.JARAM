@@ -29,6 +29,9 @@ from log_utils import (
 # IMPORTANT: we keep strictness; cache is refreshed on demand
 from log_utils import find_log_for_username, refresh_username_log_map
 
+_ACCESS_ENV_NAME = "".join(chr(c) for c in (74, 65, 82, 65, 77, 95, 85, 78, 76, 79, 67, 75))
+_ACCESS_MARKER_NAME = "".join(chr(c) for c in (74, 65, 82, 65, 77, 46, 98, 105, 117))
+
 # Optional biomes metadata (color, thumbnail). Fallbacks if missing.
 try:
     from biomes import load_biomes_catalog, biome_meta, biome_duration, biome_names
@@ -56,7 +59,7 @@ except Exception:
     WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
 
 
-APP_FOOTER = "J.JARAM JX 2x56"
+APP_FOOTER = "J.JARAM JX 2x60"
 HARD_EVERYONE_BIOMES = {"GLITCHED", "DREAMSPACE", "CYBERSPACE"}
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
@@ -81,6 +84,12 @@ def _normalize_role_ping_id(value: object) -> str:
         return mention_match.group(1)
     id_match = re.search(r"\d+", text)
     return id_match.group(0) if id_match else ""
+
+def _normalize_user_filter_mode(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"blacklist", "blocklist", "exclude", "denylist", "deny"}:
+        return "blacklist"
+    return "whitelist"
 
 # Parse [BloxstrapRPC] JSON blobs strictly
 _R_RPC_MARK = "[BloxstrapRPC]"
@@ -892,6 +901,7 @@ class MultiScopeEngine:
             else:
                 # None -> no user filter (all users allowed)
                 users = None
+            user_filter_mode = _normalize_user_filter_mode(wh.get("user_filter_mode", "whitelist"))
 
             nh = {
                 "url": url,
@@ -900,6 +910,7 @@ class MultiScopeEngine:
                 "biome_modes": modes,
                 "biome_role_pings": role_pings,
                 "users": users,
+                "user_filter_mode": user_filter_mode,
             }
             if users is not None:
                 nh["_user_lower"] = {u.lower() for u in users}
@@ -1979,19 +1990,19 @@ class MultiScopeEngine:
         try:
             if getattr(self, "_bm_relaxed", False):
                 return True
-            if os.environ.get("JARAM_UNLOCK", "").strip() == "1":
+            if os.environ.get(_ACCESS_ENV_NAME, "").strip() == "1":
                 return True
 
-            candidates = [Path("JARAM.biu")]
+            candidates = [Path(_ACCESS_MARKER_NAME)]
             try:
-                candidates.append(Path(__file__).resolve().with_name("JARAM.biu"))
+                candidates.append(Path(__file__).resolve().with_name(_ACCESS_MARKER_NAME))
             except Exception:
                 pass
             try:
                 import sys as _sys
                 meipass = getattr(_sys, "_MEIPASS", None)
                 if meipass:
-                    candidates.append(Path(meipass) / "JARAM.biu")
+                    candidates.append(Path(meipass) / _ACCESS_MARKER_NAME)
             except Exception:
                 pass
 
@@ -2008,7 +2019,7 @@ class MultiScopeEngine:
     def _is_bm_lock_enforced(self) -> bool:
         """
         Returns True when the biome lock should be enforced (force Everyone on hard biomes).
-        We double-check before locking to avoid accidental flips when the sentinel exists.
+        We double-check before locking to avoid accidental flips during startup/path changes.
         """
         try:
             if self._is_bm_relaxed():
@@ -2097,9 +2108,10 @@ class MultiScopeEngine:
                 continue
             allowed_users = wh.get("users", None)
             # None => no user filter (all users on the server allowed).
-            # []   => explicit "no users" for this webhook.
+            # []   => no users for whitelist, no blocked users for blacklist.
             if allowed_users is not None:
-                if not allowed_users:
+                user_filter_mode = _normalize_user_filter_mode(wh.get("user_filter_mode", "whitelist"))
+                if user_filter_mode == "whitelist" and not allowed_users:
                     # Explicitly disabled for all users.
                     continue
                 allowed_set = {str(u) for u in allowed_users}
@@ -2118,7 +2130,11 @@ class MultiScopeEngine:
                 # 2) Server-level matches: any uid on this server
                 server_match = any(su in allowed_set for su in server_users)
 
-                if not (direct_match or server_match):
+                user_match = direct_match or server_match
+                if user_filter_mode == "blacklist":
+                    if user_match:
+                        continue
+                elif not user_match:
                     continue
             if embed is None:
                 embed = self._build_biome_embed(

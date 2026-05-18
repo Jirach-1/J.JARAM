@@ -1090,7 +1090,7 @@ class GameLauncher:
 
         last_err = None
         applied = False
-        for attempt in range(1, 6):
+        for attempt in range(1, 11):
             try:
                 if not win32gui.IsWindow(int(hwnd)):
                     hwnd = self._find_visible_window_for_pid(target_pids, include_minimized=True)

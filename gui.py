@@ -11,6 +11,7 @@ import requests
 import re
 import queue
 import threading
+import difflib
 from collections import deque
 from typing import Any, Dict, Set, List, Tuple, Optional
 from datetime import datetime
@@ -467,7 +468,14 @@ from main import (
 )
 from log_utils import find_log_for_username, refresh_username_log_map
 from biomes import biome_names, biome_meta, biome_duration
-from utilities_tab import build_utilities_widget
+from utilities_tab import (
+    build_utilities_widget,
+    _BlockWorker,
+    _PSLOpts,
+    _PSLWorker,
+    _UnblockWorker,
+    _set_config_manager,
+)
 from trimmer import setup_TRIMMER_tab
 from discord_account_control import DiscordBotService, format_discord_ids, normalize_discord_ids
 from found_stats import FoundStatsMixin
@@ -475,6 +483,7 @@ from found_stats import FoundStatsMixin
 GUI_BIOME_NAMES = [b for b in biome_names() if str(b).upper() != "NORMAL"]
 HARD_EVERYONE_BIOMES = {"GLITCHED", "DREAMSPACE", "CYBERSPACE"}
 WEBHOOK_ROLE_PINGS_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+WEBHOOK_USER_FILTER_MODE_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 from multiscope_process import MultiScopeProcessProxy
 from antiafk import AntiAFK
 from ocr_worker import (
@@ -488,6 +497,7 @@ from ocr_worker import (
     get_ocr_available_devices,
     compute_frame_hash,
     frame_hash_diff_percent,
+    read_window_ocr_text_once,
 )
 
 OCR_MERCHANT_FILTER_IDS = {"merchant_jester", "merchant_mari", "merchant_rin"}
@@ -495,6 +505,13 @@ OCR_MERCHANT_FILTER_NAMES = {"jester", "mari", "rin", "white_text", "purple_text
 MISC_DISABLE_LOG_MERCHANTS_WHEN_OCR_ACTIVE_KEY = (
     "disable_log_based_merchant_detection_when_ocr_merchants_enabled"
 )
+
+
+def _normalize_user_filter_mode(raw: object) -> str:
+    value = str(raw or "").strip().lower()
+    if value in {"blacklist", "blocklist", "exclude", "denylist", "deny"}:
+        return "blacklist"
+    return "whitelist"
 
 
 def _candidate_ocr_filters_from_cfg(ocr_cfg: object) -> List[dict]:
@@ -639,38 +656,36 @@ def _get_icon_path():
     return None
 
 # Lockout
-_BM_RELAXED = False          # latched once sentinel/env found
+_BM_RELAXED = False          # latched once access marker is found
 _BM_LOCK_CONFIRMED = False   # latched once lock is enforced
+_ACCESS_ENV_NAME = "".join(chr(c) for c in (74, 65, 82, 65, 77, 95, 85, 78, 76, 79, 67, 75))
+_ACCESS_MARKER_NAME = "".join(chr(c) for c in (74, 65, 82, 65, 77, 46, 98, 105, 117))
 
 def _bm_relaxed() -> bool:
     global _BM_RELAXED
     if _BM_RELAXED:
         return True
     try:
-        if os.environ.get("JARAM_UNLOCK", "").strip() == "1":
+        if os.environ.get(_ACCESS_ENV_NAME, "").strip() == "1":
             _BM_RELAXED = True
             return True
     except Exception:
         pass
     try:
-        # Check for the sentinel in common launch locations:
-        # - current working directory (when run from source)
-        # - next to this file (when launched from another cwd)
-        # - PyInstaller's temp extraction dir (onefile)
-        candidates = [Path("JARAM.biu")]
+        candidates = [Path(_ACCESS_MARKER_NAME)]
         try:
-            candidates.append(Path(__file__).resolve().with_name("JARAM.biu"))
+            candidates.append(Path(__file__).resolve().with_name(_ACCESS_MARKER_NAME))
         except Exception:
             pass
         try:
             import sys as _sys
             if getattr(_sys, "_MEIPASS", None):
-                candidates.append(Path(getattr(_sys, "_MEIPASS")) / "JARAM.biu")
+                candidates.append(Path(getattr(_sys, "_MEIPASS")) / _ACCESS_MARKER_NAME)
         except Exception:
             pass
-        for sentinel in candidates:
+        for marker_path in candidates:
             try:
-                if sentinel.exists():
+                if marker_path.exists():
                     _BM_RELAXED = True
                     return True
             except Exception:
@@ -683,7 +698,7 @@ def _bm_relaxed() -> bool:
 def _bm_lock_enforced() -> bool:
     """
     True when biome lock should be enforced (force Everyone on hard biomes).
-    Uses a double-check to avoid accidental flips when the sentinel exists.
+    Uses a double-check to avoid accidental flips during startup/path changes.
     """
     global _BM_LOCK_CONFIRMED
     try:
@@ -714,6 +729,9 @@ _COOKIE_KDF_SALT_LEN = 16
 _COOKIE_GCM_NONCE_LEN = 12
 _COOKIE_GCM_TAG_LEN = 16
 _COOKIE_GCM_AAD = b"JARAM_COOKIE_v2"
+_DISCORD_TOKEN_ENC_PREFIX = "enc_discord_v1:"
+_DISCORD_TOKEN_GCM_AAD = b"JARAM_DISCORD_TOKEN_v1"
+_DISCORD_TOKEN_HIDDEN_SENTINEL = "__discord_token_hidden_by_cookie_lock__"
 _COOKIE_ENC_META_KEY = "__cookie_encryption__"
 
 class ConfigManager:
@@ -797,6 +815,7 @@ class ConfigManager:
                 "log_confirmed_launch_mode": False,
                 "disable_manager_bad_marking": False,
                 "msedgewebview2_limiter_enabled": True,
+                "hide_discord_tabs": True,
             },
             "ui": {
                 "show_tutorial_menu": False,
@@ -895,6 +914,8 @@ class ConfigManager:
         self._raw_cookie_cache: dict = {}
         self._settings_cache_mtime: float = -1.0
         self._settings_cache: dict = {}
+        self._settings_cache_unlock_token: int = -1
+        self._settings_raw_encrypted_discord_token: str = ""
         self._cookie_last_error: str = ""
         self._users_file_cookie_meta: dict = {}
         self._users_file_has_encrypted_cookies: bool = False
@@ -930,6 +951,48 @@ class ConfigManager:
             self._cleanup_old_backups(file_path.stem)
         except Exception as e:
             pass
+
+    def _create_settings_backup(self, prepared_settings: Optional[dict] = None) -> None:
+        if not self.settings_file.exists():
+            return
+
+        try:
+            prepared_token = ""
+            if isinstance(prepared_settings, dict):
+                prepared_discord = prepared_settings.get("discord_control")
+                if isinstance(prepared_discord, dict):
+                    raw_token = str(prepared_discord.get("token") or "")
+                    if self._is_discord_token_encrypted(raw_token):
+                        prepared_token = raw_token
+
+            if not prepared_token:
+                self._create_backup(self.settings_file)
+                return
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"{self.settings_file.stem}_{timestamp}.json"
+            backup_path = self.backup_dir / backup_name
+
+            with open(self.settings_file, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                shutil.copy2(self.settings_file, backup_path)
+                self._cleanup_old_backups(self.settings_file.stem)
+                return
+
+            discord_cfg = loaded.get("discord_control")
+            if isinstance(discord_cfg, dict):
+                discord_cfg["token"] = prepared_token
+            else:
+                loaded["discord_control"] = {"token": prepared_token}
+            self._safe_write_json(backup_path, loaded)
+            self._cleanup_old_backups(self.settings_file.stem)
+        except Exception:
+            if not prepared_token:
+                try:
+                    self._create_backup(self.settings_file)
+                except Exception:
+                    pass
 
     def _cleanup_old_backups(self, file_stem):
         try:
@@ -1129,33 +1192,47 @@ class ConfigManager:
             self._set_cookie_error(f"Failed to derive key: {e}")
             return None
 
-    def _encrypt_bytes_v2(self, data: bytes, entropy: bytes) -> Optional[bytes]:
+    def _encrypt_bytes_v2(
+        self,
+        data: bytes,
+        entropy: bytes,
+        *,
+        aad: bytes = _COOKIE_GCM_AAD,
+        label: str = "Cookie",
+    ) -> Optional[bytes]:
         if not _BCRYPT_AVAILABLE:
-            self._set_cookie_error("Cookie encryption is not available on this system.")
+            self._set_cookie_error(f"{label} encryption is not available on this system.")
             return None
         try:
             nonce = os.urandom(_COOKIE_GCM_NONCE_LEN)
-            ciphertext, tag = _cng_aes_gcm_encrypt(key=entropy, nonce=nonce, plaintext=data, aad=_COOKIE_GCM_AAD)
+            ciphertext, tag = _cng_aes_gcm_encrypt(key=entropy, nonce=nonce, plaintext=data, aad=aad)
             return nonce + tag + ciphertext
         except Exception as e:
-            self._set_cookie_error(f"Cookie encryption failed: {e}")
+            self._set_cookie_error(f"{label} encryption failed: {e}")
             return None
 
-    def _decrypt_bytes_v2(self, data: bytes, entropy: bytes) -> Optional[bytes]:
+    def _decrypt_bytes_v2(
+        self,
+        data: bytes,
+        entropy: bytes,
+        *,
+        aad: bytes = _COOKIE_GCM_AAD,
+        label: str = "Cookie",
+    ) -> Optional[bytes]:
         if not _BCRYPT_AVAILABLE:
-            self._set_cookie_error("Cookie decryption is not available on this system.")
+            self._set_cookie_error(f"{label} decryption is not available on this system.")
             return None
         blob = bytes(data or b"")
         if len(blob) < (_COOKIE_GCM_NONCE_LEN + _COOKIE_GCM_TAG_LEN):
-            self._set_cookie_error("Invalid encrypted cookie data.")
+            self._set_cookie_error(f"Invalid encrypted {label.lower()} data.")
             return None
         nonce = blob[:_COOKIE_GCM_NONCE_LEN]
         tag = blob[_COOKIE_GCM_NONCE_LEN:_COOKIE_GCM_NONCE_LEN + _COOKIE_GCM_TAG_LEN]
         ciphertext = blob[_COOKIE_GCM_NONCE_LEN + _COOKIE_GCM_TAG_LEN:]
         try:
-            return _cng_aes_gcm_decrypt(key=entropy, nonce=nonce, ciphertext=ciphertext, tag=tag, aad=_COOKIE_GCM_AAD)
+            return _cng_aes_gcm_decrypt(key=entropy, nonce=nonce, ciphertext=ciphertext, tag=tag, aad=aad)
         except Exception:
-            self._set_cookie_error("Incorrect password or corrupted encrypted data.")
+            self._set_cookie_error(f"Incorrect password or corrupted encrypted {label.lower()} data.")
             return None
 
     def _make_cookie_verifier(self, entropy: bytes, cfg: dict) -> Optional[str]:
@@ -1222,6 +1299,148 @@ class ConfigManager:
             return None
 
         return value
+
+    def _is_discord_token_encrypted(self, value: object) -> bool:
+        return str(value or "").startswith(_DISCORD_TOKEN_ENC_PREFIX)
+
+    def _encrypt_discord_token_value(self, value: str, entropy: bytes) -> Optional[str]:
+        token = str(value or "")
+        if not token:
+            return ""
+        if self._is_discord_token_encrypted(token):
+            return token
+        blob = self._encrypt_bytes_v2(
+            token.encode("utf-8"),
+            entropy,
+            aad=_DISCORD_TOKEN_GCM_AAD,
+            label="Discord token",
+        )
+        if blob is None:
+            return None
+        return _DISCORD_TOKEN_ENC_PREFIX + base64.b64encode(blob).decode("ascii")
+
+    def _decrypt_discord_token_value(self, value: str, entropy: bytes) -> Optional[str]:
+        token = str(value or "")
+        if not token:
+            return ""
+        if not token.startswith(_DISCORD_TOKEN_ENC_PREFIX):
+            return token
+        b64 = token[len(_DISCORD_TOKEN_ENC_PREFIX):]
+        try:
+            blob = base64.b64decode(b64)
+        except Exception:
+            self._set_cookie_error("Invalid encrypted Discord token data.")
+            return None
+        plain = self._decrypt_bytes_v2(
+            blob,
+            entropy,
+            aad=_DISCORD_TOKEN_GCM_AAD,
+            label="Discord token",
+        )
+        if plain is None:
+            return None
+        try:
+            return plain.decode("utf-8")
+        except Exception:
+            return plain.decode("utf-8", errors="replace")
+
+    def _raw_encrypted_discord_token_from_disk(self) -> str:
+        try:
+            if not self.settings_file.exists():
+                return ""
+            with open(self.settings_file, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                return ""
+            discord_cfg = loaded.get("discord_control")
+            if not isinstance(discord_cfg, dict):
+                return ""
+            token = str(discord_cfg.get("token") or "")
+            return token if self._is_discord_token_encrypted(token) else ""
+        except Exception:
+            return ""
+
+    def _apply_cookie_encryption_on_settings_load(self, settings_data: dict) -> dict:
+        data = copy.deepcopy(settings_data or {})
+        discord_cfg = data.get("discord_control")
+        if not isinstance(discord_cfg, dict):
+            return data
+        discord_cfg.pop(_DISCORD_TOKEN_HIDDEN_SENTINEL, None)
+
+        token = str(discord_cfg.get("token") or "")
+        if not self._is_discord_token_encrypted(token):
+            self._settings_raw_encrypted_discord_token = ""
+            return data
+
+        self._settings_raw_encrypted_discord_token = token
+        cfg = self._get_cookie_encryption_settings(data)
+        if not bool(cfg.get("enabled", False)):
+            discord_cfg["token"] = ""
+            discord_cfg[_DISCORD_TOKEN_HIDDEN_SENTINEL] = True
+            return data
+
+        entropy = self._get_cookie_entropy()
+        if entropy is None:
+            discord_cfg["token"] = ""
+            discord_cfg[_DISCORD_TOKEN_HIDDEN_SENTINEL] = True
+            return data
+
+        decrypted = self._decrypt_discord_token_value(token, entropy)
+        if decrypted is None:
+            discord_cfg["token"] = ""
+            discord_cfg[_DISCORD_TOKEN_HIDDEN_SENTINEL] = True
+        else:
+            discord_cfg["token"] = decrypted
+        return data
+
+    def _prepare_settings_for_save(self, settings_data: dict) -> Optional[dict]:
+        data = copy.deepcopy(settings_data or {})
+        discord_cfg = data.get("discord_control")
+        if not isinstance(discord_cfg, dict):
+            return data
+
+        hidden_token = bool(discord_cfg.pop(_DISCORD_TOKEN_HIDDEN_SENTINEL, False))
+        token = str(discord_cfg.get("token") or "")
+        cfg = self._get_cookie_encryption_settings(data)
+        if not bool(cfg.get("enabled", False)):
+            return data
+
+        entropy = self._get_cookie_entropy()
+        if entropy is None:
+            raw_encrypted = (
+                str(getattr(self, "_settings_raw_encrypted_discord_token", "") or "")
+                or self._raw_encrypted_discord_token_from_disk()
+            )
+            if self._is_discord_token_encrypted(token):
+                discord_cfg["token"] = token
+                self._settings_raw_encrypted_discord_token = token
+                return data
+            if token:
+                self._set_cookie_error("Cookies are locked. Unlock to save the Discord bot token.")
+                return None
+            discord_cfg["token"] = raw_encrypted
+            return data
+
+        if not token:
+            raw_encrypted = (
+                str(getattr(self, "_settings_raw_encrypted_discord_token", "") or "")
+                or self._raw_encrypted_discord_token_from_disk()
+            )
+            if hidden_token and raw_encrypted:
+                discord_cfg["token"] = raw_encrypted
+                self._settings_raw_encrypted_discord_token = raw_encrypted
+                return data
+            self._settings_raw_encrypted_discord_token = ""
+            return data
+        if self._is_discord_token_encrypted(token):
+            self._settings_raw_encrypted_discord_token = token
+            return data
+        encrypted = self._encrypt_discord_token_value(token, entropy)
+        if encrypted is None:
+            return None
+        discord_cfg["token"] = encrypted
+        self._settings_raw_encrypted_discord_token = encrypted
+        return data
 
     def _users_data_has_encrypted_cookies(self, users_data: dict) -> bool:
         for info in (users_data or {}).values():
@@ -1334,6 +1553,13 @@ class ConfigManager:
         except Exception:
             return []
 
+    def _iter_settings_backup_files(self) -> List[Path]:
+        try:
+            pattern = f"{self.settings_file.stem}_*.json"
+            return sorted(self.backup_dir.glob(pattern), key=lambda p: p.stat().st_mtime)
+        except Exception:
+            return []
+
     def encrypt_existing_users_backups(self, entropy: Optional[bytes] = None) -> Optional[Tuple[int, int, int]]:
         """
         Encrypt plaintext cookie values inside existing users_*.json backups in the backups folder.
@@ -1420,6 +1646,105 @@ class ConfigManager:
                 failed += 1
 
         return scanned, updated, failed
+
+    def encrypt_existing_settings_backups(self, entropy: Optional[bytes] = None) -> Optional[Tuple[int, int, int]]:
+        """
+        Encrypt plaintext Discord bot tokens inside existing settings_*.json backups.
+
+        Returns (scanned_files, updated_files, failed_files) on success, or None on hard failure.
+        """
+        self._set_cookie_error("")
+        if entropy is None:
+            entropy = self._get_cookie_entropy()
+        if entropy is None:
+            self._set_cookie_error("Cookies are locked. Unlock first.")
+            return None
+
+        scanned = 0
+        updated = 0
+        failed = 0
+
+        for backup_path in self._iter_settings_backup_files():
+            scanned += 1
+            try:
+                with open(backup_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+            except Exception:
+                failed += 1
+                continue
+            if not isinstance(loaded, dict):
+                continue
+
+            discord_cfg = loaded.get("discord_control")
+            if not isinstance(discord_cfg, dict):
+                continue
+            token = str(discord_cfg.get("token") or "")
+            if not token or self._is_discord_token_encrypted(token):
+                continue
+
+            encrypted = self._encrypt_discord_token_value(token, entropy)
+            if encrypted is None:
+                failed += 1
+                continue
+            discord_cfg["token"] = encrypted
+            try:
+                self._safe_write_json(backup_path, loaded)
+                updated += 1
+            except Exception as e:
+                self._set_cookie_error(f"Failed to write backup {backup_path.name}: {e}")
+                failed += 1
+
+        return scanned, updated, failed
+
+    def decrypt_existing_settings_backups(self, entropy: Optional[bytes] = None) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Decrypt encrypted Discord bot tokens inside existing settings_*.json backups.
+
+        Returns (scanned_files, updated_files, skipped_files, failed_files) on success, or None on hard failure.
+        """
+        self._set_cookie_error("")
+        if entropy is None:
+            entropy = self._get_cookie_entropy()
+        if entropy is None:
+            self._set_cookie_error("Cookies are locked. Unlock first.")
+            return None
+
+        scanned = 0
+        updated = 0
+        skipped = 0
+        failed = 0
+
+        for backup_path in self._iter_settings_backup_files():
+            scanned += 1
+            try:
+                with open(backup_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+            except Exception:
+                failed += 1
+                continue
+            if not isinstance(loaded, dict):
+                continue
+
+            discord_cfg = loaded.get("discord_control")
+            if not isinstance(discord_cfg, dict):
+                continue
+            token = str(discord_cfg.get("token") or "")
+            if not token or not self._is_discord_token_encrypted(token):
+                continue
+
+            decrypted = self._decrypt_discord_token_value(token, entropy)
+            if decrypted is None:
+                skipped += 1
+                continue
+            discord_cfg["token"] = decrypted
+            try:
+                self._safe_write_json(backup_path, loaded)
+                updated += 1
+            except Exception as e:
+                self._set_cookie_error(f"Failed to write backup {backup_path.name}: {e}")
+                failed += 1
+
+        return scanned, updated, skipped, failed
 
     def decrypt_existing_users_backups(self, entropy: Optional[bytes] = None) -> Optional[Tuple[int, int, int, int]]:
         """
@@ -1578,13 +1903,15 @@ class ConfigManager:
             return False
         cfg["verifier"] = verifier
 
+        old_entropy = self._get_cookie_entropy()
+        self._set_cookie_entropy(entropy)
         settings = self.load_settings()
         settings["cookie_encryption"] = cfg
         if not self.save_settings(settings):
+            self._set_cookie_entropy(old_entropy)
             self._set_cookie_error("Failed to save encryption settings.")
             return False
 
-        self._set_cookie_entropy(entropy)
         raw = self._load_users_raw_from_disk()
         raw = self._ensure_new_format(raw)
         encrypted = self._encrypt_users_cookies(raw, entropy)
@@ -1783,14 +2110,14 @@ class ConfigManager:
             return False
 
         settings = self.load_settings()
-        current = self._get_cookie_encryption_settings(settings)
         cfg["prompted"] = True
         settings["cookie_encryption"] = cfg
+        self._set_cookie_entropy(new_entropy)
         if not self.save_settings(settings):
+            self._set_cookie_entropy(entropy)
             self._set_cookie_error("Failed to save encryption settings.")
             return False
 
-        self._set_cookie_entropy(new_entropy)
         try:
             with self._cache_lock:
                 self._update_raw_cookie_cache(encrypted)
@@ -1986,10 +2313,10 @@ class ConfigManager:
                         settings["alerts"] = alerts
                     except Exception:
                         pass
-                return settings
-            return copy.deepcopy(self.default_settings)
+                return self._apply_cookie_encryption_on_settings_load(settings)
+            return self._apply_cookie_encryption_on_settings_load(copy.deepcopy(self.default_settings))
         except Exception:
-            return copy.deepcopy(self.default_settings)
+            return self._apply_cookie_encryption_on_settings_load(copy.deepcopy(self.default_settings))
 
     def peek_settings(self) -> dict:
         """
@@ -1998,8 +2325,13 @@ class ConfigManager:
         """
         try:
             mtime = self._file_mtime(self.settings_file)
+            unlock_token = self._get_cookie_unlock_token()
             with self._cache_lock:
-                if mtime == self._settings_cache_mtime and isinstance(self._settings_cache, dict):
+                if (
+                    mtime == self._settings_cache_mtime
+                    and isinstance(self._settings_cache, dict)
+                    and self._settings_cache_unlock_token == unlock_token
+                ):
                     return self._settings_cache
 
             data = self._load_settings_uncached()
@@ -2007,6 +2339,7 @@ class ConfigManager:
             with self._cache_lock:
                 self._settings_cache_mtime = mtime2
                 self._settings_cache = data if isinstance(data, dict) else {}
+                self._settings_cache_unlock_token = unlock_token
             return self._settings_cache
         except Exception:
             return copy.deepcopy(self.default_settings)
@@ -2017,14 +2350,20 @@ class ConfigManager:
 
     def save_settings(self, settings_data):
         try:
+            self._set_cookie_error("")
+            prepared = self._prepare_settings_for_save(settings_data)
+            if prepared is None:
+                return False
 
-            self._create_backup(self.settings_file)
+            self._create_settings_backup(prepared)
 
-            self._safe_write_json(self.settings_file, settings_data)
+            self._safe_write_json(self.settings_file, prepared)
             try:
+                cached = self._apply_cookie_encryption_on_settings_load(prepared)
                 with self._cache_lock:
-                    self._settings_cache = dict(settings_data or {})
+                    self._settings_cache = dict(cached or {})
                     self._settings_cache_mtime = self._file_mtime(self.settings_file)
+                    self._settings_cache_unlock_token = self._get_cookie_unlock_token()
             except Exception:
                 pass
             return True
@@ -2749,6 +3088,7 @@ class WorkerThread(QThread):
         self._last_proc_count = 0
         self._last_growth_ts  = time.time()
         self.log_inactivity_timeout = 120
+        self._action_queue = queue.Queue()
 
         # Multiscope
         self.ms = None  # ← NEW: MultiScopeEngine instance
@@ -3601,6 +3941,44 @@ class WorkerThread(QThread):
     def _log(self, msg: str):
         self.log_signal.emit(msg)
 
+    def submit_action(self, action_name: str, *args, **kwargs) -> bool:
+        try:
+            self._action_queue.put((str(action_name or ""), args, kwargs or {}))
+            return True
+        except Exception:
+            return False
+
+    def _drain_action_queue(self, max_actions: int = 8) -> None:
+        for _ in range(max(1, int(max_actions or 1))):
+            try:
+                action_name, args, kwargs = self._action_queue.get_nowait()
+            except queue.Empty:
+                break
+            except Exception as e:
+                self._log(f"[WorkerAction] queue error: {e!r}")
+                break
+
+            try:
+                if action_name == "restart_user_session":
+                    self.restart_user_session(*args, **kwargs)
+                elif action_name == "launch_user_session_custom":
+                    self.launch_user_session_custom(*args, **kwargs)
+                elif action_name == "kill_user_processes":
+                    self.kill_user_processes(*args, **kwargs)
+                elif action_name == "kill_all_processes":
+                    self.kill_all_processes(*args, **kwargs)
+                elif action_name == "cleanup_dead_processes":
+                    self.cleanup_dead_processes(*args, **kwargs)
+                else:
+                    self._log(f"[WorkerAction] unknown action: {action_name}")
+            except Exception as e:
+                self._log(f"[WorkerAction] {action_name} failed: {e!r}")
+            finally:
+                try:
+                    self._action_queue.task_done()
+                except Exception:
+                    pass
+
     def _trace(self, uid: str, msg: str, *, every: float = 30.0) -> None:
         now = time.time()
         key = (uid, msg.split()[0])
@@ -4395,18 +4773,21 @@ class WorkerThread(QThread):
 
     # -------------- actions -------------------
     def restart_user_session(self, user_id):
+        user_id = str(user_id)
         if not self.manager or user_id not in self.user_states:
+            self._log(f"[ManualRestart] skipped uid={user_id}: manager not ready or user missing")
             return False
         try:
+            self._log(f"[ManualRestart] uid={user_id} closing current Roblox process and relaunching")
             # cancel in-flight mapping on manual restart
             self.handoff_for.pop(user_id, None)
 
-            for pid in self.manager.process_tracker.user_processes.get(user_id, []):
+            for pid in list(self.manager.process_tracker.user_processes.get(user_id, [])):
                 if self.process_mgr.verify_process_active(pid):
                     self.process_mgr.terminate_process(pid, self.manager.process_tracker)
             info = self.user_states[user_id]["user_info"]
             cookie = info.get("cookie", "") if isinstance(info, dict) else info
-            ok = self.launcher.start_game_session(user_id, cookie, info)
+            ok = self.launcher.start_game_session(user_id, cookie, info, skip_cleanup=True)
             if ok:
                 now2 = time.time()
                 self.user_states[user_id]["inactive_since"] = None
@@ -4415,8 +4796,12 @@ class WorkerThread(QThread):
                 self.user_states[user_id]["status"] = "Restarting"
                 self.user_states[user_id]["last_launch"] = now2
                 self._register_successful_launch(user_id, now2)
+                self._log(f"[ManualRestart] uid={user_id} relaunch started successfully")
+            else:
+                self._log(f"[ManualRestart] uid={user_id} relaunch failed; see preceding launch log entries")
             return ok
-        except Exception:
+        except Exception as e:
+            self._log(f"[ManualRestart] uid={user_id} failed: {e!r}")
             return False
 
     def launch_user_session_custom(self, user_id: str, user_info: dict, *, skip_cleanup: bool = False) -> bool:
@@ -4486,6 +4871,7 @@ class WorkerThread(QThread):
 
         while self.running:
             try:
+                self._drain_action_queue()
                 now = time.time()
                 
                 # ---- Hot reload users.json (propagate flag flips, etc.) ----
@@ -5344,6 +5730,7 @@ class UserManagementDialogLegacy(QDialog):
             "misc.log_confirmed_launch_mode": "Launch Next After Log Confirm",
             "misc.disable_manager_bad_marking": "Disable Manager BAD Marking",
             "misc.msedgewebview2_limiter_enabled": "Enable msedgewebview2 Limiter",
+            "misc.hide_discord_tabs": "Hide Discord Tab",
             "multiscope.merchant_webhook": "Merchant Webhook URL",
             "multiscope.merchant_detection_mode": "Merchant Detection Mode",
             "multiscope.enable_jester": "Enable Jester Pings",
@@ -6712,7 +7099,11 @@ class UserManagementDialog(QDialog):
                         launch_info["private_server_link"] = ""
                         launch_info["server_type"] = "public"
                         launch_info["place"] = place_id
-                    wt.launch_user_session_custom(uid, launch_info, skip_cleanup=False)
+                    submit = getattr(wt, "submit_action", None)
+                    if callable(submit):
+                        submit("launch_user_session_custom", uid, launch_info, skip_cleanup=False)
+                    else:
+                        self._ui_log(f"[ManualLaunch] uid={uid} failed: worker action queue unavailable")
                 except Exception as e:
                     self._ui_log(f"[ManualLaunch] uid={uid} failed: {e}")
             if online_skipped:
@@ -8001,6 +8392,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "misc.log_confirmed_launch_mode": "Launch Next After Log Confirm",
             "misc.disable_manager_bad_marking": "Disable Manager BAD Marking",
             "misc.msedgewebview2_limiter_enabled": "Enable msedgewebview2 Limiter",
+            "misc.hide_discord_tabs": "Hide Discord Tab",
             "multiscope.merchant_webhook": "Merchant Webhook URL",
             "multiscope.merchant_detection_mode": "Merchant Detection Mode",
             "multiscope.enable_jester": "Enable Jester Pings",
@@ -8080,10 +8472,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.discord_control_help_box: Optional[QTextEdit] = None
         self.discord_control_links_table: Optional[QTableWidget] = None
         self.discord_control_accounts_picker: Optional[QListWidget] = None
+        self.discord_control_account_filter_input: Optional[QLineEdit] = None
+        self.discord_control_account_count_label: Optional[QLabel] = None
         self.discord_control_discord_user_id_input: Optional[QLineEdit] = None
         self.discord_control_selected_account_label: Optional[QLabel] = None
         self.discord_control_selected_discord_user_id: Optional[str] = None
+        self.discord_control_selected_account_ids: Set[str] = set()
+        self._discord_control_editor_updating: bool = False
+        self._discord_control_token_hidden_until_unlock: bool = False
         self._discord_control_action_timer: Optional[QTimer] = None
+        self._discord_control_utility_workers: List[QThread] = []
+        self._discord_control_utility_busy: bool = False
         self._ensure_discord_control_service()
 
         # Connect Anti-AFK cross-thread signals
@@ -8149,6 +8548,18 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     target = _wheel_target(obj)
                     if target is not None:
                         target.setProperty("_wheel_armed", True)
+
+                if et == QEvent.Type.KeyPress:
+                    try:
+                        w = obj if isinstance(obj, QWidget) else None
+                        while w is not None:
+                            handler = getattr(w, "_auto_item_debug_key_handler", None)
+                            if callable(handler):
+                                handler(str(event.text() or ""))
+                                break
+                            w = w.parent()
+                    except Exception:
+                        pass
 
                 if et == QEvent.Type.FocusOut:
                     target = _wheel_target(obj)
@@ -8243,9 +8654,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.setup_bes_tab()
         setup_TRIMMER_tab(self)
         self.setup_settings_tab()
-        if _bm_relaxed():
-            self.setup_discord_control_tab()
-        self.setup_credits_tab()
+        self.setup_discord_control_tab()
 
         self.setup_menu_bar()
 
@@ -8253,6 +8662,55 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         self.start_time = None
         self.user_data = {}
+
+    def _discord_tabs_hidden_from_settings(self, settings: Optional[dict] = None) -> bool:
+        if settings is None:
+            try:
+                settings = self.config_manager.load_settings() or {}
+            except Exception:
+                settings = {}
+        misc = settings.get("misc", {}) if isinstance(settings, dict) else {}
+        if not isinstance(misc, dict):
+            misc = {}
+        defaults = self.config_manager.default_settings.get("misc", {}) or {}
+        return bool(misc.get("hide_discord_tabs", defaults.get("hide_discord_tabs", True)))
+
+    def _apply_discord_tabs_visibility(self, hide_tabs: Optional[bool] = None) -> None:
+        if hide_tabs is None:
+            hide_tabs = self._discord_tabs_hidden_from_settings()
+        tab_widget = getattr(self, "tab_widget", None)
+        idx = getattr(self, "discord_control_tab_index", None)
+        if tab_widget is None or idx is None:
+            return
+        try:
+            if idx < 0 or idx >= tab_widget.count():
+                return
+        except Exception:
+            return
+        visible = not bool(hide_tabs)
+        try:
+            tab_widget.setTabVisible(idx, visible)
+        except Exception:
+            try:
+                tab_widget.setTabEnabled(idx, visible)
+            except Exception:
+                return
+        if visible or tab_widget.currentIndex() != idx:
+            return
+        for candidate in (self.settings_tab_index, self.dashboard_tab_index, 0):
+            try:
+                if candidate is None or candidate == idx:
+                    continue
+                if candidate < 0 or candidate >= tab_widget.count():
+                    continue
+                if hasattr(tab_widget, "isTabVisible") and not tab_widget.isTabVisible(candidate):
+                    continue
+                if not tab_widget.isTabEnabled(candidate):
+                    continue
+                tab_widget.setCurrentIndex(candidate)
+                return
+            except Exception:
+                continue
 
     def setup_menu_bar(self):
         menubar = self.menuBar()
@@ -8299,6 +8757,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._tutorial_menu_action = help_menu.addAction("Tutorial")
         self._tutorial_menu_action.triggered.connect(self.open_help_link)
         self._tutorial_menu_sep = help_menu.addSeparator()
+
+        credits_action = help_menu.addAction("Credits")
+        credits_action.triggered.connect(self.show_credits)
 
         about_action = help_menu.addAction("About")
         about_action.triggered.connect(self.show_about)
@@ -8371,8 +8832,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         backups_chk = None
         if include_backup_option:
-            backups_chk = QCheckBox("Encrypt cookies in existing backup files")
-            backups_chk.setToolTip("One-time action: encrypt cookies inside existing users_*.json backups.")
+            backups_chk = QCheckBox("Encrypt sensitive data in existing backup files")
+            backups_chk.setToolTip("One-time action: encrypt cookies in users_*.json backups and Discord bot tokens in settings_*.json backups.")
             backups_chk.setChecked(bool(default_encrypt_existing_backups))
             layout.addWidget(backups_chk)
 
@@ -8396,6 +8857,66 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return None
         password = pwd1.text()
         return password, (backups_chk.isChecked() if backups_chk is not None else False)
+
+    def _encrypt_existing_sensitive_backups(self) -> Tuple[Optional[str], str]:
+        users_result = self.config_manager.encrypt_existing_users_backups()
+        if users_result is None:
+            return None, self.config_manager.get_cookie_error() or "Failed to encrypt user backups."
+
+        settings_result = self.config_manager.encrypt_existing_settings_backups()
+        if settings_result is None:
+            return None, self.config_manager.get_cookie_error() or "Failed to encrypt settings backups."
+
+        u_scanned, u_updated, u_failed = users_result
+        s_scanned, s_updated, s_failed = settings_result
+        u_unchanged = max(0, u_scanned - u_updated - u_failed)
+        s_unchanged = max(0, s_scanned - s_updated - s_failed)
+
+        msg = (
+            "\n\nExisting backups:"
+            f"\n- User backups scanned: {u_scanned}"
+            f"\n- User backups updated: {u_updated}"
+            f"\n- User backups unchanged: {u_unchanged}"
+            f"\n- Settings backups scanned: {s_scanned}"
+            f"\n- Settings backups updated: {s_updated}"
+            f"\n- Settings backups unchanged: {s_unchanged}"
+        )
+        if u_failed or s_failed:
+            msg += f"\n- Failed: {u_failed + s_failed}"
+        return msg, ""
+
+    def _decrypt_existing_sensitive_backups(self, entropy: Optional[bytes]) -> Tuple[Optional[str], str]:
+        users_result = self.config_manager.decrypt_existing_users_backups(entropy)
+        if users_result is None:
+            return None, self.config_manager.get_cookie_error() or "Failed to decrypt user backups."
+
+        settings_result = self.config_manager.decrypt_existing_settings_backups(entropy)
+        if settings_result is None:
+            return None, self.config_manager.get_cookie_error() or "Failed to decrypt settings backups."
+
+        u_scanned, u_updated, u_skipped, u_failed = users_result
+        s_scanned, s_updated, s_skipped, s_failed = settings_result
+        u_unchanged = max(0, u_scanned - u_updated - u_skipped - u_failed)
+        s_unchanged = max(0, s_scanned - s_updated - s_skipped - s_failed)
+
+        msg = (
+            "Backup files:"
+            f"\n- User backups scanned: {u_scanned}"
+            f"\n- User backups decrypted: {u_updated}"
+            f"\n- User backups unchanged: {u_unchanged}"
+            f"\n- Settings backups scanned: {s_scanned}"
+            f"\n- Settings backups decrypted: {s_updated}"
+            f"\n- Settings backups unchanged: {s_unchanged}"
+        )
+        skipped = u_skipped + s_skipped
+        failed = u_failed + s_failed
+        if skipped:
+            msg += f"\n- Skipped: {skipped}"
+        if failed:
+            msg += f"\n- Failed: {failed}"
+        if skipped:
+            msg += "\n\nSkipped backups usually mean a different password was used or the file is corrupted."
+        return msg, ""
 
     def _maybe_prompt_cookie_encryption(self) -> None:
         try:
@@ -8436,21 +8957,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if self.config_manager.enable_cookie_encryption(password):
                 extra = ""
                 if encrypt_existing_backups:
-                    backup_result = self.config_manager.encrypt_existing_users_backups()
-                    if backup_result is None:
-                        err = self.config_manager.get_cookie_error() or "Failed to encrypt existing backups."
-                        extra = "\n\n" + err
+                    backup_msg, backup_err = self._encrypt_existing_sensitive_backups()
+                    if backup_msg is None:
+                        extra = "\n\n" + backup_err
                     else:
-                        scanned, updated, failed = backup_result
-                        unchanged = max(0, scanned - updated - failed)
-                        extra = (
-                            "\n\nExisting backups:"
-                            f"\n- Scanned: {scanned}"
-                            f"\n- Updated: {updated}"
-                            f"\n- Unchanged: {unchanged}"
-                        )
-                        if failed:
-                            extra += f"\n- Failed: {failed}"
+                        extra = backup_msg
                 QMessageBox.information(self, "Cookie Encryption", "Cookie encryption is enabled." + extra)
                 self.config_manager.set_cookie_encryption_prompted(True)
             else:
@@ -8491,8 +9002,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         status_label = QLabel(f"Status: {status}")
         layout.addWidget(status_label)
 
-        backups_chk = QCheckBox("Encrypt cookies in existing backup files")
-        backups_chk.setToolTip("One-time action: encrypt cookies inside existing users_*.json backups.")
+        backups_chk = QCheckBox("Encrypt sensitive data in existing backup files")
+        backups_chk.setToolTip("One-time action: encrypt cookies in users_*.json backups and Discord bot tokens in settings_*.json backups.")
         backups_chk.setEnabled(bool(enabled))
         layout.addWidget(backups_chk)
 
@@ -8532,28 +9043,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 confirm = QMessageBox.question(
                     dlg,
                     "Encrypt Existing Backups",
-                    "Encrypt cookies inside existing users.json files in the backup folder?\n\n"
+                    "Encrypt cookies and Discord bot tokens inside existing backup files?\n\n"
                     "This will overwrite those backup files.",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if confirm != QMessageBox.StandardButton.Yes:
                     return
-                result = self.config_manager.encrypt_existing_users_backups()
-                if result is None:
-                    err = self.config_manager.get_cookie_error() or "Failed to encrypt existing backups."
+                msg, err = self._encrypt_existing_sensitive_backups()
+                if msg is None:
                     QMessageBox.warning(dlg, "Cookie Encryption", err)
                     return
-                scanned, updated, failed = result
-                unchanged = max(0, scanned - updated - failed)
-                msg = (
-                    "Existing backups:"
-                    f"\n- Scanned: {scanned}"
-                    f"\n- Updated: {updated}"
-                    f"\n- Unchanged: {unchanged}"
-                )
-                if failed:
-                    msg += f"\n- Failed: {failed}"
-                QMessageBox.information(dlg, "Cookie Encryption", msg)
+                QMessageBox.information(dlg, "Cookie Encryption", msg.strip())
             except Exception as e:
                 QMessageBox.critical(dlg, "Cookie Encryption", f"Unexpected error: {e}")
 
@@ -8589,7 +9089,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                             return
                         if self.config_manager.unlock_cookie_encryption(pwd):
                             QMessageBox.information(dlg, "Cookie Encryption", "Cookies unlocked.")
-                            _refresh_after_change()
+                            self._on_cookie_encryption_unlocked()
                             dlg.accept()
                         else:
                             err = self.config_manager.get_cookie_error() or "Incorrect password."
@@ -8661,11 +9161,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     box.setIcon(QMessageBox.Icon.Question)
                     box.setWindowTitle("Decrypt Cookies")
                     box.setText(
-                        "Decrypt cookies and disable encryption?\n\n"
+                        "Decrypt cookies and Discord bot token settings, then disable encryption?\n\n"
                         "This removes the password requirement."
                     )
-                    decrypt_backups_chk = QCheckBox("Also decrypt cookies in existing backup files")
-                    decrypt_backups_chk.setToolTip("Removes the password requirement for existing users_*.json backups.")
+                    decrypt_backups_chk = QCheckBox("Also decrypt sensitive data in existing backup files")
+                    decrypt_backups_chk.setToolTip("Removes the password requirement for users_*.json cookies and settings_*.json Discord bot tokens.")
                     box.setCheckBox(decrypt_backups_chk)
                     yes_btn = box.addButton(QMessageBox.StandardButton.Yes)
                     box.addButton(QMessageBox.StandardButton.No)
@@ -8685,25 +9185,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         return
 
                     if decrypt_backups_chk.isChecked():
-                        backup_result = self.config_manager.decrypt_existing_users_backups(entropy)
-                        if backup_result is None:
-                            err = self.config_manager.get_cookie_error() or "Failed to decrypt backups."
+                        msg, err = self._decrypt_existing_sensitive_backups(entropy)
+                        if msg is None:
                             QMessageBox.warning(dlg, "Cookie Encryption", err)
                         else:
-                            scanned, updated, skipped, failed = backup_result
-                            unchanged = max(0, scanned - updated - skipped - failed)
-                            msg = (
-                                "Backup files:"
-                                f"\n- Scanned: {scanned}"
-                                f"\n- Decrypted: {updated}"
-                                f"\n- Unchanged: {unchanged}"
-                            )
-                            if skipped:
-                                msg += f"\n- Skipped: {skipped}"
-                            if failed:
-                                msg += f"\n- Failed: {failed}"
-                            if skipped:
-                                msg += "\n\nSkipped backups usually mean a different password was used or the file is corrupted."
                             QMessageBox.information(dlg, "Cookie Encryption", msg)
 
                     QMessageBox.information(dlg, "Cookie Encryption", "Cookie encryption disabled.")
@@ -8731,21 +9216,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     if self.config_manager.enable_cookie_encryption(password):
                         extra = ""
                         if encrypt_existing_backups:
-                            backup_result = self.config_manager.encrypt_existing_users_backups()
-                            if backup_result is None:
-                                err = self.config_manager.get_cookie_error() or "Failed to encrypt existing backups."
-                                extra = "\n\n" + err
+                            backup_msg, backup_err = self._encrypt_existing_sensitive_backups()
+                            if backup_msg is None:
+                                extra = "\n\n" + backup_err
                             else:
-                                scanned, updated, failed = backup_result
-                                unchanged = max(0, scanned - updated - failed)
-                                extra = (
-                                    "\n\nExisting backups:"
-                                    f"\n- Scanned: {scanned}"
-                                    f"\n- Updated: {updated}"
-                                    f"\n- Unchanged: {unchanged}"
-                                )
-                                if failed:
-                                    extra += f"\n- Failed: {failed}"
+                                extra = backup_msg
                         QMessageBox.information(dlg, "Cookie Encryption", "Cookie encryption is enabled." + extra)
                         _refresh_after_change()
                         dlg.accept()
@@ -10602,7 +11077,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.auto_item_table.setColumnWidth(4, 120)
         self.auto_item_table.setColumnWidth(5, 140)
         self.auto_item_table.setColumnWidth(6, 140)
-        # Hide per-item alert controls unless unlocked (JARAM.biu / JARAM_UNLOCK).
+        # Keep per-item alert controls behind the access gate.
         try:
             self.auto_item_table.setColumnHidden(6, not _bm_relaxed())
         except Exception:
@@ -10912,6 +11387,56 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 return ""
 
+        def _discord_ping_provider(uid: str) -> str:
+            try:
+                users = self.config_manager.peek_users() or {}
+            except Exception:
+                try:
+                    users = self.config_manager.load_users() or {}
+                except Exception:
+                    users = {}
+            try:
+                info = users.get(str(uid), {}) if isinstance(users, dict) else {}
+                if not isinstance(info, dict):
+                    return ""
+                discord_ids = normalize_discord_ids(info.get("discord_user_ids"))
+            except Exception:
+                discord_ids = []
+            return " ".join(f"<@{discord_id}>" for discord_id in discord_ids if discord_id)
+
+        def _ocr_text_provider(hwnd: int, condition: Dict[str, Any]) -> str:
+            try:
+                cfg = self._get_ocr_settings_from_ui() or {}
+            except Exception:
+                cfg = {}
+            roi = condition.get("roi") if isinstance(condition, dict) and isinstance(condition.get("roi"), dict) else None
+            try:
+                if isinstance(roi, dict):
+                    if float(roi.get("w", 0.0) or 0.0) <= 0.0 or float(roi.get("h", 0.0) or 0.0) <= 0.0:
+                        roi = None
+            except Exception:
+                roi = None
+            filter_ids = []
+            try:
+                filter_ids = [str(fid).strip() for fid in (condition.get("filter_ids") or []) if str(fid).strip()]
+            except Exception:
+                filter_ids = []
+            text = read_window_ocr_text_once(
+                int(hwnd),
+                roi=roi,
+                ocr_settings=cfg,
+                filter_ids=filter_ids,
+                color_filters=condition.get("color_filters") if isinstance(condition.get("color_filters"), list) else None,
+            )
+            try:
+                if bool(cfg.get("log_ocr_text", False)):
+                    clean = str(text or "").strip()
+                    if clean:
+                        self.autoitem_log_signal.emit(f"[Auto-Actions OCR] {clean}")
+            except Exception:
+                pass
+            return str(text or "")
+
         self.auto_item_engine = AutoItemEngine(
             pid_provider=_pid_provider,
             hwnd_provider=_hwnd_provider,
@@ -10920,6 +11445,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             username_provider=_username_provider,
             server_label_provider=_server_label_provider,
             ps_link_provider=_ps_link_provider,
+            discord_ping_provider=_discord_ping_provider,
             log=self.autoitem_log_signal.emit,
             mouse_block_notify=self.autoitem_mouse_block_signal.emit,
             pause_antiafk=self._auto_item_pause_antiafk,
@@ -10927,6 +11453,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             antiafk_overdue_within_provider=self._auto_item_is_antiafk_overdue_within,
             pre_action_hook=self._auto_item_pre_action_hook,
             post_action_hook=self._auto_item_post_action_hook,
+            ocr_text_provider=_ocr_text_provider,
         )
         try:
             self.auto_item_engine.start()
@@ -11546,6 +12073,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def _update_users_btn_text(self, btn: QPushButton):
         raw = btn.property("users")
+        def _discord_edit_note() -> str:
+            try:
+                if _bm_relaxed():
+                    return (
+                        "\nLinked Discord user action edits: "
+                        + ("on" if bool(btn.property("discord_user_edit_enabled")) else "off")
+                    )
+            except Exception:
+                pass
+            return ""
+
         # Semantics:
         # - None / missing => All users
         # - []            => No users
@@ -11553,7 +12091,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if raw is None:
             btn.setProperty("users", None)
             btn.setText("All users")
-            btn.setToolTip("Targets every checked user in the Users panel.")
+            btn.setToolTip("Targets every checked user in the Users panel." + _discord_edit_note())
             return
         if not isinstance(raw, (list, tuple, set)):
             # Be tolerant of Qt container/variant types (e.g., QStringList).
@@ -11564,14 +12102,18 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 btn.setProperty("users", None)
                 btn.setText("All users")
-                btn.setToolTip("Targets every checked user in the Users panel.")
+                btn.setToolTip("Targets every checked user in the Users panel." + _discord_edit_note())
                 return
 
         users = [str(u).strip() for u in (raw or []) if str(u).strip()]
         btn.setProperty("users", users)
+        discord_edit_note = _discord_edit_note()
         if not users:
             btn.setText("No users")
-            btn.setToolTip("This row will not run for any user until at least one user is assigned.")
+            btn.setToolTip(
+                "This row will not run for any user until at least one user is assigned."
+                + discord_edit_note
+            )
             return
 
         user_names: List[str] = []
@@ -11585,7 +12127,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 user_names.append(str(uid))
         btn.setText("1 user" if len(users) == 1 else f"{len(users)} users")
-        btn.setToolTip("Assigned users: " + ", ".join(user_names))
+        btn.setToolTip("Assigned users: " + ", ".join(user_names) + discord_edit_note)
 
     def _update_alert_btn_text(self, btn: QPushButton):
         try:
@@ -11682,6 +12224,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             raw_current = btn.property("users")
         except Exception:
             raw_current = None
+        try:
+            discord_user_edit_enabled = bool(btn.property("discord_user_edit_enabled"))
+        except Exception:
+            discord_user_edit_enabled = False
         current: Optional[List[str]] = None
         if raw_current is None:
             current = None  # All
@@ -11708,11 +12254,23 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         hint.setWordWrap(True)
         v.addWidget(hint)
 
+        discord_edit_chk: Optional[QCheckBox] = None
+        if _bm_relaxed():
+            discord_edit_chk = QCheckBox("Allow linked Discord users to edit their own account on this row")
+            discord_edit_chk.setChecked(bool(discord_user_edit_enabled))
+            discord_edit_chk.setToolTip(
+                "When enabled, a linked Discord user can use /action to enable or disable "
+                "one of their linked accounts for this action. Discord admins can always use the command."
+            )
+            v.addWidget(discord_edit_chk)
+
         btn_row = QHBoxLayout()
         sel_all_btn = QPushButton("Select All")
         sel_none_btn = QPushButton("Select None")
+        paste_values_btn = QPushButton("Paste Values")
         btn_row.addWidget(sel_all_btn)
         btn_row.addWidget(sel_none_btn)
+        btn_row.addWidget(paste_values_btn)
         btn_row.addStretch()
         v.addLayout(btn_row)
 
@@ -11750,6 +12308,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         sel_all_btn.clicked.connect(lambda: (lst.selectAll(), lst.setFocus()))
         sel_none_btn.clicked.connect(lambda: (lst.clearSelection(), lst.setFocus()))
 
+        def _open_row_paste_values() -> None:
+            row = self._auto_item_row_for_button(btn, column=4)
+            if row < 0:
+                QMessageBox.information(dlg, "Paste Values", "Could not find the action row for this users window.")
+                return
+            self._auto_item_edit_paste_values_for_row(row, parent=dlg)
+
+        paste_values_btn.clicked.connect(_open_row_paste_values)
+
         v.addWidget(lst)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(dlg.accept)
@@ -11773,6 +12340,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             else:
                 # None selected => store [] (meaning no users)
                 btn.setProperty("users", chosen)
+            if discord_edit_chk is not None:
+                btn.setProperty("discord_user_edit_enabled", bool(discord_edit_chk.isChecked()))
             self._update_users_btn_text(btn)
             self._on_auto_item_ui_changed()
 
@@ -12674,6 +13243,218 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "trigger": {"type": "normal", "filter_ids": []},
         }
 
+    def _default_auto_item_condition(self, *, enabled: bool = False, condition_type: str = "color") -> dict:
+        ctype = "ocr" if str(condition_type or "").strip().lower() == "ocr" else "color"
+        return {
+            "enabled": bool(enabled),
+            "type": ctype,
+            "point": None,
+            "roi": self._ocr_empty_roi_cfg() if hasattr(self, "_ocr_empty_roi_cfg") else {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
+            "color": "#FFFFFF",
+            "tolerance": 10,
+            "target_text": "",
+            "match_mode": "contains",
+            "case_sensitive": False,
+            "filter_ids": [],
+            "color_filters": [],
+        }
+
+    def _normalize_auto_item_ocr_color_filters(self, raw: Any) -> List[dict]:
+        if not isinstance(raw, (list, tuple)):
+            return []
+        out: List[dict] = []
+        seen: Set[Tuple[int, int, int, int]] = set()
+        for idx, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+            try:
+                spec = {
+                    "name": str(item.get("name") or f"Color {idx + 1}"),
+                    "r": max(0, min(255, int(item.get("r", 255) or 0))),
+                    "g": max(0, min(255, int(item.get("g", 255) or 0))),
+                    "b": max(0, min(255, int(item.get("b", 255) or 0))),
+                    "tol": max(0, min(255, int(item.get("tol", item.get("tolerance", 40)) or 0))),
+                    "enabled": bool(item.get("enabled", True)),
+                }
+            except Exception:
+                continue
+            key = (spec["r"], spec["g"], spec["b"], spec["tol"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(spec)
+        return out
+
+    def _normalize_auto_item_paste_user_values(self, raw: Any) -> Dict[str, str]:
+        pairs: List[Tuple[Any, Any]] = []
+        if isinstance(raw, dict):
+            pairs = list(raw.items())
+        elif isinstance(raw, (list, tuple)):
+            for item in raw:
+                if isinstance(item, dict):
+                    uid = item.get("uid", item.get("user_id", item.get("id", item.get("user"))))
+                    if "text" in item:
+                        text = item.get("text")
+                    elif "value" in item:
+                        text = item.get("value")
+                    else:
+                        text = item.get("paste", item.get("content", ""))
+                    pairs.append((uid, text))
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    pairs.append((item[0], item[1]))
+
+        out: Dict[str, str] = {}
+        for raw_uid, raw_text in pairs:
+            uid = str(raw_uid or "").strip()
+            if not uid:
+                continue
+            out[uid] = str(raw_text if raw_text is not None else "")
+        return out
+
+    def _normalize_auto_item_condition(
+        self,
+        raw: Any,
+        *,
+        fallback_enabled: bool = False,
+        legacy_point: Optional[dict] = None,
+        legacy_color: str = "#FFFFFF",
+        legacy_tolerance: int = 10,
+    ) -> dict:
+        base = raw if isinstance(raw, dict) else {}
+        ctype = str(base.get("type") or base.get("kind") or base.get("condition_type") or "color").strip().lower()
+        if ctype in ("ocr", "ocr_text", "ocr_conditional"):
+            ctype = "ocr"
+        else:
+            ctype = "color"
+
+        def _point(value: Any) -> Optional[dict]:
+            if not isinstance(value, dict):
+                return None
+            try:
+                return {"x": float(value.get("x", 0.0)), "y": float(value.get("y", 0.0))}
+            except Exception:
+                return None
+
+        def _roi(value: Any) -> dict:
+            source = value if isinstance(value, dict) else {}
+            try:
+                return {
+                    "x": float(source.get("x", 0.0) or 0.0),
+                    "y": float(source.get("y", 0.0) or 0.0),
+                    "w": float(source.get("w", source.get("width", 0.0)) or 0.0),
+                    "h": float(source.get("h", source.get("height", 0.0)) or 0.0),
+                }
+            except Exception:
+                return {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+
+        try:
+            tolerance = max(0, int(base.get("tolerance", base.get("tol", legacy_tolerance)) or 0))
+        except Exception:
+            tolerance = max(0, int(legacy_tolerance or 0))
+
+        match_mode = str(base.get("match_mode") or base.get("ocr_match_mode") or "contains").strip().lower()
+        if match_mode not in ("contains", "equals", "regex", "fuzzy"):
+            match_mode = "contains"
+
+        filter_ids = []
+        for fid in (base.get("filter_ids") or base.get("ocr_filter_ids") or []) or []:
+            value = str(fid or "").strip()
+            if value and value not in filter_ids:
+                filter_ids.append(value)
+        color_filters = self._normalize_auto_item_ocr_color_filters(
+            base.get("color_filters", base.get("ocr_color_filters", [])) or []
+        )
+
+        return {
+            "enabled": bool(base.get("enabled", fallback_enabled)),
+            "type": ctype,
+            "point": _point(base.get("point") or base.get("condition_point") or base.get("conditional_point")) or copy.deepcopy(legacy_point),
+            "roi": _roi(base.get("roi") or base.get("area") or base.get("ocr_roi")),
+            "color": str(base.get("color") or base.get("color_hex") or legacy_color or "#FFFFFF").strip() or "#FFFFFF",
+            "tolerance": tolerance,
+            "target_text": str(base.get("target_text") or base.get("ocr_text") or base.get("text") or "").strip(),
+            "match_mode": match_mode,
+            "case_sensitive": bool(base.get("case_sensitive", False)),
+            "filter_ids": filter_ids,
+            "color_filters": color_filters,
+        }
+
+    def _auto_item_condition_summary(self, condition: Optional[dict]) -> str:
+        cond = self._normalize_auto_item_condition(condition or {})
+        if not bool(cond.get("enabled", False)):
+            return ""
+        if str(cond.get("type") or "color") == "ocr":
+            roi = cond.get("roi") if isinstance(cond.get("roi"), dict) else {}
+            target = str(cond.get("target_text") or "").strip()
+            area = "OCR area"
+            if float((roi or {}).get("w", 0.0) or 0.0) > 0 and float((roi or {}).get("h", 0.0) or 0.0) > 0:
+                area = (
+                    f"OCR {float((roi or {}).get('x', 0.0) or 0.0):.3f}, "
+                    f"{float((roi or {}).get('y', 0.0) or 0.0):.3f}, "
+                    f"{float((roi or {}).get('w', 0.0) or 0.0):.3f}, "
+                    f"{float((roi or {}).get('h', 0.0) or 0.0):.3f}"
+                )
+            filters = self._normalize_auto_item_ocr_color_filters(cond.get("color_filters") or [])
+            filter_text = "" if not filters else f" using {len(filters)} color filter{'s' if len(filters) != 1 else ''}"
+            match_label = {
+                "equals": "equals",
+                "regex": "matches",
+                "fuzzy": "fuzzy matches",
+            }.get(str(cond.get("match_mode") or "contains"), "contains")
+            return f"OCR conditional: {area}{filter_text}" + (f" {match_label} '{target}'" if target else "")
+        point = cond.get("point") if isinstance(cond.get("point"), dict) else None
+        if isinstance(point, dict):
+            return (
+                f"Color conditional: {str(cond.get('color') or '#FFFFFF')} +/- {int(cond.get('tolerance', 10) or 10)} "
+                f"at {float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}"
+            )
+        return f"Color conditional: {str(cond.get('color') or '#FFFFFF')} +/- {int(cond.get('tolerance', 10) or 10)}"
+
+    def _auto_item_key_options(self) -> List[str]:
+        letters = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
+        numbers = [str(i) for i in range(10)]
+        function_keys = [f"F{i}" for i in range(1, 25)]
+        named = [
+            "Space",
+            "Enter",
+            "Tab",
+            "Escape",
+            "Backspace",
+            "Delete",
+            "Insert",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Shift",
+            "Ctrl",
+            "Alt",
+        ]
+        return named + letters + numbers + function_keys
+
+    def _auto_item_default_key_hold_s(self) -> float:
+        return 0.05
+
+    def _auto_item_key_search_score(self, key_name: str, query: str, order: int) -> Tuple[float, int, str]:
+        key = str(key_name or "")
+        q = str(query or "").strip().lower()
+        lower = key.lower()
+        if not q:
+            return (0.0, int(order), lower)
+        if lower == q:
+            return (0.0, int(order), lower)
+        if lower.startswith(q):
+            return (1.0 + (len(lower) - len(q)) / 100.0, int(order), lower)
+        pos = lower.find(q)
+        if pos >= 0:
+            return (2.0 + pos / 10.0 + (len(lower) - len(q)) / 100.0, int(order), lower)
+        ratio = difflib.SequenceMatcher(None, lower, q).ratio()
+        return (4.0 + (1.0 - ratio), int(order), lower)
+
     def _make_auto_item_preset_actions(
         self,
         legacy_coords: Optional[dict] = None,
@@ -12699,11 +13480,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if cond_enabled and cond_point is not None:
             actions.append(
                 {
-                    "name": "Conditional gate",
-                    "type": "conditional_click",
+                    "name": "Color conditional click",
+                    "type": "click",
                     "point": cond_point,
-                    "color": str((conditional or {}).get("color", "#FFFFFF") or "#FFFFFF"),
-                    "tolerance": int((conditional or {}).get("tolerance", 10) or 10),
+                    "condition": {
+                        "enabled": True,
+                        "type": "color",
+                        "point": copy.deepcopy(cond_point),
+                        "color": str((conditional or {}).get("color", "#FFFFFF") or "#FFFFFF"),
+                        "tolerance": int((conditional or {}).get("tolerance", 10) or 10),
+                    },
                 }
             )
 
@@ -12740,32 +13526,151 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return None
 
         action_type = str(raw.get("type") or raw.get("kind") or raw.get("action_type") or "").strip().lower()
-        if action_type == "conditional":
-            action_type = "conditional_click"
-        if action_type not in ("click", "conditional_click", "paste", "scroll"):
+        legacy_conditional_click = action_type in ("conditional", "conditional_click")
+        if legacy_conditional_click:
+            action_type = "click"
+        elif action_type in ("keyboard", "keyboard_click", "key_click", "keypress", "key_press"):
+            action_type = "key"
+        elif action_type in ("end", "end_if", "endif", "end_loop", "end_block"):
+            action_type = "end"
+        elif action_type in ("sleep", "wait_sleep", "delay"):
+            action_type = "wait"
+        elif action_type in ("mouse_drag", "drag_click", "click_drag"):
+            action_type = "drag"
+        elif action_type in ("discord_webhook", "send_webhook", "webhook_send"):
+            action_type = "webhook"
+        if action_type not in ("click", "key", "paste", "scroll", "drag", "wait", "webhook", "if", "else", "end", "break", "loop"):
             return None
 
-        point = None
-        if isinstance(raw.get("point"), dict):
+        def _point_from(value: Any) -> Optional[dict]:
+            if not isinstance(value, dict):
+                return None
             try:
-                point = {
-                    "x": float(raw["point"].get("x", 0.0)),
-                    "y": float(raw["point"].get("y", 0.0)),
+                return {
+                    "x": float(value.get("x", 0.0)),
+                    "y": float(value.get("y", 0.0)),
                 }
             except Exception:
-                point = None
+                return None
+
+        point = _point_from(raw.get("point") or raw.get("start_point") or raw.get("from_point"))
+        end_point = _point_from(raw.get("end_point") or raw.get("to_point") or raw.get("target_point"))
 
         try:
             tolerance = max(0, int(raw.get("tolerance", 0) or 0))
         except Exception:
             tolerance = 0
 
+        condition_raw = raw.get("condition") if isinstance(raw.get("condition"), dict) else raw.get("conditional")
+        if legacy_conditional_click:
+            condition = self._normalize_auto_item_condition(
+                condition_raw,
+                fallback_enabled=True,
+                legacy_point=copy.deepcopy(point),
+                legacy_color=str(raw.get("color") or raw.get("color_hex") or "#FFFFFF").strip() or "#FFFFFF",
+                legacy_tolerance=tolerance or 10,
+            )
+        else:
+            top_level_condition_keys = (
+                "condition_enabled",
+                "conditional_enabled",
+                "condition_type",
+                "condition_point",
+                "conditional_point",
+                "ocr_text",
+                "target_text",
+                "ocr_roi",
+            )
+            if not isinstance(condition_raw, dict) and any(k in raw for k in top_level_condition_keys):
+                condition_raw = {
+                    "enabled": raw.get("condition_enabled", raw.get("conditional_enabled", False)),
+                    "type": raw.get("condition_type", raw.get("conditional_type", "color")),
+                    "point": raw.get("condition_point") or raw.get("conditional_point"),
+                    "roi": raw.get("ocr_roi") or raw.get("condition_roi"),
+                    "color": raw.get("condition_color", raw.get("color", "#FFFFFF")),
+                    "tolerance": raw.get("condition_tolerance", raw.get("tolerance", 10)),
+                    "target_text": raw.get("target_text", raw.get("ocr_text", "")),
+                    "match_mode": raw.get("match_mode", raw.get("ocr_match_mode", "contains")),
+                    "case_sensitive": raw.get("case_sensitive", False),
+                }
+            condition = self._normalize_auto_item_condition(
+                condition_raw,
+                fallback_enabled=(action_type == "if"),
+            )
+
+        try:
+            key_hold_s = max(0.0, float(raw.get("key_hold_s", raw.get("hold_s", raw.get("hold_seconds", 0.0))) or 0.0))
+        except Exception:
+            key_hold_s = 0.0
+        key_values = []
+        for key_raw in (raw.get("keys") or []) or []:
+            value = str(key_raw or "").strip()
+            if value and value not in key_values:
+                key_values.append(value)
+        legacy_key = str(raw.get("key") or raw.get("key_name") or "").strip()
+        if legacy_key and legacy_key not in key_values:
+            key_values.insert(0, legacy_key)
+        try:
+            click_count = max(1, min(2, int(raw.get("click_count", 2 if bool(raw.get("double_click", False)) else 1) or 1)))
+        except Exception:
+            click_count = 1
+        try:
+            loop_count = max(1, int(raw.get("loop_count", raw.get("count", raw.get("times", 1))) or 1))
+        except Exception:
+            loop_count = 1
+        try:
+            wait_s = max(0.0, float(raw.get("wait_s", raw.get("sleep_s", raw.get("seconds", raw.get("duration", 0.0)))) or 0.0))
+        except Exception:
+            wait_s = 0.0
+        try:
+            drag_duration_s = max(0.0, float(raw.get("drag_duration_s", raw.get("drag_seconds", raw.get("move_duration_s", 0.5))) or 0.0))
+        except Exception:
+            drag_duration_s = 0.5
+        paste_per_user = bool(
+            raw.get(
+                "paste_per_user",
+                raw.get("per_user_paste", raw.get("user_specific_paste", False)),
+            )
+        )
+        paste_user_values = self._normalize_auto_item_paste_user_values(
+            raw.get(
+                "paste_user_values",
+                raw.get(
+                    "per_user_paste_values",
+                    raw.get("user_texts", raw.get("per_user_text", raw.get("user_values", {}))),
+                ),
+            )
+        )
+
         return {
             "name": str(raw.get("name") or fallback_name or action_type.replace("_", " ").title()).strip()
             or action_type.replace("_", " ").title(),
             "type": action_type,
             "point": point,
+            "end_point": end_point,
             "text": str(raw.get("text") or ""),
+            "paste_per_user": paste_per_user,
+            "paste_user_values": paste_user_values,
+            "webhook_url": str(raw.get("webhook_url") or raw.get("url") or "").strip(),
+            "webhook_message": str(
+                raw.get("webhook_message")
+                or raw.get("message")
+                or raw.get("content")
+                or (raw.get("text") if action_type == "webhook" else "")
+                or ""
+            ),
+            "key": key_values[0] if key_values else "",
+            "keys": key_values,
+            "key_hold_s": key_hold_s,
+            "click_button": (
+                "right"
+                if str(raw.get("click_button") or raw.get("button") or "left").strip().lower() == "right"
+                else "left"
+            ),
+            "click_count": click_count,
+            "loop_count": loop_count,
+            "wait_s": wait_s,
+            "drag_duration_s": drag_duration_s,
             "color": str(raw.get("color") or raw.get("color_hex") or "#FFFFFF").strip() or "#FFFFFF",
             "tolerance": tolerance,
             "select_all": bool(raw.get("select_all", True)),
@@ -12774,6 +13679,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 if str(raw.get("scroll_direction") or raw.get("direction") or "").strip().lower() == "up"
                 else "down"
             ),
+            "condition": condition,
         }
 
     def _normalize_auto_item_behavior(self, raw: Any, legacy: Optional[dict] = None) -> dict:
@@ -12882,6 +13788,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "behavior": self._normalize_auto_item_behavior(raw.get("behavior"), legacy=raw),
             "users": copy.deepcopy(raw.get("users")) if "users" in raw else None,
             "users_explicit": bool(raw.get("users_explicit", False)),
+            "discord_user_edit_enabled": bool(raw.get("discord_user_edit_enabled", False)),
             "alert_enabled": bool(raw.get("alert_enabled", False)),
             "alert_webhook": str(raw.get("alert_webhook") or raw.get("alert_webhook_url") or "").strip(),
             "alert_message": str(raw.get("alert_message") or ""),
@@ -12897,6 +13804,136 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "actions": self._make_auto_item_preset_actions(legacy_coords),
             }
         ]
+
+    def _debug_auto_item_presets(self) -> List[dict]:
+        center_point = {"x": 0.5, "y": 0.5}
+        top_left_area = {"x": 0.0, "y": 0.0, "w": 0.35, "h": 0.25}
+
+        def _color_condition(color: str = "#FFFFFF", tolerance: int = 25) -> dict:
+            return {
+                "enabled": True,
+                "type": "color",
+                "point": copy.deepcopy(center_point),
+                "color": color,
+                "tolerance": int(tolerance),
+            }
+
+        def _ocr_condition(target_text: str = "debug") -> dict:
+            return {
+                "enabled": True,
+                "type": "ocr",
+                "roi": copy.deepcopy(top_left_area),
+                "target_text": target_text,
+                "match_mode": "contains",
+                "case_sensitive": False,
+                "color_filters": [
+                    {"name": "Debug White", "r": 255, "g": 255, "b": 255, "tol": 60, "enabled": True}
+                ],
+            }
+
+        raw_presets = [
+            {
+                "id": "debug_core_actions",
+                "name": "Debug - Core Action Types",
+                "builtin": True,
+                "debug": True,
+                "actions": [
+                    {"name": "Wait short", "type": "wait", "wait_s": 0.25},
+                    {"name": "Left click center", "type": "click", "point": copy.deepcopy(center_point), "click_button": "left", "click_count": 1},
+                    {"name": "Right click center", "type": "click", "point": copy.deepcopy(center_point), "click_button": "right", "click_count": 1},
+                    {"name": "Double click center", "type": "click", "point": copy.deepcopy(center_point), "click_button": "left", "click_count": 2},
+                    {
+                        "name": "Drag center right",
+                        "type": "drag",
+                        "point": {"x": 0.45, "y": 0.5},
+                        "end_point": {"x": 0.55, "y": 0.5},
+                        "click_button": "left",
+                        "drag_duration_s": 0.35,
+                    },
+                    {"name": "Scroll up center", "type": "scroll", "point": copy.deepcopy(center_point), "scroll_direction": "up"},
+                    {"name": "Scroll down center", "type": "scroll", "point": copy.deepcopy(center_point), "scroll_direction": "down"},
+                    {"name": "Single key", "type": "key", "keys": ["Space"], "key_hold_s": 0.05},
+                    {"name": "Key chord", "type": "key", "keys": ["Ctrl", "A"], "key_hold_s": 0.05},
+                    {"name": "Paste text", "type": "paste", "text": "debug preset", "select_all": False},
+                    {
+                        "name": "Webhook placeholder",
+                        "type": "webhook",
+                        "webhook_url": "",
+                        "webhook_message": "Debug webhook for {username} in {biome}",
+                    },
+                ],
+            },
+            {
+                "id": "debug_color_if_else",
+                "name": "Debug - Color If Else",
+                "builtin": True,
+                "debug": True,
+                "actions": [
+                    {"name": "If center is white", "type": "if", "condition": _color_condition("#FFFFFF", 20)},
+                    {"name": "Then wait", "type": "wait", "wait_s": 0.15},
+                    {"name": "Then key", "type": "key", "keys": ["F1"], "key_hold_s": 0.03},
+                    {"name": "Else", "type": "else"},
+                    {"name": "Else wait", "type": "wait", "wait_s": 0.15},
+                    {"name": "Else key", "type": "key", "keys": ["F2"], "key_hold_s": 0.03},
+                    {"name": "End if", "type": "end"},
+                ],
+            },
+            {
+                "id": "debug_ocr_if_else",
+                "name": "Debug - OCR If Else",
+                "builtin": True,
+                "debug": True,
+                "actions": [
+                    {"name": "If OCR sees debug", "type": "if", "condition": _ocr_condition("debug")},
+                    {"name": "OCR pass wait", "type": "wait", "wait_s": 0.15},
+                    {"name": "OCR pass key", "type": "key", "keys": ["F3"], "key_hold_s": 0.03},
+                    {"name": "Else", "type": "else"},
+                    {"name": "OCR fail wait", "type": "wait", "wait_s": 0.15},
+                    {"name": "OCR fail key", "type": "key", "keys": ["F4"], "key_hold_s": 0.03},
+                    {"name": "End if", "type": "end"},
+                ],
+            },
+            {
+                "id": "debug_loop_break",
+                "name": "Debug - Loop And Break",
+                "builtin": True,
+                "debug": True,
+                "actions": [
+                    {"name": "Loop three times", "type": "loop", "loop_count": 3},
+                    {"name": "Loop wait", "type": "wait", "wait_s": 0.1},
+                    {"name": "Loop key", "type": "key", "keys": ["F5"], "key_hold_s": 0.03},
+                    {"name": "Break early", "type": "break"},
+                    {"name": "End loop", "type": "end"},
+                    {"name": "After loop wait", "type": "wait", "wait_s": 0.1},
+                ],
+            },
+            {
+                "id": "debug_nested_blocks",
+                "name": "Debug - Nested If Loop Blocks",
+                "builtin": True,
+                "debug": True,
+                "actions": [
+                    {"name": "If center is dark", "type": "if", "condition": _color_condition("#000000", 35)},
+                    {"name": "Nested loop twice", "type": "loop", "loop_count": 2},
+                    {"name": "Nested wait", "type": "wait", "wait_s": 0.1},
+                    {"name": "Nested chord", "type": "key", "keys": ["Shift", "Tab"], "key_hold_s": 0.05},
+                    {"name": "End nested loop", "type": "end"},
+                    {"name": "Else", "type": "else"},
+                    {"name": "Else wait", "type": "wait", "wait_s": 0.1},
+                    {"name": "End outer if", "type": "end"},
+                ],
+            },
+        ]
+
+        presets: List[dict] = []
+        for idx, raw in enumerate(raw_presets):
+            preset = self._normalize_auto_item_preset(raw, fallback_index=idx)
+            if preset is None:
+                continue
+            preset["debug"] = True
+            preset["builtin"] = True
+            presets.append(preset)
+        return presets
 
     def _normalize_auto_item_cfg(self, cfg: Optional[dict]) -> dict:
         base = copy.deepcopy(cfg or {})
@@ -12997,8 +14034,24 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         lines = ["Ordered steps:"]
         for idx, action in enumerate(actions[:8], 1):
             name = str(action.get("name") or action.get("type") or f"Step {idx}").strip()
-            kind = str(action.get("type") or "").replace("_", " ").title()
-            lines.append(f"{idx}. {name} [{kind}]")
+            kind_key = str(action.get("type") or "")
+            kind = {
+                "key": "Keyboard Click",
+                "drag": "Drag",
+                "wait": "Wait",
+                "webhook": "Webhook",
+                "if": "If",
+                "else": "Else",
+                "end": "End Block",
+                "break": "Break",
+                "loop": "Loop",
+            }.get(kind_key, kind_key.replace("_", " ").title())
+            condition = self._auto_item_condition_summary(action.get("condition"))
+            suffix = f" - {condition}" if condition and kind_key != "if" else ""
+            if kind_key == "paste" and bool(action.get("paste_per_user", False)):
+                override_count = len(self._normalize_auto_item_paste_user_values(action.get("paste_user_values") or {}))
+                suffix += f" - per-user paste ({override_count} override{'' if override_count == 1 else 's'})"
+            lines.append(f"{idx}. {name} [{kind}]{suffix}")
         if len(actions) > 8:
             lines.append(f"... +{len(actions) - 8} more")
         lines.append("")
@@ -13377,31 +14430,74 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return None
 
     def _edit_auto_item_action_step_dialog(self, action_type: str, current: Optional[dict] = None) -> Optional[dict]:
+        is_new_step = not isinstance(current, dict)
         action = self._normalize_auto_item_action(current or {"type": action_type}, fallback_name=action_type.title())
         if action is None:
             action = {
                 "name": action_type.replace("_", " ").title(),
                 "type": action_type,
                 "point": None,
+                "end_point": None,
                 "text": "",
+                "paste_per_user": False,
+                "paste_user_values": {},
+                "webhook_url": "",
+                "webhook_message": "",
+                "key": "",
+                "keys": [],
+                "key_hold_s": self._auto_item_default_key_hold_s() if str(action_type) == "key" else 0.0,
+                "click_button": "left",
+                "click_count": 1,
+                "loop_count": 1,
+                "wait_s": 0.0,
+                "drag_duration_s": 0.5,
                 "color": "#FFFFFF",
                 "tolerance": 10,
                 "select_all": True,
                 "scroll_direction": "down",
+                "condition": self._default_auto_item_condition(enabled=(action_type == "if")),
             }
+        action_type = str(action.get("type") or action_type or "").strip().lower()
+        if action_type in ("end_if", "endif", "end_loop", "end_block"):
+            action_type = "end"
+        if is_new_step and action_type == "key":
+            action["key_hold_s"] = self._auto_item_default_key_hold_s()
 
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Edit {action_type.replace('_', ' ').title()} Action")
-        dlg.resize(620, 420 if action_type in ("paste", "scroll") else 360)
+        display_names = {
+            "click": "Click",
+            "key": "Keyboard Click",
+            "paste": "Paste",
+            "scroll": "Scroll",
+            "drag": "Drag",
+            "webhook": "Webhook",
+            "wait": "Wait",
+            "if": "If",
+            "else": "Else",
+            "end": "End Block",
+            "break": "Break",
+            "loop": "Loop",
+        }
+        display_name = display_names.get(action_type, action_type.replace("_", " ").title())
+        dlg.setWindowTitle(f"Edit {display_name} Action")
+        dlg.resize(700, 660)
         self._auto_item_apply_dialog_style(dlg)
         layout = QVBoxLayout(dlg)
         layout.setSpacing(12)
 
         intro_map = {
-            "click": "A click action taps a captured point whenever the row executes.",
-            "conditional_click": "A conditional click only fires when the sampled color matches the captured point.",
+            "click": "A click action taps its captured action point when the step executes.",
+            "key": "A keyboard click sends one key press to the active Roblox window.",
             "paste": "A paste action sends text into the active field as part of the row sequence.",
             "scroll": "A scroll action moves the mouse to a captured point and scrolls either up or down there.",
+            "drag": "A drag action holds a mouse button from one captured point to another over a configured duration.",
+            "webhook": "A webhook action sends a Discord webhook message when this step is reached.",
+            "wait": "A wait step pauses this action string for the configured amount of time.",
+            "if": "An if step chooses whether to enter the following block from a color or OCR conditional.",
+            "else": "An else step runs only when the nearest matching if condition failed.",
+            "end": "An end block step closes the nearest if/else or loop block.",
+            "break": "A break step stops the current action string immediately when reached.",
+            "loop": "A loop step repeats the following block until the matching end block.",
         }
         intro = QLabel(str(intro_map.get(action_type, "Configure the action step.")))
         intro.setProperty("role", "hint")
@@ -13419,26 +14515,80 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         basics_form.addRow("Action name:", name_le)
         layout.addWidget(basics_group)
 
-        if action_type in ("click", "conditional_click", "scroll"):
+        def _point_text(point: Optional[dict]) -> str:
+            if not isinstance(point, dict):
+                return ""
+            try:
+                return f"{float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}"
+            except Exception:
+                return ""
+
+        def _point_from_text(label: str, text: str) -> Optional[dict]:
+            raw = str(text or "").strip()
+            if not raw:
+                return None
+            parts = [part for part in re.split(r"[,\s]+", raw) if part]
+            if len(parts) != 2:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Point",
+                    f"{label} must be entered as two relative values: x, y",
+                )
+                raise ValueError(label)
+            try:
+                x = float(parts[0])
+                y = float(parts[1])
+            except Exception:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Point",
+                    f"{label} must use numeric relative values from 0.0 to 1.0.",
+                )
+                raise ValueError(label)
+            if x < 0.0 or x > 1.0 or y < 0.0 or y > 1.0:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Point",
+                    f"{label} values must be between 0.0 and 1.0.",
+                )
+                raise ValueError(label)
+            return {"x": float(x), "y": float(y)}
+
+        def _roi_text(roi: Optional[dict]) -> str:
+            if not isinstance(roi, dict):
+                return ""
+            try:
+                w = float(roi.get("w", 0.0) or 0.0)
+                h = float(roi.get("h", 0.0) or 0.0)
+                if w <= 0.0 or h <= 0.0:
+                    return ""
+                return (
+                    f"{float(roi.get('x', 0.0) or 0.0):.4f}, "
+                    f"{float(roi.get('y', 0.0) or 0.0):.4f}, "
+                    f"{w:.4f}, {h:.4f}"
+                )
+            except Exception:
+                return ""
+
+        if action_type in ("click", "scroll"):
             target_group = QGroupBox("Target")
             target_layout = QVBoxLayout(target_group)
-            target_hint = QLabel("Capture the exact on-screen point this action should use.")
+            target_hint = QLabel("Capture the exact action point this step should use.")
             target_hint.setProperty("role", "hint")
             target_hint.setWordWrap(True)
             target_layout.addWidget(target_hint)
 
             point_le = QLineEdit()
-            point_le.setReadOnly(True)
-            point_le.setPlaceholderText("No point captured yet")
+            point_le.setPlaceholderText("x, y (0.0-1.0)")
+            point_le.setToolTip("Client-relative point. Enter as x, y values from 0.0 to 1.0, or use Capture Point.")
             point = action.get("point") if isinstance(action.get("point"), dict) else None
-            if isinstance(point, dict):
-                point_le.setText(f"{float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}")
+            point_le.setText(_point_text(point))
             capture_btn = QPushButton("Capture Point")
             capture_btn.setToolTip("Minimize the app overlay and click inside the game window to sample a point.")
             capture_btn.setStyleSheet(self._get_primary_button_style())
 
             def _capture() -> None:
-                result = self._capture_auto_item_point(sample_color=(action_type == "conditional_click"))
+                result = self._capture_auto_item_point(sample_color=False)
                 if not result:
                     return
                 point_val = result.get("point")
@@ -13447,9 +14597,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         "x": float(point_val.get("x", 0.0)),
                         "y": float(point_val.get("y", 0.0)),
                     }
-                    point_le.setText(f"{action['point']['x']:.4f}, {action['point']['y']:.4f}")
-                if action_type == "conditional_click" and result.get("color"):
-                    color_le.setText(str(result.get("color") or "#FFFFFF"))
+                    point_le.setText(_point_text(action["point"]))
 
             capture_btn.clicked.connect(_capture)
             row = QHBoxLayout()
@@ -13460,23 +14608,91 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             target_layout.addWidget(holder)
             layout.addWidget(target_group)
 
-        if action_type == "conditional_click":
-            cond_group = QGroupBox("Condition")
-            cond_layout = QVBoxLayout(cond_group)
-            cond_hint = QLabel("The click only runs when the sampled pixel color matches within the chosen tolerance.")
-            cond_hint.setProperty("role", "hint")
-            cond_hint.setWordWrap(True)
-            cond_layout.addWidget(cond_hint)
-            cond_form = QFormLayout()
-            color_le = QLineEdit(str(action.get("color") or "#FFFFFF"))
-            color_le.setPlaceholderText("#FFFFFF")
-            cond_form.addRow("Expected color:", color_le)
-            tolerance_spin = QSpinBox()
-            tolerance_spin.setRange(0, 255)
-            tolerance_spin.setValue(int(action.get("tolerance", 10) or 10))
-            cond_form.addRow("Tolerance:", tolerance_spin)
-            cond_layout.addLayout(cond_form)
-            layout.addWidget(cond_group)
+        if action_type == "drag":
+            drag_target_group = QGroupBox("Drag Points")
+            drag_target_layout = QVBoxLayout(drag_target_group)
+            drag_target_hint = QLabel("Capture the start and end points for the drag.")
+            drag_target_hint.setProperty("role", "hint")
+            drag_target_hint.setWordWrap(True)
+            drag_target_layout.addWidget(drag_target_hint)
+
+            start_point_le = QLineEdit()
+            start_point_le.setPlaceholderText("x, y (0.0-1.0)")
+            start_point_le.setToolTip("Client-relative drag start point. Enter as x, y values from 0.0 to 1.0, or use Capture.")
+            start_point = action.get("point") if isinstance(action.get("point"), dict) else None
+            start_point_le.setText(_point_text(start_point))
+
+            end_point_le = QLineEdit()
+            end_point_le.setPlaceholderText("x, y (0.0-1.0)")
+            end_point_le.setToolTip("Client-relative drag end point. Enter as x, y values from 0.0 to 1.0, or use Capture.")
+            end_point = action.get("end_point") if isinstance(action.get("end_point"), dict) else None
+            end_point_le.setText(_point_text(end_point))
+
+            def _capture_drag_point(key: str, line_edit: QLineEdit) -> None:
+                result = self._capture_auto_item_point(sample_color=False)
+                if not result:
+                    return
+                point_val = result.get("point")
+                if not isinstance(point_val, dict):
+                    return
+                saved = {
+                    "x": float(point_val.get("x", 0.0)),
+                    "y": float(point_val.get("y", 0.0)),
+                }
+                action[key] = saved
+                line_edit.setText(_point_text(saved))
+
+            for label, key, line_edit in (
+                ("Start:", "point", start_point_le),
+                ("End:", "end_point", end_point_le),
+            ):
+                capture_drag_btn = QPushButton("Capture")
+                capture_drag_btn.setToolTip("Minimize the app overlay and click inside the game window to sample this drag point.")
+                capture_drag_btn.setStyleSheet(self._get_primary_button_style())
+                capture_drag_btn.clicked.connect(lambda _checked=False, k=key, le=line_edit: _capture_drag_point(k, le))
+                point_row = QHBoxLayout()
+                point_row.addWidget(QLabel(label))
+                point_row.addWidget(line_edit, 1)
+                point_row.addWidget(capture_drag_btn)
+                holder = QWidget()
+                holder.setLayout(point_row)
+                drag_target_layout.addWidget(holder)
+
+            layout.addWidget(drag_target_group)
+
+        if action_type == "click":
+            click_group = QGroupBox("Click Options")
+            click_form = QFormLayout(click_group)
+            click_button_combo = QComboBox()
+            click_button_combo.addItem("Left Click", "left")
+            click_button_combo.addItem("Right Click", "right")
+            click_button_combo.setCurrentIndex(
+                max(0, click_button_combo.findData(str(action.get("click_button") or "left")))
+            )
+            click_form.addRow("Button:", click_button_combo)
+            double_click_chk = QCheckBox("Double click")
+            double_click_chk.setChecked(int(action.get("click_count", 1) or 1) >= 2)
+            click_form.addRow(double_click_chk)
+            layout.addWidget(click_group)
+
+        if action_type == "drag":
+            drag_group = QGroupBox("Drag Options")
+            drag_form = QFormLayout(drag_group)
+            drag_button_combo = QComboBox()
+            drag_button_combo.addItem("Left Click", "left")
+            drag_button_combo.addItem("Right Click", "right")
+            drag_button_combo.setCurrentIndex(
+                max(0, drag_button_combo.findData(str(action.get("click_button") or "left")))
+            )
+            drag_form.addRow("Button:", drag_button_combo)
+            drag_duration_spin = QDoubleSpinBox()
+            drag_duration_spin.setRange(0.0, 60.0)
+            drag_duration_spin.setDecimals(2)
+            drag_duration_spin.setSingleStep(0.05)
+            drag_duration_spin.setSuffix(" s")
+            drag_duration_spin.setValue(float(action.get("drag_duration_s", 0.5) or 0.0))
+            drag_form.addRow("Move time:", drag_duration_spin)
+            layout.addWidget(drag_group)
 
         if action_type == "scroll":
             scroll_group = QGroupBox("Scroll")
@@ -13496,10 +14712,184 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             scroll_layout.addLayout(scroll_form)
             layout.addWidget(scroll_group)
 
+        if action_type == "key":
+            key_group = QGroupBox("Keyboard")
+            key_layout = QVBoxLayout(key_group)
+            key_hint = QLabel("Search the key list, then select one or more keys to press together.")
+            key_hint.setProperty("role", "hint")
+            key_hint.setWordWrap(True)
+            key_layout.addWidget(key_hint)
+
+            key_search_le = QLineEdit()
+            key_search_le.setPlaceholderText("Search keys")
+            try:
+                key_search_le.setClearButtonEnabled(True)
+            except Exception:
+                pass
+            key_layout.addWidget(key_search_le)
+
+            key_list = QListWidget()
+            key_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+            key_list.setMinimumHeight(160)
+            key_list.setMaximumHeight(220)
+            key_layout.addWidget(key_list)
+
+            selected_keys = {
+                str(key or "").strip()
+                for key in (action.get("keys") or [])
+                if str(key or "").strip()
+            }
+            if not selected_keys and str(action.get("key") or "").strip():
+                selected_keys.add(str(action.get("key") or "").strip())
+            key_options = self._auto_item_key_options()
+            for value in list(selected_keys):
+                if value not in key_options:
+                    key_options.insert(0, value)
+            selected_keys_label = QLabel()
+            selected_keys_label.setProperty("role", "hint")
+            key_layout.addWidget(selected_keys_label)
+
+            def _ordered_selected_keys() -> List[str]:
+                ordered = [str(key).strip() for key in key_options if str(key).strip() in selected_keys]
+                extras = sorted(
+                    {
+                        str(key).strip()
+                        for key in selected_keys
+                        if str(key).strip() and str(key).strip() not in ordered
+                    }
+                )
+                return [key for key in (ordered + extras) if key]
+
+            def _refresh_selected_keys_label() -> None:
+                key_text = " + ".join(_ordered_selected_keys())
+                selected_keys_label.setText("Selected: " + (key_text or "None"))
+
+            def _refresh_key_list() -> None:
+                query = key_search_le.text().strip().lower()
+                visible_selected = {
+                    str(key_list.item(i).text() or "").strip()
+                    for i in range(key_list.count())
+                    if key_list.item(i).isSelected()
+                }
+                visible_all = {
+                    str(key_list.item(i).text() or "").strip()
+                    for i in range(key_list.count())
+                }
+                selected_keys.difference_update({key for key in visible_all if key})
+                selected_keys.update({key for key in visible_selected if key})
+                if query:
+                    ranked = sorted(
+                        key_options,
+                        key=lambda item: self._auto_item_key_search_score(str(item), query, key_options.index(item)),
+                    )
+                else:
+                    ranked = sorted(
+                        key_options,
+                        key=lambda item: (0 if str(item) in selected_keys else 1, key_options.index(item), str(item).lower()),
+                    )
+                key_list.blockSignals(True)
+                try:
+                    key_list.clear()
+                    for key_name in ranked:
+                        if query and self._auto_item_key_search_score(str(key_name), query, key_options.index(key_name))[0] >= 4.45:
+                            continue
+                        item = QListWidgetItem(str(key_name))
+                        key_list.addItem(item)
+                        if str(key_name) in selected_keys:
+                            item.setSelected(True)
+                finally:
+                    key_list.blockSignals(False)
+                _refresh_selected_keys_label()
+
+            def _on_key_selection_changed() -> None:
+                visible_all = {
+                    str(key_list.item(i).text() or "").strip()
+                    for i in range(key_list.count())
+                }
+                selected_keys.difference_update({key for key in visible_all if key})
+                for item in key_list.selectedItems():
+                    value = str(item.text() or "").strip()
+                    if value:
+                        selected_keys.add(value)
+                _refresh_selected_keys_label()
+
+            key_search_le.textChanged.connect(_refresh_key_list)
+            key_list.itemSelectionChanged.connect(_on_key_selection_changed)
+            _refresh_key_list()
+
+            key_form = QFormLayout()
+            key_hold_spin = QDoubleSpinBox()
+            key_hold_spin.setRange(0.0, 60.0)
+            key_hold_spin.setDecimals(2)
+            key_hold_spin.setSingleStep(0.05)
+            key_hold_spin.setSuffix(" s")
+            key_hold_spin.setValue(float(action.get("key_hold_s", self._auto_item_default_key_hold_s()) or 0.0))
+            key_form.addRow("Hold for:", key_hold_spin)
+            key_layout.addLayout(key_form)
+            layout.addWidget(key_group)
+
+        if action_type == "loop":
+            loop_group = QGroupBox("Loop")
+            loop_layout = QVBoxLayout(loop_group)
+            loop_hint = QLabel("Steps after this loop run repeatedly until the matching End Block.")
+            loop_hint.setProperty("role", "hint")
+            loop_hint.setWordWrap(True)
+            loop_layout.addWidget(loop_hint)
+            loop_form = QFormLayout()
+            loop_count_spin = QSpinBox()
+            loop_count_spin.setRange(1, 9999)
+            loop_count_spin.setValue(max(1, int(action.get("loop_count", 1) or 1)))
+            loop_form.addRow("Times:", loop_count_spin)
+            loop_layout.addLayout(loop_form)
+            layout.addWidget(loop_group)
+
+        if action_type == "wait":
+            wait_group = QGroupBox("Wait")
+            wait_form = QFormLayout(wait_group)
+            wait_spin = QDoubleSpinBox()
+            wait_spin.setRange(0.0, 86400.0)
+            wait_spin.setDecimals(2)
+            wait_spin.setSingleStep(0.25)
+            wait_spin.setSuffix(" s")
+            wait_spin.setValue(max(0.0, float(action.get("wait_s", 0.0) or 0.0)))
+            wait_form.addRow("Duration:", wait_spin)
+            layout.addWidget(wait_group)
+
+        if action_type == "webhook":
+            webhook_group = QGroupBox("Webhook")
+            webhook_layout = QVBoxLayout(webhook_group)
+            webhook_hint = QLabel(
+                "Send a Discord webhook when this step is reached. Message placeholders: "
+                "{username}, {user_id}, {biome}, {action}, {step}, {server}, {ps_link}, {time}."
+            )
+            webhook_hint.setProperty("role", "hint")
+            webhook_hint.setWordWrap(True)
+            webhook_layout.addWidget(webhook_hint)
+            webhook_form = QFormLayout()
+            webhook_url_le = QLineEdit(str(action.get("webhook_url") or ""))
+            webhook_url_le.setPlaceholderText("https://discord.com/api/webhooks/...")
+            try:
+                webhook_url_le.setClearButtonEnabled(True)
+            except Exception:
+                pass
+            webhook_form.addRow("Webhook URL:", webhook_url_le)
+            webhook_layout.addLayout(webhook_form)
+            webhook_msg_te = QTextEdit()
+            webhook_msg_te.setAcceptRichText(False)
+            webhook_msg_te.setPlaceholderText("Message to send when this step runs")
+            webhook_msg_te.setPlainText(str(action.get("webhook_message") or ""))
+            webhook_msg_te.setMinimumHeight(110)
+            webhook_msg_te.setMaximumHeight(170)
+            webhook_layout.addWidget(webhook_msg_te)
+            layout.addWidget(webhook_group)
+
         if action_type == "paste":
             paste_group = QGroupBox("Paste Content")
             paste_layout = QVBoxLayout(paste_group)
-            paste_hint = QLabel("Enter the exact text this step should send. Multi-line text is supported.")
+            paste_hint = QLabel(
+                "Enter the exact text this step should send. Multi-line text is supported. "
+                "When per-user values are enabled, this text is the fallback."
+            )
             paste_hint.setProperty("role", "hint")
             paste_hint.setWordWrap(True)
             paste_layout.addWidget(paste_hint)
@@ -13513,7 +14903,289 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             select_all_chk = QCheckBox("Select all before paste")
             select_all_chk.setChecked(bool(action.get("select_all", True)))
             paste_layout.addWidget(select_all_chk)
+            per_user_paste_chk = QCheckBox("Use per-user paste values")
+            per_user_paste_chk.setChecked(bool(action.get("paste_per_user", False)))
+            per_user_paste_chk.setToolTip(
+                "When enabled, the Paste Values button in this row's Users window can set user-specific text. "
+                "The paste content above remains the fallback."
+            )
+            paste_layout.addWidget(per_user_paste_chk)
             layout.addWidget(paste_group)
+
+        condition_supported = action_type not in ("else", "end")
+        condition_widgets: Dict[str, Any] = {}
+        if condition_supported:
+            condition = self._normalize_auto_item_condition(
+                action.get("condition"),
+                fallback_enabled=(action_type == "if"),
+            )
+            cond_group = QGroupBox("Conditional")
+            cond_layout = QVBoxLayout(cond_group)
+            cond_hint = QLabel(
+                "A conditional can skip this step, or drive an if block, using a separate color point or OCR area."
+            )
+            cond_hint.setProperty("role", "hint")
+            cond_hint.setWordWrap(True)
+            cond_layout.addWidget(cond_hint)
+
+            cond_enable_chk = QCheckBox("Enable conditional for this step")
+            cond_enable_chk.setChecked(bool(condition.get("enabled", False)))
+            if action_type == "if":
+                cond_enable_chk.setChecked(True)
+                cond_enable_chk.setEnabled(False)
+                cond_enable_chk.setText("Use this condition for the if")
+            cond_layout.addWidget(cond_enable_chk)
+
+            cond_form = QFormLayout()
+            condition_type_combo = QComboBox()
+            condition_type_combo.addItem("Color Conditional", "color")
+            condition_type_combo.addItem("OCR Conditional", "ocr")
+            condition_type_combo.setCurrentIndex(
+                max(0, condition_type_combo.findData(str(condition.get("type") or "color")))
+            )
+            cond_form.addRow("Type:", condition_type_combo)
+            cond_layout.addLayout(cond_form)
+
+            color_group = QGroupBox("Color Conditional")
+            color_layout = QVBoxLayout(color_group)
+            color_hint = QLabel("Sample one pixel at the condition point and compare it to the expected color.")
+            color_hint.setProperty("role", "hint")
+            color_hint.setWordWrap(True)
+            color_layout.addWidget(color_hint)
+            color_form = QFormLayout()
+            cond_point_le = QLineEdit(_point_text(condition.get("point") if isinstance(condition.get("point"), dict) else None))
+            cond_point_le.setPlaceholderText("x, y (0.0-1.0)")
+            cond_point_le.setToolTip("Client-relative conditional point. Enter as x, y values from 0.0 to 1.0, or use Capture Condition Point.")
+            cond_capture_btn = QPushButton("Capture Condition Point")
+            cond_capture_btn.setStyleSheet(self._get_secondary_button_style())
+
+            def _capture_condition_point() -> None:
+                result = self._capture_auto_item_point(sample_color=True)
+                if not result:
+                    return
+                point_val = result.get("point")
+                if isinstance(point_val, dict):
+                    condition["point"] = {
+                        "x": float(point_val.get("x", 0.0)),
+                        "y": float(point_val.get("y", 0.0)),
+                    }
+                    cond_point_le.setText(_point_text(condition["point"]))
+                if result.get("color"):
+                    color_le.setText(str(result.get("color") or "#FFFFFF"))
+
+            cond_capture_btn.clicked.connect(_capture_condition_point)
+            cond_point_row = QWidget()
+            cond_point_lay = QHBoxLayout(cond_point_row)
+            cond_point_lay.setContentsMargins(0, 0, 0, 0)
+            cond_point_lay.setSpacing(8)
+            cond_point_lay.addWidget(cond_point_le, 1)
+            cond_point_lay.addWidget(cond_capture_btn)
+            color_form.addRow("Point:", cond_point_row)
+            color_le = QLineEdit(str(condition.get("color") or "#FFFFFF"))
+            color_le.setPlaceholderText("#FFFFFF")
+            color_form.addRow("Expected color:", color_le)
+            tolerance_spin = QSpinBox()
+            tolerance_spin.setRange(0, 255)
+            tolerance_spin.setValue(int(condition.get("tolerance", 10) or 10))
+            color_form.addRow("Tolerance:", tolerance_spin)
+            color_layout.addLayout(color_form)
+            cond_layout.addWidget(color_group)
+
+            ocr_group = QGroupBox("OCR Conditional")
+            ocr_layout = QVBoxLayout(ocr_group)
+            ocr_hint = QLabel("Capture an OCR area. When this step is reached, Auto Actions reads that area immediately.")
+            ocr_hint.setProperty("role", "hint")
+            ocr_hint.setWordWrap(True)
+            ocr_layout.addWidget(ocr_hint)
+            ocr_form = QFormLayout()
+            ocr_roi_le = QLineEdit(_roi_text(condition.get("roi") if isinstance(condition.get("roi"), dict) else None))
+            ocr_roi_le.setReadOnly(True)
+            ocr_roi_le.setPlaceholderText("Uses OCR tab chat ROI if left blank")
+            ocr_area_btn = QPushButton("Capture OCR Area")
+            ocr_area_btn.setStyleSheet(self._get_secondary_button_style())
+
+            def _capture_ocr_area() -> None:
+                roi_cfg = self._pick_ocr_filter_roi("Select OCR Conditional Area")
+                if not roi_cfg:
+                    return
+                condition["roi"] = copy.deepcopy(roi_cfg)
+                ocr_roi_le.setText(_roi_text(condition["roi"]))
+
+            ocr_area_btn.clicked.connect(_capture_ocr_area)
+            ocr_area_row = QWidget()
+            ocr_area_lay = QHBoxLayout(ocr_area_row)
+            ocr_area_lay.setContentsMargins(0, 0, 0, 0)
+            ocr_area_lay.setSpacing(8)
+            ocr_area_lay.addWidget(ocr_roi_le, 1)
+            ocr_area_lay.addWidget(ocr_area_btn)
+            ocr_form.addRow("Area:", ocr_area_row)
+            ocr_text_le = QLineEdit(str(condition.get("target_text") or ""))
+            ocr_text_le.setPlaceholderText("Text to look for")
+            try:
+                ocr_text_le.setClearButtonEnabled(True)
+            except Exception:
+                pass
+            ocr_form.addRow("Text:", ocr_text_le)
+            match_combo = QComboBox()
+            match_combo.addItem("Contains", "contains")
+            match_combo.addItem("Equals line", "equals")
+            match_combo.addItem("Fuzzy", "fuzzy")
+            match_combo.addItem("Regex", "regex")
+            match_combo.setToolTip("Fuzzy ignores line-break differences and tolerates small OCR mistakes.")
+            match_combo.setCurrentIndex(max(0, match_combo.findData(str(condition.get("match_mode") or "contains"))))
+            ocr_form.addRow("Match:", match_combo)
+            case_chk = QCheckBox("Case sensitive")
+            case_chk.setChecked(bool(condition.get("case_sensitive", False)))
+            ocr_form.addRow(case_chk)
+            ocr_layout.addLayout(ocr_form)
+
+            ocr_filter_hint = QLabel("Optional preprocessing color values for this OCR read.")
+            ocr_filter_hint.setProperty("role", "hint")
+            ocr_filter_hint.setWordWrap(True)
+            ocr_layout.addWidget(ocr_filter_hint)
+
+            color_filter_table = QTableWidget(0, 5)
+            color_filter_table.setHorizontalHeaderLabels(["On", "R", "G", "B", "Tol"])
+            color_filter_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            color_filter_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            color_filter_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            color_filter_table.verticalHeader().setVisible(False)
+            color_filter_table.verticalHeader().setDefaultSectionSize(44)
+            color_filter_table.setMinimumHeight(120)
+            color_filter_table.setMaximumHeight(190)
+            color_filter_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            for col_idx in range(1, 5):
+                color_filter_table.horizontalHeader().setSectionResizeMode(col_idx, QHeaderView.ResizeMode.Stretch)
+            ocr_layout.addWidget(color_filter_table)
+
+            def _make_color_spin(value: int) -> QSpinBox:
+                spin = _AutoItemSpinBox()
+                spin.setRange(0, 255)
+                spin.setValue(max(0, min(255, int(value or 0))))
+                spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                try:
+                    spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+                except Exception:
+                    pass
+                spin.setMinimumWidth(70)
+                spin.setMinimumHeight(30)
+                spin.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                spin.setStyleSheet(
+                    f"""
+                    QSpinBox {{
+                        background-color: {ModernStyle.SURFACE};
+                        color: {ModernStyle.TEXT_PRIMARY};
+                        border: 1px solid {ModernStyle.BORDER};
+                        border-radius: 6px;
+                        padding: 4px 18px 4px 6px;
+                    }}
+                    QSpinBox:focus {{
+                        border-color: {ModernStyle.PRIMARY};
+                    }}
+                    """
+                )
+                return spin
+
+            def _add_condition_color_filter(spec: Optional[dict] = None) -> None:
+                spec = spec or {"r": 255, "g": 255, "b": 255, "tol": 40, "enabled": True}
+                row_idx = color_filter_table.rowCount()
+                color_filter_table.insertRow(row_idx)
+                color_filter_table.setRowHeight(row_idx, 44)
+                enabled_chk = QCheckBox()
+                enabled_chk.setChecked(bool(spec.get("enabled", True)))
+                enabled_chk.setStyleSheet("background: transparent;")
+                color_filter_table.setCellWidget(
+                    row_idx,
+                    0,
+                    self._ocr_wrap_table_cell(enabled_chk, center=True, margins=(0, 0, 0, 0)),
+                )
+                color_filter_table.setCellWidget(row_idx, 1, _make_color_spin(int(spec.get("r", 255) or 0)))
+                color_filter_table.setCellWidget(row_idx, 2, _make_color_spin(int(spec.get("g", 255) or 0)))
+                color_filter_table.setCellWidget(row_idx, 3, _make_color_spin(int(spec.get("b", 255) or 0)))
+                color_filter_table.setCellWidget(row_idx, 4, _make_color_spin(int(spec.get("tol", spec.get("tolerance", 40)) or 0)))
+
+            def _read_condition_color_filters() -> List[dict]:
+                values: List[dict] = []
+                for row_idx in range(color_filter_table.rowCount()):
+                    enabled_w = self._ocr_unwrap_table_widget(color_filter_table.cellWidget(row_idx, 0), QCheckBox)
+                    r_w = self._ocr_unwrap_table_widget(color_filter_table.cellWidget(row_idx, 1), QSpinBox)
+                    g_w = self._ocr_unwrap_table_widget(color_filter_table.cellWidget(row_idx, 2), QSpinBox)
+                    b_w = self._ocr_unwrap_table_widget(color_filter_table.cellWidget(row_idx, 3), QSpinBox)
+                    tol_w = self._ocr_unwrap_table_widget(color_filter_table.cellWidget(row_idx, 4), QSpinBox)
+                    values.append(
+                        {
+                            "enabled": bool(enabled_w.isChecked()) if isinstance(enabled_w, QCheckBox) else True,
+                            "r": int(r_w.value()) if isinstance(r_w, QSpinBox) else 255,
+                            "g": int(g_w.value()) if isinstance(g_w, QSpinBox) else 255,
+                            "b": int(b_w.value()) if isinstance(b_w, QSpinBox) else 255,
+                            "tol": int(tol_w.value()) if isinstance(tol_w, QSpinBox) else 40,
+                        }
+                    )
+                return self._normalize_auto_item_ocr_color_filters(values)
+
+            for spec in self._normalize_auto_item_ocr_color_filters(condition.get("color_filters") or []):
+                _add_condition_color_filter(spec)
+
+            filter_btn_row = QHBoxLayout()
+            add_filter_btn = QPushButton("Add Color")
+            pick_filter_btn = QPushButton("Pick Color")
+            remove_filter_btn = QPushButton("Remove Color")
+            for btn in (add_filter_btn, pick_filter_btn, remove_filter_btn):
+                btn.setStyleSheet(self._get_secondary_button_style())
+                filter_btn_row.addWidget(btn)
+            filter_btn_row.addStretch()
+            ocr_layout.addLayout(filter_btn_row)
+
+            def _add_blank_filter() -> None:
+                _add_condition_color_filter()
+                color_filter_table.setCurrentCell(max(0, color_filter_table.rowCount() - 1), 0)
+
+            def _pick_filter_color() -> None:
+                rgb = self._pick_ocr_filter_color()
+                if not rgb:
+                    return
+                r, g, b = rgb
+                _add_condition_color_filter({"r": r, "g": g, "b": b, "tol": 40, "enabled": True})
+                color_filter_table.setCurrentCell(max(0, color_filter_table.rowCount() - 1), 0)
+
+            def _remove_filter_color() -> None:
+                row_idx = color_filter_table.currentRow()
+                if row_idx < 0:
+                    rows = sorted({idx.row() for idx in color_filter_table.selectedIndexes()}, reverse=True)
+                else:
+                    rows = [row_idx]
+                for idx in sorted(set(rows), reverse=True):
+                    if 0 <= idx < color_filter_table.rowCount():
+                        color_filter_table.removeRow(idx)
+
+            add_filter_btn.clicked.connect(_add_blank_filter)
+            pick_filter_btn.clicked.connect(_pick_filter_color)
+            remove_filter_btn.clicked.connect(_remove_filter_color)
+            cond_layout.addWidget(ocr_group)
+
+            def _sync_condition_state() -> None:
+                active = bool(cond_enable_chk.isChecked()) or action_type == "if"
+                is_ocr = str(condition_type_combo.currentData() or "color") == "ocr"
+                condition_type_combo.setEnabled(active)
+                color_group.setVisible(active and not is_ocr)
+                ocr_group.setVisible(active and is_ocr)
+
+            cond_enable_chk.toggled.connect(_sync_condition_state)
+            condition_type_combo.currentIndexChanged.connect(_sync_condition_state)
+            _sync_condition_state()
+            layout.addWidget(cond_group)
+            condition_widgets = {
+                "enable": cond_enable_chk,
+                "type": condition_type_combo,
+                "condition": condition,
+                "point_edit": cond_point_le,
+                "color": color_le,
+                "tolerance": tolerance_spin,
+                "ocr_text": ocr_text_le,
+                "match": match_combo,
+                "case": case_chk,
+                "color_filter_reader": _read_condition_color_filters,
+            }
 
         layout.addStretch(1)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -13524,29 +15196,97 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
 
+        try:
+            action_point = copy.deepcopy(action.get("point"))
+            action_end_point = copy.deepcopy(action.get("end_point"))
+            if action_type in ("click", "scroll"):
+                action_point = _point_from_text("Action point", point_le.text())
+            if action_type == "drag":
+                action_point = _point_from_text("Drag start point", start_point_le.text())
+                action_end_point = _point_from_text("Drag end point", end_point_le.text())
+            condition_point = None
+            if condition_supported and "point_edit" in condition_widgets:
+                condition_point = _point_from_text("Condition point", condition_widgets["point_edit"].text())
+        except ValueError:
+            return None
+
         out = {
-            "name": name_le.text().strip() or action_type.replace("_", " ").title(),
+            "name": name_le.text().strip() or display_name,
             "type": action_type,
-            "point": copy.deepcopy(action.get("point")),
+            "point": action_point,
+            "end_point": action_end_point,
             "text": "",
+            "paste_per_user": False,
+            "paste_user_values": {},
+            "webhook_url": "",
+            "webhook_message": "",
+            "key": "",
+            "keys": [],
+            "key_hold_s": 0.0,
+            "click_button": "left",
+            "click_count": 1,
+            "loop_count": 1,
+            "wait_s": 0.0,
+            "drag_duration_s": 0.5,
             "color": "#FFFFFF",
             "tolerance": 0,
             "select_all": True,
             "scroll_direction": "down",
+            "condition": self._default_auto_item_condition(enabled=False),
         }
-        if action_type == "conditional_click":
-            out["color"] = color_le.text().strip() or "#FFFFFF"
-            out["tolerance"] = int(tolerance_spin.value())
+        if condition_supported:
+            cond_source = copy.deepcopy(condition_widgets.get("condition") or {})
+            cond_enabled = bool(condition_widgets["enable"].isChecked()) or action_type == "if"
+            cond_type = str(condition_widgets["type"].currentData() or "color")
+            out["condition"] = {
+                "enabled": cond_enabled,
+                "type": cond_type,
+                "point": condition_point,
+                "roi": copy.deepcopy(cond_source.get("roi")) if isinstance(cond_source.get("roi"), dict) else self._ocr_empty_roi_cfg(),
+                "color": condition_widgets["color"].text().strip() or "#FFFFFF",
+                "tolerance": int(condition_widgets["tolerance"].value()),
+                "target_text": condition_widgets["ocr_text"].text().strip(),
+                "match_mode": str(condition_widgets["match"].currentData() or "contains"),
+                "case_sensitive": bool(condition_widgets["case"].isChecked()),
+                "filter_ids": [],
+                "color_filters": condition_widgets["color_filter_reader"](),
+            }
+        if action_type == "click":
+            out["click_button"] = str(click_button_combo.currentData() or "left")
+            out["click_count"] = 2 if bool(double_click_chk.isChecked()) else 1
+        if action_type == "drag":
+            out["click_button"] = str(drag_button_combo.currentData() or "left")
+            out["drag_duration_s"] = float(drag_duration_spin.value())
         if action_type == "scroll":
             out["scroll_direction"] = str(scroll_direction_combo.currentData() or "down")
+        if action_type == "key":
+            key_values = _ordered_selected_keys()
+            out["keys"] = key_values
+            out["key"] = key_values[0] if key_values else ""
+            out["key_hold_s"] = float(key_hold_spin.value())
+        if action_type == "loop":
+            out["loop_count"] = int(loop_count_spin.value())
+        if action_type == "wait":
+            out["wait_s"] = float(wait_spin.value())
+        if action_type == "webhook":
+            out["webhook_url"] = webhook_url_le.text().strip()
+            out["webhook_message"] = webhook_msg_te.toPlainText()
         if action_type == "paste":
             out["text"] = text_le.toPlainText()
             out["select_all"] = bool(select_all_chk.isChecked())
+            out["paste_per_user"] = bool(per_user_paste_chk.isChecked())
+            out["paste_user_values"] = self._normalize_auto_item_paste_user_values(
+                action.get("paste_user_values") or {}
+            )
 
         return out
 
     def _edit_auto_item_actions_dialog(self, actions: List[dict], *, title: str = "Actions") -> Optional[List[dict]]:
-        working = [copy.deepcopy(a) for a in (actions or []) if isinstance(a, dict)]
+        working = []
+        for idx, raw_action in enumerate(actions or []):
+            action = self._normalize_auto_item_action(raw_action, fallback_name=f"Action {idx + 1}")
+            if action is not None:
+                working.append(action)
 
         dlg = QDialog(self)
         dlg.setWindowTitle(title)
@@ -13563,7 +15303,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         table = QTableWidget(0, 3)
         table.setHorizontalHeaderLabels(["Name", "Type", "Details"])
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setShowGrid(False)
         table.setWordWrap(False)
@@ -13579,28 +15319,74 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         def _details(action: dict) -> str:
             kind = str(action.get("type") or "")
+            cond_summary = self._auto_item_condition_summary(action.get("condition"))
+            cond_suffix = f" | {cond_summary}" if cond_summary else ""
+            key_values = [
+                str(key or "").strip()
+                for key in (action.get("keys") or [])
+                if str(key or "").strip()
+            ]
+            if not key_values and str(action.get("key") or "").strip():
+                key_values = [str(action.get("key") or "").strip()]
             if kind == "paste":
                 text = str(action.get("text") or "")
                 text = text.replace("\r", " ").replace("\n", " ")
                 if len(text) > 48:
                     text = text[:45] + "..."
-                return f"Paste '{text}'"
+                paste_suffix = ""
+                if bool(action.get("paste_per_user", False)):
+                    override_count = len(self._normalize_auto_item_paste_user_values(action.get("paste_user_values") or {}))
+                    paste_suffix = (
+                        f" | per-user paste ({override_count} override"
+                        f"{'' if override_count == 1 else 's'})"
+                    )
+                return f"Paste '{text}'{paste_suffix}{cond_suffix}"
+            if kind == "key":
+                hold = float(action.get("key_hold_s", 0.0) or 0.0)
+                hold_text = f" for {hold:.2f}s" if hold > 0.0 else ""
+                key_text = " + ".join(key_values) if key_values else "(unset)"
+                label = "Keys" if len(key_values) > 1 else "Key"
+                return f"{label} {key_text}{hold_text}{cond_suffix}"
+            if kind == "wait":
+                return f"Wait {float(action.get('wait_s', 0.0) or 0.0):.2f}s{cond_suffix}"
+            if kind == "webhook":
+                has_url = bool(str(action.get("webhook_url") or "").strip())
+                msg = str(action.get("webhook_message") or "").replace("\r", " ").replace("\n", " ")
+                if len(msg) > 48:
+                    msg = msg[:45] + "..."
+                return f"Webhook {'configured' if has_url else 'missing URL'}: '{msg or '(default message)'}'{cond_suffix}"
+            if kind == "if":
+                return f"If {cond_summary or '(condition not configured)'}"
+            if kind == "loop":
+                return f"Loop x{max(1, int(action.get('loop_count', 1) or 1))}{cond_suffix}"
+            if kind == "else":
+                return "Else"
+            if kind == "end":
+                return "End Block"
+            if kind == "break":
+                return f"Break{cond_suffix}"
             point = action.get("point") if isinstance(action.get("point"), dict) else None
             if kind == "scroll":
                 direction = "Up" if str(action.get("scroll_direction") or "down").strip().lower() == "up" else "Down"
                 if isinstance(point, dict):
-                    return f"Scroll {direction} at {float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}"
-                return f"Scroll {direction} (no point)"
-            if kind == "conditional_click":
-                if isinstance(point, dict):
+                    return f"Scroll {direction} at {float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}{cond_suffix}"
+                return f"Scroll {direction} (no point){cond_suffix}"
+            if kind == "drag":
+                end_point = action.get("end_point") if isinstance(action.get("end_point"), dict) else None
+                button = "Right" if str(action.get("click_button") or "left") == "right" else "Left"
+                duration = float(action.get("drag_duration_s", 0.5) or 0.0)
+                if isinstance(point, dict) and isinstance(end_point, dict):
                     return (
-                        f"{float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f} "
-                        f"{str(action.get('color') or '#FFFFFF')}"
+                        f"{button} drag {float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f} -> "
+                        f"{float(end_point.get('x', 0.0)):.4f}, {float(end_point.get('y', 0.0)):.4f} "
+                        f"over {duration:.2f}s{cond_suffix}"
                     )
-                return "No point"
+                return f"{button} drag (missing point){cond_suffix}"
             if isinstance(point, dict):
-                return f"{float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}"
-            return "No point"
+                button = "Right" if str(action.get("click_button") or "left") == "right" else "Left"
+                dbl = " double" if int(action.get("click_count", 1) or 1) >= 2 else ""
+                return f"{button}{dbl} click {float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}{cond_suffix}"
+            return f"No point{cond_suffix}"
 
         def _refresh() -> None:
             table.setRowCount(len(working))
@@ -13610,7 +15396,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 except Exception:
                     pass
                 name_item = QTableWidgetItem(str(action.get("name") or ""))
-                type_item = QTableWidgetItem(str(action.get("type") or "").replace("_", " ").title())
+                type_labels = {
+                    "key": "Keyboard Click",
+                    "drag": "Drag",
+                    "wait": "Wait",
+                    "webhook": "Webhook",
+                    "if": "If",
+                    "else": "Else",
+                    "end": "End Block",
+                    "break": "Break",
+                    "loop": "Loop",
+                }
+                type_key = str(action.get("type") or "")
+                type_item = QTableWidgetItem(type_labels.get(type_key, type_key.replace("_", " ").title()))
                 detail_text = _details(action)
                 detail_item = QTableWidgetItem(detail_text)
                 for item in (name_item, type_item, detail_item):
@@ -13625,30 +15423,117 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 row = 0
             return row
 
+        def _selected_rows() -> List[int]:
+            rows = sorted({idx.row() for idx in table.selectedIndexes()})
+            rows = [row for row in rows if 0 <= row < len(working)]
+            if not rows:
+                row = _current_row()
+                if 0 <= row < len(working):
+                    rows = [row]
+            return rows
+
+        def _select_rows(rows: List[int]) -> None:
+            rows = sorted({int(row) for row in rows if 0 <= int(row) < len(working)})
+            table.clearSelection()
+            if not rows:
+                return
+            table.setCurrentCell(rows[0], 0)
+            for row in rows:
+                for col in range(table.columnCount()):
+                    item = table.item(row, col)
+                    if item is not None:
+                        item.setSelected(True)
+            try:
+                table.scrollTo(table.model().index(rows[0], 0), QAbstractItemView.ScrollHint.EnsureVisible)
+            except Exception:
+                pass
+
+        def _selected_ranges(rows: List[int]) -> List[Tuple[int, int]]:
+            if not rows:
+                return []
+            ranges: List[Tuple[int, int]] = []
+            start = prev = rows[0]
+            for row in rows[1:]:
+                if row == prev + 1:
+                    prev = row
+                    continue
+                ranges.append((start, prev))
+                start = prev = row
+            ranges.append((start, prev))
+            return ranges
+
         add_row = QHBoxLayout()
         add_click_btn = QPushButton("Add Click")
-        add_cond_btn = QPushButton("Add Conditional")
+        add_drag_btn = QPushButton("Add Drag")
+        add_key_btn = QPushButton("Add Key")
         add_paste_btn = QPushButton("Add Paste")
         add_scroll_btn = QPushButton("Add Scroll")
+        add_wait_btn = QPushButton("Add Wait")
+        add_webhook_btn = QPushButton("Add Webhook")
+        add_control_row = QHBoxLayout()
+        add_if_btn = QPushButton("Add If")
+        add_loop_btn = QPushButton("Add Loop")
+        add_else_btn = QPushButton("Add Else")
+        add_end_btn = QPushButton("Add End Block")
+        add_break_btn = QPushButton("Add Break")
         edit_btn = QPushButton("Edit")
+        duplicate_btn = QPushButton("Duplicate")
         remove_btn = QPushButton("Remove")
         up_btn = QPushButton("Move Up")
         down_btn = QPushButton("Move Down")
         add_click_btn.setStyleSheet(self._get_primary_button_style())
-        for btn in (add_cond_btn, add_paste_btn, add_scroll_btn, edit_btn, remove_btn, up_btn, down_btn):
+        for btn in (
+            add_key_btn,
+            add_drag_btn,
+            add_paste_btn,
+            add_scroll_btn,
+            add_wait_btn,
+            add_webhook_btn,
+            add_if_btn,
+            add_loop_btn,
+            add_else_btn,
+            add_end_btn,
+            add_break_btn,
+            edit_btn,
+            duplicate_btn,
+            remove_btn,
+            up_btn,
+            down_btn,
+        ):
             btn.setStyleSheet(self._get_secondary_button_style())
-        for btn in (add_click_btn, add_cond_btn, add_paste_btn, add_scroll_btn):
+        for btn in (
+            add_click_btn,
+            add_drag_btn,
+            add_key_btn,
+            add_paste_btn,
+            add_scroll_btn,
+            add_wait_btn,
+            add_webhook_btn,
+        ):
             add_row.addWidget(btn)
         add_row.addStretch()
         layout.addLayout(add_row)
 
+        for btn in (
+            add_if_btn,
+            add_loop_btn,
+            add_else_btn,
+            add_end_btn,
+            add_break_btn,
+        ):
+            add_control_row.addWidget(btn)
+        add_control_row.addStretch()
+        layout.addLayout(add_control_row)
+
         manage_row = QHBoxLayout()
-        for btn in (edit_btn, remove_btn, up_btn, down_btn):
+        for btn in (edit_btn, duplicate_btn, remove_btn, up_btn, down_btn):
             manage_row.addWidget(btn)
         manage_row.addStretch()
         layout.addLayout(manage_row)
 
-        helper = QLabel("Double-click any step to edit it. Reorder with Move Up and Move Down.")
+        helper = QLabel(
+            "Double-click any step to edit it. Use Ctrl/Shift selection to move, duplicate, or remove multiple steps."
+        )
         helper.setProperty("role", "hint")
         helper.setWordWrap(True)
         layout.addWidget(helper)
@@ -13657,9 +15542,18 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             result = self._edit_auto_item_action_step_dialog(kind)
             if result is None:
                 return
-            working.append(result)
+            selected = _selected_rows()
+            row = max(selected) if selected else table.currentRow()
+            insert_at = len(working)
+            if 0 <= row < len(working):
+                insert_at = row + 1
+            working.insert(insert_at, result)
             _refresh()
-            table.setCurrentCell(max(0, len(working) - 1), 0)
+            _select_rows([max(0, min(insert_at, len(working) - 1))])
+            try:
+                table.scrollTo(table.model().index(insert_at, 0), QAbstractItemView.ScrollHint.EnsureVisible)
+            except Exception:
+                pass
 
         def _edit_selected() -> None:
             row = _current_row()
@@ -13671,31 +15565,76 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 return
             working[row] = result
             _refresh()
-            table.setCurrentCell(row, 0)
+            _select_rows([row])
 
         def _move(delta: int) -> None:
-            row = _current_row()
-            new_row = row + int(delta)
-            if row < 0 or new_row < 0 or new_row >= len(working):
+            rows = _selected_rows()
+            if not rows:
                 return
-            working[row], working[new_row] = working[new_row], working[row]
+            direction = -1 if int(delta) < 0 else 1
+            ranges = _selected_ranges(rows)
+            if direction < 0:
+                if ranges[0][0] <= 0:
+                    return
+                new_rows: List[int] = []
+                for start, end in ranges:
+                    segment = working[start : end + 1]
+                    before = working[start - 1]
+                    working[start - 1 : end + 1] = segment + [before]
+                    new_rows.extend(range(start - 1, end))
+            else:
+                if ranges[-1][1] >= len(working) - 1:
+                    return
+                new_rows = []
+                for start, end in reversed(ranges):
+                    segment = working[start : end + 1]
+                    after = working[end + 1]
+                    working[start : end + 2] = [after] + segment
+                    new_rows.extend(range(start + 1, end + 2))
             _refresh()
-            table.setCurrentCell(new_row, 0)
+            _select_rows(new_rows)
+
+        def _duplicate_selected() -> None:
+            rows = _selected_rows()
+            if not rows:
+                return
+            copies = [copy.deepcopy(working[row]) for row in rows]
+            insert_at = max(rows) + 1
+            working[insert_at:insert_at] = copies
+            _refresh()
+            duplicate_rows = list(range(insert_at, insert_at + len(copies)))
+            _select_rows(duplicate_rows)
+            try:
+                table.scrollTo(table.model().index(insert_at, 0), QAbstractItemView.ScrollHint.EnsureVisible)
+            except Exception:
+                pass
 
         def _remove_selected() -> None:
-            row = _current_row()
-            if row < 0 or row >= len(working):
+            rows = _selected_rows()
+            if not rows:
                 return
-            working.pop(row)
+            next_row = min(rows)
+            for row in sorted(rows, reverse=True):
+                if 0 <= row < len(working):
+                    working.pop(row)
             _refresh()
             if working:
-                table.setCurrentCell(max(0, min(row, len(working) - 1)), 0)
+                _select_rows([max(0, min(next_row, len(working) - 1))])
 
         add_click_btn.clicked.connect(lambda: _add("click"))
-        add_cond_btn.clicked.connect(lambda: _add("conditional_click"))
+        add_drag_btn.clicked.connect(lambda: _add("drag"))
+        add_key_btn.clicked.connect(lambda: _add("key"))
         add_paste_btn.clicked.connect(lambda: _add("paste"))
         add_scroll_btn.clicked.connect(lambda: _add("scroll"))
+        add_wait_btn.clicked.connect(lambda: _add("wait"))
+        add_webhook_btn.clicked.connect(lambda: _add("webhook"))
+        add_if_btn.clicked.connect(lambda: _add("if"))
+        add_loop_btn.clicked.connect(lambda: _add("loop"))
+        add_else_btn.clicked.connect(lambda: _add("else"))
+        add_end_btn.clicked.connect(lambda: _add("end"))
+        add_break_btn.clicked.connect(lambda: _add("break"))
         edit_btn.clicked.connect(_edit_selected)
+        duplicate_btn.clicked.connect(_duplicate_selected)
         remove_btn.clicked.connect(_remove_selected)
         up_btn.clicked.connect(lambda: _move(-1))
         down_btn.clicked.connect(lambda: _move(1))
@@ -13976,6 +15915,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "builtin": False,
             "actions": [],
         }
+        is_builtin = bool(current.get("builtin", False)) or str(current.get("id") or "") == "item"
         actions = [copy.deepcopy(a) for a in (current.get("actions") or []) if isinstance(a, dict)]
 
         dlg = QDialog(self)
@@ -13994,6 +15934,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         form = QFormLayout(identity_group)
         name_le = QLineEdit(str(current.get("name") or ""))
         name_le.setPlaceholderText("Preset name")
+        if is_builtin:
+            name_le.setReadOnly(True)
+            name_le.setToolTip("Built-in preset names cannot be edited.")
         form.addRow("Preset name:", name_le)
         layout.addWidget(identity_group)
 
@@ -14003,16 +15946,25 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         summary_lbl.setProperty("role", "section")
         summary_lbl.setToolTip(self._auto_item_actions_tooltip(actions))
         sequence_layout.addWidget(summary_lbl)
-        sequence_hint = QLabel("Edit the underlying steps without leaving this preset dialog.")
+        sequence_hint = QLabel(
+            "This built-in preset sequence is locked. Duplicate it to make an editable copy."
+            if is_builtin
+            else "Edit the underlying steps without leaving this preset dialog."
+        )
         sequence_hint.setProperty("role", "hint")
         sequence_hint.setWordWrap(True)
         sequence_layout.addWidget(sequence_hint)
 
         edit_actions_btn = QPushButton("Edit Actions")
         edit_actions_btn.setStyleSheet(self._get_primary_button_style())
+        if is_builtin:
+            edit_actions_btn.setEnabled(False)
+            edit_actions_btn.setToolTip("Built-in preset sequences cannot be edited.")
 
         def _edit_actions() -> None:
             nonlocal actions
+            if is_builtin:
+                return
             updated = self._edit_auto_item_actions_dialog(actions, title=f"Preset Actions - {name_le.text().strip() or 'Preset'}")
             if updated is None:
                 return
@@ -14034,13 +15986,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         return {
             "id": str(current.get("id") or f"preset_{uuid.uuid4().hex[:8]}"),
-            "name": name_le.text().strip() or "Preset",
-            "builtin": bool(current.get("builtin", False)),
-            "actions": [copy.deepcopy(a) for a in actions],
+            "name": str(current.get("name") or "Preset") if is_builtin else (name_le.text().strip() or "Preset"),
+            "builtin": bool(current.get("builtin", False)) or is_builtin,
+            "actions": [copy.deepcopy(a) for a in ((current.get("actions") or []) if is_builtin else actions)],
         }
 
     def _open_auto_item_presets_dialog(self) -> None:
         presets = [copy.deepcopy(p) for p in (getattr(self, "_auto_item_presets", []) or []) if isinstance(p, dict)]
+        debug_presets_visible = False
+        debug_key_buffer = ""
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Action Presets")
@@ -14089,7 +16043,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             target_row = 0
             for row, preset in enumerate(presets):
                 label = str(preset.get("name") or "Preset")
-                if bool(preset.get("builtin", False)):
+                if bool(preset.get("debug", False)):
+                    label += " [Debug]"
+                elif bool(preset.get("builtin", False)):
                     label += " [Built-in]"
                 item = QListWidgetItem(label)
                 item.setData(Qt.ItemDataRole.UserRole, str(preset.get("id") or ""))
@@ -14113,24 +16069,90 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 return
             preset = presets[row]
             preset_actions = [a for a in (preset.get("actions") or []) if isinstance(a, dict)]
+            preset_type = "Debug" if bool(preset.get("debug", False)) else (
+                "Built-in" if bool(preset.get("builtin", False)) else "Custom"
+            )
             lines = [
                 str(preset.get("name") or "Preset"),
                 "=" * max(6, len(str(preset.get("name") or "Preset"))),
-                f"Type: {'Built-in' if bool(preset.get('builtin', False)) else 'Custom'}",
+                f"Type: {preset_type}",
                 f"Steps: {len(preset_actions)}",
                 "",
             ]
             if not preset_actions:
                 lines.append("No steps configured yet.")
             for idx, action in enumerate(preset_actions):
-                kind = str(action.get("type") or "").replace("_", " ").title()
+                kind_key = str(action.get("type") or "")
+                kind = {
+                    "key": "Keyboard Click",
+                    "drag": "Drag",
+                    "wait": "Wait",
+                    "webhook": "Webhook",
+                    "if": "If",
+                    "else": "Else",
+                    "end": "End Block",
+                    "break": "Break",
+                    "loop": "Loop",
+                }.get(kind_key, kind_key.replace("_", " ").title())
                 name = str(action.get("name") or action.get("type") or "Action")
                 lines.append(f"{idx + 1}. {name} [{kind}]")
-                if str(action.get("type") or "") == "paste":
+                cond_summary = self._auto_item_condition_summary(action.get("condition"))
+                if cond_summary:
+                    lines.append(f"    Conditional: {cond_summary}")
+                if kind_key == "paste":
                     text = str(action.get("text") or "").replace("\r", " ").replace("\n", " ").strip()
                     if len(text) > 70:
                         text = text[:67] + "..."
                     lines.append(f"    Paste: {text or '(empty)'}")
+                    if bool(action.get("paste_per_user", False)):
+                        override_count = len(self._normalize_auto_item_paste_user_values(action.get("paste_user_values") or {}))
+                        lines.append(
+                            f"    Per-user values: on ({override_count} override"
+                            f"{'' if override_count == 1 else 's'})"
+                        )
+                elif kind_key == "key":
+                    key_values = [
+                        str(key or "").strip()
+                        for key in (action.get("keys") or [])
+                        if str(key or "").strip()
+                    ]
+                    if not key_values and str(action.get("key") or "").strip():
+                        key_values = [str(action.get("key") or "").strip()]
+                    key_label = "Keys" if len(key_values) > 1 else "Key"
+                    lines.append(f"    {key_label}: {' + '.join(key_values) if key_values else '(unset)'}")
+                    hold = float(action.get("key_hold_s", 0.0) or 0.0)
+                    if hold > 0.0:
+                        lines.append(f"    Hold: {hold:.2f}s")
+                elif kind_key == "wait":
+                    lines.append(f"    Wait: {float(action.get('wait_s', 0.0) or 0.0):.2f}s")
+                elif kind_key == "webhook":
+                    url = str(action.get("webhook_url") or "").strip()
+                    msg = str(action.get("webhook_message") or "").replace("\r", " ").replace("\n", " ").strip()
+                    if len(msg) > 70:
+                        msg = msg[:67] + "..."
+                    lines.append(f"    Webhook: {'configured' if url else 'missing URL'}")
+                    lines.append(f"    Message: {msg or '(default message)'}")
+                elif kind_key == "loop":
+                    lines.append(f"    Times: {max(1, int(action.get('loop_count', 1) or 1))}")
+                elif kind_key in ("else", "end", "break"):
+                    continue
+                elif kind_key == "drag":
+                    point = action.get("point") if isinstance(action.get("point"), dict) else None
+                    end_point = action.get("end_point") if isinstance(action.get("end_point"), dict) else None
+                    if isinstance(point, dict):
+                        lines.append(
+                            f"    Start: {float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}"
+                        )
+                    else:
+                        lines.append("    Start: not set")
+                    if isinstance(end_point, dict):
+                        lines.append(
+                            f"    End: {float(end_point.get('x', 0.0)):.4f}, {float(end_point.get('y', 0.0)):.4f}"
+                        )
+                    else:
+                        lines.append("    End: not set")
+                    button = "Right" if str(action.get("click_button") or "left") == "right" else "Left"
+                    lines.append(f"    Drag: {button} over {float(action.get('drag_duration_s', 0.5) or 0.0):.2f}s")
                 else:
                     point = action.get("point") if isinstance(action.get("point"), dict) else None
                     if isinstance(point, dict):
@@ -14139,17 +16161,21 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         )
                     else:
                         lines.append("    Point: not set")
-                    if str(action.get("type") or "") == "scroll":
+                    if kind_key == "scroll":
                         direction = "Up" if str(action.get("scroll_direction") or "down").strip().lower() == "up" else "Down"
                         lines.append(f"    Scroll: {direction}")
-                    if str(action.get("type") or "") == "conditional_click":
-                        lines.append(
-                            f"    Match: {str(action.get('color') or '#FFFFFF')} +/- {int(action.get('tolerance', 10) or 10)}"
-                        )
+                    if kind_key == "click":
+                        button = "Right" if str(action.get("click_button") or "left") == "right" else "Left"
+                        count = "Double" if int(action.get("click_count", 1) or 1) >= 2 else "Single"
+                        lines.append(f"    Click: {count} {button}")
             preview.setPlainText("\n".join(lines))
 
         def _sync_presets() -> None:
-            self._auto_item_presets = [copy.deepcopy(p) for p in presets]
+            self._auto_item_presets = [
+                copy.deepcopy(p)
+                for p in presets
+                if not bool(p.get("debug", False))
+            ]
             self._on_auto_item_ui_changed()
 
         add_to_table_btn = QPushButton("Add To Table")
@@ -14181,7 +16207,68 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         manage_row.addStretch()
         left.addLayout(manage_row)
 
-        preset_list.currentRowChanged.connect(lambda *_args: _refresh_preview())
+        def _selected_preset_is_builtin() -> bool:
+            row = _selected_index()
+            if row < 0:
+                return False
+            preset = presets[row]
+            return bool(preset.get("builtin", False)) or str(preset.get("id") or "") == "item"
+
+        def _sync_preset_buttons() -> None:
+            row = _selected_index()
+            has_selection = row >= 0
+            is_builtin = _selected_preset_is_builtin()
+            add_to_table_btn.setEnabled(has_selection)
+            edit_btn.setEnabled(has_selection and not is_builtin)
+            duplicate_btn.setEnabled(has_selection)
+            remove_btn.setEnabled(has_selection and not is_builtin)
+            export_btn.setEnabled(has_selection)
+            edit_btn.setToolTip(
+                "Built-in preset names and sequences cannot be edited. Duplicate it to make an editable copy."
+                if has_selection and is_builtin
+                else ""
+            )
+            remove_btn.setToolTip("Built-in presets cannot be removed." if has_selection and is_builtin else "")
+
+        def _on_preset_selection_changed() -> None:
+            _refresh_preview()
+            _sync_preset_buttons()
+
+        preset_list.currentRowChanged.connect(lambda *_args: _on_preset_selection_changed())
+
+        def _show_debug_presets() -> None:
+            nonlocal debug_presets_visible
+            if debug_presets_visible:
+                return
+            debug_presets_visible = True
+            existing_ids = {str(p.get("id") or "") for p in presets}
+            first_id = None
+            for preset in self._debug_auto_item_presets():
+                preset_id = str(preset.get("id") or "")
+                if not preset_id or preset_id in existing_ids:
+                    continue
+                existing_ids.add(preset_id)
+                presets.append(copy.deepcopy(preset))
+                if first_id is None:
+                    first_id = preset_id
+            _refresh_list(select_id=first_id)
+            _refresh_preview()
+            _sync_preset_buttons()
+
+        def _handle_debug_key(text: str) -> None:
+            nonlocal debug_key_buffer
+            if debug_presets_visible:
+                return
+            if not text:
+                return
+            char = str(text).lower()
+            if len(char) != 1 or not char.isalpha():
+                return
+            debug_key_buffer = (debug_key_buffer + char)[-5:]
+            if debug_key_buffer == "debug":
+                _show_debug_presets()
+
+        setattr(dlg, "_auto_item_debug_key_handler", _handle_debug_key)
 
         def _insert_preset_as_row() -> None:
             row = _selected_index()
@@ -14201,7 +16288,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     "alert_lead_s": 15.0,
                 }
             )
+            new_row = len(items) - 1
             self._load_auto_item_items_table(items)
+            self._auto_item_focus_row(new_row, column=1, position_at_bottom=True)
             self._on_auto_item_ui_changed()
 
         def _new_preset() -> None:
@@ -14215,6 +16304,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         def _edit_preset() -> None:
             row = _selected_index()
             if row < 0:
+                return
+            if bool(presets[row].get("builtin", False)) or str(presets[row].get("id") or "") == "item":
+                QMessageBox.information(
+                    self,
+                    "Action Presets",
+                    "Built-in preset names and sequences cannot be edited. Duplicate it to make an editable copy.",
+                )
                 return
             updated = self._edit_auto_item_preset_dialog(presets[row])
             if updated is None:
@@ -14231,6 +16327,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             dup["id"] = f"preset_{uuid.uuid4().hex[:8]}"
             dup["name"] = f"{str(dup.get('name') or 'Preset')} Copy"
             dup["builtin"] = False
+            dup.pop("debug", None)
             presets.append(dup)
             _refresh_list(select_id=str(dup.get("id") or ""))
             _sync_presets()
@@ -14294,6 +16391,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         _refresh_list()
         _refresh_preview()
+        _sync_preset_buttons()
         close_row = QHBoxLayout()
         close_row.addStretch()
         close_btn = QPushButton("Close")
@@ -14316,7 +16414,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         info_layout = QVBoxLayout(info_group)
         info_layout.setSpacing(6)
         desc = QLabel(
-            "Chain clicks, conditional clicks, and pastes into reusable rows."
+            "Chain clicks, drags, keyboard presses, pastes, scrolls, waits, webhooks, conditionals, loops, and control flow into reusable rows."
         )
         desc.setWordWrap(True)
         desc.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
@@ -14398,7 +16496,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setMinimumSectionSize(72)
         self.auto_item_table.setColumnWidth(0, 72)
-        self.auto_item_table.setMinimumHeight(280)
+        self.auto_item_table.setMinimumHeight(440)
         try:
             self.auto_item_table.setColumnHidden(5, not _bm_relaxed())
         except Exception:
@@ -14518,6 +16616,43 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         self.tab_widget.addTab(scroll, "Auto Actions")
 
+    def _auto_item_focus_row(self, row: int, *, column: int = 1, position_at_bottom: bool = False) -> None:
+        table = getattr(self, "auto_item_table", None)
+        if not isinstance(table, QTableWidget):
+            return
+        try:
+            row_i = int(row)
+            col_i = max(0, min(table.columnCount() - 1, int(column)))
+        except Exception:
+            return
+        if row_i < 0 or row_i >= table.rowCount():
+            return
+
+        def _apply_focus() -> None:
+            try:
+                if row_i < 0 or row_i >= table.rowCount():
+                    return
+                table.clearSelection()
+                table.setCurrentCell(row_i, col_i)
+                table.selectRow(row_i)
+                hint = (
+                    QAbstractItemView.ScrollHint.PositionAtBottom
+                    if bool(position_at_bottom)
+                    else QAbstractItemView.ScrollHint.EnsureVisible
+                )
+                table.scrollTo(table.model().index(row_i, col_i), hint)
+            except Exception:
+                try:
+                    table.verticalScrollBar().setValue(table.verticalScrollBar().maximum())
+                except Exception:
+                    pass
+
+        _apply_focus()
+        try:
+            QTimer.singleShot(0, _apply_focus)
+        except Exception:
+            pass
+
     def _auto_item_add_item(self):
         items = self._current_auto_item_items()
         items.append(
@@ -14532,7 +16667,275 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "alert_lead_s": 15.0,
             }
         )
+        new_row = len(items) - 1
         self._load_auto_item_items_table(items)
+        self._auto_item_focus_row(new_row, column=1, position_at_bottom=True)
+        self._on_auto_item_ui_changed()
+
+    def _auto_item_user_catalog(self) -> List[Tuple[str, str]]:
+        try:
+            users = self.config_manager.load_users() or {}
+        except Exception:
+            try:
+                users = self.config_manager.peek_users() or {}
+            except Exception:
+                users = {}
+        if not isinstance(users, dict):
+            users = {}
+
+        def _label(uid: Any) -> str:
+            info = users.get(uid, {}) if isinstance(users, dict) else {}
+            if not isinstance(info, dict):
+                info = {}
+            return str(info.get("username") or uid)
+
+        out: List[Tuple[str, str]] = []
+        for uid in sorted((users or {}).keys(), key=lambda value: _label(value).lower()):
+            uid_s = str(uid).strip()
+            if not uid_s:
+                continue
+            out.append((uid_s, _label(uid)))
+        return out
+
+    def _auto_item_unwrap_cell_widget(self, col_widget: QWidget, typ):
+        if col_widget is None:
+            return None
+        if isinstance(col_widget, typ):
+            return col_widget
+        try:
+            return col_widget.findChild(typ)
+        except Exception:
+            return None
+
+    def _auto_item_row_for_button(self, btn: QPushButton, *, column: int) -> int:
+        table = getattr(self, "auto_item_table", None)
+        if not isinstance(table, QTableWidget):
+            return -1
+        try:
+            col = int(column)
+        except Exception:
+            return -1
+        if col < 0 or col >= table.columnCount():
+            return -1
+        for row in range(table.rowCount()):
+            candidate = self._auto_item_unwrap_cell_widget(table.cellWidget(row, col), QPushButton)
+            if candidate is btn:
+                return row
+        return -1
+
+    def _auto_item_edit_selected_paste_values(self) -> None:
+        table = getattr(self, "auto_item_table", None)
+        if not isinstance(table, QTableWidget):
+            return
+        rows = sorted({idx.row() for idx in table.selectedIndexes()})
+        if not rows:
+            current_row = table.currentRow()
+            if current_row >= 0:
+                rows = [current_row]
+        if len(rows) != 1:
+            QMessageBox.information(self, "Paste Values", "Select exactly one action row first.")
+            return
+
+        row = int(rows[0])
+        self._auto_item_edit_paste_values_for_row(row)
+
+    def _auto_item_edit_paste_values_for_row(self, row: int, *, parent: Optional[QWidget] = None) -> None:
+        table = getattr(self, "auto_item_table", None)
+        if not isinstance(table, QTableWidget):
+            return
+        try:
+            row = int(row)
+        except Exception:
+            return
+        if row < 0 or row >= table.rowCount():
+            return
+
+        actions_btn = self._auto_item_unwrap_cell_widget(table.cellWidget(row, 2), QPushButton)
+        if not isinstance(actions_btn, QPushButton):
+            QMessageBox.information(self, "Paste Values", "Could not find the selected row's actions.")
+            return
+
+        actions: List[dict] = []
+        for idx, raw_action in enumerate((actions_btn.property("actions") or []) or []):
+            action = self._normalize_auto_item_action(raw_action, fallback_name=f"Action {idx + 1}")
+            if action is not None:
+                actions.append(action)
+
+        paste_indices = [
+            idx
+            for idx, action in enumerate(actions)
+            if str(action.get("type") or "") == "paste" and bool(action.get("paste_per_user", False))
+        ]
+        if not paste_indices:
+            QMessageBox.information(
+                self,
+                "Paste Values",
+                "This row has no paste steps with per-user values enabled. Edit a paste step and turn on Use per-user paste values first.",
+            )
+            return
+
+        users = self._auto_item_user_catalog()
+        if not users:
+            QMessageBox.information(self, "Paste Values", "No users are configured yet.")
+            return
+
+        dlg = QDialog(parent if isinstance(parent, QWidget) else self)
+        dlg.setWindowTitle("Per-User Paste Values")
+        dlg.resize(760, 660)
+        self._auto_item_apply_dialog_style(dlg)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+
+        hint = QLabel(
+            "Set optional paste overrides for each user. Blank values use the paste step's default content."
+        )
+        hint.setProperty("role", "hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        action_combo = QComboBox()
+        for action_idx in paste_indices:
+            action = actions[action_idx]
+            label = str(action.get("name") or f"Paste {action_idx + 1}").strip() or f"Paste {action_idx + 1}"
+            action_combo.addItem(f"{action_idx + 1}. {label}", int(action_idx))
+        form.addRow("Paste step:", action_combo)
+
+        default_label = QLabel()
+        default_label.setWordWrap(True)
+        default_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow("Default paste:", default_label)
+        search_le = QLineEdit()
+        search_le.setPlaceholderText("Search users by name or ID")
+        try:
+            search_le.setClearButtonEnabled(True)
+        except Exception:
+            pass
+        form.addRow("Search:", search_le)
+        layout.addLayout(form)
+
+        values_table = QTableWidget(0, 2)
+        values_table.setHorizontalHeaderLabels(["User", "Paste value"])
+        values_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        values_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        values_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        values_table.setShowGrid(False)
+        values_table.verticalHeader().setVisible(False)
+        values_table.verticalHeader().setDefaultSectionSize(72)
+        values_table.setMinimumHeight(430)
+        values_table.setWordWrap(False)
+        values_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        values_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._auto_item_apply_main_table_style(values_table)
+        layout.addWidget(values_table)
+
+        for uid, username in users:
+            value_row = values_table.rowCount()
+            values_table.insertRow(value_row)
+            values_table.setRowHeight(value_row, 74)
+            user_item = QTableWidgetItem(f"{username} ({uid})")
+            user_item.setData(Qt.ItemDataRole.UserRole, uid)
+            user_item.setToolTip(uid)
+            values_table.setItem(value_row, 0, user_item)
+
+            value_edit = QTextEdit()
+            value_edit.setAcceptRichText(False)
+            value_edit.setMinimumHeight(56)
+            value_edit.setMaximumHeight(66)
+            value_edit.setStyleSheet(
+                f"""
+                QTextEdit {{
+                    background-color: {ModernStyle.BACKGROUND};
+                    color: {ModernStyle.TEXT_PRIMARY};
+                    border: 1px solid {ModernStyle.BORDER};
+                    border-radius: 7px;
+                    padding: 5px 8px;
+                }}
+                QTextEdit:focus {{
+                    border-color: {ModernStyle.PRIMARY};
+                }}
+                """
+            )
+            values_table.setCellWidget(value_row, 1, value_edit)
+
+        active_action_idx: Dict[str, Optional[int]] = {"value": None}
+
+        def _apply_user_search() -> None:
+            query = search_le.text().strip().lower()
+            for value_row in range(values_table.rowCount()):
+                item = values_table.item(value_row, 0)
+                user_text = str(item.text() if item is not None else "")
+                uid = str(item.data(Qt.ItemDataRole.UserRole) if item is not None else "")
+                haystack = f"{user_text} {uid}".lower()
+                values_table.setRowHidden(value_row, bool(query) and query not in haystack)
+
+        def _text_preview(text: str, *, limit: int = 140) -> str:
+            preview = str(text or "").replace("\r", " ").replace("\n", " ")
+            if len(preview) > limit:
+                preview = preview[: max(0, limit - 3)] + "..."
+            return preview or "(empty)"
+
+        def _save_table_to_action(action_idx: Optional[int]) -> None:
+            if action_idx is None or action_idx < 0 or action_idx >= len(actions):
+                return
+            mapping = self._normalize_auto_item_paste_user_values(
+                actions[action_idx].get("paste_user_values") or {}
+            )
+            for value_row in range(values_table.rowCount()):
+                item = values_table.item(value_row, 0)
+                uid = str(item.data(Qt.ItemDataRole.UserRole) if item is not None else "").strip()
+                if not uid:
+                    continue
+                edit = values_table.cellWidget(value_row, 1)
+                value = edit.toPlainText() if isinstance(edit, QTextEdit) else ""
+                if value:
+                    mapping[uid] = value
+                else:
+                    mapping.pop(uid, None)
+            actions[action_idx]["paste_user_values"] = mapping
+
+        def _load_action(action_idx: int) -> None:
+            action = actions[action_idx]
+            mapping = self._normalize_auto_item_paste_user_values(action.get("paste_user_values") or {})
+            default_text = str(action.get("text") or "")
+            default_preview = _text_preview(default_text)
+            default_label.setText(default_preview)
+            placeholder = f"Default: {default_preview}"
+            for value_row in range(values_table.rowCount()):
+                item = values_table.item(value_row, 0)
+                uid = str(item.data(Qt.ItemDataRole.UserRole) if item is not None else "").strip()
+                edit = values_table.cellWidget(value_row, 1)
+                if isinstance(edit, QTextEdit):
+                    edit.setPlaceholderText(placeholder)
+                    edit.setPlainText(mapping.get(uid, ""))
+
+        def _switch_action() -> None:
+            previous = active_action_idx.get("value")
+            _save_table_to_action(previous)
+            try:
+                action_idx = int(action_combo.currentData())
+            except Exception:
+                action_idx = paste_indices[0]
+            active_action_idx["value"] = action_idx
+            _load_action(action_idx)
+
+        action_combo.currentIndexChanged.connect(lambda *_args: _switch_action())
+        search_le.textChanged.connect(lambda *_args: _apply_user_search())
+        _switch_action()
+        _apply_user_search()
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        _save_table_to_action(active_action_idx.get("value"))
+        actions_btn.setProperty("actions", copy.deepcopy(actions))
+        self._update_actions_btn_text(actions_btn)
+        self._auto_item_focus_row(row, column=2)
         self._on_auto_item_ui_changed()
 
     def _auto_item_save_selected_rows_as_presets(self) -> None:
@@ -14675,7 +17078,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.auto_item_table.setCellWidget(row, 1, _wrap_cell(name, margins=(6, 6, 6, 6)))
 
             actions_btn = QPushButton()
-            actions_btn.setProperty("actions", [copy.deepcopy(a) for a in (item.get("actions") or []) if isinstance(a, dict)])
+            normalized_actions = []
+            for idx, raw_action in enumerate(item.get("actions") or []):
+                action = self._normalize_auto_item_action(raw_action, fallback_name=f"Action {idx + 1}")
+                if action is not None:
+                    normalized_actions.append(action)
+            actions_btn.setProperty("actions", normalized_actions)
             self._auto_item_apply_cell_button_style(actions_btn, accent=True)
             self._update_actions_btn_text(actions_btn)
             actions_btn.clicked.connect(lambda _, b=actions_btn: self._edit_item_actions(b))
@@ -14697,6 +17105,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 users_list = [str(u).strip() for u in raw_users if str(u).strip()]
                 users_prop = users_list if users_list or bool(item.get("users_explicit", False)) else None
             users_btn.setProperty("users", users_prop)
+            users_btn.setProperty("discord_user_edit_enabled", bool(item.get("discord_user_edit_enabled", False)))
             self._auto_item_apply_cell_button_style(users_btn)
             self._update_users_btn_text(users_btn)
             users_btn.clicked.connect(lambda _, b=users_btn: self._edit_item_users(b))
@@ -14732,11 +17141,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             behavior_btn = _unwrap(self.auto_item_table.cellWidget(row, 3), QPushButton)
             users_btn = _unwrap(self.auto_item_table.cellWidget(row, 4), QPushButton)
             alert_btn = _unwrap(self.auto_item_table.cellWidget(row, 5), QPushButton)
+            actions_out = []
+            for idx, raw_action in enumerate((actions_btn.property("actions") if isinstance(actions_btn, QPushButton) else []) or []):
+                action = self._normalize_auto_item_action(raw_action, fallback_name=f"Action {idx + 1}")
+                if action is not None:
+                    actions_out.append(action)
 
             item = {
                 "enabled": bool(enabled.isChecked()) if isinstance(enabled, QCheckBox) else True,
                 "name": name.text().strip() if isinstance(name, QLineEdit) else "",
-                "actions": [copy.deepcopy(a) for a in ((actions_btn.property("actions") if isinstance(actions_btn, QPushButton) else []) or []) if isinstance(a, dict)],
+                "actions": actions_out,
                 "behavior": self._normalize_auto_item_behavior(behavior_btn.property("behavior") if isinstance(behavior_btn, QPushButton) else {}),
             }
 
@@ -14748,6 +17162,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 elif isinstance(raw_users, (list, tuple, set)):
                     item["users"] = [str(u).strip() for u in raw_users if str(u).strip()]
                     item["users_explicit"] = True
+                item["discord_user_edit_enabled"] = bool(users_btn.property("discord_user_edit_enabled"))
 
             if isinstance(alert_btn, QPushButton):
                 item["alert_enabled"] = bool(alert_btn.property("alert_enabled"))
@@ -15842,6 +18257,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "send_screenshot": bool(base.get("send_screenshot", default_spec.get("send_screenshot", behavior == "merchant"))),
             "repeat_alert_sound": bool(base.get("repeat_alert_sound", default_spec.get("repeat_alert_sound", False))),
             "user_ids": self._normalize_ocr_filter_user_ids(base.get("user_ids", default_spec.get("user_ids"))),
+            "user_filter_mode": _normalize_user_filter_mode(base.get("user_filter_mode", default_spec.get("user_filter_mode", "whitelist"))),
             "behavior": behavior,
             "cooldown_group": cooldown_group,
             "locked": bool(filter_id in default_map),
@@ -15908,6 +18324,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         "send_screenshot": bool(behavior == "merchant"),
                         "repeat_alert_sound": False,
                         "user_ids": None,
+                        "user_filter_mode": "whitelist",
                         "behavior": behavior,
                         "cooldown_group": "merchant_filters" if behavior == "merchant" else (filter_id or f"legacy_{idx}"),
                     }
@@ -15988,6 +18405,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "webhook_message": "",
             "repeat_alert_sound": False,
             "user_ids": None,
+            "user_filter_mode": "whitelist",
             "behavior": "webhook",
         }
         spec = self._normalize_ocr_filter_spec(base_cfg, fallback_index=self.ocr_filter_table.rowCount())
@@ -16471,10 +18889,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def _ocr_filter_assignment_summary(self, spec: Optional[dict], user_map: Optional[dict] = None) -> str:
         clean_ids = self._normalize_ocr_filter_user_ids((spec or {}).get("user_ids", None))
+        mode = _normalize_user_filter_mode((spec or {}).get("user_filter_mode", "whitelist"))
         if clean_ids is None:
-            return "All users."
+            return "All users." if mode == "whitelist" else "All users. Blacklist is empty."
         if not clean_ids:
-            return "No users selected."
+            return "No users selected." if mode == "whitelist" else "All users. Blacklist is empty."
         if user_map is None:
             try:
                 user_map = self.config_manager.load_users() or {}
@@ -16486,14 +18905,22 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             names.append(str(info.get("username") or uid))
         preview = ", ".join(names[:4])
         suffix = "..." if len(names) > 4 else ""
+        if mode == "blacklist":
+            return f"Blocked users: {preview}{suffix}"
         return f"Users: {preview}{suffix}"
 
-    def _apply_ocr_filter_user_ids_to_row(self, row: int, user_ids: Optional[List[str]]) -> None:
+    def _apply_ocr_filter_user_ids_to_row(
+        self,
+        row: int,
+        user_ids: Optional[List[str]],
+        user_filter_mode: str = "whitelist",
+    ) -> None:
         btn = self._ocr_unwrap_table_widget(self.ocr_filter_table.cellWidget(row, 6), QPushButton)
         if not isinstance(btn, QPushButton):
             return
         spec = self._get_ocr_filter_button_meta(btn)
         spec["user_ids"] = self._normalize_ocr_filter_user_ids(user_ids)
+        spec["user_filter_mode"] = _normalize_user_filter_mode(user_filter_mode)
         self._set_ocr_filter_button_meta(btn, spec)
         tip = self._ocr_filter_assignment_summary(spec)
         try:
@@ -16530,8 +18957,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             filter_id = str(spec.get("id") or "").strip()
             filter_name = str(spec.get("name") or filter_id or f"Filter {row + 1}").strip()
             raw_selected = self._normalize_ocr_filter_user_ids(spec.get("user_ids", None))
+            mode = _normalize_user_filter_mode(spec.get("user_filter_mode", "whitelist"))
             if raw_selected is None:
-                selected = set(choice_ids)
+                selected = set(choice_ids) if mode == "whitelist" else set()
                 explicit = False
             else:
                 selected = set(raw_selected)
@@ -16543,6 +18971,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     "name": filter_name,
                     "selected": selected,
                     "explicit": explicit,
+                    "mode": mode,
                 }
             )
 
@@ -16551,10 +18980,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         dlg.resize(760, 540)
 
         outer = QVBoxLayout(dlg)
+        top_row = QHBoxLayout()
         only_mapped_chk = QCheckBox("Only search mapped PIDs")
         only_mapped_chk.setChecked(bool(getattr(self, "ocr_only_mapped_pids", False)))
         only_mapped_chk.setToolTip("When enabled, OCR skips Roblox processes that are not mapped to a known user.")
-        outer.addWidget(only_mapped_chk)
+        top_row.addWidget(only_mapped_chk)
+        top_row.addStretch()
+        top_row.addWidget(QLabel("Mode:"))
+        mode_combo = QComboBox()
+        mode_combo.addItem("Whitelist", "whitelist")
+        mode_combo.addItem("Blacklist", "blacklist")
+        mode_combo.setToolTip("Whitelist allows only selected users. Blacklist allows everyone except selected users.")
+        top_row.addWidget(mode_combo)
+        outer.addLayout(top_row)
 
         h = QHBoxLayout()
         outer.addLayout(h)
@@ -16564,7 +19002,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         filter_list.setMinimumWidth(260)
         for entry in entries:
             item = QListWidgetItem(entry["name"])
-            item.setToolTip(self._ocr_filter_assignment_summary({"user_ids": None if not entry["explicit"] else sorted(entry["selected"])}, users_cfg))
+            item.setToolTip(
+                self._ocr_filter_assignment_summary(
+                    {
+                        "user_ids": None if not entry["explicit"] else sorted(entry["selected"]),
+                        "user_filter_mode": entry.get("mode", "whitelist"),
+                    },
+                    users_cfg,
+                )
+            )
             filter_list.addItem(item)
         left_col.addWidget(filter_list)
         left_col.addStretch()
@@ -16572,7 +19018,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         right = QVBoxLayout()
         h.addLayout(right)
-        right.addWidget(QLabel("Choose which users each OCR filter applies to:"))
+        right.addWidget(QLabel("Choose users for each OCR filter's mode:"))
 
         btn_row = QHBoxLayout()
         select_all_btn = QPushButton("Select All")
@@ -16599,6 +19045,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         right.addWidget(btn_box)
 
         current_checks: List[QCheckBox] = []
+        updating_mode_combo = False
 
         def _clear_user_layout() -> None:
             nonlocal current_checks
@@ -16610,10 +19057,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     widget.deleteLater()
 
         def _entry_summary(entry: dict) -> str:
+            mode = _normalize_user_filter_mode(entry.get("mode", "whitelist"))
             if not entry.get("explicit", False):
-                return "All users."
+                return "All users." if mode == "whitelist" else "All users. Blacklist is empty."
             selected = sorted({str(uid).strip() for uid in (entry.get("selected") or set()) if str(uid).strip()})
-            return self._ocr_filter_assignment_summary({"user_ids": selected}, users_cfg)
+            return self._ocr_filter_assignment_summary({"user_ids": selected, "user_filter_mode": mode}, users_cfg)
 
         def _refresh_filter_list_labels() -> None:
             for idx, entry in enumerate(entries):
@@ -16634,16 +19082,25 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 return
             selected = {str(cb.property("user_id") or "").strip() for cb in current_checks if cb.isChecked() and str(cb.property("user_id") or "").strip()}
             entry["selected"] = selected
-            entry["explicit"] = selected != choice_set
+            mode = _normalize_user_filter_mode(entry.get("mode", "whitelist"))
+            entry["explicit"] = True if mode == "blacklist" else selected != choice_set
             _refresh_filter_list_labels()
             helper_label.setText(_entry_summary(entry))
 
         def _build_user_checks(_idx: int) -> None:
+            nonlocal updating_mode_combo
             _clear_user_layout()
             entry = _current_entry()
             if entry is None:
                 helper_label.setText("Select a filter to edit.")
                 return
+
+            updating_mode_combo = True
+            try:
+                idx = mode_combo.findData(_normalize_user_filter_mode(entry.get("mode", "whitelist")))
+                mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            finally:
+                updating_mode_combo = False
 
             selected = set(entry.get("selected") or set())
             if not user_choices:
@@ -16672,7 +19129,35 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 cb.setChecked(bool(state))
             _recompute_entry_from_checks()
 
+        def _mode_changed(_idx: int) -> None:
+            if updating_mode_combo:
+                return
+            entry = _current_entry()
+            if entry is None:
+                return
+            old_mode = _normalize_user_filter_mode(entry.get("mode", "whitelist"))
+            new_mode = _normalize_user_filter_mode(mode_combo.currentData())
+            if old_mode == new_mode:
+                return
+            was_default_all = old_mode == "whitelist" and not entry.get("explicit", False)
+            entry["mode"] = new_mode
+            if was_default_all and new_mode == "blacklist":
+                for cb in current_checks:
+                    cb.setChecked(False)
+                selected = set()
+            elif old_mode == "blacklist" and new_mode == "whitelist" and not entry.get("selected"):
+                for cb in current_checks:
+                    cb.setChecked(True)
+                selected = set(choice_set)
+            else:
+                selected = {str(cb.property("user_id") or "").strip() for cb in current_checks if cb.isChecked() and str(cb.property("user_id") or "").strip()}
+            entry["selected"] = selected
+            entry["explicit"] = True if new_mode == "blacklist" else selected != choice_set
+            _refresh_filter_list_labels()
+            helper_label.setText(_entry_summary(entry))
+
         filter_list.currentRowChanged.connect(_build_user_checks)
+        mode_combo.currentIndexChanged.connect(_mode_changed)
         select_all_btn.clicked.connect(lambda: _set_all_checks(True))
         deselect_all_btn.clicked.connect(lambda: _set_all_checks(False))
         btn_box.accepted.connect(dlg.accept)
@@ -16685,10 +19170,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         self.ocr_only_mapped_pids = bool(only_mapped_chk.isChecked())
         for entry in entries:
-            normalized = None if not entry.get("explicit", False) else sorted(
+            mode = _normalize_user_filter_mode(entry.get("mode", "whitelist"))
+            normalized = None if mode == "whitelist" and not entry.get("explicit", False) else sorted(
                 {str(uid).strip() for uid in (entry.get("selected") or set()) if str(uid).strip()}
             )
-            self._apply_ocr_filter_user_ids_to_row(int(entry.get("row", -1)), normalized)
+            self._apply_ocr_filter_user_ids_to_row(int(entry.get("row", -1)), normalized, mode)
         self._on_ocr_settings_changed()
 
     def _open_ocr_filter_presets_dialog(self) -> None:
@@ -17813,7 +20299,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     st["status"] = "CAP"
                 wt.active_pool.discard(uid)
                 wt.spare_pool.discard(uid)
-                wt.kill_user_processes(uid)
+                self._queue_worker_action("kill_user_processes", uid)
         except Exception:
             pass
 
@@ -17943,15 +20429,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.cap_msg_input.setPlaceholderText("This message is sent whenever a user is marked for captcha. Leave this empty if not interested. — Supports {username} and {uid}")
         self.cap_msg_input.setToolTip("Sent when a user is marked CAP. Example Message: User {username} has disconnected, User ID = {uid}.")
         alerts_layout.addRow("CAP Ping:", self.cap_msg_input)
-        self.cap_msg_input.setPlaceholderText("Sent when a user is marked CAP. Supports {username}, {uid}, and {discord_ping}")
-        self.cap_msg_input.setToolTip("Sent when a user is marked CAP. Example: {discord_ping} User {username} has disconnected, User ID = {uid}.")
+        self.cap_msg_input.setPlaceholderText("Sent when a user is marked CAP. Supports {username}, and {uid},")
+        self.cap_msg_input.setToolTip("Sent when a user is marked CAP. Example: User {username} has disconnected, User ID = {uid}.")
 
         self.bad_msg_input = QLineEdit()
         self.bad_msg_input.setPlaceholderText("This message is sent whenever a user is marked BAD. Leave this empty if not interested. - Supports {username} and {uid}")
         self.bad_msg_input.setToolTip("Sent when a user is marked BAD. Example Message: User {username} has a bad cookie, User ID = {uid}.")
         alerts_layout.addRow("BAD Ping:", self.bad_msg_input)
-        self.bad_msg_input.setPlaceholderText("Sent when a user is marked BAD. Supports {username}, {uid}, and {discord_ping}")
-        self.bad_msg_input.setToolTip("Sent when a user is marked BAD. Example: {discord_ping} User {username} has a bad cookie, User ID = {uid}.")
+        self.bad_msg_input.setPlaceholderText("Sent when a user is marked BAD. Supports {username}, and {uid},")
+        self.bad_msg_input.setToolTip("Sent when a user is marked BAD. Example: User {username} has a bad cookie, User ID = {uid}.")
 
         self.hourly_users_report_chk = QCheckBox("")
         self.hourly_users_report_chk.setToolTip(
@@ -17990,6 +20476,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "Tip: Click “Save Settings” to persist this toggle."
         )
         misc_layout.addRow(self.ui_show_selected_sets_bes_exempt_slot1_chk)
+        self.misc_hide_discord_tabs_chk = QCheckBox("Hide Discord tab")
+        self.misc_hide_discord_tabs_chk.setToolTip(
+            "When enabled, the top-level Discord tab is hidden from the main tab bar."
+        )
+        self.misc_hide_discord_tabs_chk.setChecked(True)
+        misc_layout.addRow(self.misc_hide_discord_tabs_chk)
         self.misc_skip_unknown_webhook_chk = QCheckBox("Skip webhooks if owner/PS unknown")
         self.misc_skip_unknown_webhook_chk.setToolTip(
             "When enabled, webhook messages are suppressed if the owner or private server is unknown."
@@ -18155,7 +20647,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             btn_box.rejected.connect(dlg.reject)
             dlg.exec()
 
-        def _apply_user_filter_to_row(row: int, user_ids=None, user_map: Optional[dict] = None, all_user_ids=None):
+        def _apply_user_filter_to_row(
+            row: int,
+            user_ids=None,
+            user_map: Optional[dict] = None,
+            all_user_ids=None,
+            user_filter_mode: str = "whitelist",
+        ):
             """Persist the selected users and surface a quick tooltip."""
             name_item = self.webhooks_table.item(row, 0)
             url_item  = self.webhooks_table.item(row, 1)
@@ -18163,14 +20661,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if not target_item:
                 return
 
-            tip = "Sends events for all users."
+            mode = _normalize_user_filter_mode(user_filter_mode)
+            target_item.setData(WEBHOOK_USER_FILTER_MODE_ROLE, mode)
+            tip = "Sends events for all users." if mode == "whitelist" else "Sends events for all users. Blacklist is empty."
             cleaned = None
             if user_ids is None:
                 target_item.setData(Qt.ItemDataRole.UserRole, None)
             else:
                 cleaned = [str(u).strip() for u in (user_ids or []) if str(u).strip()]
                 # If caller passes the full universe, treat it as no filter for clarity.
-                if all_user_ids and set(cleaned) == set(all_user_ids):
+                if mode == "whitelist" and all_user_ids and set(cleaned) == set(all_user_ids):
                     cleaned = None
                     target_item.setData(Qt.ItemDataRole.UserRole, None)
                 else:
@@ -18190,9 +20690,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         names.append(info.get("username") or uid)
                     preview = ", ".join(names[:4])
                     suffix = "..." if len(names) > 4 else ""
-                    tip = f"Users: {preview}{suffix}"
+                    tip = f"Users: {preview}{suffix}" if mode == "whitelist" else f"Blocked users: {preview}{suffix}"
                 else:
-                    tip = "No users selected. This webhook will be skipped until users are assigned."
+                    tip = (
+                        "No users selected. This webhook will be skipped until users are assigned."
+                        if mode == "whitelist"
+                        else "Sends events for all users. Blacklist is empty."
+                    )
 
             if name_item:
                 name_item.setToolTip(tip)
@@ -18201,6 +20705,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         def _row_data_item(row: int):
             return self.webhooks_table.item(row, 0) or self.webhooks_table.item(row, 1)
+
+        def _user_filter_mode_for_row(row: int) -> str:
+            item = _row_data_item(row)
+            if item is None:
+                return "whitelist"
+            return _normalize_user_filter_mode(item.data(WEBHOOK_USER_FILTER_MODE_ROLE))
 
         def _role_pings_for_row(row: int) -> dict:
             item = _row_data_item(row)
@@ -18257,7 +20767,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return holder
 
 
-        def add_webhook_row(name: str = "", url: str = "", allowed_biomes=None, biome_modes=None, user_ids=None, biome_role_pings=None):
+        def add_webhook_row(
+            name: str = "",
+            url: str = "",
+            allowed_biomes=None,
+            biome_modes=None,
+            user_ids=None,
+            biome_role_pings=None,
+            user_filter_mode: str = "whitelist",
+        ):
             """
             allowed_biomes: Optional[List[str]]  -> kept for backward compatibility
             biome_modes:    Optional[Dict[str, str]] per-biome: "None"|"Message"|"Everyone"
@@ -18270,7 +20788,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             url_item = QTableWidgetItem(url)
             self.webhooks_table.setItem(row, 0, name_item)
             self.webhooks_table.setItem(row, 1, url_item)
-            _apply_user_filter_to_row(row, user_ids)
+            _apply_user_filter_to_row(row, user_ids, user_filter_mode=user_filter_mode)
             _apply_role_pings_to_row(row, biome_role_pings)
 
             allowed_set = {str(b).upper() for b in (allowed_biomes or [])}
@@ -18345,6 +20863,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 url_item  = self.webhooks_table.item(r, 1)
                 data_item = name_item or url_item
                 selected_raw = data_item.data(Qt.ItemDataRole.UserRole) if data_item else None
+                mode = _user_filter_mode_for_row(r)
                 # None  -> no explicit filter yet (default: all users)
                 # []    -> explicit "no users"
                 # [ids] -> explicit subset
@@ -18352,11 +20871,18 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 if isinstance(selected_raw, (list, tuple, set)):
                     selected_set = {str(u).strip() for u in selected_raw if str(u).strip()}
                 if selected_raw is None and choice_ids:
-                    selected_set = set(choice_ids)  # default: all users enabled
+                    selected_set = set(choice_ids) if mode == "whitelist" else set()
                 name_txt = (name_item.text().strip() if name_item else "")
                 url_txt = (url_item.text().strip() if url_item else "")
                 display = name_txt or url_txt or f"Webhook {r + 1}"
-                entries.append({"row": r, "name": name_txt, "url": url_txt, "display": display, "selected": selected_set})
+                entries.append({
+                    "row": r,
+                    "name": name_txt,
+                    "url": url_txt,
+                    "display": display,
+                    "selected": selected_set,
+                    "mode": mode,
+                })
 
             dlg = QDialog(self)
             dlg.setWindowTitle("Webhook User Routing")
@@ -18378,7 +20904,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             right = QVBoxLayout()
             h.addLayout(right)
 
-            right.addWidget(QLabel("Choose which users can send events to the selected webhook:"))
+            right.addWidget(QLabel("Choose users for the selected webhook's mode:"))
+
+            mode_row = QHBoxLayout()
+            mode_row.addWidget(QLabel("Mode:"))
+            mode_combo = QComboBox()
+            mode_combo.addItem("Whitelist", "whitelist")
+            mode_combo.addItem("Blacklist", "blacklist")
+            mode_combo.setToolTip("Whitelist allows only selected users. Blacklist allows everyone except selected users.")
+            mode_row.addWidget(mode_combo)
+            mode_row.addStretch()
+            right.addLayout(mode_row)
 
             btn_row = QHBoxLayout()
             select_all_btn = QPushButton("Select All")
@@ -18404,6 +20940,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             right.addWidget(btn_box)
 
             current_checks: list[QCheckBox] = []
+            updating_mode_combo = False
 
             def _clear_user_layout():
                 while user_layout.count():
@@ -18415,6 +20952,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 current_checks.clear()
 
             def _build_user_checks(idx: int):
+                nonlocal updating_mode_combo
                 _clear_user_layout()
                 if idx < 0 or idx >= len(entries):
                     user_layout.addWidget(QLabel("Select a webhook to edit."))
@@ -18422,6 +20960,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     return
 
                 entry = entries[idx]
+                updating_mode_combo = True
+                try:
+                    mode_idx = mode_combo.findData(_normalize_user_filter_mode(entry.get("mode", "whitelist")))
+                    mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+                finally:
+                    updating_mode_combo = False
+
                 # Normalize any legacy selections (usernames, mixed casing) to IDs where possible
                 def _resolve_to_id(val: str) -> str:
                     val_clean = (val or "").strip()
@@ -18498,16 +21043,39 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     return
                 extras_map = {e["row"]: {uid for uid in e["selected"] if uid not in choice_set} for e in entries}
                 for e in entries:
+                    e["mode"] = "whitelist"
                     e["selected"] = set(extras_map.get(e["row"], set()))
                 for i, uid in enumerate(choice_ids):
                     entries[i % len(entries)]["selected"].add(uid)
                 _build_user_checks(webhook_list.currentRow())
+
+            def _mode_changed(_idx: int):
+                if updating_mode_combo:
+                    return
+                idx = webhook_list.currentRow()
+                if idx < 0 or idx >= len(entries):
+                    return
+                entry = entries[idx]
+                old_mode = _normalize_user_filter_mode(entry.get("mode", "whitelist"))
+                new_mode = _normalize_user_filter_mode(mode_combo.currentData())
+                if old_mode == new_mode:
+                    return
+                entry["mode"] = new_mode
+                if old_mode == "whitelist" and new_mode == "blacklist" and set(entry.get("selected") or set()) == choice_set:
+                    entry["selected"] = set()
+                    for cb in current_checks:
+                        cb.setChecked(False)
+                elif old_mode == "blacklist" and new_mode == "whitelist" and not entry.get("selected"):
+                    entry["selected"] = set(choice_ids)
+                    for cb in current_checks:
+                        cb.setChecked(True)
 
             select_all_btn.clicked.connect(lambda: _set_checks(True))
             deselect_all_btn.clicked.connect(lambda: _set_checks(False))
             stagger_btn.clicked.connect(_stagger_checks)
             invert_btn.clicked.connect(_invert_checks)
             distribute_btn.clicked.connect(_distribute_evenly)
+            mode_combo.currentIndexChanged.connect(_mode_changed)
 
             webhook_list.currentRowChanged.connect(_build_user_checks)
             webhook_list.setCurrentRow(0 if entries else -1)
@@ -18521,7 +21089,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     existing = []
 
                 # Only persist per-webhook user routing; do NOT save name/url/biomes/modes here.
-                updates: dict[str, tuple[bool, list[str]]] = {}
+                updates: dict[str, tuple[bool, list[str], str]] = {}
                 for entry in entries:
                     row_idx = entry["row"]
                     name_item = self.webhooks_table.item(row_idx, 0)
@@ -18532,6 +21100,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
                     data_item = name_item or url_item
                     user_filter = data_item.data(Qt.ItemDataRole.UserRole) if data_item else None
+                    mode = _normalize_user_filter_mode(data_item.data(WEBHOOK_USER_FILTER_MODE_ROLE) if data_item else "whitelist")
                     selected_users: list[str] = []
                     explicit_users = False
                     if isinstance(user_filter, (list, tuple, set)):
@@ -18539,11 +21108,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         selected_users = [str(u).strip() for u in user_filter if str(u).strip()]
                         selected_users = sorted({u for u in selected_users})
                         # If the explicit selection equals "all users", treat it as no filter.
-                        if choice_ids and set(selected_users) == set(choice_ids):
+                        if mode == "whitelist" and choice_ids and set(selected_users) == set(choice_ids):
                             explicit_users = False
                             selected_users = []
+                    if mode == "blacklist":
+                        explicit_users = True
 
-                    updates[url] = (explicit_users, selected_users)
+                    updates[url] = (explicit_users, selected_users, mode)
 
                 if not updates:
                     return
@@ -18555,13 +21126,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     url = str(wh.get("url", "") or "").strip()
                     if url not in updates:
                         continue
-                    explicit_users, selected_users = updates[url]
+                    explicit_users, selected_users, mode = updates[url]
                     if explicit_users:
                         wh["users"] = selected_users
                         wh["users_explicit"] = True
                     else:
                         wh.pop("users", None)
                         wh.pop("users_explicit", None)
+                    if mode == "blacklist":
+                        wh["user_filter_mode"] = "blacklist"
+                    else:
+                        wh.pop("user_filter_mode", None)
                     updated_any = True
 
                 if not updated_any:
@@ -18580,13 +21155,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                                 burl = str(bh.get("url", "") or "").strip()
                                 if burl not in updates:
                                     continue
-                                explicit_users, selected_users = updates[burl]
+                                explicit_users, selected_users, mode = updates[burl]
                                 if explicit_users:
                                     bh["users"] = selected_users
                                     bh["users_explicit"] = True
                                 else:
                                     bh.pop("users", None)
                                     bh.pop("users_explicit", None)
+                                if mode == "blacklist":
+                                    bh["user_filter_mode"] = "blacklist"
+                                else:
+                                    bh.pop("user_filter_mode", None)
 
                     try:
                         if self.worker_thread and self.worker_thread.isRunning():
@@ -18596,7 +21175,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
             def _apply_selections_and_close():
                 for entry in entries:
-                    _apply_user_filter_to_row(entry["row"], sorted(entry["selected"]), user_map=users_cfg, all_user_ids=choice_ids)
+                    _apply_user_filter_to_row(
+                        entry["row"],
+                        sorted(entry["selected"]),
+                        user_map=users_cfg,
+                        all_user_ids=choice_ids,
+                        user_filter_mode=entry.get("mode", "whitelist"),
+                    )
                 _persist_webhook_users_only()
                 dlg.accept()
 
@@ -18936,7 +21521,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         return card
     
 
-    def setup_credits_tab(self):
+    def _build_credits_widget(self) -> QWidget:
         credits_widget = QWidget()
         layout = QVBoxLayout(credits_widget)
 
@@ -18990,14 +21575,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         content_layout.addWidget(developer_group)
 
-        support_group = QGroupBox("Support")
+        support_group = QGroupBox("Essentials")
         support_layout = QVBoxLayout(support_group)
 
-        support_label = QLabel("Discord Support Server:")
+        support_label = QLabel("The Official J.Jaram Discord Server:")
         support_label.setStyleSheet(f"color: {ModernStyle.TEXT_PRIMARY}; font-weight: bold; margin-bottom: 5px;")
         support_layout.addWidget(support_label)
 
-        discord_btn = QPushButton("https://discord.gg/6cuCu6ymkX")
+        discord_btn = QPushButton("https://discord.gg/TheGlitchCore")
         discord_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: 
@@ -19012,7 +21597,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 background-color: 
             }}
         """)
-        discord_btn.clicked.connect(lambda: self.open_url("https://discord.gg/6cuCu6ymkX"))
+        discord_btn.clicked.connect(lambda: self.open_url("https://discord.gg/TheGlitchCore"))
         support_layout.addWidget(discord_btn)
 
         content_layout.addWidget(support_group) 
@@ -19020,11 +21605,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         support_group2 = QGroupBox("Additional") #lazy copy and paste...
         support_layout2 = QVBoxLayout(support_group2)
 
-        support_label2 = QLabel("The Best Glitch Hunt Server:")
+        support_label2 = QLabel("Scope Development:")
         support_label2.setStyleSheet(f"color: {ModernStyle.TEXT_PRIMARY}; font-weight: bold; margin-bottom: 5px;")
         support_layout2.addWidget(support_label2)
 
-        discord_btn2 = QPushButton("https://discord.gg/TheGlitchCore")
+        discord_btn2 = QPushButton("https://discord.gg/6cuCu6ymkX")
         discord_btn2.setStyleSheet(f"""
             QPushButton {{
                 background-color: 
@@ -19039,7 +21624,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 background-color: 
             }}
         """)
-        discord_btn2.clicked.connect(lambda: self.open_url("https://discord.gg/TheGlitchCore"))
+        discord_btn2.clicked.connect(lambda: self.open_url("https://discord.gg/6cuCu6ymkX"))
         support_layout2.addWidget(discord_btn2)
 
         bes_label = QLabel("BES (Battle Encoder Shirasé):")
@@ -19128,7 +21713,22 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         scroll_area.setWidget(content_widget)
         layout.addWidget(scroll_area)
 
-        self.tab_widget.addTab(credits_widget, "Credits")
+        return credits_widget
+
+    def show_credits(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("JARAM Credits")
+        dlg.setMinimumSize(640, 520)
+        dlg.resize(760, 680)
+
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(self._build_credits_widget())
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        dlg.exec()
         
     def execute_ram_import(self):
         base_url = f"http://127.0.0.1:{self.ram_port_input.text().strip() or '7963'}"
@@ -19281,6 +21881,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             settings = {}
         return self._normalize_discord_control_settings((settings or {}).get("discord_control"))
 
+    def _discord_control_runtime_config(self, config: dict) -> dict:
+        runtime = dict(config if isinstance(config, dict) else {})
+        runtime["user_account_list_visible"] = bool(_bm_relaxed())
+        return runtime
+
     def _save_discord_control_config(self, config: dict) -> bool:
         clean = self._normalize_discord_control_settings(config)
         try:
@@ -19291,6 +21896,50 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             settings = copy.deepcopy(self.config_manager.default_settings)
         settings["discord_control"] = clean
         return bool(self.config_manager.save_settings(settings))
+
+    def _refresh_discord_control_token_after_cookie_unlock(self, *, force: bool = False) -> bool:
+        token_input = getattr(self, "discord_control_token_input", None)
+        if token_input is None:
+            return False
+        current = str(token_input.text() or "").strip()
+        if current:
+            self._discord_control_token_hidden_until_unlock = False
+            return False
+        if not force and not bool(getattr(self, "_discord_control_token_hidden_until_unlock", False)):
+            return False
+        try:
+            if not self.config_manager.cookie_encryption_enabled():
+                self._discord_control_token_hidden_until_unlock = False
+                return False
+            if not self.config_manager.is_cookie_unlocked():
+                return False
+            config = self._load_discord_control_config()
+            token = str(config.get("token") or "").strip()
+            if not token:
+                return False
+            token_input.setText(token)
+            self._discord_control_token_hidden_until_unlock = False
+            return True
+        except Exception:
+            return False
+
+    def _on_cookie_encryption_unlocked(self) -> None:
+        try:
+            self._schedule_users_table_refresh(force_full=True)
+        except Exception:
+            pass
+        try:
+            self.load_settings_tab()
+        except Exception:
+            pass
+        try:
+            self._refresh_discord_control_token_after_cookie_unlock(force=True)
+        except Exception:
+            pass
+        try:
+            QTimer.singleShot(0, self._maybe_autostart_discord_control_bot)
+        except Exception:
+            pass
 
     def _discord_control_config_from_ui(self) -> dict:
         return self._normalize_discord_control_settings(
@@ -19325,26 +21974,31 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         doc = getattr(self, "discord_control_help_box", None)
         if doc is None:
             return
+        commands = [
+            "/help",
+            "/status <account>",
+            "/enable <account>",
+            "/disable <account>",
+            "/action <account> <action> [enabled]",
+            "/clearflags <account>",
+            "/restartall",
+            "/psl <account> [game_slug] [server_name] [estimated_value] [only_without_private_server_link]",
+            "/block <account> <target> [force]",
+            "/unblock <account> <target> [force]",
+        ]
+        if _bm_relaxed():
+            commands.insert(1, "/list")
+        notes = [
+            "<account> can be a JARAM user ID or exact username.",
+            "<action> can be an Auto Actions action number or exact action name.",
+            "<target> can be a Roblox username or user ID.",
+        ]
         doc.setPlainText(
             "Commands\n"
-            "/jaram help\n"
-            "/jaram list\n"
-            "/jaram status <account>\n"
-            "/jaram enable <account>\n"
-            "/jaram disable <account>\n\n"
-            "/jaramadmin help\n"
-            "/jaramadmin status <account>\n"
-            "/jaramadmin enable <account>\n"
-            "/jaramadmin disable <account>\n"
-            "/jaramadmin clearflags <account>\n\n"
-            "Notes\n"
-            "- <account> can be a JARAM user ID or exact username.\n"
-            "- User commands only work when the target account is attached to your Discord user ID.\n"
-            "- Admin commands allow Discord administrators by default, plus any explicit admin user IDs / role IDs.\n"
-            "- Account parameters use slash-command autocomplete and narrow results as you type.\n"
-            "- Slash commands require the bot invite to include both the bot and applications.commands scopes.\n"
-            "- Message Content Intent is not needed for slash commands.\n"
-            "- The bot token is stored in settings.json. Use a dedicated bot token."
+            + "\n".join(commands)
+            + "\n\n"
+            + "Notes\n"
+            + "\n".join(f"- {note}" for note in notes)
         )
 
     def _get_discord_control_tab_style(self) -> str:
@@ -19482,7 +22136,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if summary is not None:
             if uid_text:
                 summary.setText(
-                    f"{attached_count} account(s) currently attached. "
+                    f"{attached_count} account(s) selected for this Discord user. "
                     f"{max(int(total_accounts), 0)} JARAM account(s) are available to link below."
                 )
             else:
@@ -19491,18 +22145,207 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     "Select a Discord user from the table or paste an ID below to create a new mapping."
                 )
 
+    def _discord_control_uid_sort_key(self, value: str) -> Tuple[int, object]:
+        text = str(value or "").strip()
+        if text.isdigit():
+            try:
+                return (0, int(text))
+            except Exception:
+                return (0, text)
+        return (1, text.lower())
+
+    def _discord_control_account_sort_key(self, uid: str, username: str) -> Tuple[str, Tuple[int, object]]:
+        user_text = str(username or uid).strip().lower()
+        return (user_text, self._discord_control_uid_sort_key(uid))
+
+    def _discord_control_selected_entries(self, users: dict) -> List[Tuple[str, str]]:
+        selected_ids = {str(uid) for uid in (getattr(self, "discord_control_selected_account_ids", set()) or set())}
+        if not isinstance(users, dict) or not selected_ids:
+            return []
+        entries: List[Tuple[str, str]] = []
+        for uid, info in users.items():
+            uid_s = str(uid)
+            if uid_s not in selected_ids:
+                continue
+            username = str(info.get("username") or f"User_{uid_s}") if isinstance(info, dict) else f"User_{uid_s}"
+            entries.append((uid_s, username))
+        entries.sort(key=lambda item: self._discord_control_account_sort_key(item[0], item[1]))
+        return entries
+
+    def _refresh_discord_control_picker_count(
+        self,
+        *,
+        total_accounts: Optional[int] = None,
+        visible_count: Optional[int] = None,
+    ) -> None:
+        label = getattr(self, "discord_control_account_count_label", None)
+        if label is None:
+            return
+        selected_count = len(getattr(self, "discord_control_selected_account_ids", set()) or set())
+        picker = getattr(self, "discord_control_accounts_picker", None)
+        if visible_count is None and picker is not None:
+            visible_count = picker.count()
+        if total_accounts is None:
+            try:
+                users = self.config_manager.load_users() or {}
+                total_accounts = len(users) if isinstance(users, dict) else 0
+            except Exception:
+                total_accounts = visible_count or 0
+        filter_box = getattr(self, "discord_control_account_filter_input", None)
+        filter_text = str(filter_box.text() if filter_box is not None else "").strip()
+        if filter_text:
+            label.setText(f"{selected_count} attached / {int(visible_count or 0)} shown")
+        else:
+            label.setText(f"{selected_count} attached / {int(total_accounts or 0)} accounts")
+
+    def _sync_discord_control_selected_account_ids_from_picker(self) -> Set[str]:
+        selected_ids = {str(uid) for uid in (getattr(self, "discord_control_selected_account_ids", set()) or set())}
+        picker = getattr(self, "discord_control_accounts_picker", None)
+        if picker is None:
+            self.discord_control_selected_account_ids = selected_ids
+            return selected_ids
+        for row in range(picker.count()):
+            item = picker.item(row)
+            if item is None:
+                continue
+            account_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if not account_id:
+                continue
+            if item.checkState() == Qt.CheckState.Checked:
+                selected_ids.add(account_id)
+            else:
+                selected_ids.discard(account_id)
+        self.discord_control_selected_account_ids = selected_ids
+        return selected_ids
+
+    def _select_discord_control_link_table_row(self, discord_uid: str) -> None:
+        table = getattr(self, "discord_control_links_table", None)
+        if table is None:
+            return
+        previous = table.blockSignals(True)
+        try:
+            table.clearSelection()
+            target = str(discord_uid or "").strip()
+            if not target:
+                return
+            for row in range(table.rowCount()):
+                item = table.item(row, 0)
+                if item is not None and str(item.text()).strip() == target:
+                    table.selectRow(row)
+                    return
+        finally:
+            table.blockSignals(previous)
+
+    def _begin_new_discord_control_link(self) -> None:
+        users = self.config_manager.load_users() or {}
+        total_accounts = len(users) if isinstance(users, dict) else 0
+        self.discord_control_selected_discord_user_id = None
+        self.discord_control_selected_account_ids = set()
+        self._discord_control_editor_updating = True
+        try:
+            table = getattr(self, "discord_control_links_table", None)
+            if table is not None:
+                table.clearSelection()
+            input_box = getattr(self, "discord_control_discord_user_id_input", None)
+            if input_box is not None:
+                input_box.clear()
+            filter_box = getattr(self, "discord_control_account_filter_input", None)
+            if filter_box is not None:
+                filter_box.clear()
+        finally:
+            self._discord_control_editor_updating = False
+        self._populate_discord_control_accounts_picker(users, selected_account_ids=set())
+        self._update_discord_control_editor_state("", [], total_accounts=total_accounts)
+        input_box = getattr(self, "discord_control_discord_user_id_input", None)
+        if input_box is not None:
+            input_box.setFocus()
+
+    def _on_discord_control_editor_id_changed(self, _text: str = "") -> None:
+        if getattr(self, "_discord_control_editor_updating", False):
+            return
+        input_box = getattr(self, "discord_control_discord_user_id_input", None)
+        users = self.config_manager.load_users() or {}
+        total_accounts = len(users) if isinstance(users, dict) else 0
+        discord_uid = self._normalize_single_discord_user_id(input_box.text() if input_box is not None else "")
+        link_index = self._build_discord_control_link_index(users)
+        entries = link_index.get(discord_uid, []) if discord_uid else []
+        self.discord_control_selected_discord_user_id = discord_uid or None
+        self.discord_control_selected_account_ids = {uid for uid, _username in entries}
+        self._select_discord_control_link_table_row(discord_uid)
+        self._populate_discord_control_accounts_picker(
+            users,
+            selected_account_ids=self.discord_control_selected_account_ids,
+        )
+        self._update_discord_control_editor_state(
+            discord_uid,
+            self._discord_control_selected_entries(users),
+            total_accounts=total_accounts,
+        )
+
+    def _on_discord_control_account_item_changed(self, item: QListWidgetItem) -> None:
+        if getattr(self, "_discord_control_editor_updating", False) or item is None:
+            return
+        account_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not account_id:
+            return
+        selected_ids = {str(uid) for uid in (getattr(self, "discord_control_selected_account_ids", set()) or set())}
+        if item.checkState() == Qt.CheckState.Checked:
+            selected_ids.add(account_id)
+        else:
+            selected_ids.discard(account_id)
+        self.discord_control_selected_account_ids = selected_ids
+        users = self.config_manager.load_users() or {}
+        input_box = getattr(self, "discord_control_discord_user_id_input", None)
+        discord_uid = self._normalize_single_discord_user_id(input_box.text() if input_box is not None else "")
+        self._refresh_discord_control_picker_count(
+            total_accounts=len(users) if isinstance(users, dict) else 0,
+        )
+        self._update_discord_control_editor_state(
+            discord_uid,
+            self._discord_control_selected_entries(users),
+            total_accounts=len(users) if isinstance(users, dict) else 0,
+        )
+
+    def _refresh_discord_control_accounts_picker_filter(self) -> None:
+        if getattr(self, "_discord_control_editor_updating", False):
+            return
+        users = self.config_manager.load_users() or {}
+        self._sync_discord_control_selected_account_ids_from_picker()
+        self._populate_discord_control_accounts_picker(
+            users,
+            selected_account_ids=getattr(self, "discord_control_selected_account_ids", set()),
+        )
+
     def _set_discord_control_accounts_picker_selection(self, selected: bool) -> None:
         picker = getattr(self, "discord_control_accounts_picker", None)
         if picker is None:
             return
+        selected_ids = self._sync_discord_control_selected_account_ids_from_picker()
         picker.blockSignals(True)
         try:
             for row in range(picker.count()):
                 item = picker.item(row)
                 if item is not None:
-                    item.setSelected(selected)
+                    account_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                    item.setCheckState(Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked)
+                    if account_id:
+                        if selected:
+                            selected_ids.add(account_id)
+                        else:
+                            selected_ids.discard(account_id)
         finally:
             picker.blockSignals(False)
+        self.discord_control_selected_account_ids = selected_ids
+        users = self.config_manager.load_users() or {}
+        input_box = getattr(self, "discord_control_discord_user_id_input", None)
+        discord_uid = self._normalize_single_discord_user_id(input_box.text() if input_box is not None else "")
+        total_accounts = len(users) if isinstance(users, dict) else 0
+        self._refresh_discord_control_picker_count(total_accounts=total_accounts)
+        self._update_discord_control_editor_state(
+            discord_uid,
+            self._discord_control_selected_entries(users),
+            total_accounts=total_accounts,
+        )
 
     def setup_discord_control_tab(self):
         self._ensure_discord_control_service()
@@ -19531,10 +22374,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         header_row.addWidget(self.discord_control_status_label, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header_row)
 
-        sub = QLabel(
-            "Connect a Discord bot that can manage account enable and disable state from slash commands. "
-            "Admin commands can also clear flags, while linked Discord users are limited to the accounts assigned here."
+        link_management_visible = _bm_relaxed()
+        sub_text = (
+            "Connect a Discord bot that can manage accounts from slash commands."
         )
+        if not link_management_visible:
+            sub_text = (
+                "Connect a Discord bot that can manage accounts from slash commands. "
+            )
+        sub = QLabel(sub_text)
         sub.setWordWrap(True)
         sub.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
         layout.addWidget(sub)
@@ -19640,6 +22488,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.discord_control_refresh_links_btn.setStyleSheet(self._get_secondary_button_style())
         self.discord_control_refresh_links_btn.clicked.connect(self._refresh_discord_control_accounts_table)
         accounts_header.addWidget(self.discord_control_refresh_links_btn)
+
+        new_link_btn = QPushButton("New Link")
+        new_link_btn.setStyleSheet(self._get_secondary_button_style())
+        new_link_btn.clicked.connect(self._begin_new_discord_control_link)
+        accounts_header.addWidget(new_link_btn)
         accounts_layout.addLayout(accounts_header)
 
         self.discord_control_links_table = QTableWidget()
@@ -19666,6 +22519,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         )
         accounts_layout.addWidget(self.discord_control_links_table)
         left_layout.addWidget(accounts_box)
+        left_panel.setVisible(link_management_visible)
         main_splitter.addWidget(left_panel)
 
         right_panel = QWidget()
@@ -19692,26 +22546,40 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.discord_control_discord_user_id_input.setPlaceholderText(
             "Discord user ID to edit or create"
         )
+        self.discord_control_discord_user_id_input.textChanged.connect(
+            self._on_discord_control_editor_id_changed
+        )
         editor_layout.addWidget(self.discord_control_discord_user_id_input)
 
-        picker_hint = QLabel("Select the JARAM accounts attached to this Discord user ID.")
+        picker_hint = QLabel("Check the JARAM accounts attached to this Discord user ID.")
         picker_hint.setProperty("discordRole", "muted")
         editor_layout.addWidget(picker_hint)
+
+        self.discord_control_account_filter_input = QLineEdit()
+        self.discord_control_account_filter_input.setPlaceholderText("Filter accounts by username or ID")
+        self.discord_control_account_filter_input.textChanged.connect(
+            self._refresh_discord_control_accounts_picker_filter
+        )
+        editor_layout.addWidget(self.discord_control_account_filter_input)
 
         picker_header = QHBoxLayout()
         picker_title = QLabel("Attached JARAM Accounts")
         picker_title.setProperty("discordRole", "sectionTitle")
         picker_header.addWidget(picker_title)
+
+        self.discord_control_account_count_label = QLabel("0 attached")
+        self.discord_control_account_count_label.setProperty("discordRole", "muted")
+        picker_header.addWidget(self.discord_control_account_count_label)
         picker_header.addStretch(1)
 
-        picker_select_all_btn = QPushButton("Select All")
+        picker_select_all_btn = QPushButton("Check All")
         picker_select_all_btn.setStyleSheet(self._get_secondary_button_style())
         picker_select_all_btn.clicked.connect(
             lambda: self._set_discord_control_accounts_picker_selection(True)
         )
         picker_header.addWidget(picker_select_all_btn)
 
-        picker_select_none_btn = QPushButton("Select None")
+        picker_select_none_btn = QPushButton("Uncheck All")
         picker_select_none_btn.setStyleSheet(self._get_secondary_button_style())
         picker_select_none_btn.clicked.connect(
             lambda: self._set_discord_control_accounts_picker_selection(False)
@@ -19721,25 +22589,29 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         self.discord_control_accounts_picker = QListWidget()
         try:
-            self.discord_control_accounts_picker.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+            self.discord_control_accounts_picker.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         except Exception:
             pass
         self.discord_control_accounts_picker.setStyleSheet(self._get_discord_control_picker_style())
         self.discord_control_accounts_picker.setMinimumHeight(220)
         self.discord_control_accounts_picker.setAlternatingRowColors(False)
+        self.discord_control_accounts_picker.itemChanged.connect(
+            self._on_discord_control_account_item_changed
+        )
         editor_layout.addWidget(self.discord_control_accounts_picker)
 
         links_btn_row = QHBoxLayout()
-        self.discord_control_save_links_btn = QPushButton("Save Attached Accounts")
+        self.discord_control_save_links_btn = QPushButton("Save Link")
         self.discord_control_save_links_btn.setStyleSheet(self._get_primary_button_style())
         self.discord_control_save_links_btn.clicked.connect(self._save_selected_discord_control_links)
         links_btn_row.addWidget(self.discord_control_save_links_btn)
-        self.discord_control_clear_links_btn = QPushButton("Clear Attached Accounts")
+        self.discord_control_clear_links_btn = QPushButton("Remove Link")
         self.discord_control_clear_links_btn.setStyleSheet(self._get_discord_control_danger_button_style())
         self.discord_control_clear_links_btn.clicked.connect(self._clear_selected_discord_control_links)
         links_btn_row.addWidget(self.discord_control_clear_links_btn)
         links_btn_row.addStretch(1)
         editor_layout.addLayout(links_btn_row)
+        editor_box.setVisible(link_management_visible)
         right_layout.addWidget(editor_box, 3)
 
         commands_box = QGroupBox("Slash Command Reference")
@@ -19776,8 +22648,21 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.discord_control_tab_index = self.tab_widget.addTab(scroll, "Discord")
 
         config = self._load_discord_control_config()
+        token = str(config.get("token") or "")
+        try:
+            raw_encrypted_token = str(
+                getattr(self.config_manager, "_settings_raw_encrypted_discord_token", "") or ""
+            ) or self.config_manager._raw_encrypted_discord_token_from_disk()
+        except Exception:
+            raw_encrypted_token = ""
+        self._discord_control_token_hidden_until_unlock = bool(
+            not token
+            and self.config_manager.cookie_encryption_enabled()
+            and not self.config_manager.is_cookie_unlocked()
+            and raw_encrypted_token
+        )
         self.discord_control_enabled_chk.setChecked(bool(config.get("enabled", False)))
-        self.discord_control_token_input.setText(str(config.get("token") or ""))
+        self.discord_control_token_input.setText(token)
         self.discord_control_admin_users_input.setPlainText("\n".join(config.get("admin_user_ids", [])))
         self.discord_control_admin_roles_input.setPlainText("\n".join(config.get("admin_role_ids", [])))
         self.discord_control_allow_admin_perm_chk.setChecked(
@@ -19786,11 +22671,22 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._refresh_discord_control_command_docs()
         self._refresh_discord_control_accounts_table()
         self._on_discord_control_state_changed("stopped", "Discord bot is stopped.")
+        self._apply_discord_tabs_visibility()
 
     def _save_discord_control_config_from_ui(self) -> None:
+        self._refresh_discord_control_token_after_cookie_unlock()
         config = self._discord_control_config_from_ui()
         if not self._save_discord_control_config(config):
-            QMessageBox.critical(self, "Discord Control", "Failed to save Discord control settings.")
+            err = ""
+            try:
+                err = self.config_manager.get_cookie_error()
+            except Exception:
+                err = ""
+            QMessageBox.critical(
+                self,
+                "Discord Control",
+                "Failed to save Discord control settings." + (f"\n\n{err}" if err else ""),
+            )
             return
 
         running = bool(self.discord_control_service and self.discord_control_service.is_running())
@@ -19800,7 +22696,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 QMessageBox.warning(self, "Discord Control", stop_msg)
                 return
             if str(config.get("token") or "").strip():
-                start_ok, start_msg = self.discord_control_service.start(config)
+                start_ok, start_msg = self.discord_control_service.start(self._discord_control_runtime_config(config))
                 if not start_ok:
                     QMessageBox.warning(self, "Discord Control", start_msg)
                     return
@@ -19808,9 +22704,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         QMessageBox.information(self, "Discord Control", "Discord control settings saved.")
 
     def _start_discord_control_bot_from_ui(self) -> None:
+        self._refresh_discord_control_token_after_cookie_unlock()
         config = self._discord_control_config_from_ui()
         if not self._save_discord_control_config(config):
-            QMessageBox.critical(self, "Discord Control", "Failed to save Discord control settings.")
+            err = ""
+            try:
+                err = self.config_manager.get_cookie_error()
+            except Exception:
+                err = ""
+            QMessageBox.critical(
+                self,
+                "Discord Control",
+                "Failed to save Discord control settings." + (f"\n\n{err}" if err else ""),
+            )
             return
         if self.discord_control_service is None:
             QMessageBox.warning(self, "Discord Control", "Discord control service is unavailable.")
@@ -19820,7 +22726,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if not stop_ok:
                 QMessageBox.warning(self, "Discord Control", stop_msg)
                 return
-        ok, msg = self.discord_control_service.start(config)
+        ok, msg = self.discord_control_service.start(self._discord_control_runtime_config(config))
         if not ok:
             QMessageBox.warning(self, "Discord Control", msg)
 
@@ -19833,8 +22739,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             QMessageBox.warning(self, "Discord Control", msg)
 
     def _maybe_autostart_discord_control_bot(self) -> None:
-        if not _bm_relaxed():
-            return
         if self.discord_control_service is None:
             return
         if self.discord_control_service.is_running():
@@ -19844,7 +22748,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
         if not str(config.get("token") or "").strip():
             return
-        self.discord_control_service.start(config)
+        self.discord_control_service.start(self._discord_control_runtime_config(config))
 
     def _on_discord_control_log(self, message: str) -> None:
         text = str(message or "").rstrip()
@@ -19912,15 +22816,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if not isinstance(users, dict):
             return {}
 
-        def _uid_sort_key(value: str) -> Tuple[int, object]:
-            text = str(value or "").strip()
-            if text.isdigit():
-                try:
-                    return (0, int(text))
-                except Exception:
-                    return (0, text)
-            return (1, text.lower())
-
         index: Dict[str, List[Tuple[str, str]]] = {}
         for uid, info in users.items():
             if not isinstance(info, dict):
@@ -19931,9 +22826,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 index.setdefault(discord_uid, []).append((uid_s, username))
 
         for discord_uid, entries in index.items():
-            index[discord_uid] = sorted(entries, key=lambda item: _uid_sort_key(item[0]))
+            index[discord_uid] = sorted(
+                entries,
+                key=lambda item: self._discord_control_account_sort_key(item[0], item[1]),
+            )
 
-        ordered_keys = sorted(index.keys(), key=_uid_sort_key)
+        ordered_keys = sorted(index.keys(), key=self._discord_control_uid_sort_key)
         return {key: index[key] for key in ordered_keys}
 
     def _normalize_single_discord_user_id(self, raw: object) -> str:
@@ -19956,39 +22854,50 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         picker = getattr(self, "discord_control_accounts_picker", None)
         if picker is None:
             return
-        selected_account_ids = {str(uid) for uid in (selected_account_ids or set())}
+        if selected_account_ids is not None:
+            self.discord_control_selected_account_ids = {str(uid) for uid in (selected_account_ids or set())}
+        selected_account_ids = {str(uid) for uid in (getattr(self, "discord_control_selected_account_ids", set()) or set())}
 
-        def _uid_sort_key(value: str) -> Tuple[int, object]:
-            text = str(value or "").strip()
-            if text.isdigit():
-                try:
-                    return (0, int(text))
-                except Exception:
-                    return (0, text)
-            return (1, text.lower())
+        filter_box = getattr(self, "discord_control_account_filter_input", None)
+        query = str(filter_box.text() if filter_box is not None else "").strip().lower()
 
+        total_accounts = len(users) if isinstance(users, dict) else 0
         picker.blockSignals(True)
+        visible_count = 0
         try:
             picker.clear()
             if not isinstance(users, dict):
-                return
-            rows: List[Tuple[str, str]] = []
-            for uid, info in users.items():
-                uid_s = str(uid)
-                if isinstance(info, dict):
-                    username = str(info.get("username") or f"User_{uid_s}")
-                else:
-                    username = f"User_{uid_s}"
-                rows.append((uid_s, username))
-            rows.sort(key=lambda item: _uid_sort_key(item[0]))
-            for uid_s, username in rows:
-                item = QListWidgetItem(f"{username} ({uid_s})")
-                item.setData(Qt.ItemDataRole.UserRole, uid_s)
-                picker.addItem(item)
-                if uid_s in selected_account_ids:
-                    item.setSelected(True)
+                users = {}
+            else:
+                rows: List[Tuple[str, str]] = []
+                for uid, info in users.items():
+                    uid_s = str(uid)
+                    if isinstance(info, dict):
+                        username = str(info.get("username") or f"User_{uid_s}")
+                    else:
+                        username = f"User_{uid_s}"
+                    if query and query not in uid_s.lower() and query not in username.lower():
+                        continue
+                    rows.append((uid_s, username))
+                rows.sort(key=lambda item: self._discord_control_account_sort_key(item[0], item[1]))
+                for uid_s, username in rows:
+                    item = QListWidgetItem(f"{username} ({uid_s})")
+                    item.setData(Qt.ItemDataRole.UserRole, uid_s)
+                    try:
+                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    except Exception:
+                        pass
+                    item.setCheckState(
+                        Qt.CheckState.Checked if uid_s in selected_account_ids else Qt.CheckState.Unchecked
+                    )
+                    picker.addItem(item)
+                    visible_count += 1
         finally:
             picker.blockSignals(False)
+        self._refresh_discord_control_picker_count(
+            total_accounts=total_accounts,
+            visible_count=visible_count,
+        )
 
     def _refresh_discord_control_accounts_table(self) -> None:
         table = getattr(self, "discord_control_links_table", None)
@@ -19996,7 +22905,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
 
         input_box = getattr(self, "discord_control_discord_user_id_input", None)
-        picker = getattr(self, "discord_control_accounts_picker", None)
         summary_label = getattr(self, "discord_control_links_summary_label", None)
         selected_uid = str(getattr(self, "discord_control_selected_discord_user_id", "") or "").strip()
         if not selected_uid and input_box is not None:
@@ -20015,53 +22923,55 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 summary_label.setText(
                     "No Discord user links saved yet. Use the editor on the right to attach accounts."
                 )
-        table.setRowCount(len(link_index))
-        row_to_select = -1
-        for row, (discord_uid, entries) in enumerate(link_index.items()):
-            summary = self._format_discord_control_link_summary(entries)
-            table.setItem(row, 0, QTableWidgetItem(discord_uid))
-            accounts_item = QTableWidgetItem(summary or "None")
-            if summary:
-                accounts_item.setToolTip(summary)
-            table.setItem(row, 1, accounts_item)
-            table.setItem(row, 2, QTableWidgetItem(str(len(entries))))
-            if selected_uid and discord_uid == selected_uid:
-                row_to_select = row
-        if row_to_select >= 0:
-            try:
-                table.selectRow(row_to_select)
-            except Exception:
-                pass
-        else:
-            self.discord_control_selected_discord_user_id = None
-            current_uid = ""
-            if input_box is not None:
-                current_uid = self._normalize_single_discord_user_id(input_box.text())
-            current_entries = link_index.get(current_uid, []) if current_uid else []
-            self._update_discord_control_editor_state(
-                current_uid,
-                current_entries,
-                total_accounts=total_accounts,
-            )
-            if picker is not None:
-                self._populate_discord_control_accounts_picker(users, selected_account_ids=set())
 
-        if picker is not None and selected_uid:
+        row_to_select = -1
+        previous = table.blockSignals(True)
+        try:
+            table.setRowCount(len(link_index))
+            for row, (discord_uid, entries) in enumerate(link_index.items()):
+                summary = self._format_discord_control_link_summary(entries)
+                table.setItem(row, 0, QTableWidgetItem(discord_uid))
+                accounts_item = QTableWidgetItem(summary or "None")
+                if summary:
+                    accounts_item.setToolTip(summary)
+                table.setItem(row, 1, accounts_item)
+                table.setItem(row, 2, QTableWidgetItem(str(len(entries))))
+                if selected_uid and discord_uid == selected_uid:
+                    row_to_select = row
+            table.clearSelection()
+            if row_to_select >= 0:
+                table.selectRow(row_to_select)
+        finally:
+            table.blockSignals(previous)
+
+        if selected_uid:
             entries = link_index.get(selected_uid, [])
+            self.discord_control_selected_discord_user_id = selected_uid
+            self.discord_control_selected_account_ids = {uid for uid, _username in entries}
+            if input_box is not None and self._normalize_single_discord_user_id(input_box.text()) != selected_uid:
+                previous_input = input_box.blockSignals(True)
+                try:
+                    input_box.setText(selected_uid)
+                finally:
+                    input_box.blockSignals(previous_input)
             self._populate_discord_control_accounts_picker(
                 users,
-                selected_account_ids={uid for uid, _username in entries},
+                selected_account_ids=self.discord_control_selected_account_ids,
             )
             self._update_discord_control_editor_state(
                 selected_uid,
                 entries,
                 total_accounts=total_accounts,
             )
-        elif picker is not None and not selected_uid:
+        else:
+            self.discord_control_selected_discord_user_id = None
+            self.discord_control_selected_account_ids = set()
             self._populate_discord_control_accounts_picker(users, selected_account_ids=set())
             self._update_discord_control_editor_state("", [], total_accounts=total_accounts)
 
     def _on_discord_control_discord_user_selection_changed(self) -> None:
+        if getattr(self, "_discord_control_editor_updating", False):
+            return
         table = getattr(self, "discord_control_links_table", None)
         picker = getattr(self, "discord_control_accounts_picker", None)
         input_box = getattr(self, "discord_control_discord_user_id_input", None)
@@ -20076,9 +22986,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if current_uid:
                 link_index = self._build_discord_control_link_index(users)
                 entries = link_index.get(current_uid, [])
+                self.discord_control_selected_account_ids = {uid for uid, _username in entries}
                 self._populate_discord_control_accounts_picker(
                     users,
-                    selected_account_ids={uid for uid, _username in entries},
+                    selected_account_ids=self.discord_control_selected_account_ids,
                 )
                 self._update_discord_control_editor_state(
                     current_uid,
@@ -20086,6 +22997,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     total_accounts=total_accounts,
                 )
             else:
+                self.discord_control_selected_account_ids = set()
                 self._populate_discord_control_accounts_picker(users, selected_account_ids=set())
                 self._update_discord_control_editor_state("", [], total_accounts=total_accounts)
             return
@@ -20097,7 +23009,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         link_index = self._build_discord_control_link_index(users)
         entries = link_index.get(discord_uid, [])
         self.discord_control_selected_discord_user_id = discord_uid
-        input_box.setText(discord_uid)
+        self.discord_control_selected_account_ids = {uid for uid, _username in entries}
+        self._discord_control_editor_updating = True
+        try:
+            input_box.setText(discord_uid)
+        finally:
+            self._discord_control_editor_updating = False
         self._update_discord_control_editor_state(
             discord_uid,
             entries,
@@ -20105,7 +23022,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         )
         self._populate_discord_control_accounts_picker(
             users,
-            selected_account_ids={uid for uid, _username in entries},
+            selected_account_ids=self.discord_control_selected_account_ids,
         )
 
     def _save_selected_discord_control_links(self) -> None:
@@ -20123,16 +23040,25 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if not isinstance(users, dict):
             users = {}
 
-        desired_account_ids: List[str] = []
-        seen_ids = set()
-        for item in picker.selectedItems():
-            account_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
-            if not account_id or account_id in seen_ids:
-                continue
-            seen_ids.add(account_id)
-            desired_account_ids.append(account_id)
+        self._sync_discord_control_selected_account_ids_from_picker()
+        valid_account_ids = {str(account_id) for account_id in users.keys()}
+        desired_set = {
+            str(account_id)
+            for account_id in (getattr(self, "discord_control_selected_account_ids", set()) or set())
+            if str(account_id) in valid_account_ids
+        }
+        desired_account_ids = [
+            str(account_id)
+            for account_id, info in sorted(
+                users.items(),
+                key=lambda item: self._discord_control_account_sort_key(
+                    str(item[0]),
+                    str(item[1].get("username") or f"User_{item[0]}") if isinstance(item[1], dict) else f"User_{item[0]}",
+                ),
+            )
+            if str(account_id) in desired_set
+        ]
 
-        desired_set = set(desired_account_ids)
         changed = 0
         for account_id, info in users.items():
             if not isinstance(info, dict):
@@ -20155,6 +23081,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
 
         self.discord_control_selected_discord_user_id = discord_uid
+        self.discord_control_selected_account_ids = desired_set
+        previous_input = input_box.blockSignals(True)
+        try:
+            input_box.setText(discord_uid)
+        finally:
+            input_box.blockSignals(previous_input)
         self._refresh_discord_control_accounts_table()
         self.add_log(
             f"[Discord Control] Updated attached accounts for Discord user {discord_uid} "
@@ -20189,10 +23121,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
 
         self.discord_control_selected_discord_user_id = discord_uid
+        self.discord_control_selected_account_ids = set()
+        picker.blockSignals(True)
         try:
-            picker.clearSelection()
-        except Exception:
-            pass
+            for row in range(picker.count()):
+                item = picker.item(row)
+                if item is not None:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+        finally:
+            picker.blockSignals(False)
         self._refresh_discord_control_accounts_table()
         self.add_log(
             f"[Discord Control] Cleared attached accounts for Discord user {discord_uid} "
@@ -20251,7 +23188,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             state += f" with flags: {'/'.join(flags)}"
         linked = normalize_discord_ids(info.get("discord_user_ids"))
         if linked:
-            state += f" | linked Discord IDs: {', '.join(linked)}"
+            state += f" | Discord IDs: {', '.join(linked)}"
         return f"{username} ({uid}) is {state}."
 
     def _resolve_discord_control_account(self, users: dict, account_ref: object) -> Tuple[Optional[str], Optional[dict], str]:
@@ -20306,14 +23243,559 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def _discord_control_command_label(self, action_type: str) -> str:
         labels = {
-            "list_linked_accounts": "/jaram list",
-            "get_linked_account_status": "/jaram status",
-            "set_linked_account_disabled": "/jaram enable/disable",
-            "get_account_status": "/jaramadmin status",
-            "set_account_disabled": "/jaramadmin enable/disable",
-            "clear_account_flags": "/jaramadmin clearflags",
+            "list_linked_accounts": "/list",
+            "get_linked_account_status": "/status",
+            "set_linked_account_disabled": "/enable/disable",
+            "get_account_status": "/status",
+            "set_account_disabled": "/enable/disable",
+            "clear_account_flags": "/clearflags",
+            "restart_all_sessions": "/restartall",
+            "grab_private_server_link": "/psl",
+            "block_user": "/block",
+            "unblock_user": "/unblock",
+            "set_linked_auto_action_row_user": "/action",
+            "set_auto_action_row_user": "/action",
         }
         return labels.get(str(action_type or "").strip().lower(), str(action_type or "").strip())
+
+    def _discord_control_bool_option(self, value: object, *, default: bool = False) -> bool:
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "f", "no", "n", "off"}:
+            return False
+        return bool(default)
+
+    def _discord_control_int_option(self, value: object, *, default: int = 0, minimum: int = 0) -> Tuple[Optional[int], str]:
+        if value is None or str(value).strip() == "":
+            return max(int(default), int(minimum)), ""
+        try:
+            parsed = int(value)
+        except Exception:
+            return None, f"Expected a whole number, got '{value}'."
+        if parsed < int(minimum):
+            return None, f"Value must be at least {int(minimum)}."
+        return parsed, ""
+
+    def _discord_control_auto_item_cfg_snapshot(self) -> dict:
+        try:
+            cfg = self._get_auto_item_settings_from_ui()
+        except Exception:
+            try:
+                cfg = self._get_auto_item_cfg_from_disk()
+            except Exception:
+                cfg = {}
+        return self._normalize_auto_item_cfg(cfg if isinstance(cfg, dict) else {})
+
+    def _discord_control_auto_action_row_name(self, row_index: int, row: object) -> str:
+        row = row if isinstance(row, dict) else {}
+        name = str(row.get("name") or f"Action {int(row_index) + 1}").strip()
+        return name or f"Action {int(row_index) + 1}"
+
+    def _discord_control_auto_action_row_choice_name(self, row_index: int, row: object) -> str:
+        row = row if isinstance(row, dict) else {}
+        name = self._discord_control_auto_action_row_name(row_index, row)
+        label = f"{int(row_index) + 1}. {name}"
+        extras: List[str] = []
+        if not bool(row.get("enabled", True)):
+            extras.append("disabled")
+        if extras:
+            label += f" ({', '.join(extras)})"
+        return label if len(label) <= 100 else f"{label[:97]}..."
+
+    def _resolve_discord_control_auto_action_row(
+        self,
+        cfg: dict,
+        row_ref: object,
+    ) -> Tuple[Optional[int], Optional[dict], str]:
+        items = cfg.get("items") if isinstance(cfg, dict) else []
+        if not isinstance(items, list):
+            items = []
+        ref = str(row_ref or "").strip()
+        if not ref:
+            return None, None, "Action is required."
+        if not items:
+            return None, None, "No Auto Actions are configured."
+
+        index_text = ""
+        if ref.isdigit():
+            index_text = ref
+        else:
+            match = re.match(r"^\s*#?(\d+)(?:\s*[.)-]|\s*$)", ref)
+            if match:
+                index_text = match.group(1)
+        if index_text:
+            try:
+                row_index = int(index_text) - 1
+            except Exception:
+                row_index = -1
+            if 0 <= row_index < len(items) and isinstance(items[row_index], dict):
+                return row_index, items[row_index], ""
+            return None, None, f"Action {index_text} was not found."
+
+        ref_lc = ref.lower()
+        matches: List[Tuple[int, dict]] = []
+        for idx, row in enumerate(items):
+            if not isinstance(row, dict):
+                continue
+            if self._discord_control_auto_action_row_name(idx, row).lower() == ref_lc:
+                matches.append((idx, row))
+        if len(matches) == 1:
+            return matches[0][0], matches[0][1], ""
+        if len(matches) > 1:
+            return None, None, f"Multiple actions are named '{ref}'. Use the action number instead."
+        return None, None, f"Action '{ref}' was not found."
+
+    def _discord_control_autocomplete_auto_action_rows(self, payload: dict) -> dict:
+        cfg = self._discord_control_auto_item_cfg_snapshot()
+        items = cfg.get("items") if isinstance(cfg, dict) else []
+        if not isinstance(items, list):
+            items = []
+
+        query = str((payload or {}).get("query") or "").strip().lower()
+        require_toggle = bool((payload or {}).get("require_linked_edit_enabled", False))
+        try:
+            limit = int((payload or {}).get("limit", 25))
+        except Exception:
+            limit = 25
+        limit = max(1, min(limit, 25))
+
+        def _match_rank(row_index: int, row: dict) -> Optional[Tuple[int, str, int]]:
+            number_text = str(int(row_index) + 1)
+            name = self._discord_control_auto_action_row_name(row_index, row)
+            label = self._discord_control_auto_action_row_choice_name(row_index, row)
+            if not query:
+                return (3, name.lower(), int(row_index))
+            if number_text.startswith(query):
+                return (0, name.lower(), int(row_index))
+            if name.lower().startswith(query):
+                return (1, name.lower(), int(row_index))
+            if query in label.lower():
+                return (2, name.lower(), int(row_index))
+            return None
+
+        matches: List[Tuple[Tuple[int, str, int], dict]] = []
+        for idx, row in enumerate(items):
+            if not isinstance(row, dict):
+                continue
+            if require_toggle and not bool(row.get("discord_user_edit_enabled", False)):
+                continue
+            rank = _match_rank(idx, row)
+            if rank is None:
+                continue
+            matches.append(
+                (
+                    rank,
+                    {
+                        "row_ref": str(idx + 1),
+                        "row_index": idx,
+                        "row_number": idx + 1,
+                        "name": self._discord_control_auto_action_row_name(idx, row),
+                        "choice_name": self._discord_control_auto_action_row_choice_name(idx, row),
+                        "enabled": bool(row.get("enabled", True)),
+                        "discord_user_edit_enabled": bool(row.get("discord_user_edit_enabled", False)),
+                    },
+                )
+            )
+
+        matches.sort(key=lambda item: item[0])
+        return {"ok": True, "rows": [entry for _rank, entry in matches[:limit]]}
+
+    def _save_discord_control_auto_item_cfg(self, cfg: dict) -> Tuple[bool, str]:
+        clean = self._normalize_auto_item_cfg(cfg if isinstance(cfg, dict) else {})
+        try:
+            settings = self.config_manager.load_settings() or {}
+        except Exception:
+            settings = copy.deepcopy(self.config_manager.default_settings)
+        if not isinstance(settings, dict):
+            settings = copy.deepcopy(self.config_manager.default_settings)
+        settings["auto_item"] = clean
+
+        try:
+            if not bool(self.config_manager.save_settings(settings)):
+                return False, "Failed to save settings.json."
+        except Exception as exc:
+            return False, f"Failed to save settings.json: {exc}"
+
+        old_loading = bool(getattr(self, "_loading_autoitem_settings", False))
+        try:
+            self._loading_autoitem_settings = True
+            if hasattr(self, "_auto_item_presets"):
+                self._auto_item_presets = [
+                    copy.deepcopy(p) for p in (clean.get("presets") or []) if isinstance(p, dict)
+                ]
+            table = getattr(self, "auto_item_table", None)
+            if isinstance(table, QTableWidget):
+                self._load_auto_item_items_table(clean.get("items", []) or [])
+            if getattr(self, "auto_item_user_checks", None) is not None:
+                self._apply_auto_item_users_to_ui(clean.get("users", []) or [])
+        except Exception:
+            pass
+        finally:
+            self._loading_autoitem_settings = old_loading
+
+        try:
+            if self.auto_item_engine is not None:
+                self.auto_item_engine.update_config(clean)
+        except Exception:
+            pass
+        return True, ""
+
+    def _discord_control_ordered_user_ids(self, users: dict) -> List[str]:
+        rows: List[Tuple[str, str]] = []
+        for uid, info in (users or {}).items():
+            uid_s = str(uid)
+            if isinstance(info, dict):
+                username = str(info.get("username") or uid_s)
+            else:
+                username = uid_s
+            rows.append((uid_s, username))
+        rows.sort(key=lambda item: self._discord_control_account_sort_key(item[0], item[1]))
+        return [uid for uid, _username in rows]
+
+    def _discord_control_set_auto_action_row_user(self, payload: dict, *, require_link: bool) -> dict:
+        users = self.config_manager.load_users() or {}
+        if not isinstance(users, dict):
+            users = {}
+
+        uid, info, err = self._resolve_discord_control_account(users, (payload or {}).get("account_ref"))
+        if not uid or not isinstance(info, dict):
+            return {"ok": False, "message": err or "Account not found."}
+
+        actor_id = str((payload or {}).get("discord_user_id") or "").strip()
+        if require_link:
+            linked_ids = normalize_discord_ids(info.get("discord_user_ids"))
+            if not actor_id or actor_id not in linked_ids:
+                return {"ok": False, "message": f"You are not allowed to access {info.get('username', uid)} ({uid})."}
+
+        cfg = self._discord_control_auto_item_cfg_snapshot()
+        row_index, row, row_err = self._resolve_discord_control_auto_action_row(
+            cfg,
+            (payload or {}).get("row_ref"),
+        )
+        if row_index is None or not isinstance(row, dict):
+            return {"ok": False, "message": row_err or "Action not found."}
+
+        row_name = self._discord_control_auto_action_row_name(row_index, row)
+        if require_link and not bool(row.get("discord_user_edit_enabled", False)):
+            return {
+                "ok": False,
+                "message": (
+                    f"{row_name} does not allow that account-level edit."
+                ),
+                "account_id": uid,
+                "username": str(info.get("username") or uid),
+                "row_index": row_index,
+                "row_name": row_name,
+            }
+
+        raw_users = row.get("users", None)
+        users_explicit = bool(row.get("users_explicit", False))
+        explicit_users: List[str] = []
+        if isinstance(raw_users, (list, tuple, set)):
+            explicit_users = [str(value).strip() for value in raw_users if str(value).strip()]
+        elif raw_users is not None:
+            try:
+                if not isinstance(raw_users, (str, dict)):
+                    explicit_users = [str(value).strip() for value in list(raw_users) if str(value).strip()]  # type: ignore[arg-type]
+            except Exception:
+                explicit_users = []
+
+        all_user_ids = self._discord_control_ordered_user_ids(users)
+        all_user_set = set(all_user_ids)
+        row_targets_all = raw_users is None or (not explicit_users and not users_explicit)
+        if row_targets_all:
+            current_enabled = uid in all_user_set
+            next_user_set = set(all_user_ids)
+            unknown_existing: List[str] = []
+        else:
+            current_enabled = uid in set(explicit_users)
+            next_user_set = set(explicit_users)
+            unknown_existing = [value for value in explicit_users if value not in all_user_set]
+
+        target_raw = (payload or {}).get("enabled", None)
+        target_enabled = (not current_enabled) if target_raw is None else self._discord_control_bool_option(target_raw, default=current_enabled)
+
+        username = str(info.get("username") or uid)
+        if target_enabled == current_enabled:
+            state = "enabled" if target_enabled else "disabled"
+            return {
+                "ok": True,
+                "message": f"{row_name} is already {state} for {username}.",
+                "account_id": uid,
+                "username": username,
+                "row_index": row_index,
+                "row_name": row_name,
+                "user_enabled": bool(target_enabled),
+            }
+
+        if target_enabled:
+            next_user_set.add(uid)
+        else:
+            next_user_set.discard(uid)
+
+        if target_enabled and all_user_ids and next_user_set == all_user_set:
+            row["users"] = None
+            row["users_explicit"] = False
+        else:
+            ordered = [value for value in all_user_ids if value in next_user_set]
+            ordered.extend(value for value in unknown_existing if value in next_user_set and value not in ordered)
+            row["users"] = ordered
+            row["users_explicit"] = True
+
+        items = cfg.get("items") if isinstance(cfg.get("items"), list) else []
+        if 0 <= row_index < len(items):
+            normalized_row = self._normalize_auto_item_row(row, fallback_index=row_index)
+            items[row_index] = normalized_row if normalized_row is not None else row
+            cfg["items"] = items
+
+        ok, save_msg = self._save_discord_control_auto_item_cfg(cfg)
+        if not ok:
+            return {"ok": False, "message": save_msg or "Failed to save Auto Actions settings."}
+
+        actor_text = f"Discord user {actor_id}" if require_link else "admin command"
+        action_state = "enabled" if target_enabled else "disabled"
+        self.add_log(
+            f"[Discord Control] {actor_text} set {row_name} {action_state} for {username} ({uid})"
+        )
+        return {
+            "ok": True,
+            "message": f"{row_name} {action_state} for {username}.",
+            "account_id": uid,
+            "username": username,
+            "row_index": row_index,
+            "row_name": row_name,
+            "user_enabled": bool(target_enabled),
+        }
+
+    def _discord_control_account_place_id(self, info: dict) -> str:
+        if not isinstance(info, dict):
+            return ""
+        candidates = [
+            info.get("place"),
+            info.get("place_id"),
+            info.get("placeId"),
+            info.get("roblox_place_id"),
+            info.get("private_server_link"),
+        ]
+        for raw in candidates:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            if text.isdigit():
+                return text
+            match = re.search(r"/games/(\d+)(?:/|$|\?)", text)
+            if match:
+                return match.group(1)
+        return ""
+
+    def _discord_control_start_utility_worker(
+        self,
+        worker: QThread,
+        *,
+        job_name: str,
+        refresh_users_on_done: bool = False,
+    ) -> Tuple[bool, str]:
+        if bool(getattr(self, "_util_busy", False)) or bool(getattr(self, "_discord_control_utility_busy", False)):
+            return False, "A Utilities job is already running."
+
+        try:
+            _set_config_manager(getattr(self, "config_manager", None))
+        except Exception:
+            pass
+
+        workers = getattr(self, "_discord_control_utility_workers", None)
+        if not isinstance(workers, list):
+            workers = []
+            self._discord_control_utility_workers = workers
+
+        self._discord_control_utility_busy = True
+        self._util_busy = True
+        workers.append(worker)
+
+        try:
+            progress_signal = getattr(worker, "progress", None)
+            if progress_signal is not None:
+                progress_signal.connect(lambda s: self.add_log(str(s or "")))
+        except Exception:
+            pass
+
+        finish_state = {"done": False}
+
+        def _finish() -> None:
+            if finish_state.get("done", False):
+                return
+            finish_state["done"] = True
+            try:
+                self.add_log(f"[Discord Control] {job_name} complete.")
+            except Exception:
+                pass
+            try:
+                if worker in workers:
+                    workers.remove(worker)
+            except Exception:
+                pass
+            self._discord_control_utility_busy = False
+            self._util_busy = False
+            if refresh_users_on_done:
+                try:
+                    self.refresh_users()
+                except Exception:
+                    pass
+                try:
+                    self.refresh_accounts_list()
+                except Exception:
+                    pass
+                try:
+                    self._refresh_discord_control_accounts_table()
+                except Exception:
+                    pass
+
+        try:
+            done_signal = getattr(worker, "done", None)
+            if done_signal is not None:
+                done_signal.connect(_finish)
+            worker.finished.connect(_finish)
+            worker.start()
+            return True, f"{job_name} started. Progress will be written to the JARAM log."
+        except Exception as exc:
+            try:
+                if worker in workers:
+                    workers.remove(worker)
+            except Exception:
+                pass
+            self._discord_control_utility_busy = False
+            self._util_busy = False
+            return False, f"Failed to start {job_name}: {exc}"
+
+    def _discord_control_restart_all_sessions(self, payload: dict) -> dict:
+        response = self._restart_all_sessions_core(confirm=False, source="Discord Control")
+        if response.get("ok", False):
+            self.add_log("[Discord Control] admin command requested restart all sessions.")
+        return response
+
+    def _discord_control_grab_private_server_link(self, payload: dict) -> dict:
+        users = self.config_manager.load_users() or {}
+        uid, info, err = self._resolve_discord_control_account(users, (payload or {}).get("account_ref"))
+        if not uid or not isinstance(info, dict):
+            return {"ok": False, "message": err or "Account not found."}
+
+        username = str(info.get("username") or uid)
+        if not str(info.get("cookie") or "").strip():
+            return {"ok": False, "message": f"{username} ({uid}) has no cookie."}
+        if bool(info.get("bad", False)):
+            return {"ok": False, "message": f"{username} ({uid}) is marked bad."}
+
+        place_id = self._discord_control_account_place_id(info)
+        if not place_id:
+            return {
+                "ok": False,
+                "message": f"{username} ({uid}) has no place ID. Set the account place before running the PSL grabber.",
+            }
+
+        expected_value, value_err = self._discord_control_int_option(
+            (payload or {}).get("estimated_value"),
+            default=0,
+            minimum=0,
+        )
+        if expected_value is None:
+            return {"ok": False, "message": value_err}
+
+        only_missing = self._discord_control_bool_option(
+            (payload or {}).get("only_missing"),
+            default=True,
+        )
+        existing_link = str(info.get("private_server_link") or "").strip()
+        if only_missing and existing_link:
+            return {
+                "ok": True,
+                "message": f"{username} ({uid}) already has a private server link; no action taken.",
+                "account_id": uid,
+                "username": username,
+            }
+
+        game_slug = str((payload or {}).get("game_slug") or "").strip() or "-"
+        server_name = str((payload or {}).get("server_name") or "").strip() or "JARAM-{username}-{ts}"
+        opts = _PSLOpts(
+            place_id=place_id,
+            game_slug=game_slug,
+            name_template=server_name,
+            expected_price=int(expected_value),
+            only_missing=only_missing,
+        )
+        worker = _PSLWorker(opts, allowed_uids={uid})
+        ok, msg = self._discord_control_start_utility_worker(
+            worker,
+            job_name=f"PSL grabber for {username} ({uid})",
+            refresh_users_on_done=True,
+        )
+        if ok:
+            self.add_log(
+                f"[Discord Control] admin command started PSL grabber for {username} ({uid}) "
+                f"place={place_id} slug={game_slug}"
+            )
+        return {
+            "ok": bool(ok),
+            "message": msg,
+            "account_id": uid,
+            "username": username,
+        }
+
+    def _discord_control_block_or_unblock_user(self, payload: dict, *, unblock: bool) -> dict:
+        users = self.config_manager.load_users() or {}
+        uid, info, err = self._resolve_discord_control_account(users, (payload or {}).get("account_ref"))
+        if not uid or not isinstance(info, dict):
+            return {"ok": False, "message": err or "Account not found."}
+
+        target = str((payload or {}).get("target") or "").strip()
+        if not target:
+            return {"ok": False, "message": "Target Roblox username or user ID is required."}
+
+        username = str(info.get("username") or uid)
+        if not str(info.get("cookie") or "").strip():
+            return {"ok": False, "message": f"{username} ({uid}) has no cookie."}
+        if bool(info.get("bad", False)):
+            return {"ok": False, "message": f"{username} ({uid}) is marked bad."}
+
+        force = self._discord_control_bool_option((payload or {}).get("force"), default=False)
+        if unblock:
+            worker = _UnblockWorker(
+                headless=True,
+                unblock_text=target,
+                allowed_uids={uid},
+                force=force,
+            )
+            job = f"unblock {target} for {username} ({uid})"
+        else:
+            worker = _BlockWorker(
+                headless=True,
+                targets_text=target,
+                allowed_uids={uid},
+                force=force,
+            )
+            job = f"block {target} for {username} ({uid})"
+
+        ok, msg = self._discord_control_start_utility_worker(
+            worker,
+            job_name=job,
+            refresh_users_on_done=False,
+        )
+        if ok:
+            action = "unblock" if unblock else "block"
+            self.add_log(
+                f"[Discord Control] admin command started {action} target={target} "
+                f"for {username} ({uid}) force={force}"
+            )
+        return {
+            "ok": bool(ok),
+            "message": msg,
+            "account_id": uid,
+            "username": username,
+        }
 
     def _discord_control_record_command_usage(
         self,
@@ -20350,12 +23832,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "channel_id": str(payload.get("channel_id") or "").strip(),
             "channel_name": str(payload.get("channel_name") or "").strip(),
             "account_ref": str(payload.get("account_ref") or "").strip(),
+            "row_ref": str(payload.get("row_ref") or "").strip(),
             "ok": bool(ok_value) if ok_value is not None else None,
             "message": message[:1000],
         }
         if response is not None:
             record["target_account_id"] = str(response.get("account_id") or "").strip()
             record["target_username"] = str(response.get("username") or "").strip()
+            if "row_index" in response:
+                record["row_index"] = response.get("row_index")
+            if "row_name" in response:
+                record["row_name"] = str(response.get("row_name") or "").strip()
+            if "user_enabled" in response:
+                record["user_enabled"] = bool(response.get("user_enabled", False))
             if "disabled" in response:
                 record["disabled"] = bool(response.get("disabled", False))
             if "flags" in response:
@@ -20385,6 +23874,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return self._discord_control_autocomplete_accounts(payload, require_link=True)
         if action_type == "autocomplete_accounts":
             return self._discord_control_autocomplete_accounts(payload, require_link=False)
+        if action_type == "autocomplete_auto_action_rows":
+            return self._discord_control_autocomplete_auto_action_rows(payload)
         if action_type == "get_linked_account_status":
             response = self._discord_control_get_account_status(payload, require_link=True)
             self._discord_control_record_command_usage(payload, response=response)
@@ -20401,22 +23892,47 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             response = self._discord_control_set_account_disabled(payload, require_link=False)
             self._discord_control_record_command_usage(payload, response=response)
             return response
+        if action_type == "set_linked_auto_action_row_user":
+            response = self._discord_control_set_auto_action_row_user(payload, require_link=True)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        if action_type == "set_auto_action_row_user":
+            response = self._discord_control_set_auto_action_row_user(payload, require_link=False)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
         if action_type == "clear_account_flags":
             response = self._discord_control_clear_account_flags(payload)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        if action_type == "restart_all_sessions":
+            response = self._discord_control_restart_all_sessions(payload)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        if action_type == "grab_private_server_link":
+            response = self._discord_control_grab_private_server_link(payload)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        if action_type == "block_user":
+            response = self._discord_control_block_or_unblock_user(payload, unblock=False)
+            self._discord_control_record_command_usage(payload, response=response)
+            return response
+        if action_type == "unblock_user":
+            response = self._discord_control_block_or_unblock_user(payload, unblock=True)
             self._discord_control_record_command_usage(payload, response=response)
             return response
         return {"ok": False, "message": f"Unknown Discord control request: {action_type or 'missing'}"}
 
     def _discord_control_list_linked_accounts(self, payload: dict) -> dict:
         actor_id = str((payload or {}).get("discord_user_id") or "").strip()
-        if not actor_id:
+        list_all = bool((payload or {}).get("list_all", False))
+        if not actor_id and not list_all:
             return {"ok": False, "message": "Discord user ID is missing."}
         users = self.config_manager.load_users() or {}
         accounts: List[dict] = []
         for uid, info in users.items():
             if not isinstance(info, dict):
                 continue
-            if actor_id not in normalize_discord_ids(info.get("discord_user_ids")):
+            if not list_all and actor_id not in normalize_discord_ids(info.get("discord_user_ids")):
                 continue
             accounts.append(
                 {
@@ -20504,7 +24020,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             actor_id = str((payload or {}).get("discord_user_id") or "").strip()
             linked_ids = normalize_discord_ids(info.get("discord_user_ids"))
             if not actor_id or actor_id not in linked_ids:
-                return {"ok": False, "message": f"You are not linked to {info.get('username', uid)} ({uid})."}
+                return {"ok": False, "message": f"You are not allowed to access {info.get('username', uid)} ({uid})."}
         return {
             "ok": True,
             "message": self._discord_control_account_status_text(uid, info),
@@ -20524,7 +24040,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if require_link:
             linked_ids = normalize_discord_ids(info.get("discord_user_ids"))
             if not actor_id or actor_id not in linked_ids:
-                return {"ok": False, "message": f"You are not linked to {info.get('username', uid)} ({uid})."}
+                return {"ok": False, "message": f"You are not allowed to access {info.get('username', uid)} ({uid})."}
 
         target_disabled = bool((payload or {}).get("disabled", False))
         previous = bool(info.get("disabled", False))
@@ -20536,7 +24052,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         if target_disabled and not previous and self.worker_thread and self.worker_thread.isRunning():
             try:
-                self.worker_thread.kill_user_processes(uid)
+                self._queue_worker_action("kill_user_processes", uid)
             except Exception:
                 pass
 
@@ -20546,7 +24062,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if flags:
             message += f" Flags still set: {'/'.join(flags)}."
 
-        actor_text = f"linked user {actor_id}" if require_link else "admin command"
+        actor_text = f"Discord user {actor_id}" if require_link else "admin command"
         self.add_log(f"[Discord Control] {actor_text} set {username} ({uid}) disabled={target_disabled}")
         return {
             "ok": True,
@@ -21874,6 +25390,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         suffix = "" if len(users) <= 3 else f", +{len(users) - 3} more"
         return f"{len(users)} user(s): {preview}{suffix}"
 
+    def _format_webhook_user_filter_for_diff(self, entry: dict) -> str:
+        mode = _normalize_user_filter_mode((entry or {}).get("user_filter_mode", "whitelist"))
+        users = self._normalize_webhook_users_for_diff(entry or {})
+        if mode == "blacklist":
+            if not users:
+                return "Blacklist: no blocked users"
+            return "Blacklist: " + self._format_webhook_users_for_diff(users)
+        return "Whitelist: " + self._format_webhook_users_for_diff(users)
+
     def _normalize_role_id_for_ping(self, value: object) -> str:
         text = str(value or "").strip()
         if not text:
@@ -21975,10 +25500,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if old_name != new_name:
                 segs.append(f"name {self._format_settings_value(old_name)} -> {self._format_settings_value(new_name)}")
 
-            old_users = self._normalize_webhook_users_for_diff(old)
-            new_users = self._normalize_webhook_users_for_diff(new)
-            if old_users != new_users:
-                segs.append(f"users {self._format_webhook_users_for_diff(old_users)} -> {self._format_webhook_users_for_diff(new_users)}")
+            old_user_filter = self._format_webhook_user_filter_for_diff(old)
+            new_user_filter = self._format_webhook_user_filter_for_diff(new)
+            if old_user_filter != new_user_filter:
+                segs.append(f"users {old_user_filter} -> {new_user_filter}")
 
             old_role_pings = self._normalize_webhook_role_pings_config(old.get("biome_role_pings", {}))
             new_role_pings = self._normalize_webhook_role_pings_config(new.get("biome_role_pings", {}))
@@ -22062,15 +25587,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             biome_modes = {}
             data_item = name_item or url_item
             user_filter = data_item.data(Qt.ItemDataRole.UserRole) if data_item else None
+            user_filter_mode = _normalize_user_filter_mode(
+                data_item.data(WEBHOOK_USER_FILTER_MODE_ROLE) if data_item is not None else "whitelist"
+            )
             selected_users: list[str] = []
             explicit_users = False
             if isinstance(user_filter, (list, tuple, set)):
                 explicit_users = True
                 selected_users = [str(u).strip() for u in user_filter if str(u).strip()]
                 selected_users = sorted({u for u in selected_users})
-                if all_user_ids and set(selected_users) == all_user_ids:
+                if user_filter_mode == "whitelist" and all_user_ids and set(selected_users) == all_user_ids:
                     explicit_users = False
                     selected_users = []
+            if user_filter_mode == "blacklist":
+                explicit_users = True
 
             for idx, biome_name in enumerate(GUI_BIOME_NAMES):
                 w = self.webhooks_table.cellWidget(r, 2 + idx)
@@ -22101,6 +25631,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if explicit_users:
                 entry["users"] = selected_users
                 entry["users_explicit"] = True
+            if user_filter_mode == "blacklist":
+                entry["user_filter_mode"] = "blacklist"
             webhooks.append(entry)
 
         return webhooks
@@ -22181,6 +25713,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "msedgewebview2_limiter_enabled": bool(
                     self.misc_msedgewebview2_limiter_enabled_chk.isChecked()
                 ) if hasattr(self, "misc_msedgewebview2_limiter_enabled_chk") else True,
+                "hide_discord_tabs": bool(
+                    self.misc_hide_discord_tabs_chk.isChecked()
+                ) if hasattr(self, "misc_hide_discord_tabs_chk") else True,
             },
         }
         return snapshot
@@ -22417,9 +25952,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             raw_users = wh.get("users", None)
             users_explicit = bool(wh.get("users_explicit", raw_users is not None))
             users   = raw_users if users_explicit else None  # optional per-user routing
+            user_filter_mode = _normalize_user_filter_mode(wh.get("user_filter_mode", "whitelist"))
             if url:
                 try:
-                    self._add_webhook_row(name, url, allowed, modes, users, role_pings)
+                    self._add_webhook_row(name, url, allowed, modes, users, role_pings, user_filter_mode)
                 except TypeError:
                     self._add_webhook_row(name, url, allowed)
 
@@ -22465,6 +26001,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         log_confirmed_launch_mode = None
         disable_manager_bad_marking = None
         msedge_limiter_enabled = None
+        hide_discord_tabs = None
         if isinstance(misc, dict) and "skip_webhook_unknown_context" in misc:
             skip_unknown = bool(misc.get("skip_webhook_unknown_context", False))
         if isinstance(misc, dict) and MISC_DISABLE_LOG_MERCHANTS_WHEN_OCR_ACTIVE_KEY in misc:
@@ -22477,6 +26014,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             disable_manager_bad_marking = bool(misc.get("disable_manager_bad_marking", False))
         if isinstance(misc, dict) and "msedgewebview2_limiter_enabled" in misc:
             msedge_limiter_enabled = bool(misc.get("msedgewebview2_limiter_enabled", True))
+        if isinstance(misc, dict) and "hide_discord_tabs" in misc:
+            hide_discord_tabs = bool(misc.get("hide_discord_tabs", True))
         if skip_unknown is None:
             ocr_cfg = settings.get("ocr", {}) or {}
             if isinstance(ocr_cfg, dict) and "skip_webhook_unknown_context" in ocr_cfg:
@@ -22504,6 +26043,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             msedge_limiter_enabled = bool(
                 self.config_manager.default_settings.get("misc", {}).get("msedgewebview2_limiter_enabled", True)
             )
+        if hide_discord_tabs is None:
+            hide_discord_tabs = bool(
+                self.config_manager.default_settings.get("misc", {}).get("hide_discord_tabs", True)
+            )
         if hasattr(self, "misc_skip_unknown_webhook_chk"):
             self.misc_skip_unknown_webhook_chk.setChecked(bool(skip_unknown))
         if hasattr(self, "misc_disable_log_merchants_when_ocr_active_chk"):
@@ -22519,6 +26062,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             )
         if hasattr(self, "misc_msedgewebview2_limiter_enabled_chk"):
             self.misc_msedgewebview2_limiter_enabled_chk.setChecked(bool(msedge_limiter_enabled))
+        if hasattr(self, "misc_hide_discord_tabs_chk"):
+            self.misc_hide_discord_tabs_chk.setChecked(bool(hide_discord_tabs))
+        self._apply_discord_tabs_visibility(bool(hide_discord_tabs))
 
         # ---------- OCR tab ----------
         self._apply_ocr_settings_to_ui(settings.get("ocr", {}))
@@ -22801,6 +26347,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             misc["msedgewebview2_limiter_enabled"] = bool(
                 self.misc_msedgewebview2_limiter_enabled_chk.isChecked()
             )
+        if hasattr(self, "misc_hide_discord_tabs_chk"):
+            misc["hide_discord_tabs"] = bool(self.misc_hide_discord_tabs_chk.isChecked())
         settings["misc"] = misc
 
         # ---------- OCR settings ----------
@@ -22829,6 +26377,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 ui_cfg = settings.get("ui", {}) or {}
                 if isinstance(ui_cfg, dict):
                     self._apply_tutorial_menu_visibility(bool(ui_cfg.get("show_tutorial_menu", False)))
+                self._apply_discord_tabs_visibility(
+                    bool((settings.get("misc", {}) or {}).get("hide_discord_tabs", True))
+                )
             except Exception:
                 pass
             if self.worker_thread and self.worker_thread.isRunning():
@@ -22964,6 +26515,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.misc_msedgewebview2_limiter_enabled_chk.setChecked(
                 bool(defaults.get("misc", {}).get("msedgewebview2_limiter_enabled", True))
             )
+        if hasattr(self, "misc_hide_discord_tabs_chk"):
+            hide_discord_tabs = bool(defaults.get("misc", {}).get("hide_discord_tabs", True))
+            self.misc_hide_discord_tabs_chk.setChecked(hide_discord_tabs)
+            self._apply_discord_tabs_visibility(hide_discord_tabs)
 
         QMessageBox.information(
             self,
@@ -23048,22 +26603,38 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def show_about(self):
         config_info = self.config_manager.get_config_info()
         QMessageBox.about(self, "About J.JARAM",
-                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x56\n\n"
+                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x60\n\n"
                          "Advanced multi-account Roblox session manager\n"
                          "with automated log based monitoring and process management.\n\n"
                          "Built with PySide6 and modern design principles.\n\n"
+                         "https://github.com/Jirach-1/J.JARAM\n\n"
                          f"Configuration stored in:\n{config_info['config_dir']}")
 
-    def restart_all_sessions(self):
-        if not self.worker_thread or not self.worker_thread.isRunning():
-            QMessageBox.warning(self, "Manager Not Running", "Please start the manager first.")
-            return
+    def _queue_worker_action(self, action_name: str, *args, **kwargs) -> bool:
+        wt = getattr(self, "worker_thread", None)
+        if not wt or not wt.isRunning():
+            return False
+        submit = getattr(wt, "submit_action", None)
+        if not callable(submit):
+            return False
+        return bool(submit(action_name, *args, **kwargs))
 
-        reply = QMessageBox.question(self, "Confirm Restart",
-                                   "Are you sure you want to restart all sessions?",
-                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
-            return
+    def _restart_all_sessions_core(self, *, confirm: bool = True, source: str = "UI") -> dict:
+        if not self.worker_thread or not self.worker_thread.isRunning():
+            msg = "Please start the manager first."
+            if confirm:
+                QMessageBox.warning(self, "Manager Not Running", msg)
+            return {"ok": False, "message": msg}
+
+        if confirm:
+            reply = QMessageBox.question(
+                self,
+                "Confirm Restart",
+                "Are you sure you want to restart all sessions?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return {"ok": False, "message": "Restart all sessions was cancelled."}
 
         online_uids: set[str] = set()
         try:
@@ -23104,8 +26675,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             restartables.append(uid)
 
         if not restartables:
-            QMessageBox.information(self, "No Online Sessions", "No online sessions were found to restart.")
-            return
+            msg = "No online sessions were found to restart."
+            if confirm:
+                QMessageBox.information(self, "No Online Sessions", msg)
+            return {"ok": False, "message": msg}
 
         try:
             launch_delay_s = float(getattr(getattr(self.worker_thread, "launcher", None), "launch_delay", 0) or 0)
@@ -23115,16 +26688,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         def delayed_restart():
             for i, user_id in enumerate(restartables):
                 delay_ms = int(max(0.0, float(i) * launch_delay_s) * 1000)
-                QTimer.singleShot(delay_ms, lambda uid=user_id: self.worker_thread.restart_user_session(uid))
+                QTimer.singleShot(delay_ms, lambda uid=user_id: self._queue_worker_action("restart_user_session", uid))
 
         run_id = int(getattr(self, "_restart_all_run_id", 0) or 0) + 1
         self._restart_all_run_id = run_id
 
         total_span_s = max(0.0, float(len(restartables) - 1) * float(launch_delay_s))
-        self.add_log(
-            f"Restarting All Sessions...: {len(restartables)} online sessions "
-            f"(delay={launch_delay_s}s, span≈{total_span_s:.1f}s)"
+        restart_msg = (
+            f"[{source}] Restarting all sessions: {len(restartables)} online sessions "
+            f"(delay={launch_delay_s}s, span~{total_span_s:.1f}s)"
         )
+        self.add_log(restart_msg)
         delayed_restart()
 
         # "Stop" = the queue finished firing restart_user_session calls (not necessarily fully reconnected).
@@ -23135,6 +26709,18 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         completion_delay_ms = int(total_span_s * 1000) + 50
         QTimer.singleShot(completion_delay_ms, _log_done)
+
+        return {
+            "ok": True,
+            "message": (
+                f"Restarting {len(restartables)} online session(s). "
+                f"Delay={launch_delay_s}s, span~{total_span_s:.1f}s."
+            ),
+            "session_count": len(restartables),
+        }
+
+    def restart_all_sessions(self):
+        self._restart_all_sessions_core(confirm=True, source="UI")
             
     def kill_all_processes(self):
         reply = QMessageBox.question(self, "Confirm Kill All",
@@ -23145,7 +26731,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         # If the manager is running, route through the worker so its tracker stays consistent.
         if self.worker_thread and self.worker_thread.isRunning():
-            self.worker_thread.kill_all_processes()
+            if not self._queue_worker_action("kill_all_processes"):
+                QMessageBox.warning(self, "Kill All Failed", "Failed to queue kill-all action.")
             return
 
         # Manager is stopped: kill RobloxPlayerBeta.exe processes directly.
@@ -23166,14 +26753,18 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             QMessageBox.warning(self, "Manager Not Running", "Please start the manager first.")
             return
 
-        self.worker_thread.cleanup_dead_processes()
+        if not self._queue_worker_action("cleanup_dead_processes"):
+            QMessageBox.warning(self, "Cleanup Failed", "Failed to queue cleanup action.")
 
     def restart_user_session(self, user_id):
         if not self.worker_thread or not self.worker_thread.isRunning():
             QMessageBox.warning(self, "Manager Not Running", "Please start the manager first.")
             return
 
-        self.worker_thread.restart_user_session(user_id)
+        if self._queue_worker_action("restart_user_session", user_id):
+            self.add_log(f"[UI] Queued restart for user {user_id}.")
+        else:
+            QMessageBox.warning(self, "Restart Failed", "Failed to queue restart action.")
 
     # ---------------- Accounts tab helpers ----------------
     def _infer_account_server_type(self, user_info: dict) -> str:
@@ -23718,7 +27309,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             info["disabled"] = not info.get("disabled", False)
             if self.config_manager.save_users(users_config):
                 if info["disabled"] and self.worker_thread and self.worker_thread.isRunning():
-                    self.worker_thread.kill_user_processes(user_id)
+                    self._queue_worker_action("kill_user_processes", user_id)
                 self.refresh_users()
                 status = "disabled" if info["disabled"] else "enabled"
                 QMessageBox.information(self, "Account Status Changed", f"Account {user_id} has been {status}.")
@@ -23742,7 +27333,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             user_info["disabled"] = not user_info.get("disabled", False)
             if self.config_manager.save_users(users_config):
                 if user_info["disabled"] and self.worker_thread and self.worker_thread.isRunning():
-                    self.worker_thread.kill_user_processes(user_id)
+                    self._queue_worker_action("kill_user_processes", user_id)
                 self.refresh_users()
                 status = "disabled" if user_info["disabled"] else "enabled"
                 QMessageBox.information(self, "Account Status Changed", f"Account {user_id} has been {status}.")
@@ -23810,7 +27401,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if self.config_manager.save_users(users_config):
             if disabled_now and self.worker_thread and self.worker_thread.isRunning():
                 for uid in disabled_now:
-                    self.worker_thread.kill_user_processes(uid)
+                    self._queue_worker_action("kill_user_processes", uid)
             self.refresh_users()
             self.refresh_accounts_list()
             QMessageBox.information(self, "Accounts Disabled", f"Disabled {changed} account(s).")
@@ -23843,7 +27434,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if self.config_manager.save_users(users_config):
             if disabled_now and self.worker_thread and self.worker_thread.isRunning():
                 for uid in disabled_now:
-                    self.worker_thread.kill_user_processes(uid)
+                    self._queue_worker_action("kill_user_processes", uid)
             self.refresh_users()
             self.refresh_accounts_list()
             QMessageBox.information(
@@ -24081,7 +27672,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                                    f"Are you sure you want to kill processes for user {user_id}?",
                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
-            self.worker_thread.kill_user_processes(user_id)
+            if not self._queue_worker_action("kill_user_processes", user_id):
+                QMessageBox.warning(self, "Kill Failed", "Failed to queue kill action.")
 
     def closeEvent(self, event):
         if self.worker_thread and self.worker_thread.isRunning():
@@ -24579,7 +28171,7 @@ def main():
     app = QApplication(sys.argv)
 
     app.setApplicationName("J.JARAM")
-    app.setApplicationVersion("JX 2x56")
+    app.setApplicationVersion("JX 2x60")
     app.setOrganizationName("Jirach1")
     # Qt 6 ships a Windows 11 style that can change widget visuals. Force the
     # Windows 10-era style for consistent UI across OS versions.
