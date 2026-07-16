@@ -8,6 +8,10 @@ import threading
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
+try:
+    from concurrent.futures.process import BrokenProcessPool
+except Exception:  # pragma: no cover
+    BrokenProcessPool = RuntimeError  # type: ignore
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from multiprocessing import get_context
@@ -36,6 +40,9 @@ from multiscope import APP_FOOTER
 # -----------------------------
 
 _FRAME_HASH_SIZE = 16  # 16x16 = 256-bit perceptual hash (fast, robust to minor noise)
+_WINDOW_ENUM_INTERVAL_SECONDS = 1.0
+_OCR_INFERENCE_SIZE = (1024, 512)
+_OCR_EMPTY_COLOR_MASK_PIXELS = 0
 
 
 def compute_frame_hash(image: Image.Image, hash_size: int = _FRAME_HASH_SIZE) -> int:
@@ -65,6 +72,16 @@ def frame_hash_diff_percent(hash_a: int, hash_b: int, hash_size: int = _FRAME_HA
     dist = (int(hash_a) ^ int(hash_b)).bit_count()
     return (float(dist) / float(bits)) * 100.0
 
+
+def _format_step_duration(seconds: float) -> str:
+    try:
+        value = max(0.0, float(seconds))
+    except Exception:
+        value = 0.0
+    if value < 1.0:
+        return f"{value * 1000.0:.1f}ms"
+    return f"{value:.3f}s"
+
 # RapidOCR (ONNXRuntime) import with fallback search paths (helps when the frozen EXE missed the package)
 RapidOCR = None  # type: ignore
 ort = None  # type: ignore
@@ -75,6 +92,7 @@ _OCR_ENGINE_REF: Any = None
 _OCR_DEVICE_ID: Optional[int] = None
 _RAPIDOCR_ORIG_GET_EP_LIST = None
 _RAPIDOCR_PATCHED_DEVICE_ID: Optional[int] = None
+_RAPIDOCR_NATIVE_LOCK = threading.RLock()
 
 
 def _hresult_code(value: int) -> int:
@@ -232,7 +250,7 @@ def _get_gpu_name_for_device(device_id: int) -> Optional[str]:
 
 
 def _format_provider_summary(provider: str, device_id: Optional[int]) -> str:
-    if provider == "DmlExecutionProvider" or "CUDAExecutionProvider":
+    if provider in ("DmlExecutionProvider", "CUDAExecutionProvider"):
         base = "GPU"
     elif provider == "CPUExecutionProvider":
         return "CPU"
@@ -476,42 +494,46 @@ def _init_rapidocr_engine(
         raise RuntimeError("rapidocr_onnxruntime is not available.")
     if ort is None:
         raise RuntimeError("onnxruntime is not available.")
-    if force_cpu:
-        require_dml = False
-    _OCR_DEVICE_ID = device_id
-    if force_cpu:
-        _apply_rapidocr_device_id(None)
-    else:
-        _apply_rapidocr_device_id(device_id)
-    providers = _get_ort_providers()
-    use_dml = "DmlExecutionProvider" in providers
-    if require_dml and not use_dml:
-        _OCR_DEVICE_SUMMARY = "Unavailable (DirectML provider not available)"
-        raise RuntimeError("DirectML provider is not available (install onnxruntime-directml).")
-    if force_cpu:
-        try:
-            engine = RapidOCR(
-                det_use_dml=False,
-                cls_use_dml=False,
-                rec_use_dml=False,
-                det_use_cuda=False,
-                cls_use_cuda=False,
-                rec_use_cuda=False,
-            )
-        except TypeError:
-            engine = RapidOCR()
-        _OCR_DEVICE_SUMMARY = "CPU"
-    else:
-        if use_dml:
+
+    # DirectML-backed ONNX Runtime has crashed in native code when different
+    # app threads entered RapidOCR sessions at the same time.
+    with _RAPIDOCR_NATIVE_LOCK:
+        if force_cpu:
+            require_dml = False
+        _OCR_DEVICE_ID = device_id
+        if force_cpu:
+            _apply_rapidocr_device_id(None)
+        else:
+            _apply_rapidocr_device_id(device_id)
+        providers = _get_ort_providers()
+        use_dml = "DmlExecutionProvider" in providers
+        if require_dml and not use_dml:
+            _OCR_DEVICE_SUMMARY = "Unavailable (DirectML provider not available)"
+            raise RuntimeError("DirectML provider is not available (install onnxruntime-directml).")
+        if force_cpu:
             try:
-                engine = RapidOCR(det_use_dml=True, cls_use_dml=True, rec_use_dml=True)
+                engine = RapidOCR(
+                    det_use_dml=False,
+                    cls_use_dml=False,
+                    rec_use_dml=False,
+                    det_use_cuda=False,
+                    cls_use_cuda=False,
+                    rec_use_cuda=False,
+                )
             except TypeError:
                 engine = RapidOCR()
+            _OCR_DEVICE_SUMMARY = "CPU"
         else:
-            engine = RapidOCR()
-        _OCR_DEVICE_SUMMARY = _summarize_device_from_engine(engine, providers, device_id)
-    _OCR_ENGINE_REF = engine
-    return engine
+            if use_dml:
+                try:
+                    engine = RapidOCR(det_use_dml=True, cls_use_dml=True, rec_use_dml=True)
+                except TypeError:
+                    engine = RapidOCR()
+            else:
+                engine = RapidOCR()
+            _OCR_DEVICE_SUMMARY = _summarize_device_from_engine(engine, providers, device_id)
+        _OCR_ENGINE_REF = engine
+        return engine
 
 
 def _rapidocr_text_only(engine, img_np: np.ndarray) -> str:
@@ -519,7 +541,8 @@ def _rapidocr_text_only(engine, img_np: np.ndarray) -> str:
     Run RapidOCR and return text only (one line per detection).
     rapidocr_onnxruntime returns (ocr_result, elapse).
     """
-    ocr_result, _elapse = engine(img_np)
+    with _RAPIDOCR_NATIVE_LOCK:
+        ocr_result, _elapse = engine(img_np)
     if not ocr_result:
         return ""
 
@@ -537,6 +560,14 @@ def _rapidocr_text_only(engine, img_np: np.ndarray) -> str:
 _POOL_ENGINE = None
 
 
+@dataclass
+class PreparedOCRImage:
+    image: Image.Image
+    has_color_filters: bool = False
+    mask_pixels: int = 0
+    total_pixels: int = 0
+
+
 def _init_pool_reader(device_id: Optional[int] = None, force_cpu: bool = False) -> None:
     """Initializer for OCR process workers so RapidOCR is created once per process."""
     global _POOL_ENGINE
@@ -548,19 +579,74 @@ def _init_pool_reader(device_id: Optional[int] = None, force_cpu: bool = False) 
         )
 
 
-def _pool_read_text(img_bytes: bytes) -> str:
+def _image_payload(img: Image.Image) -> Tuple[str, Tuple[int, int], bytes]:
+    mode = img.mode if img.mode in ("L", "RGB", "RGBA") else "RGB"
+    work = img if img.mode == mode else img.convert(mode)
+    return mode, work.size, work.tobytes()
+
+
+def _image_from_payload(payload: Tuple[str, Tuple[int, int], bytes]) -> Image.Image:
+    mode, size, data = payload
+    return Image.frombytes(str(mode), tuple(size), data)
+
+
+def _ocr_input_array(image: Image.Image) -> np.ndarray:
+    img = image.convert("RGB")
+    target_w, target_h = _OCR_INFERENCE_SIZE
+    if img.size != _OCR_INFERENCE_SIZE:
+        w, h = img.size
+        if w <= 0 or h <= 0:
+            img = Image.new("RGB", _OCR_INFERENCE_SIZE, "white")
+        else:
+            scale = min(float(target_w) / float(w), float(target_h) / float(h))
+            new_size = (
+                max(1, min(target_w, int(round(w * scale)))),
+                max(1, min(target_h, int(round(h * scale)))),
+            )
+            resized = img.resize(new_size, Image.BILINEAR)
+            canvas = Image.new("RGB", _OCR_INFERENCE_SIZE, "white")
+            canvas.paste(resized, ((target_w - new_size[0]) // 2, (target_h - new_size[1]) // 2))
+            img = canvas
+    return np.asarray(img, dtype=np.uint8)
+
+
+def _pool_read_text(img_payload: Tuple[str, Tuple[int, int], bytes]) -> str:
     """Read text from a preprocessed image inside a process worker."""
     global _POOL_ENGINE
     if _POOL_ENGINE is None:
         _init_pool_reader()
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    return _rapidocr_text_only(_POOL_ENGINE, np.array(img))
+    img = _image_from_payload(img_payload)
+    return _rapidocr_text_only(_POOL_ENGINE, _ocr_input_array(img))
 
 
-def _prepare_filter_ocr_image(image: Image.Image, filter_specs: List[Dict[str, Any]]) -> Image.Image:
+def _ocr_text_task(img_payload: Tuple[str, Tuple[int, int], bytes]) -> Dict[str, Any]:
+    try:
+        return {"text": _pool_read_text(img_payload)}
+    except Exception as e:
+        return {"error": f"{e.__class__.__name__}: {e}", "text": ""}
+
+
+def _ocr_pool_warmup_task() -> Dict[str, Any]:
+    try:
+        global _POOL_ENGINE
+        if _POOL_ENGINE is None:
+            _init_pool_reader()
+        return {
+            "ok": True,
+            "providers": _get_ort_providers(),
+            "device": get_ocr_device_summary(),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{e.__class__.__name__}: {e}"}
+
+
+def _prepare_filter_ocr_image_with_stats(
+    image: Image.Image,
+    filter_specs: List[Dict[str, Any]],
+) -> PreparedOCRImage:
     colors = [_filter_color_from_spec(spec) for spec in (filter_specs or []) if bool((spec or {}).get("enabled", True))]
     if not colors:
-        return preprocess_for_ocr(image, [])
+        return preprocess_for_ocr_with_stats(image, [])
 
     try:
         w, h = image.size
@@ -568,14 +654,22 @@ def _prepare_filter_ocr_image(image: Image.Image, filter_specs: List[Dict[str, A
         if max(w, h) > 800:
             scale = 800.0 / float(max(w, h))
             work = work.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR)
-        return preprocess_for_ocr(work, colors)
+        return preprocess_for_ocr_with_stats(work, colors)
     except Exception as e:
         raise RuntimeError(f"OCR preprocessing failed: {e}") from e
 
 
+def _prepare_filter_ocr_image(image: Image.Image, filter_specs: List[Dict[str, Any]]) -> Image.Image:
+    return _prepare_filter_ocr_image_with_stats(image, filter_specs).image
+
+
+def _prepared_has_empty_color_mask(prepared: PreparedOCRImage) -> bool:
+    return bool(prepared.has_color_filters and prepared.mask_pixels <= _OCR_EMPTY_COLOR_MASK_PIXELS)
+
+
 def _ocr_pool_task(
-    preprocessed_bytes: bytes,
-    raw_bytes: bytes,
+    preprocessed_payload: Tuple[str, Tuple[int, int], bytes],
+    raw_payload: Tuple[str, Tuple[int, int], bytes],
     filters: List[Dict[str, Any]],
     use_preprocess: bool,
 ) -> Dict[str, Any]:
@@ -583,18 +677,20 @@ def _ocr_pool_task(
     Run OCR inside a process worker and return all verified filter matches.
     """
     try:
-        broad_bytes = preprocessed_bytes if use_preprocess else raw_bytes
-        text = _pool_read_text(broad_bytes)
+        broad_payload = preprocessed_payload if use_preprocess else raw_payload
+        text = _pool_read_text(broad_payload)
         ranked = _rank_filter_candidates(text, filters)
         if not ranked:
             return {"matches": [], "text": text}
 
-        raw_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        raw_img = _image_from_payload(raw_payload).convert("RGB")
         matches: List[Dict[str, Any]] = []
         for score, spec in ranked:
             if use_preprocess:
-                verify_img = _prepare_filter_ocr_image(raw_img, [spec])
-                verify_text = _pool_read_text(_image_bytes(verify_img))
+                verify_prepared = _prepare_filter_ocr_image_with_stats(raw_img, [spec])
+                if _prepared_has_empty_color_mask(verify_prepared):
+                    continue
+                verify_text = _pool_read_text(_image_payload(verify_prepared.image))
             else:
                 verify_text = text
             verify_score = _score_text_against_target(verify_text, str(spec.get("target_text", "") or ""))
@@ -659,6 +755,7 @@ DEFAULT_OCR_FILTERS: List[Dict[str, Any]] = [
         "b": 255,
         "tol": 60,
         "enabled": True,
+        "solo_ocr": False,
         "target_text": MERCHANT_LINES["jester"],
         "cooldown_seconds": 900,
         "use_shared_area": True,
@@ -678,6 +775,7 @@ DEFAULT_OCR_FILTERS: List[Dict[str, Any]] = [
         "b": 255,
         "tol": 60,
         "enabled": True,
+        "solo_ocr": False,
         "target_text": MERCHANT_LINES["mari"],
         "cooldown_seconds": 900,
         "use_shared_area": True,
@@ -697,6 +795,7 @@ DEFAULT_OCR_FILTERS: List[Dict[str, Any]] = [
         "b": 68,
         "tol": 60,
         "enabled": True,
+        "solo_ocr": False,
         "target_text": MERCHANT_LINES["rin"],
         "cooldown_seconds": 900,
         "use_shared_area": True,
@@ -716,6 +815,7 @@ DEFAULT_OCR_FILTERS: List[Dict[str, Any]] = [
         "b": 255,
         "tol": 60,
         "enabled": True,
+        "solo_ocr": False,
         "target_text": "Start Puzzle",
         "cooldown_seconds": 600,
         "use_shared_area": False,
@@ -863,6 +963,14 @@ def _filter_uses_chat_area(spec: Dict[str, Any]) -> bool:
     return _filter_shared_area_id(spec) == "chat"
 
 
+def _filter_solo_ocr(spec: Dict[str, Any]) -> bool:
+    base = spec or {}
+    for key in ("solo_ocr", "isolate_color_filter", "isolated_ocr"):
+        if key in base:
+            return bool(base.get(key))
+    return False
+
+
 def _normalize_filter_user_ids(raw: Any) -> Optional[List[str]]:
     if raw is None:
         return None
@@ -925,6 +1033,9 @@ def _normalize_filter_spec(raw: Dict[str, Any], *, fallback_index: int = 0) -> D
         "w": float((roi_cfg or {}).get("w", 0.0) or 0.0),
         "h": float((roi_cfg or {}).get("h", 0.0) or 0.0),
     }
+    solo_ocr = _filter_solo_ocr(base)
+    if not any(key in base for key in ("solo_ocr", "isolate_color_filter", "isolated_ocr")):
+        solo_ocr = _filter_solo_ocr(default_spec)
 
     return {
         "id": filter_id,
@@ -934,6 +1045,7 @@ def _normalize_filter_spec(raw: Dict[str, Any], *, fallback_index: int = 0) -> D
         "b": int(base.get("b", default_spec.get("b", 255)) or 0),
         "tol": int(base.get("tol", default_spec.get("tol", 60)) or 0),
         "enabled": bool(base.get("enabled", default_spec.get("enabled", True))),
+        "solo_ocr": solo_ocr,
         "target_text": str(base.get("target_text", default_spec.get("target_text", name)) or "").strip(),
         "cooldown_seconds": float(base.get("cooldown_seconds", default_spec.get("cooldown_seconds", 600)) or 0.0),
         "use_shared_area": bool(use_shared_area),
@@ -1001,6 +1113,7 @@ def _migrate_legacy_filters(
                 "b": int(raw.get("b", default_spec.get("b", 255)) or 0),
                 "tol": int(raw.get("tol", default_spec.get("tol", 60)) or 0),
                 "enabled": bool(raw.get("enabled", True)),
+                "solo_ocr": False,
                 "target_text": str(default_spec.get("target_text") or name or "").strip(),
                 "cooldown_seconds": float(legacy_cooldown_seconds or default_spec.get("cooldown_seconds", 600) or 600),
                 "use_shared_area": bool(use_shared_area),
@@ -1220,12 +1333,13 @@ def capture_window_printwindow(hwnd: int) -> Optional[Image.Image]:
     mfc_dc = None
     save_dc = None
     save_bitmap = None
+    old_bitmap = None
     try:
         mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
         save_dc = mfc_dc.CreateCompatibleDC()
         save_bitmap = win32ui.CreateBitmap()
         save_bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
-        save_dc.SelectObject(save_bitmap)
+        old_bitmap = save_dc.SelectObject(save_bitmap)
         result = windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 0x00000002)
         if result != 1:
             return None
@@ -1244,6 +1358,11 @@ def capture_window_printwindow(hwnd: int) -> Optional[Image.Image]:
     except Exception:
         return None
     finally:
+        try:
+            if save_dc is not None and old_bitmap is not None:
+                save_dc.SelectObject(old_bitmap)
+        except Exception:
+            pass
         try:
             if save_bitmap is not None:
                 win32gui.DeleteObject(save_bitmap.GetHandle())
@@ -1289,7 +1408,7 @@ def capture_window_image(hwnd: int, roi: Optional[Tuple[float, float, float, flo
     return img
 
 
-def preprocess_for_ocr(image: Image.Image, color_filters: List[ColorFilter]) -> Image.Image:
+def preprocess_for_ocr_with_stats(image: Image.Image, color_filters: List[ColorFilter]) -> PreparedOCRImage:
     def _finalize_gray(gray_img: Image.Image) -> Image.Image:
         """Apply contrast, scale, and invert to prepare for OCR."""
         if gray_img.mode != "L":
@@ -1303,18 +1422,18 @@ def preprocess_for_ocr(image: Image.Image, color_filters: List[ColorFilter]) -> 
         return ImageOps.invert(resized)
 
     if not color_filters:
-        return _finalize_gray(image.convert("L"))
+        return PreparedOCRImage(image=_finalize_gray(image.convert("L")))
 
     rgb = image.convert("RGB")
     arr = np.asarray(rgb, dtype=np.uint8)
 
     h, w = arr.shape[0], arr.shape[1]
     if h == 0 or w == 0:
-        return _finalize_gray(rgb.convert("L"))
+        return PreparedOCRImage(image=_finalize_gray(rgb.convert("L")), has_color_filters=True)
 
     enabled_filters = [cf for cf in color_filters if cf.enabled]
     if not enabled_filters:
-        return _finalize_gray(rgb.convert("L"))
+        return PreparedOCRImage(image=_finalize_gray(rgb.convert("L")))
 
     keep_mask = np.zeros((h, w), dtype=bool)
     r_channel = arr[:, :, 0].astype(np.int16)
@@ -1337,7 +1456,16 @@ def preprocess_for_ocr(image: Image.Image, color_filters: List[ColorFilter]) -> 
     mask_arr[keep_mask] = [255, 255, 255]
     text_only = Image.fromarray(mask_arr, mode="RGB")
     gray = text_only.convert("L")
-    return _finalize_gray(gray)
+    return PreparedOCRImage(
+        image=_finalize_gray(gray),
+        has_color_filters=True,
+        mask_pixels=int(np.count_nonzero(keep_mask)),
+        total_pixels=int(h * w),
+    )
+
+
+def preprocess_for_ocr(image: Image.Image, color_filters: List[ColorFilter]) -> Image.Image:
+    return preprocess_for_ocr_with_stats(image, color_filters).image
 
 def _active_color_filters_from_specs(filter_specs: List[Dict[str, Any]]) -> List[ColorFilter]:
     colors: List[ColorFilter] = []
@@ -1387,21 +1515,54 @@ def _parse_device_id(raw: Any) -> Tuple[Optional[int], bool]:
 
 
 _ON_DEMAND_OCR_LOCK = threading.Lock()
-_ON_DEMAND_OCR_READER = None
+_ON_DEMAND_OCR_POOL: Optional[ProcessPoolExecutor] = None
 _ON_DEMAND_OCR_KEY: Optional[Tuple[Optional[int], bool]] = None
 
 
-def _on_demand_ocr_reader(device_id: Optional[int], force_cpu: bool):
-    global _ON_DEMAND_OCR_READER, _ON_DEMAND_OCR_KEY
+def _is_ort_device_lost_error(exc: BaseException) -> bool:
+    text = f"{exc.__class__.__name__}: {exc}".lower()
+    return any(
+        token in text
+        for token in (
+            "887a0005",
+            "887a0006",
+            "device instance has been suspended",
+            "device removed",
+            "deviceremoved",
+            "dml executionprovider",
+        )
+    )
+
+
+def _reset_on_demand_ocr_reader() -> None:
+    global _ON_DEMAND_OCR_POOL, _ON_DEMAND_OCR_KEY
+    if _ON_DEMAND_OCR_POOL is not None:
+        try:
+            _ON_DEMAND_OCR_POOL.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            try:
+                _ON_DEMAND_OCR_POOL.shutdown(wait=False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    _ON_DEMAND_OCR_POOL = None
+    _ON_DEMAND_OCR_KEY = None
+
+
+def _on_demand_ocr_pool(device_id: Optional[int], force_cpu: bool) -> ProcessPoolExecutor:
+    global _ON_DEMAND_OCR_POOL, _ON_DEMAND_OCR_KEY
     key = (device_id, bool(force_cpu))
-    if _ON_DEMAND_OCR_READER is None or _ON_DEMAND_OCR_KEY != key:
-        _ON_DEMAND_OCR_READER = _init_rapidocr_engine(
-            require_dml=not bool(force_cpu),
-            device_id=device_id,
-            force_cpu=bool(force_cpu),
+    if _ON_DEMAND_OCR_POOL is None or _ON_DEMAND_OCR_KEY != key:
+        _reset_on_demand_ocr_reader()
+        _ON_DEMAND_OCR_POOL = ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=get_context("spawn"),
+            initializer=_init_pool_reader,
+            initargs=(device_id, bool(force_cpu)),
         )
         _ON_DEMAND_OCR_KEY = key
-    return _ON_DEMAND_OCR_READER
+    return _ON_DEMAND_OCR_POOL
 
 
 def read_window_ocr_text_once(
@@ -1411,6 +1572,7 @@ def read_window_ocr_text_once(
     ocr_settings: Optional[Dict[str, Any]] = None,
     filter_ids: Optional[List[str]] = None,
     color_filters: Optional[List[Dict[str, Any]]] = None,
+    ocr_pool: Optional[ProcessPoolExecutor] = None,
 ) -> str:
     """
     Capture one window/ROI and run OCR using the same RapidOCR/preprocess stack as OCRWorker.
@@ -1461,14 +1623,38 @@ def read_window_ocr_text_once(
 
     use_preprocess = bool(cfg.get("use_preprocess", True))
     try:
-        img_for_ocr = _prepare_filter_ocr_image(raw_img, filters) if use_preprocess else raw_img
+        prepared = _prepare_filter_ocr_image_with_stats(raw_img, filters) if use_preprocess else PreparedOCRImage(raw_img)
+        if _prepared_has_empty_color_mask(prepared):
+            return ""
+        img_for_ocr = prepared.image
     except Exception:
         img_for_ocr = raw_img
 
     device_id, force_cpu = _parse_device_id(cfg.get("device_id"))
+    payload = _image_payload(img_for_ocr)
+
+    if ocr_pool is not None:
+        result = ocr_pool.submit(_ocr_text_task, payload).result()
+        if isinstance(result, dict) and result.get("error"):
+            raise RuntimeError(str(result.get("error")))
+        return str((result or {}).get("text") or "") if isinstance(result, dict) else ""
+
     with _ON_DEMAND_OCR_LOCK:
-        reader = _on_demand_ocr_reader(device_id, force_cpu)
-        return _rapidocr_text_only(reader, np.array(img_for_ocr))
+        pool = _on_demand_ocr_pool(device_id, force_cpu)
+        try:
+            result = pool.submit(_ocr_text_task, payload).result()
+            if isinstance(result, dict) and result.get("error"):
+                raise RuntimeError(str(result.get("error")))
+            return str((result or {}).get("text") or "") if isinstance(result, dict) else ""
+        except Exception as e:
+            if not _is_ort_device_lost_error(e):
+                raise
+            _reset_on_demand_ocr_reader()
+            retry_pool = _on_demand_ocr_pool(device_id, force_cpu)
+            result = retry_pool.submit(_ocr_text_task, payload).result()
+            if isinstance(result, dict) and result.get("error"):
+                raise RuntimeError(str(result.get("error")))
+            return str((result or {}).get("text") or "") if isinstance(result, dict) else ""
 
 
 class OCRWorker(QThread):
@@ -1500,7 +1686,6 @@ class OCRWorker(QThread):
         self._capture_rr_index = 0
         self._stop_event = threading.Event()
         self._last_log: Optional[str] = None
-        self._reader = None
         self._ocr_pool: Optional[ProcessPoolExecutor] = None
         self._mp_ctx = get_context("spawn")
         self._frame_hash_size = _FRAME_HASH_SIZE
@@ -1508,6 +1693,14 @@ class OCRWorker(QThread):
         self._last_frame_hash_by_key: Dict[str, int] = {}
         self._verification_next_check_by_pid: Dict[int, float] = {}
         self._verification_check_interval = 2.0
+        self._window_snapshot_lock = threading.Lock()
+        self._window_snapshot_ready = threading.Event()
+        self._window_snapshot: List[RobloxWindow] = []
+        self._window_snapshot_at = 0.0
+        self._window_snapshot_elapsed = 0.0
+        self._window_snapshot_error = ""
+        self._window_enumerator_thread: Optional[threading.Thread] = None
+        self._window_enum_interval_seconds = _WINDOW_ENUM_INTERVAL_SECONDS
 
         self._send_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr-send")
 
@@ -1519,8 +1712,76 @@ class OCRWorker(QThread):
     def update_settings(self, ocr_settings: Dict[str, Any], ms_settings: Optional[Dict[str, Any]] = None) -> None:
         self._apply_cfg(ocr_settings or {}, ms_settings or self._ms_cfg)
 
+    # -------------------- window enumeration cache --------------------
+    def _start_window_enumerator(self) -> None:
+        thread = getattr(self, "_window_enumerator_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        with self._window_snapshot_lock:
+            self._window_snapshot = []
+            self._window_snapshot_at = 0.0
+            self._window_snapshot_elapsed = 0.0
+            self._window_snapshot_error = ""
+        self._window_snapshot_ready.clear()
+        thread = threading.Thread(
+            target=self._window_enumerator_loop,
+            name="ocr-window-enumerator",
+            daemon=True,
+        )
+        self._window_enumerator_thread = thread
+        thread.start()
+
+    def _stop_window_enumerator(self) -> None:
+        thread = getattr(self, "_window_enumerator_thread", None)
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._window_enumerator_thread = None
+
+    def _window_enumerator_loop(self) -> None:
+        while not self._stop_event.is_set():
+            started = time.perf_counter()
+            windows: List[RobloxWindow] = []
+            error_text = ""
+            try:
+                windows = enum_roblox_windows()
+            except Exception as e:
+                error_text = repr(e)
+
+            elapsed = time.perf_counter() - started
+            with self._window_snapshot_lock:
+                self._window_snapshot = list(windows or [])
+                self._window_snapshot_at = time.perf_counter()
+                self._window_snapshot_elapsed = elapsed
+                self._window_snapshot_error = error_text
+            self._window_snapshot_ready.set()
+
+            try:
+                interval = max(0.05, float(getattr(self, "_window_enum_interval_seconds", _WINDOW_ENUM_INTERVAL_SECONDS)))
+            except Exception:
+                interval = _WINDOW_ENUM_INTERVAL_SECONDS
+            self._stop_event.wait(timeout=max(0.0, interval - (time.perf_counter() - started)))
+
+    def _get_window_snapshot(self) -> Tuple[List[RobloxWindow], Optional[float], Optional[float], bool, str]:
+        if not self._window_snapshot_ready.is_set():
+            try:
+                interval = max(0.05, float(getattr(self, "_window_enum_interval_seconds", _WINDOW_ENUM_INTERVAL_SECONDS)))
+            except Exception:
+                interval = _WINDOW_ENUM_INTERVAL_SECONDS
+            self._window_snapshot_ready.wait(timeout=min(0.25, interval))
+
+        with self._window_snapshot_lock:
+            windows = list(self._window_snapshot or [])
+            snapshot_at = float(self._window_snapshot_at or 0.0)
+            enum_elapsed = float(self._window_snapshot_elapsed or 0.0)
+            error_text = str(self._window_snapshot_error or "")
+
+        if snapshot_at <= 0.0:
+            return windows, None, None, False, error_text
+        return windows, max(0.0, time.perf_counter() - snapshot_at), enum_elapsed, True, error_text
+
     # -------------------------- core loop --------------------------
     def run(self) -> None:
+        global _OCR_DEVICE_SUMMARY
         if RapidOCR is None or ort is None:
             missing: List[str] = []
             if RapidOCR is None:
@@ -1532,18 +1793,34 @@ class OCRWorker(QThread):
 
         self._stop_event.clear()
         loop_idx = 0
-        try:
-            self._reader = self._init_reader()
-        except Exception as e:  # pragma: no cover - GPU/driver specific
-            self._log(f"[OCR] Failed to initialize RapidOCR (DirectML): {e}")
+        providers = _get_ort_providers()
+        if providers:
+            self._log(f"[ORT] Available providers: {providers}")
+        else:
+            self._log("[ORT] No ONNX Runtime providers detected.")
+        if not self._force_cpu and "DmlExecutionProvider" not in providers:
+            _OCR_DEVICE_SUMMARY = "Unavailable (DirectML provider not available)"
+            self._log("[OCR] Failed to initialize RapidOCR (DirectML): DirectML provider is not available.")
             return
         try:
             self._ocr_pool = ProcessPoolExecutor(
-                max_workers=max(1, self._workers),
+                max_workers=1,
                 mp_context=self._mp_ctx,
                 initializer=_init_pool_reader,
                 initargs=(self._device_id, self._force_cpu),
             )
+            warmup = self._ocr_pool.submit(_ocr_pool_warmup_task)
+            warmup_result = warmup.result()
+            if not isinstance(warmup_result, dict) or not warmup_result.get("ok"):
+                err = warmup_result.get("error") if isinstance(warmup_result, dict) else "unknown error"
+                self._log(f"[OCR] Failed to initialize OCR process: {err}")
+                self._shutdown_ocr_pool()
+                return
+            _OCR_DEVICE_SUMMARY = str(warmup_result.get("device") or "")
+            if self._force_cpu:
+                self._log("[ORT] OCR initialized on CPU in the OCR process.")
+            elif "DmlExecutionProvider" in providers:
+                self._log("[ORT] DirectML detected. OCR initialized in one OCR process.")
         except Exception as e:
             self._log(f"[OCR] Failed to start OCR process pool: {e}")
             return
@@ -1551,27 +1828,63 @@ class OCRWorker(QThread):
         try:
             self.status_signal.emit("running")
             self._log("OCR worker started.")
+            self._start_window_enumerator()
 
             while not self._stop_event.is_set():
                 loop_idx += 1
-                start = time.time()
+                loop_started = time.perf_counter()
                 try:
-                    windows = enum_roblox_windows()
-                    self._log(f"[Loop {loop_idx}] Enumerated {len(windows)} Roblox window(s).")
+                    step_started = time.perf_counter()
+                    windows, snapshot_age, enum_elapsed, snapshot_ready, snapshot_error = self._get_window_snapshot()
+                    snapshot_load_elapsed = time.perf_counter() - step_started
+                    if snapshot_ready:
+                        self._log(
+                            f"[Loop {loop_idx}] Loaded cached window snapshot: {len(windows)} Roblox window(s) "
+                            f"in {_format_step_duration(snapshot_load_elapsed)} "
+                            f"(age {_format_step_duration(snapshot_age or 0.0)}, "
+                            f"enum {_format_step_duration(enum_elapsed or 0.0)})."
+                        )
+                    else:
+                        self._log(
+                            f"[Loop {loop_idx}] Window snapshot pending after "
+                            f"{_format_step_duration(snapshot_load_elapsed)}."
+                        )
+                    if snapshot_error:
+                        self._log(f"[OCR] Last window enumeration error: {snapshot_error}")
                     if not windows:
-                        self._log("No Roblox windows found.")
+                        if snapshot_ready:
+                            self._log("No Roblox windows found.")
+                            sleep_reason = "no windows"
+                        else:
+                            self._log(f"[Loop {loop_idx}] No cached windows available yet.")
+                            sleep_reason = "snapshot pending"
                         sleep_for = max(0.0, getattr(self, "_batch_delay_seconds", 1.0))
-                        self._log(f"[Loop {loop_idx}] Sleeping {sleep_for:.2f}s (no windows).")
-                        time.sleep(sleep_for)
+                        active_elapsed = time.perf_counter() - loop_started
+                        self._log(
+                            f"[Loop {loop_idx}] Sleeping {sleep_for:.2f}s ({sleep_reason}; "
+                            f"active {_format_step_duration(active_elapsed)})."
+                        )
+                        self._stop_event.wait(timeout=sleep_for)
                         continue
 
+                    step_started = time.perf_counter()
                     work_list = self._select_windows(windows)
-                    self._log(f"[Loop {loop_idx}] Selected {len(work_list)} window(s) for capture.")
+                    select_elapsed = time.perf_counter() - step_started
+                    self._log(
+                        f"[Loop {loop_idx}] Selected {len(work_list)} window(s) for capture "
+                        f"in {_format_step_duration(select_elapsed)}."
+                    )
                     if work_list:
+                        step_started = time.perf_counter()
                         try:
                             self._run_verification_checks(work_list)
                         except Exception as e:
                             self._log(f"[Verification] check error: {e}")
+                        verification_elapsed = time.perf_counter() - step_started
+                        self._log(
+                            f"[Loop {loop_idx}] Verification checks finished "
+                            f"in {_format_step_duration(verification_elapsed)}."
+                        )
 
                         remaining_slots = max(1, int(getattr(self, "_max_captures_per_second", 1) or 1))
                         processed_count = 0
@@ -1580,76 +1893,136 @@ class OCRWorker(QThread):
                         future_map = {}
 
                         pending_groups: List[Dict[str, Any]] = []
+                        step_started = time.perf_counter()
                         for win in work_list:
                             groups = self._build_capture_groups(int(getattr(win, "pid", 0) or 0))
                             if groups:
                                 pending_groups.append({"win": win, "groups": list(groups)})
+                        build_groups_elapsed = time.perf_counter() - step_started
+                        total_groups = sum(len(item.get("groups") or []) for item in pending_groups)
+                        self._log(
+                            f"[Loop {loop_idx}] Built {total_groups} capture group(s) "
+                            f"in {_format_step_duration(build_groups_elapsed)}."
+                        )
 
-                        while pending_groups and not self._stop_event.is_set() and remaining_slots > 0:
-                            next_round: List[Dict[str, Any]] = []
-                            for entry in pending_groups:
-                                if self._stop_event.is_set() or remaining_slots <= 0:
+                        capture_elapsed = 0.0
+                        payload_elapsed = 0.0
+                        preprocess_elapsed = 0.0
+                        frame_compare_elapsed = 0.0
+                        dispatch_elapsed = 0.0
+                        skipped_empty_mask = 0
+                        dispatched_count = 0
+
+                        for entry in pending_groups:
+                            if self._stop_event.is_set() or remaining_slots <= 0:
+                                break
+
+                            win = entry.get("win")
+                            groups = list(entry.get("groups") or [])
+                            if win is None or not groups:
+                                continue
+
+                            step_started = time.perf_counter()
+                            full_img = capture_window_image(win.hwnd)
+                            capture_elapsed += time.perf_counter() - step_started
+                            remaining_slots -= 1
+                            if full_img is None:
+                                continue
+
+                            captured_count += 1
+                            roi_cache: Dict[str, Image.Image] = {}
+                            raw_payload_cache: Dict[str, Tuple[str, Tuple[int, int], bytes]] = {}
+
+                            for group in groups:
+                                if self._stop_event.is_set():
                                     break
 
-                                win = entry.get("win")
-                                groups = list(entry.get("groups") or [])
-                                if win is None or not groups:
+                                capture_key = str(group.get("capture_key") or group.get("cache_key") or "")
+                                raw_img = roi_cache.get(capture_key)
+                                if raw_img is None:
+                                    raw_img = crop_image_with_roi(full_img, group["roi"])
+                                    roi_cache[capture_key] = raw_img
+
+                                try:
+                                    step_started = time.perf_counter()
+                                    prepared = (
+                                        _prepare_filter_ocr_image_with_stats(raw_img, group["filters"])
+                                        if self._use_preprocess
+                                        else PreparedOCRImage(raw_img)
+                                    )
+                                    preprocess_elapsed += time.perf_counter() - step_started
+                                except Exception as e:
+                                    preprocess_elapsed += time.perf_counter() - step_started
+                                    self._log(f"[OCR] Preprocess failed for PID {win.pid}: {e}")
+                                    self._log(traceback.format_exc())
+                                    prepared = PreparedOCRImage(raw_img)
+
+                                if _prepared_has_empty_color_mask(prepared):
+                                    skipped_empty_mask += 1
                                     continue
 
-                                group = groups.pop(0)
-                                raw_img = capture_window_image(win.hwnd, group["roi"])
-                                remaining_slots -= 1
-                                if raw_img is not None:
-                                    captured_count += 1
-                                    try:
-                                        prep_img = self._preprocess_image(raw_img, group["filters"])
-                                    except Exception as e:
-                                        self._log(f"[OCR] Preprocess failed for PID {win.pid}: {e}")
-                                        self._log(traceback.format_exc())
-                                        prep_img = raw_img
+                                prep_img = prepared.image
+                                step_started = time.perf_counter()
+                                skip, _diff_pct = self._skip_ocr_for_similar_frame(
+                                    self._frame_cache_key(int(win.pid), str(group["cache_key"])),
+                                    prep_img,
+                                )
+                                frame_compare_elapsed += time.perf_counter() - step_started
+                                if skip:
+                                    skipped_similar += 1
+                                    continue
 
-                                    skip, _diff_pct = self._skip_ocr_for_similar_frame(
-                                        self._frame_cache_key(int(win.pid), str(group["cache_key"])),
-                                        prep_img,
+                                if not self._ocr_pool:
+                                    self._log("[OCR] Process pool is unavailable; skipping OCR task.")
+                                    continue
+
+                                try:
+                                    step_started = time.perf_counter()
+                                    raw_payload = raw_payload_cache.get(capture_key)
+                                    if raw_payload is None:
+                                        raw_payload = _image_payload(raw_img)
+                                        raw_payload_cache[capture_key] = raw_payload
+                                    prep_payload = _image_payload(prep_img)
+                                    payload_elapsed += time.perf_counter() - step_started
+
+                                    step_started = time.perf_counter()
+                                    fut = self._ocr_pool.submit(
+                                        _ocr_pool_task,
+                                        prep_payload,
+                                        raw_payload,
+                                        group["filters"],
+                                        self._use_preprocess,
                                     )
-                                    if skip:
-                                        skipped_similar += 1
-                                    elif self._ocr_pool:
-                                        try:
-                                            fut = self._ocr_pool.submit(
-                                                _ocr_pool_task,
-                                                _image_bytes(prep_img),
-                                                _image_bytes(raw_img),
-                                                group["filters"],
-                                                self._use_preprocess,
-                                            )
-                                            future_map[fut] = {
-                                                "win": win,
-                                                "raw_img": raw_img,
-                                                "group": group,
-                                            }
-                                        except Exception as e:
-                                            self._log(f"[OCR] Failed to dispatch process task for PID {win.pid}: {e}")
-                                    else:
-                                        try:
-                                            self._process_group_preprocessed(
-                                                win,
-                                                raw_img,
-                                                prep_img,
-                                                group["filters"],
-                                                group["label"],
-                                            )
-                                            processed_count += 1
-                                        except Exception as e:
-                                            self._log(f"[OCR] Worker error for PID {win.pid}: {e}")
+                                    dispatch_elapsed += time.perf_counter() - step_started
+                                    dispatched_count += 1
+                                    future_map[fut] = {
+                                        "win": win,
+                                        "raw_img": raw_img,
+                                        "group": group,
+                                    }
+                                except Exception as e:
+                                    dispatch_elapsed += time.perf_counter() - step_started
+                                    self._log(f"[OCR] Failed to dispatch process task for PID {win.pid}: {e}")
+                                    if isinstance(e, BrokenProcessPool):
+                                        self._restart_ocr_pool()
 
-                                if groups:
-                                    next_round.append({"win": win, "groups": groups})
-                            pending_groups = next_round
-
-                        self._log(f"[Loop {loop_idx}] Captured {captured_count} ROI image(s).")
+                        self._log(
+                            f"[Loop {loop_idx}] Captured {captured_count} window image(s) "
+                            f"in {_format_step_duration(capture_elapsed)}."
+                        )
+                        self._log(
+                            f"[Loop {loop_idx}] Prepared OCR tasks in "
+                            f"{_format_step_duration(payload_elapsed + preprocess_elapsed + frame_compare_elapsed + dispatch_elapsed)} "
+                            f"(payload {_format_step_duration(payload_elapsed)}, "
+                            f"preprocess {_format_step_duration(preprocess_elapsed)}, "
+                            f"frame compare {_format_step_duration(frame_compare_elapsed)}, "
+                            f"empty masks {skipped_empty_mask}, "
+                            f"dispatch {dispatched_count} task(s) in {_format_step_duration(dispatch_elapsed)})."
+                        )
 
                         pending = set(future_map.keys())
+                        ocr_wait_elapsed = 0.0
+                        result_handle_elapsed = 0.0
                         while pending:
                             if self._stop_event.is_set():
                                 for fut in list(pending):
@@ -1659,69 +2032,91 @@ class OCRWorker(QThread):
                                         pass
                                 break
 
+                            step_started = time.perf_counter()
                             done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                            ocr_wait_elapsed += time.perf_counter() - step_started
                             if not done:
                                 continue
 
                             for fut in done:
-                                meta = future_map.get(fut) or {}
-                                win = meta.get("win")
-                                raw_img = meta.get("raw_img")
-                                group = meta.get("group") or {}
-                                if win is None or raw_img is None:
-                                    continue
-                                if self._stop_event.is_set():
-                                    break
+                                step_started = time.perf_counter()
                                 try:
-                                    result = fut.result()
-                                except Exception as e:
-                                    self._log(f"[OCR] Worker process error for PID {win.pid}: {e}")
-                                    continue
-
-                                if not isinstance(result, dict):
-                                    continue
-                                if result.get("error"):
-                                    self._log(f"[OCR] Worker reported error for PID {win.pid}: {result['error']}")
-                                    continue
-
-                                if getattr(self, "_log_ocr_text", False):
-                                    text = str(result.get("text") or "").strip()
-                                    if text:
-                                        self._log(f"[OCR TEXT] PID {win.pid} [{group.get('label') or 'group'}]:\n{text}")
-
-                                matches = result.get("matches")
-                                if not isinstance(matches, list):
-                                    legacy_match = result.get("match")
-                                    matches = [legacy_match] if isinstance(legacy_match, dict) else []
-                                for match in matches:
-                                    if not isinstance(match, dict):
+                                    meta = future_map.get(fut) or {}
+                                    win = meta.get("win")
+                                    raw_img = meta.get("raw_img")
+                                    group = meta.get("group") or {}
+                                    if win is None or raw_img is None:
                                         continue
-                                    spec = self._filter_spec_by_id(str(match.get("id") or ""))
-                                    if spec:
-                                        if self._handle_filter_match(spec, win.pid, raw_img):
-                                            self._set_filter_cooldown(win.pid, spec)
-                                processed_count += 1
+                                    if self._stop_event.is_set():
+                                        break
+                                    try:
+                                        result = fut.result()
+                                    except Exception as e:
+                                        self._log(f"[OCR] Worker process error for PID {win.pid}: {e}")
+                                        if isinstance(e, BrokenProcessPool):
+                                            self._restart_ocr_pool()
+                                        continue
+
+                                    if not isinstance(result, dict):
+                                        continue
+                                    if result.get("error"):
+                                        self._log(f"[OCR] Worker reported error for PID {win.pid}: {result['error']}")
+                                        continue
+
+                                    if getattr(self, "_log_ocr_text", False):
+                                        text = str(result.get("text") or "").strip()
+                                        if text:
+                                            self._log(f"[OCR TEXT] PID {win.pid} [{group.get('label') or 'group'}]:\n{text}")
+
+                                    matches = result.get("matches")
+                                    if not isinstance(matches, list):
+                                        legacy_match = result.get("match")
+                                        matches = [legacy_match] if isinstance(legacy_match, dict) else []
+                                    for match in matches:
+                                        if not isinstance(match, dict):
+                                            continue
+                                        spec = self._filter_spec_by_id(str(match.get("id") or ""))
+                                        if spec:
+                                            if self._handle_filter_match(spec, win.pid, raw_img):
+                                                self._set_filter_cooldown(win.pid, spec)
+                                    processed_count += 1
+                                finally:
+                                    result_handle_elapsed += time.perf_counter() - step_started
 
                         self._log(
-                            f"[Loop {loop_idx}] Completed OCR for {processed_count} image(s) (skipped {skipped_similar} similar)."
+                            f"[Loop {loop_idx}] Completed OCR for {processed_count} image(s) "
+                            f"(skipped {skipped_similar} similar) in "
+                            f"{_format_step_duration(ocr_wait_elapsed + result_handle_elapsed)}."
+                        )
+                        self._log(
+                            f"[Loop {loop_idx}] OCR wait/result handling took "
+                            f"{_format_step_duration(ocr_wait_elapsed + result_handle_elapsed)} "
+                            f"(wait {_format_step_duration(ocr_wait_elapsed)}, "
+                            f"handle {_format_step_duration(result_handle_elapsed)})."
                         )
                     else:
                         self._log(f"[Loop {loop_idx}] No windows eligible for capture this cycle.")
 
-                    elapsed = time.time() - start
+                    elapsed = time.perf_counter() - loop_started
+                    self._log(f"[Loop {loop_idx}] Active loop time {_format_step_duration(elapsed)}.")
                     target_delay = max(0.0, getattr(self, "_batch_delay_seconds", 1.0))
                     if elapsed < target_delay:
                         sleep_for = max(0.0, target_delay - elapsed)
-                        self._log(f"[Loop {loop_idx}] Sleeping {sleep_for:.2f}s to throttle loop.")
-                        time.sleep(sleep_for)
+                        self._log(
+                            f"[Loop {loop_idx}] Sleeping {sleep_for:.2f}s to throttle loop "
+                            f"(target {target_delay:.2f}s)."
+                        )
+                        self._stop_event.wait(timeout=sleep_for)
                 except Exception as e:
                     self._log(f"[OCR] Loop error: {e}")
                     self._log(traceback.format_exc())
-                    time.sleep(1.0)
+                    self._stop_event.wait(timeout=1.0)
 
             self._log("OCR worker stopped.")
             self.status_signal.emit("stopped")
         finally:
+            self._stop_event.set()
+            self._stop_window_enumerator()
             self._shutdown_ocr_pool()
             self._shutdown_send_pool()
 
@@ -1731,43 +2126,6 @@ class OCRWorker(QThread):
             return image
 
         return _prepare_filter_ocr_image(image, filter_specs)
-
-    def _process_group_preprocessed(
-        self,
-        win,
-        raw_img: Image.Image,
-        img_for_ocr: Image.Image,
-        filters: List[Dict[str, Any]],
-        label: str,
-    ) -> None:
-        try:
-            source_img = img_for_ocr if self._use_preprocess else raw_img
-            text = _rapidocr_text_only(self._reader, np.array(source_img))
-        except Exception as e:
-            self._log(f"[OCR error pid {win.pid}] {e}")
-            return
-
-        if getattr(self, "_log_ocr_text", False):
-            clean_text = str(text or "").strip()
-            if clean_text:
-                self._log(f"[OCR TEXT] PID {win.pid} [{label}]:\n{clean_text}")
-
-        ranked = _rank_filter_candidates(text, filters)
-        if not ranked:
-            return
-
-        for _score, spec in ranked:
-            try:
-                verify_img = self._preprocess_image(raw_img, [spec]) if self._use_preprocess else raw_img
-                verify_text = _rapidocr_text_only(self._reader, np.array(verify_img))
-            except Exception as e:
-                self._log(f"[OCR verify pid {win.pid}] {e}")
-                continue
-
-            verify_score = _score_text_against_target(verify_text, str(spec.get("target_text", "") or ""))
-            if verify_score >= DEFAULT_OCR_MATCH_THRESHOLD:
-                if self._handle_filter_match(spec, win.pid, raw_img):
-                    self._set_filter_cooldown(win.pid, spec)
 
     def _handle_detection(self, merchant: str, pid: int, raw_img: Image.Image) -> None:
         ctx = self._context_provider(pid) if self._context_provider else {}
@@ -1890,6 +2248,15 @@ class OCRWorker(QThread):
             "server_label": str((ctx or {}).get("server_label") or "").strip(),
             "ps_link": str((ctx or {}).get("ps_link") or "").strip(),
         }
+        discord_ping = str(
+            (ctx or {}).get("discord_ping")
+            or (ctx or {}).get("discord_user_ping")
+            or (ctx or {}).get("discord_mention")
+            or ""
+        ).strip()
+        values["discord_ping"] = discord_ping
+        values["discord_user_ping"] = discord_ping
+        values["discord_mention"] = discord_ping
 
         class _SafeFormatDict(dict):
             def __missing__(self, key):
@@ -2090,13 +2457,19 @@ class OCRWorker(QThread):
             roi = self._effective_filter_roi(spec)
             if roi is None:
                 continue
-            cache_key = self._roi_cache_key(roi, use_chat_area=_filter_uses_chat_area(spec))
+            capture_key = self._roi_cache_key(roi, use_chat_area=_filter_uses_chat_area(spec))
+            cache_key = capture_key
+            if _filter_solo_ocr(spec):
+                filter_key = str(spec.get("id") or spec.get("name") or "filter").strip() or "filter"
+                cache_key = f"{cache_key}|solo:{filter_key}"
             group = groups.setdefault(
                 cache_key,
                 {
                     "roi": roi,
                     "filters": [],
                     "cache_key": cache_key,
+                    "capture_key": capture_key,
+                    "solo_ocr": bool(_filter_solo_ocr(spec)),
                 },
             )
             group["filters"].append(spec)
@@ -2106,7 +2479,13 @@ class OCRWorker(QThread):
             names = [str(spec.get("name", "") or "").strip() for spec in group.get("filters", [])]
             group["label"] = ", ".join(name for name in names if name) or "filters"
             out.append(group)
-        out.sort(key=lambda item: str(item.get("label", "")).lower())
+        out.sort(
+            key=lambda item: (
+                str(item.get("capture_key") or item.get("cache_key") or ""),
+                1 if bool(item.get("solo_ocr", False)) else 0,
+                str(item.get("label", "")).lower(),
+            )
+        )
         return out
 
     def _filter_group_key(self, spec: Dict[str, Any]) -> str:
@@ -2185,6 +2564,13 @@ class OCRWorker(QThread):
         except Exception:
             self._batch_delay_seconds = 1.0
         try:
+            self._window_enum_interval_seconds = max(
+                0.05,
+                min(5.0, float(self._ocr_cfg.get("window_enum_interval_seconds", _WINDOW_ENUM_INTERVAL_SECONDS))),
+            )
+        except Exception:
+            self._window_enum_interval_seconds = _WINDOW_ENUM_INTERVAL_SECONDS
+        try:
             self._verification_check_interval = max(
                 0.5,
                 float(self._ocr_cfg.get("verification_check_interval", 2.0)),
@@ -2229,33 +2615,12 @@ class OCRWorker(QThread):
                 pass
         if (
             (prev_device_id != self._device_id or prev_force_cpu != self._force_cpu)
-            and getattr(self, "_reader", None) is not None
+            and getattr(self, "_ocr_pool", None) is not None
         ):
             try:
                 self._log("[OCR] Device change detected; restart OCR to apply.")
             except Exception:
                 pass
-
-    def _init_reader(self):
-        try:
-            providers = _get_ort_providers()
-            if providers:
-                self._log(f"[ORT] Available providers: {providers}")
-            else:
-                self._log("[ORT] No ONNX Runtime providers detected.")
-
-            engine = _init_rapidocr_engine(
-                require_dml=not self._force_cpu,
-                device_id=self._device_id,
-                force_cpu=self._force_cpu,
-            )
-            if self._force_cpu:
-                self._log("[ORT] OCR initialized on CPU.")
-            elif "DmlExecutionProvider" in providers:
-                self._log("[ORT] DirectML detected. RapidOCR initialized with DirectML.")
-            return engine
-        except Exception as e:
-            raise RuntimeError(f"RapidOCR init failed: {e}")
 
     def _shutdown_ocr_pool(self) -> None:
         if self._ocr_pool:
@@ -2266,6 +2631,24 @@ class OCRWorker(QThread):
             except Exception:
                 pass
             self._ocr_pool = None
+
+    def _restart_ocr_pool(self) -> bool:
+        if self._stop_event.is_set():
+            return False
+        self._log("[OCR] process pool broke; restarting OCR pool.")
+        self._shutdown_ocr_pool()
+        try:
+            self._ocr_pool = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=self._mp_ctx,
+                initializer=_init_pool_reader,
+                initargs=(self._device_id, self._force_cpu),
+            )
+            return True
+        except Exception as e:
+            self._ocr_pool = None
+            self._log(f"[OCR] Failed to restart OCR process pool: {e}")
+            return False
 
     def _shutdown_send_pool(self) -> None:
         pool = getattr(self, "_send_pool", None)
@@ -2285,6 +2668,22 @@ class OCRWorker(QThread):
         except Exception:
             pass
 
+    def _run_text_ocr_in_pool(self, image: Image.Image) -> str:
+        pool = getattr(self, "_ocr_pool", None)
+        if pool is None:
+            raise RuntimeError("OCR process pool is not running")
+        try:
+            result = pool.submit(_ocr_text_task, _image_payload(image)).result()
+        except Exception as e:
+            if isinstance(e, BrokenProcessPool):
+                self._restart_ocr_pool()
+            raise
+        if not isinstance(result, dict):
+            return ""
+        if result.get("error"):
+            raise RuntimeError(str(result.get("error")))
+        return str(result.get("text") or "")
+
     def _emit_filter_match_signal(self, pid: int, filter_id: str, filter_name: str) -> None:
         try:
             self.filter_match_signal.emit(int(pid), str(filter_id or "").strip(), str(filter_name or "").strip())
@@ -2302,7 +2701,7 @@ class OCRWorker(QThread):
         return "startpuzzle" in squashed
 
     def _run_verification_checks(self, windows: List[Any]) -> None:
-        if self._reader is None:
+        if self._ocr_pool is None:
             return
 
         now = time.time()
@@ -2336,6 +2735,11 @@ class OCRWorker(QThread):
             if not verification_specs:
                 continue
 
+            full_img = capture_window_image(win.hwnd)
+            if full_img is None:
+                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+                continue
+
             matched = False
             for spec in verification_specs:
                 if self._stop_event.is_set():
@@ -2345,13 +2749,17 @@ class OCRWorker(QThread):
                 if roi is None:
                     continue
 
-                img = capture_window_image(win.hwnd, roi)
-                if img is None:
-                    continue
+                img = crop_image_with_roi(full_img, roi)
 
                 try:
-                    img_for_ocr = self._preprocess_image(img, [spec]) if self._use_preprocess else img
-                    text = _rapidocr_text_only(self._reader, np.array(img_for_ocr))
+                    prepared = (
+                        _prepare_filter_ocr_image_with_stats(img, [spec])
+                        if self._use_preprocess
+                        else PreparedOCRImage(img)
+                    )
+                    if _prepared_has_empty_color_mask(prepared):
+                        continue
+                    text = self._run_text_ocr_in_pool(prepared.image)
                 except Exception as e:
                     self._log(f"[Verification] OCR error for PID {pid}: {e}")
                     continue

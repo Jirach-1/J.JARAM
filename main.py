@@ -8,6 +8,7 @@ import requests
 import json
 from log_utils import find_log_for_username, refresh_username_log_map
 from pathlib import Path
+from launch_priority import launch_priority_sort_key, sort_user_items_by_launch_priority
 
 try:
     from roblox_cookie_utils import (
@@ -156,6 +157,17 @@ except ImportError:
             self.app_name = "JARAM"
             self.config_dir = self._get_config_directory()
             self.users_file = self.config_dir / "users.json"
+            self.settings_file = self.config_dir / "settings.json"
+            self.default_settings = {
+                "window_limit": 1,
+                "timeouts": {
+                    "offline": 25,
+                    "launch_delay": 10,
+                    "initial_delay": 10,
+                    "kill_timeout": 1740,
+                    "poll_interval": 10,
+                },
+            }
             self._ensure_directories()
 
         def _get_config_directory(self):
@@ -840,6 +852,13 @@ class ProcessManager:
         return eliminated
 
 class GameLauncher:
+    # Guards all GameLauncher instances in this Python process. The instance-level
+    # guard below is not enough when a manual launcher, old ramp thread, or resumed
+    # worker owns a different GameLauncher object.
+    _global_launch_inflight_lock = threading.Lock()
+    _global_launch_inflight = set()
+    _global_launch_attempt_lock = threading.Lock()
+
     def __init__(self,
                  target_place,
                  process_mgr,
@@ -866,6 +885,14 @@ class GameLauncher:
         # relaunch scheduler, disconnect handling, manual restarts, etc.).
         self._launch_inflight_lock = threading.Lock()
         self._launch_inflight = set()
+
+    def _record_account_launch_activity(self, user_id, launched_at=None) -> None:
+        marker = getattr(self.cfg, "mark_user_launched", None)
+        if callable(marker):
+            try:
+                marker(str(user_id), launched_at if launched_at is not None else time.time())
+            except Exception:
+                pass
 
 
     def _extract_private_server_info(self, private_server_link, cookie=None):
@@ -1032,7 +1059,22 @@ class GameLauncher:
         except Exception:
             return False
 
-    def _maybe_enforce_roblox_window_geometry(self, user_id: str, pid: int) -> None:
+    def _schedule_roblox_window_geometry_retry(self, user_id: str, pid: int) -> None:
+        """Retry a failed launch-time geometry update once after Roblox settles."""
+        try:
+            timer = threading.Timer(
+                5.0,
+                self._maybe_enforce_roblox_window_geometry,
+                args=(str(user_id), int(pid)),
+                kwargs={"is_retry": True},
+            )
+            timer.daemon = True
+            timer.start()
+            self.log(f"[WINPOS RETRY] uid={user_id} pid={pid} scheduled_in=5s")
+        except Exception:
+            pass
+
+    def _maybe_enforce_roblox_window_geometry(self, user_id: str, pid: int, *, is_retry: bool = False) -> None:
         try:
             if hasattr(self.cfg, "peek_settings"):
                 settings = self.cfg.peek_settings() or {}
@@ -1080,6 +1122,8 @@ class GameLauncher:
                 self.log(f"[WINPOS FAIL] uid={user_id} pid={pid} err={e!r}")
             except Exception:
                 pass
+            if not is_retry:
+                self._schedule_roblox_window_geometry_retry(user_id, pid)
             return
 
         flags = int(win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
@@ -1144,6 +1188,8 @@ class GameLauncher:
             )
         except Exception:
             pass
+        if not is_retry:
+            self._schedule_roblox_window_geometry_retry(user_id, pid)
 
 
     def _convert_share_link(self, share_code, cookie):
@@ -1338,6 +1384,23 @@ class GameLauncher:
         original_cookie = str(cookie or "")
 
         # Fast-path: if this uid is already mid-launch, skip BEFORE any network/auth work or logs.
+        with GameLauncher._global_launch_inflight_lock:
+            if uid_key in GameLauncher._global_launch_inflight:
+                server_label = "Unknown"
+                try:
+                    us = getattr(self.tracker, "user_server", {}) or {}
+                    server_label = str(us.get(user_id) or us.get(uid_key) or server_label)
+                except Exception:
+                    pass
+                try:
+                    self.log_skip(uid_key, server_label, "launch_inflight_global", throttle=2.0)
+                except Exception:
+                    try:
+                        self.log(f"[LAUNCH SKIP] {uid_key} -> {server_label} launch_inflight_global")
+                    except Exception:
+                        pass
+                return False
+
         with self._launch_inflight_lock:
             if uid_key in self._launch_inflight:
                 server_label = "Unknown"
@@ -1522,8 +1585,22 @@ class GameLauncher:
             )
 
         # Per-user "inflight" launch guard: avoids double os.startfile()/PID waits for the same uid.
+        with GameLauncher._global_launch_inflight_lock:
+            if uid_key in GameLauncher._global_launch_inflight:
+                try:
+                    self.log_skip(uid_key, server_label, "launch_inflight_global", throttle=2.0)
+                except Exception:
+                    try:
+                        self.log(f"[LAUNCH SKIP] {uid_key} -> {server_label} launch_inflight_global")
+                    except Exception:
+                        pass
+                return False
+            GameLauncher._global_launch_inflight.add(uid_key)
+
         with self._launch_inflight_lock:
             if uid_key in self._launch_inflight:
+                with GameLauncher._global_launch_inflight_lock:
+                    GameLauncher._global_launch_inflight.discard(uid_key)
                 try:
                     self.log_skip(uid_key, server_label, "launch_inflight", throttle=2.0)
                 except Exception:
@@ -1535,23 +1612,25 @@ class GameLauncher:
             self._launch_inflight.add(uid_key)
 
         try:
-            if not skip_cleanup:
-                for pid in self.tracker.user_processes.get(user_id, []).copy():
-                    if pid != self.process_manager.excluded_pid:
-                        self.process_manager.terminate_process(pid, self.tracker)
+            with GameLauncher._global_launch_attempt_lock:
+                if not skip_cleanup:
+                    for pid in self.tracker.user_processes.get(user_id, []).copy():
+                        if pid != self.process_manager.excluded_pid:
+                            self.process_manager.terminate_process(pid, self.tracker)
 
-            self.log(f"[LAUNCH] uid={user_id} label={server_label} calling os.startfile()")
-            os.startfile(game_url)
-            self.log(f"[LAUNCH] uid={user_id} label={server_label} startfile returned, waiting for PID...")
+                pid_launch_ts = time.time()
+                self.log(f"[LAUNCH] uid={user_id} label={server_label} calling os.startfile()")
+                os.startfile(game_url)
+                self.log(f"[LAUNCH] uid={user_id} label={server_label} startfile returned, waiting for PID...")
 
-            # Allow ProcessManager.await_new_process to emit into the same log sink
-            if getattr(self, "tracker", None) is not None:
-                try:
-                    self.tracker.debug_log = self.log
-                except Exception:
-                    pass
+                # Allow ProcessManager.await_new_process to emit into the same log sink
+                if getattr(self, "tracker", None) is not None:
+                    try:
+                        self.tracker.debug_log = self.log
+                    except Exception:
+                        pass
 
-            new_pid = self.process_manager.await_new_process(user_id, launch_ts, self.process_timeout, self.tracker)
+                new_pid = self.process_manager.await_new_process(user_id, pid_launch_ts, self.process_timeout, self.tracker)
             if new_pid:
                 # clear bad flag if we just launched fine
                 if user_info and user_info.get("bad", False):
@@ -1583,6 +1662,11 @@ class GameLauncher:
                 except Exception:
                     pass
 
+                try:
+                    self._record_account_launch_activity(user_id, time.time())
+                except Exception:
+                    pass
+
                 return True
 
             # failed to see a process — leave cleanup to caller/TTL
@@ -1604,13 +1688,16 @@ class GameLauncher:
         finally:
             with self._launch_inflight_lock:
                 self._launch_inflight.discard(uid_key)
+            with GameLauncher._global_launch_inflight_lock:
+                GameLauncher._global_launch_inflight.discard(uid_key)
 
 
     def initialize_all_sessions(self, user_configs: dict):
         import time
         self.tracker.initialization_mode = True
         try:
-            for idx, (user_id, user_info) in enumerate(user_configs.items()):
+            ordered_configs = sort_user_items_by_launch_priority((user_configs or {}).items())
+            for idx, (user_id, user_info) in enumerate(ordered_configs):
                 if user_info.get("bad", False) or user_info.get("cap", False):
                     continue
                 cookie = user_info.get("cookie", "") if isinstance(user_info, dict) else user_info
@@ -1618,7 +1705,7 @@ class GameLauncher:
                     if self.process_manager.verify_process_active(pid):
                         self.process_manager.terminate_process(pid, self.tracker)
                 self.start_game_session(user_id, cookie, user_info, skip_cleanup=True)
-                if idx < len(user_configs) - 1:
+                if idx < len(ordered_configs) - 1:
                     time.sleep(self.initial_delay)
         finally:
             self.tracker.initialization_mode = False
@@ -1696,7 +1783,7 @@ def execute_main_loop():
         uid: {"last_launch": 0,
               "log_miss_streak": 0,
               "user_info" : info}
-        for uid, info in manager.settings.items()
+        for uid, info in sort_user_items_by_launch_priority(manager.settings.items())
     }
 
     # fire everything once on boot
@@ -1858,9 +1945,21 @@ def execute_main_loop():
             # if we got here, this uid is a valid candidate for launching this tick
             eligible.append((uid, st, cookie, info, server_label))
 
-        # --- deterministic: preserve dict insertion order; try up to N immediately ---
+        # --- deterministic: try higher launch priority first ---
         MAX_TRIES = 3
         tries = 0
+        eligible = [
+            row
+            for _idx, row in sorted(
+                enumerate(eligible),
+                key=lambda pair: launch_priority_sort_key(
+                    pair[1][0],
+                    pair[1][3] if isinstance(pair[1][3], dict) else {},
+                    pair[0],
+                ),
+            )
+        ]
+
         for uid, st, cookie, info, server_label in eligible:
             if tries >= MAX_TRIES:
                 break

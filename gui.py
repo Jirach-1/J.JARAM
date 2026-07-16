@@ -7,6 +7,7 @@ import time
 import os
 import shutil
 import uuid
+import importlib
 import requests
 import re
 import queue
@@ -28,7 +29,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QFormLayout, QScrollArea, QSizePolicy, QFileDialog,
                             QAbstractScrollArea,
                             QAbstractItemView, QHeaderView, QScrollArea, QRubberBand,
-                            QRadioButton, QListWidget, QListWidgetItem, QKeySequenceEdit)
+                            QRadioButton, QListWidget, QListWidgetItem, QKeySequenceEdit,
+                            QStyledItemDelegate, QStyleOptionViewItem)
 from PySide6.QtCore import (
     QTimer,
     QThread,
@@ -47,7 +49,7 @@ from PySide6.QtCore import (
     QAbstractNativeEventFilter,
     QEventLoop,
 )
-from PySide6.QtGui import QFont, QIcon, QColor, QPixmap, QMovie, QRegion, QPainter, QPainterPath, QImage, QTextCursor, QKeySequence, QBrush
+from PySide6.QtGui import QFont, QIcon, QColor, QPixmap, QMovie, QRegion, QPainter, QPainterPath, QImage, QTextCursor, QKeySequence, QBrush, QPen
 
 try:
     from roblox_cookie_utils import (
@@ -471,19 +473,34 @@ from biomes import biome_names, biome_meta, biome_duration
 from utilities_tab import (
     build_utilities_widget,
     _BlockWorker,
+    _extract_place_id_from_text,
+    _format_psl_place_history_label,
+    _load_psl_place_id_history,
     _PSLOpts,
     _PSLWorker,
+    _save_psl_place_id_history,
     _UnblockWorker,
     _set_config_manager,
+    shutdown_UTILITIES_tab,
 )
 from trimmer import setup_TRIMMER_tab
 from discord_account_control import DiscordBotService, format_discord_ids, normalize_discord_ids
 from found_stats import FoundStatsMixin
+from launch_priority import (
+    DEFAULT_LAUNCH_PRIORITY,
+    MAX_LAUNCH_PRIORITY,
+    MIN_LAUNCH_PRIORITY,
+    coerce_launch_priority,
+    launch_priority_value,
+    sort_user_ids_by_launch_priority,
+    sort_user_items_by_launch_priority,
+)
 # Exclude NORMAL from the Settings table (still exists internally, we just don't offer it as a toggle)
 GUI_BIOME_NAMES = [b for b in biome_names() if str(b).upper() != "NORMAL"]
 HARD_EVERYONE_BIOMES = {"GLITCHED", "DREAMSPACE", "CYBERSPACE"}
 WEBHOOK_ROLE_PINGS_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 WEBHOOK_USER_FILTER_MODE_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+AUTO_ACTION_LINK_BORDER_ROLE = int(Qt.ItemDataRole.UserRole) + 3
 from multiscope_process import MultiScopeProcessProxy
 from antiafk import AntiAFK
 from ocr_worker import (
@@ -564,6 +581,60 @@ def _should_disable_log_based_merchant_detection(settings_cfg: object) -> bool:
         return False
     return _ocr_merchant_filters_enabled_in_cfg(settings_cfg.get("ocr"))
 
+_SECONDS_PER_DAY = 86400.0
+_ACTIVITY_FRESH_DAYS = 1.0
+_ACTIVITY_STALE_DAYS = 30.0
+_ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT = 10.0
+_AUTO_ACTION_ANTIAFK_PAUSE_GUARD_S = 30.0
+_ACTIVITY_TIMESTAMP_ROLE = int(Qt.ItemDataRole.UserRole) + 50
+_LAUNCH_PRIORITY_STATUS_ROLE = int(Qt.ItemDataRole.UserRole) + 51
+
+
+def _coerce_activity_timestamp(value: object) -> float:
+    try:
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value or "").strip()
+        if not text:
+            return 0.0
+        try:
+            return float(text)
+        except Exception:
+            pass
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return float(datetime.fromisoformat(text).timestamp())
+        except Exception:
+            return 0.0
+    except Exception:
+        return 0.0
+
+
+def _activity_days_since(timestamp: object, *, now: Optional[float] = None) -> Optional[float]:
+    ts = _coerce_activity_timestamp(timestamp)
+    if ts <= 0:
+        return None
+    try:
+        ref = float(time.time() if now is None else now)
+        return max(0.0, (ref - float(ts)) / _SECONDS_PER_DAY)
+    except Exception:
+        return None
+
+
+def _activity_tooltip(timestamp: object) -> str:
+    ts = _coerce_activity_timestamp(timestamp)
+    days = _activity_days_since(ts)
+    if ts <= 0 or days is None:
+        return "Never launched"
+    try:
+        launched = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        launched = "Unknown"
+    return f"Last launched: {launched}\nActivity age: {days:.3f} days"
+
 # --- Auto Item engine (local module) ---
 try:
     from auto_actions_automation import AutoActionEngine as AutoItemEngine  # type: ignore
@@ -577,13 +648,14 @@ except Exception:  # pragma: no cover
     BESMultiProcessController = None  # type: ignore
 
 # --- minimal crash logging (EXE-safe, AV-friendly) ---
-import os, sys, atexit, logging, logging.handlers, threading, warnings
+import os, sys, atexit, logging, logging.handlers, threading, warnings, faulthandler, signal, uuid
 from pathlib import Path
 
 # Put logs in Jaram folder
 _log_dir = Path(os.getenv("APPDATA", Path.home())) / "Jaram" / "logs"
 _log_dir.mkdir(parents=True, exist_ok=True)
 LOGFILE = _log_dir / "JARAM.log"
+FAULT_LOGFILE = _log_dir / "JARAM_fault.log"
 
 _logger = logging.getLogger("jaram")
 _logger.setLevel(logging.INFO)
@@ -602,6 +674,18 @@ _logger.addHandler(_handler)
 # Also capture warnings->logging (no consoles needed)
 warnings.simplefilter("default")
 logging.captureWarnings(True)
+
+_fault_log_handle = None
+try:
+    _fault_log_handle = open(FAULT_LOGFILE, "a", encoding="utf-8", buffering=1)
+    faulthandler.enable(file=_fault_log_handle, all_threads=True)
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            faulthandler.register(signal.SIGBREAK, file=_fault_log_handle, all_threads=True)
+        except Exception:
+            pass
+except Exception:
+    _fault_log_handle = None
 
 def _log_unhandled(exc_type, exc_value, exc_traceback):
     try:
@@ -627,6 +711,10 @@ setattr(sys, "unraisablehook", _unraisable_hook)
 
 # Clean shutdown of handlers
 def _close_handlers():
+    try:
+        faulthandler.disable()
+    except Exception:
+        pass
     for h in list(_logger.handlers):
         try:
             h.flush()
@@ -634,6 +722,12 @@ def _close_handlers():
         except Exception:
             pass
         _logger.removeHandler(h)
+    try:
+        if _fault_log_handle is not None:
+            _fault_log_handle.flush()
+            _fault_log_handle.close()
+    except Exception:
+        pass
 atexit.register(_close_handlers)
 # --- end minimal crash logging ---
 
@@ -746,6 +840,7 @@ class ConfigManager:
         self.settings_file = self.config_dir / "settings.json"
         self.manager_pause_state_file = self.config_dir / "manager_pause_state.json"
         self.backup_dir = self.config_dir / "backups"
+        self._json_write_lock = threading.RLock()
         
 
         self._ensure_directories()
@@ -822,9 +917,12 @@ class ConfigManager:
                 "webhooks_hidden_biomes": [],
                 "show_selected_sets_bes_exempt_slot1": False,
             },
+            "utilities": {
+                "psl_place_id_history": [],
+            },
             "roblox_window_geometry": {
-                # When enabled, each newly launched Roblox window gets a one-time size/position check.
-                # If it differs from the recorded geometry, we move/resize it to match.
+                # When enabled, each newly launched Roblox window gets a size/position check.
+                # If it differs from the recorded geometry, we move/resize it to match and retry once after 5 seconds on failure.
                 "enforce_on_launch": False,
                 "x": 0,
                 "y": 0,
@@ -862,7 +960,9 @@ class ConfigManager:
                    "enabled": False,
                    "tick_interval": 1.0,
                    "click_delay": 0.2,
+                   "antiafk_auto_action_overdue_min": _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT,
                    "disable_mouse_move": False,
+                   "menu_debug": False,
                    "toggle_hotkey": "Ctrl+Alt+Space",
                    "users": [],
                    "presets": [],
@@ -872,6 +972,8 @@ class ConfigManager:
             "bes": {
                 "enabled": False,
                 "cycle_ms": 50,
+                "throttle_mode": "all_threads",
+                "smart_thread_count": 4,
                 "menu_throttle_percent": 85,
                 "game_throttle_percent": 50,
                 # Exactly 3 slots (strings). Empty/None => unused.
@@ -897,10 +999,12 @@ class ConfigManager:
             "cookie": "",
             "private_server_link": "",
             "place": "",
+            "last_launch": 0.0,
             "bad": False,
             "cap": False,
             "disabled": False,
             "alternate_launch": False,
+            "launch_priority": DEFAULT_LAUNCH_PRIORITY,
             "skip_reconnect_on_log_disconnect": False,
             "discord_user_ids": [],
         }
@@ -1005,21 +1109,28 @@ class ConfigManager:
             pass
 
     def _safe_write_json(self, file_path, data):
-        temp_path = file_path.with_suffix('.tmp')
+        file_path = Path(file_path)
+        temp_path = file_path.with_name(f"{file_path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp")
 
-        try:
+        with self._json_write_lock:
+            try:
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except Exception:
+                        pass
 
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-
-            os.replace(str(temp_path), str(file_path))
-
-            return True
-        except Exception as e:
-
-            if temp_path.exists():
-                temp_path.unlink()
-            raise e
+                os.replace(str(temp_path), str(file_path))
+                return True
+            except Exception:
+                try:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                except Exception:
+                    pass
+                raise
     # ADD this helper anywhere inside the class
     def _deep_update(self, base: dict, updates: dict):
         """Recursive dict.update so nested keys survive partial files."""
@@ -2249,6 +2360,46 @@ class ConfigManager:
         except Exception as e:
             return False
 
+    def mark_user_launched(self, user_id: str, launched_at: Optional[float] = None) -> bool:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return False
+        try:
+            ts = float(time.time() if launched_at is None else launched_at)
+        except Exception:
+            ts = float(time.time())
+        if ts <= 0:
+            ts = float(time.time())
+
+        try:
+            self._set_cookie_error("")
+            with self._json_write_lock:
+                users_data = self._load_users_raw_from_disk()
+                if not isinstance(users_data, dict):
+                    return False
+                info = users_data.get(uid)
+                if not isinstance(info, dict):
+                    return False
+                info["last_launch"] = ts
+                users_data[uid] = info
+
+                meta = self._users_file_cookie_meta if isinstance(self._users_file_cookie_meta, dict) else {}
+                payload = self._merge_users_payload(users_data, meta)
+                if not self._safe_write_json(self.users_file, payload):
+                    return False
+
+                try:
+                    with self._cache_lock:
+                        self._update_raw_cookie_cache(users_data)
+                        self._users_cache = self._apply_cookie_encryption_on_load(copy.deepcopy(users_data))
+                        self._users_cache_mtime = self._file_mtime(self.users_file)
+                        self._users_cache_unlock_token = self._get_cookie_unlock_token()
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            return False
+
     def _load_settings_uncached(self) -> dict:
         try:
             if self.settings_file.exists():
@@ -2423,6 +2574,7 @@ class ConfigManager:
                     "cookie": cookie,
                     "private_server_link": "",
                     "place": "",
+                    "last_launch": 0.0,
                     "bad": False,
                     "cap": False,
                     "alternate_launch": False,
@@ -2475,11 +2627,13 @@ class ConfigManager:
                     "private_server_link": "",
                     "place": "",
                     "server_type": "private",
+                    "last_launch": 0.0,
                     "bad": False,
                     "cap": False,
                     "disabled": False,
                     "description": "",
                     "alternate_launch": False,
+                    "launch_priority": DEFAULT_LAUNCH_PRIORITY,
                     "skip_reconnect_on_log_disconnect": False,
                     "discord_user_ids": [],
                 }
@@ -2500,11 +2654,13 @@ class ConfigManager:
                     "private_server_link": private_link,
                     "place": place,
                     "server_type": server_type,
+                    "last_launch": _coerce_activity_timestamp(user_info.get("last_launch", user_info.get("last_launched", 0.0))),
                     "bad":  user_info.get("bad", False),
                     "cap":  user_info.get("cap", False),
                     "disabled": user_info.get("disabled", False),
                     "description": str(user_info.get("description", "") or ""),
                     "alternate_launch": _is_alternate_launch(user_info),
+                    "launch_priority": coerce_launch_priority(user_info.get("launch_priority", DEFAULT_LAUNCH_PRIORITY)),
                     "skip_reconnect_on_log_disconnect": _skip_reconnect_on_log_disconnect(user_info),
                     "discord_user_ids": normalize_discord_ids(user_info.get("discord_user_ids")),
                 }
@@ -2516,11 +2672,13 @@ class ConfigManager:
                     "private_server_link": "",
                     "place": "",
                     "server_type": "private",
+                    "last_launch": 0.0,
                     "bad":  False,
                     "cap": False,
                     "disabled": False,
                     "description": "",
                     "alternate_launch": False,
+                    "launch_priority": DEFAULT_LAUNCH_PRIORITY,
                     "skip_reconnect_on_log_disconnect": False,
                     "discord_user_ids": [],
                 }
@@ -2957,6 +3115,96 @@ class ModernStyle:
         """
 
 
+def _activity_color_for_days(days: Optional[float]) -> QColor:
+    if days is None:
+        return QColor("#6b7280")
+    try:
+        ratio = (float(days) - _ACTIVITY_FRESH_DAYS) / (_ACTIVITY_STALE_DAYS - _ACTIVITY_FRESH_DAYS)
+    except Exception:
+        ratio = 1.0
+    ratio = max(0.0, min(1.0, ratio))
+    hue = 0.33 * (1.0 - ratio)
+    return QColor.fromHsvF(hue, 0.82, 0.92)
+
+
+class _ActivityDotDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        raw_ts = index.data(_ACTIVITY_TIMESTAMP_ROLE)
+        if raw_ts is None:
+            return
+        try:
+            ts = _coerce_activity_timestamp(raw_ts)
+            days = _activity_days_since(ts)
+            fill = _activity_color_for_days(days)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor("#111827"), 1))
+            painter.setBrush(QBrush(fill))
+            diameter = 12
+            margin = 5
+            rect = option.rect
+            x = int(rect.right() - diameter - margin)
+            y = int(rect.top() + margin)
+            painter.drawEllipse(QRect(x, y, diameter, diameter))
+        except Exception:
+            return
+        finally:
+            try:
+                painter.restore()
+            except Exception:
+                pass
+
+
+class _LaunchPriorityStatusDelegate(QStyledItemDelegate):
+    _STATUS_COLORS = {
+        "Enabled": QColor("#66FF66"),
+        "Disabled": QColor("#FF6666"),
+        "BAD": QColor(ModernStyle.ERROR),
+        "CAP": QColor(ModernStyle.ERROR),
+        "Alternate": QColor("#f1c40f"),
+    }
+
+    def paint(self, painter, option, index):
+        segments = index.data(_LAUNCH_PRIORITY_STATUS_ROLE)
+        if not isinstance(segments, (list, tuple)) or not segments:
+            super().paint(painter, option, index)
+            return
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        style = opt.widget.style() if opt.widget is not None else QApplication.style()
+
+        painter.save()
+        try:
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+            text_rect = style.subElementRect(
+                QStyle.SubElement.SE_ItemViewItemText,
+                opt,
+                opt.widget,
+            )
+            painter.setClipRect(text_rect)
+            painter.setFont(opt.font)
+            metrics = painter.fontMetrics()
+            baseline = text_rect.top() + ((text_rect.height() - metrics.height()) // 2) + metrics.ascent()
+            x = text_rect.left()
+
+            for segment_index, raw_segment in enumerate(segments):
+                segment = str(raw_segment)
+                if segment_index:
+                    separator = " / "
+                    painter.setPen(QColor(ModernStyle.TEXT_SECONDARY))
+                    painter.drawText(x, baseline, separator)
+                    x += metrics.horizontalAdvance(separator)
+
+                painter.setPen(self._STATUS_COLORS.get(segment, QColor(ModernStyle.TEXT_PRIMARY)))
+                painter.drawText(x, baseline, segment)
+                x += metrics.horizontalAdvance(segment)
+        finally:
+            painter.restore()
+
+
 class _AutoItemSpinBox(QSpinBox):
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -3025,6 +3273,702 @@ class _AutoItemSpinBox(QSpinBox):
         except Exception:
             return None
 
+
+class _AutoActionsMonitorTableItem(QTableWidgetItem):
+    def __init__(self, text="", sort_value=None):
+        super().__init__(str(text))
+        self._sort_value = str(text).casefold() if sort_value is None else sort_value
+
+    def __lt__(self, other):
+        if isinstance(other, _AutoActionsMonitorTableItem):
+            left = self._sort_value
+            right = other._sort_value
+            try:
+                if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                    return float(left) < float(right)
+                return str(left).casefold() < str(right).casefold()
+            except Exception:
+                pass
+        return super().__lt__(other)
+
+
+class _AutoActionsMonitorHeader(QHeaderView):
+    def sectionSizeFromContents(self, logical_index):
+        size = super().sectionSizeFromContents(logical_index)
+        # Every column can become the active sort column, so permanently reserve
+        # room for the gap and 8 px direction arrow instead of resizing on click.
+        return QSize(max(90, size.width() + 18), max(36, size.height()))
+
+    def paintSection(self, painter, rect, logical_index):
+        if not rect.isValid():
+            return
+
+        painter.save()
+        try:
+            painter.fillRect(rect, QColor(ModernStyle.SURFACE_VARIANT))
+            painter.setPen(QPen(QColor(ModernStyle.BORDER), 1))
+            painter.drawLine(rect.topRight(), rect.bottomRight())
+            painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+
+            label = self.model().headerData(
+                logical_index,
+                self.orientation(),
+                Qt.ItemDataRole.DisplayRole,
+            )
+            label = str(label or "")
+
+            font = painter.font()
+            font.setBold(True)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+
+            is_sorted = (
+                self.isSortIndicatorShown()
+                and logical_index == self.sortIndicatorSection()
+            )
+            arrow_width = 8 if is_sorted else 0
+            arrow_gap = 5 if is_sorted else 0
+            text_limit = max(0, rect.width() - 20 - arrow_width - arrow_gap)
+            visible_label = metrics.elidedText(
+                label,
+                Qt.TextElideMode.ElideRight,
+                text_limit,
+            )
+            text_width = metrics.horizontalAdvance(visible_label)
+            content_width = text_width + arrow_gap + arrow_width
+            start_x = rect.x() + max(8, (rect.width() - content_width) // 2)
+
+            painter.setPen(QColor(ModernStyle.TEXT_PRIMARY))
+            text_rect = QRect(
+                int(start_x),
+                rect.y(),
+                int(text_width),
+                rect.height(),
+            )
+            painter.drawText(
+                text_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                visible_label,
+            )
+
+            if is_sorted:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                arrow_x = float(start_x + text_width + arrow_gap)
+                center_y = float(rect.center().y())
+                arrow = QPainterPath()
+                if self.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder:
+                    arrow.moveTo(arrow_x, center_y + 2.5)
+                    arrow.lineTo(arrow_x + 4.0, center_y - 2.5)
+                    arrow.lineTo(arrow_x + 8.0, center_y + 2.5)
+                else:
+                    arrow.moveTo(arrow_x, center_y - 2.5)
+                    arrow.lineTo(arrow_x + 4.0, center_y + 2.5)
+                    arrow.lineTo(arrow_x + 8.0, center_y - 2.5)
+                arrow.closeSubpath()
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(ModernStyle.TEXT_SECONDARY))
+                painter.drawPath(arrow)
+        finally:
+            painter.restore()
+
+
+class _AutoActionsMonitorDialog(QDialog):
+    def __init__(self, snapshot_provider, parent=None):
+        super().__init__(parent)
+        self._snapshot_provider = snapshot_provider
+        self.setObjectName("autoActionsMonitor")
+        self.setWindowTitle("Auto Actions Monitor")
+        self.resize(1040, 600)
+        self.setMinimumSize(800, 440)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
+        self.setStyleSheet(
+            f"""
+            QDialog#autoActionsMonitor {{
+                background-color: {ModernStyle.BACKGROUND};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            QDialog#autoActionsMonitor QLabel {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                background: transparent;
+            }}
+            QDialog#autoActionsMonitor QLabel[monitorRole="subtitle"],
+            QDialog#autoActionsMonitor QLabel[monitorRole="muted"] {{
+                color: {ModernStyle.TEXT_SECONDARY};
+            }}
+            QDialog#autoActionsMonitor QLabel[monitorRole="stat"] {{
+                background-color: {ModernStyle.SURFACE};
+                border: 1px solid {ModernStyle.BORDER};
+                border-radius: 9px;
+                padding: 10px 12px;
+                min-width: 112px;
+            }}
+            QDialog#autoActionsMonitor QLabel[monitorRole="empty"] {{
+                color: {ModernStyle.TEXT_SECONDARY};
+                background-color: {ModernStyle.SURFACE};
+                border: 1px dashed {ModernStyle.BORDER};
+                border-radius: 10px;
+                padding: 24px;
+            }}
+            QDialog#autoActionsMonitor QLineEdit,
+            QDialog#autoActionsMonitor QComboBox {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                background-color: {ModernStyle.SURFACE};
+                border: 1px solid {ModernStyle.BORDER};
+                border-radius: 7px;
+                padding: 7px 10px;
+                min-height: 22px;
+            }}
+            QDialog#autoActionsMonitor QLineEdit:focus,
+            QDialog#autoActionsMonitor QComboBox:focus {{
+                border-color: {ModernStyle.PRIMARY};
+            }}
+            QDialog#autoActionsMonitor QComboBox::drop-down {{
+                border: none;
+                width: 24px;
+            }}
+            QDialog#autoActionsMonitor QComboBox QAbstractItemView {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                background-color: {ModernStyle.SURFACE};
+                border: 1px solid {ModernStyle.BORDER};
+                selection-background-color: {ModernStyle.PRIMARY_VARIANT};
+                outline: none;
+            }}
+            QDialog#autoActionsMonitor QPushButton {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                background-color: {ModernStyle.PRIMARY};
+                border: 1px solid {ModernStyle.PRIMARY};
+                border-radius: 7px;
+                padding: 7px 14px;
+                min-height: 22px;
+                font-weight: 600;
+            }}
+            QDialog#autoActionsMonitor QPushButton:hover {{
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+                border-color: {ModernStyle.PRIMARY_VARIANT};
+            }}
+            QDialog#autoActionsMonitor QPushButton[kind="secondary"] {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                border-color: {ModernStyle.BORDER};
+            }}
+            QDialog#autoActionsMonitor QPushButton[kind="secondary"]:hover {{
+                background-color: {ModernStyle.SURFACE};
+                border-color: {ModernStyle.PRIMARY};
+            }}
+            QDialog#autoActionsMonitor QTableWidget {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                background-color: {ModernStyle.SURFACE};
+                alternate-background-color: {ModernStyle.SURFACE};
+                border: 1px solid {ModernStyle.BORDER};
+                border-radius: 10px;
+                gridline-color: transparent;
+                selection-background-color: {ModernStyle.PRIMARY_VARIANT};
+                selection-color: {ModernStyle.TEXT_PRIMARY};
+                outline: none;
+            }}
+            QDialog#autoActionsMonitor QTableWidget::item {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                background-color: transparent;
+                border-bottom: 1px solid {ModernStyle.BORDER};
+                padding: 7px 9px;
+            }}
+            QDialog#autoActionsMonitor QTableWidget::item:selected {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                background-color: {ModernStyle.PRIMARY_VARIANT};
+            }}
+            QDialog#autoActionsMonitor QHeaderView::section {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                border: none;
+                border-right: 1px solid {ModernStyle.BORDER};
+                padding: 9px 10px;
+                font-weight: 700;
+            }}
+            QDialog#autoActionsMonitor QScrollBar:vertical {{
+                background-color: {ModernStyle.SURFACE};
+                border: none;
+                width: 11px;
+                margin: 2px;
+            }}
+            QDialog#autoActionsMonitor QScrollBar::handle:vertical {{
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                border-radius: 5px;
+                min-height: 28px;
+            }}
+            QDialog#autoActionsMonitor QScrollBar::add-line:vertical,
+            QDialog#autoActionsMonitor QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+            QToolTip {{
+                color: {ModernStyle.TEXT_PRIMARY};
+                background-color: {ModernStyle.SURFACE_VARIANT};
+                border: 1px solid {ModernStyle.BORDER};
+                padding: 6px;
+            }}
+            """
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("Auto Actions Monitor")
+        title.setStyleSheet("font-size: 18px; font-weight: 700;")
+        layout.addWidget(title)
+        subtitle = QLabel(
+            "Choose a user or action to narrow the view. Click any column header to sort; hover rows for details."
+        )
+        subtitle.setProperty("monitorRole", "subtitle")
+        layout.addWidget(subtitle)
+
+        stats = QHBoxLayout()
+        stats.setSpacing(8)
+        self.engine_stat = QLabel()
+        self.users_stat = QLabel()
+        self.active_stat = QLabel()
+        self.attention_stat = QLabel()
+        for label in (self.engine_stat, self.users_stat, self.active_stat, self.attention_stat):
+            label.setProperty("monitorRole", "stat")
+            stats.addWidget(label)
+        stats.addStretch()
+        layout.addLayout(stats)
+
+        browse_controls = QHBoxLayout()
+        browse_controls.setSpacing(8)
+        browse_label = QLabel("Browse by:")
+        browse_label.setProperty("monitorRole", "muted")
+        browse_controls.addWidget(browse_label)
+        self.browse_mode = QComboBox()
+        self.browse_mode.setMinimumWidth(160)
+        self.browse_mode.addItem("User → Actions", "user")
+        self.browse_mode.addItem("Action → Users", "action")
+        browse_controls.addWidget(self.browse_mode)
+        self.browse_selection = QComboBox()
+        self.browse_selection.setMinimumWidth(280)
+        browse_controls.addWidget(self.browse_selection)
+        self.browse_hint = QLabel()
+        self.browse_hint.setProperty("monitorRole", "muted")
+        browse_controls.addWidget(self.browse_hint, 1)
+        layout.addLayout(browse_controls)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Search users or actions...")
+        self.filter_edit.setClearButtonEnabled(True)
+        controls.addWidget(self.filter_edit, 1)
+        self.status_filter = QComboBox()
+        self.status_filter.setMinimumWidth(160)
+        self.status_filter.addItem("All statuses", "all")
+        self.status_filter.addItem("Needs attention", "attention")
+        self.status_filter.addItem("Running / queued", "active")
+        self.status_filter.addItem("On cooldown", "cooldown")
+        self.status_filter.addItem("Ready", "ready")
+        self.status_filter.addItem("Waiting", "waiting")
+        self.status_filter.addItem("Completed", "complete")
+        controls.addWidget(self.status_filter)
+        refresh_btn = QPushButton("Refresh Now")
+        refresh_btn.setProperty("kind", "secondary")
+        refresh_btn.clicked.connect(self.refresh)
+        controls.addWidget(refresh_btn)
+        layout.addLayout(controls)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "User",
+                "Action",
+                "Status",
+                "Next In",
+                "Cooldown",
+                "Context",
+                "Trigger",
+            ]
+        )
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setAlternatingRowColors(False)
+        self.table.setShowGrid(False)
+        self.table.setWordWrap(False)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        header = _AutoActionsMonitorHeader(Qt.Orientation.Horizontal, self.table)
+        self.table.setHorizontalHeader(header)
+        header.setSectionsClickable(True)
+        header.setHighlightSections(False)
+        header.setMinimumSectionSize(90)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSortingEnabled(True)
+        header.setSortIndicatorShown(True)
+        header.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        layout.addWidget(self.table, 1)
+
+        self.empty_label = QLabel()
+        self.empty_label.setProperty("monitorRole", "empty")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setMinimumHeight(160)
+        self.empty_label.hide()
+        layout.addWidget(self.empty_label, 1)
+
+        footer = QHBoxLayout()
+        self.updated_label = QLabel()
+        self.updated_label.setProperty("monitorRole", "muted")
+        footer.addWidget(self.updated_label)
+        footer.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setProperty("kind", "secondary")
+        close_btn.clicked.connect(self.close)
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
+
+        self._latest_snapshot = {}
+        self.browse_mode.currentIndexChanged.connect(self._on_browse_mode_changed)
+        self.browse_selection.currentIndexChanged.connect(self._populate_table)
+        self.filter_edit.textChanged.connect(self._populate_table)
+        self.status_filter.currentIndexChanged.connect(self._populate_table)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(1000)
+        self._refresh_timer.timeout.connect(self.refresh)
+        self._refresh_timer.start()
+        self.refresh()
+
+    def _on_browse_mode_changed(self, *_):
+        self._refresh_browse_choices()
+        self._populate_table()
+
+    def _refresh_browse_choices(self):
+        rows = list((self._latest_snapshot or {}).get("rows") or [])
+        mode = str(self.browse_mode.currentData() or "user")
+        previous = self.browse_selection.currentData()
+        self.browse_selection.blockSignals(True)
+        try:
+            self.browse_selection.clear()
+            if mode == "action":
+                self.browse_hint.setText("Choose an action to view its users.")
+                self.browse_selection.addItem("All actions", -1)
+                actions = {}
+                for row in rows:
+                    try:
+                        action_index = int(row.get("action_index", 0) or 0)
+                    except Exception:
+                        action_index = 0
+                    actions.setdefault(action_index, str(row.get("action_name") or f"Action {action_index + 1}"))
+                for action_index, action_name in sorted(
+                    actions.items(),
+                    key=lambda entry: (str(entry[1]).casefold(), int(entry[0])),
+                ):
+                    self.browse_selection.addItem(f"#{action_index + 1}  {action_name}", action_index)
+            else:
+                self.browse_hint.setText("Choose a user to view their actions.")
+                self.browse_selection.addItem("All users", "")
+                users = {}
+                for row in rows:
+                    uid = str(row.get("uid") or "").strip()
+                    if uid:
+                        users.setdefault(uid, str(row.get("username") or uid))
+                for uid, username in sorted(
+                    users.items(),
+                    key=lambda entry: (str(entry[1]).casefold(), str(entry[0])),
+                ):
+                    self.browse_selection.addItem(username, uid)
+                    item_index = self.browse_selection.count() - 1
+                    self.browse_selection.setItemData(
+                        item_index,
+                        f"User ID: {uid}",
+                        Qt.ItemDataRole.ToolTipRole,
+                    )
+
+            selected_index = self.browse_selection.findData(previous)
+            self.browse_selection.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+        finally:
+            self.browse_selection.blockSignals(False)
+
+    @staticmethod
+    def _duration_text(seconds) -> str:
+        try:
+            value = max(0.0, float(seconds or 0.0))
+        except Exception:
+            value = 0.0
+        if value <= 0.0:
+            return "-"
+        total = int(value + 0.999)
+        hours, rem = divmod(total, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:d}:{secs:02d}"
+
+    def refresh(self):
+        try:
+            snapshot = self._snapshot_provider() or {}
+        except Exception as exc:
+            self.engine_stat.setText(
+                f"<span style='color:{ModernStyle.ERROR}; font-weight:700;'>Unavailable</span><br>"
+                "<span style='color:{0};'>Engine</span>".format(ModernStyle.TEXT_SECONDARY)
+            )
+            self.empty_label.setText(f"Monitor data is unavailable.\n{exc}")
+            self.table.hide()
+            self.empty_label.show()
+            return
+        self._latest_snapshot = snapshot
+        self._refresh_browse_choices()
+        running = bool(snapshot.get("engine_running", False))
+        enabled = bool(snapshot.get("enabled", False))
+        users = int(snapshot.get("selected_user_count", 0) or 0)
+        rows = list(snapshot.get("rows") or [])
+        active = sum(
+            1
+            for row in rows
+            if str(row.get("status") or "") in {"running", "triggered", "alert"}
+            or str(row.get("status_detail") or "") == "Action queued"
+        )
+        attention = sum(
+            1
+            for row in rows
+            if str(row.get("status") or "") == "blocked"
+        )
+
+        def _stat(label, value, color):
+            return (
+                f"<span style='color:{color}; font-size:15px; font-weight:700;'>{value}</span><br>"
+                f"<span style='color:{ModernStyle.TEXT_SECONDARY};'>{label}</span>"
+            )
+
+        engine_value = "Running" if running and enabled else ("Disabled" if running else "Stopped")
+        engine_color = ModernStyle.SECONDARY if running and enabled else ModernStyle.WARNING
+        self.engine_stat.setText(_stat("Engine", engine_value, engine_color))
+        self.users_stat.setText(_stat("Selected users", users, ModernStyle.TEXT_PRIMARY))
+        self.active_stat.setText(_stat("Active / queued", active, ModernStyle.PRIMARY))
+        self.attention_stat.setText(
+            _stat(
+                "Needs attention",
+                attention,
+                ModernStyle.ERROR if attention else ModernStyle.SECONDARY,
+            )
+        )
+        self.updated_label.setText(f"Updated {datetime.now().strftime('%H:%M:%S')}")
+        self._populate_table()
+
+    def _populate_table(self, *_):
+        rows = list((self._latest_snapshot or {}).get("rows") or [])
+        browse_mode = str(self.browse_mode.currentData() or "user")
+        browse_value = self.browse_selection.currentData()
+        if browse_mode == "action":
+            try:
+                action_index_filter = int(browse_value)
+            except Exception:
+                action_index_filter = -1
+            if action_index_filter >= 0:
+                rows = [
+                    row
+                    for row in rows
+                    if int(row.get("action_index", -1) or 0) == action_index_filter
+                ]
+        else:
+            uid_filter = str(browse_value or "").strip()
+            if uid_filter:
+                rows = [
+                    row
+                    for row in rows
+                    if str(row.get("uid") or "").strip() == uid_filter
+                ]
+
+        needle = self.filter_edit.text().strip().lower()
+        if needle:
+            rows = [
+                row
+                for row in rows
+                if needle
+                in " ".join(
+                    [
+                        str(row.get("username") or ""),
+                        str(row.get("uid") or ""),
+                        str(row.get("action_name") or ""),
+                        str(row.get("status_detail") or ""),
+                        str(row.get("biome") or ""),
+                        str(row.get("pid") or ""),
+                    ]
+                ).lower()
+            ]
+
+        status_filter = str(self.status_filter.currentData() or "all")
+        status_groups = {
+            "attention": {"blocked"},
+            "active": {"running", "triggered", "alert"},
+            "cooldown": {"cooldown"},
+            "ready": {"ready"},
+            "waiting": {"waiting"},
+            "complete": {"complete"},
+        }
+        allowed_statuses = status_groups.get(status_filter)
+        if allowed_statuses is not None:
+            rows = [
+                row
+                for row in rows
+                if (
+                    str(row.get("status") or "") in allowed_statuses
+                    and not (
+                        status_filter == "waiting"
+                        and str(row.get("status_detail") or "") == "Action queued"
+                    )
+                )
+                or (
+                    status_filter == "active"
+                    and str(row.get("status_detail") or "") == "Action queued"
+                )
+            ]
+
+        if not rows:
+            has_configured_rows = bool((self._latest_snapshot or {}).get("rows"))
+            if has_configured_rows:
+                if browse_mode == "action" and int(action_index_filter) >= 0:
+                    self.empty_label.setText("No users match this action and the current filters.")
+                elif browse_mode == "user" and uid_filter:
+                    self.empty_label.setText("No actions match this user and the current filters.")
+                else:
+                    self.empty_label.setText("No user actions match the current filters.")
+            else:
+                self.empty_label.setText(
+                    "Nothing to monitor yet.\nSelect users and add enabled action rows in Auto Actions."
+                )
+            self.table.hide()
+            self.empty_label.show()
+            return
+
+        self.empty_label.hide()
+        self.table.show()
+        status_colors = {
+            "ready": ModernStyle.SECONDARY,
+            "running": ModernStyle.PRIMARY,
+            "triggered": ModernStyle.PRIMARY,
+            "cooldown": ModernStyle.WARNING,
+            "alert": ModernStyle.WARNING,
+            "waiting": ModernStyle.TEXT_SECONDARY,
+            "blocked": ModernStyle.ERROR,
+            "disabled": ModernStyle.TEXT_SECONDARY,
+            "complete": ModernStyle.SECONDARY,
+        }
+        self.table.setUpdatesEnabled(False)
+        table_header = self.table.horizontalHeader()
+        sort_column = table_header.sortIndicatorSection()
+        sort_order = table_header.sortIndicatorOrder()
+        sorting_enabled = self.table.isSortingEnabled()
+        if sorting_enabled:
+            self.table.setSortingEnabled(False)
+        try:
+            self.table.setRowCount(len(rows))
+            for table_row, row in enumerate(rows):
+                trigger_type = str(row.get("trigger_type") or "normal")
+                filter_count = len(row.get("trigger_filter_ids") or [])
+                trigger_text = f"OCR ({filter_count})" if trigger_type == "ocr_filter" else "Normal"
+                mode = str(row.get("repeat_mode") or "repeat")
+                if mode == "once_per_pid":
+                    mode_text = "Once / PID"
+                elif mode == "count":
+                    mode_text = f"x{int(row.get('repeat_count', 1) or 1)}"
+                else:
+                    mode_text = "Repeat"
+                last_trigger_at = float(row.get("last_trigger_at", 0.0) or 0.0)
+                last_trigger_text = (
+                    self._duration_text(max(0.0, time.time() - last_trigger_at)) + " ago"
+                    if last_trigger_at > 0.0
+                    else "-"
+                )
+                username = str(row.get("username") or row.get("uid") or "")
+                uid = str(row.get("uid") or "")
+                status_key = str(row.get("status") or "")
+                next_in = self._duration_text(row.get("remaining_s"))
+                if status_key == "ready":
+                    next_in = "Now"
+                pid = int(row.get("pid", 0) or 0)
+                biome = str(row.get("biome") or "").strip()
+                context_parts = []
+                if biome:
+                    context_parts.append(biome)
+                if pid > 0:
+                    context_parts.append(f"PID {pid}")
+                context_text = "  /  ".join(context_parts) or "No window"
+                values = [
+                    username,
+                    str(row.get("action_name") or ""),
+                    str(row.get("status_detail") or ""),
+                    next_in,
+                    self._duration_text(row.get("cooldown_s")),
+                    context_text,
+                    trigger_text,
+                ]
+                remaining_value = float(row.get("remaining_s", 0.0) or 0.0)
+                if status_key == "ready":
+                    remaining_sort = 0.0
+                elif remaining_value > 0.0:
+                    remaining_sort = remaining_value
+                else:
+                    remaining_sort = float("inf")
+                sort_values = [
+                    username,
+                    str(row.get("action_name") or ""),
+                    str(row.get("status_detail") or ""),
+                    remaining_sort,
+                    float(row.get("cooldown_s", 0.0) or 0.0),
+                    context_text,
+                    trigger_text,
+                ]
+                for column, value in enumerate(values):
+                    item = _AutoActionsMonitorTableItem(value, sort_values[column])
+                    if column == 0:
+                        item.setToolTip(f"User ID: {uid}")
+                    elif column == 1:
+                        allowed_biomes = list(row.get("allowed_biomes") or [])
+                        item.setToolTip(
+                            f"Action row {int(row.get('action_index', 0) or 0) + 1}\n"
+                            f"Mode: {mode_text}\n"
+                            f"Cooldown: {self._duration_text(row.get('cooldown_s'))}\n"
+                            f"Biomes: {', '.join(allowed_biomes) if allowed_biomes else 'Any'}"
+                        )
+                    elif column == 2:
+                        color = status_colors.get(status_key, ModernStyle.TEXT_PRIMARY)
+                        item.setForeground(QBrush(QColor(color)))
+                        status_font = item.font()
+                        status_font.setBold(True)
+                        item.setFont(status_font)
+                    elif column == 5:
+                        menu_state = row.get("in_menu")
+                        if menu_state is True:
+                            menu_text = "In menu"
+                        elif menu_state is False:
+                            menu_text = "Out of menu"
+                        else:
+                            menu_text = "Menu state unknown"
+                        item.setToolTip(f"User ID: {uid}\n{menu_text}")
+                    elif column == 6:
+                        filter_ids = list(row.get("trigger_filter_ids") or [])
+                        if trigger_type == "ocr_filter":
+                            item.setToolTip(
+                                "OCR filters: "
+                                + (", ".join(str(value) for value in filter_ids) if filter_ids else "None")
+                                + f"\nLast trigger: {last_trigger_text}"
+                            )
+                        else:
+                            item.setToolTip("Runs without an OCR trigger.")
+                    self.table.setItem(table_row, column, item)
+        finally:
+            if sorting_enabled:
+                self.table.setSortingEnabled(True)
+                if 0 <= int(sort_column) < self.table.columnCount():
+                    self.table.sortItems(int(sort_column), sort_order)
+            self.table.setUpdatesEnabled(True)
+
+
 class WorkerThread(QThread):
     log_signal     = Signal(str)
     status_signal  = Signal(object)
@@ -3036,6 +3980,8 @@ class WorkerThread(QThread):
         self.cfg_manager      = cfg_manager
         self._resume_state    = resume_state
         self.running          = False
+        self._stop_event      = threading.Event()
+        self._resuming_from_snapshot = isinstance(resume_state, dict) and bool(resume_state)
         self.manager          = None
         self.process_mgr      = None
         self.launcher         = None
@@ -3062,6 +4008,7 @@ class WorkerThread(QThread):
         self._launch_gate_started_at: float = 0.0
         self._launch_gate_min_delay_s: float = 0.0
         self._launch_gate_log_confirmed_uid: Optional[str] = None
+        self._launch_gate_log_baseline: Optional[dict] = None
         self._last_gate_log_refresh_at: float = 0.0
         self._launch_gate_debug_last_key: str = ""
         self._launch_gate_debug_last_ts: float = 0.0
@@ -3079,6 +4026,8 @@ class WorkerThread(QThread):
 
         self.active_pool = set()      # type: Set[str]
         self.spare_pool  = set()      # type: Set[str]
+        self.active_pool_order = []   # type: List[str]
+        self.spare_pool_order = []    # type: List[str]
         self.handoff_for = {}         # type: Dict[str, str]     # donor_uid -> spare_uid
         self.last_launch = {}         # type: Dict[str, float]   # uid -> epoch of last launch
         self._skip_until_by_user = {}   # uid -> epoch (per-user backoff after a conflict)
@@ -3089,6 +4038,8 @@ class WorkerThread(QThread):
         self._last_growth_ts  = time.time()
         self.log_inactivity_timeout = 120
         self._action_queue = queue.Queue()
+        self._antiafk_action_lock = threading.Lock()
+        self._antiafk_last_action_by_uid: Dict[str, float] = {}
 
         # Multiscope
         self.ms = None  # ← NEW: MultiScopeEngine instance
@@ -3111,6 +4062,30 @@ class WorkerThread(QThread):
             self._bootstrap_multiscope_rows = None
             self._bootstrap_multiscope_deadline = 0.0
 
+    def record_antiafk_action(self, uid: str, ts: Optional[float] = None) -> None:
+        uid_s = str(uid or "").strip()
+        if not uid_s:
+            return
+        try:
+            ts_f = time.time() if ts is None else float(ts)
+        except Exception:
+            ts_f = time.time()
+        try:
+            with self._antiafk_action_lock:
+                self._antiafk_last_action_by_uid[uid_s] = ts_f
+        except Exception:
+            pass
+
+    def _get_antiafk_last_action_at(self, uid: str) -> float:
+        uid_s = str(uid or "").strip()
+        if not uid_s:
+            return 0.0
+        try:
+            with self._antiafk_action_lock:
+                return float(self._antiafk_last_action_by_uid.get(uid_s, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
     def _current_launch_gate_delay(self) -> float:
         try:
             if bool(getattr(self, "_boot_phase", False)):
@@ -3128,6 +4103,90 @@ class WorkerThread(QThread):
                 delay = 0.0
         return max(0.0, delay)
 
+    def _last_recorded_launch_at(self) -> float:
+        latest = 0.0
+
+        try:
+            latest = max(latest, float((getattr(self, "timing_trackers", {}) or {}).get("relaunch", 0) or 0))
+        except Exception:
+            pass
+
+        try:
+            for st in (getattr(self, "user_states", {}) or {}).values():
+                if not isinstance(st, dict):
+                    continue
+                try:
+                    latest = max(latest, float(st.get("last_launch", 0) or 0))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        try:
+            for ts in (getattr(self, "last_launch", {}) or {}).values():
+                try:
+                    latest = max(latest, float(ts or 0))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return max(0.0, latest)
+
+    def _sync_global_launch_timer(self, launched_at: Optional[float] = None) -> None:
+        try:
+            ts = time.time() if launched_at is None else float(launched_at)
+        except Exception:
+            ts = time.time()
+        if ts <= 0:
+            return
+
+        try:
+            if not isinstance(getattr(self, "timing_trackers", None), dict):
+                self.timing_trackers = {}
+            current = float(self.timing_trackers.get("relaunch", 0) or 0)
+            self.timing_trackers["relaunch"] = max(current, ts)
+        except Exception:
+            pass
+
+    def _seconds_until_launch_delay_ready(self, now: Optional[float] = None) -> float:
+        delay = self._current_launch_gate_delay()
+        if delay <= 0:
+            return 0.0
+        try:
+            ts = time.time() if now is None else float(now)
+        except Exception:
+            ts = time.time()
+        last_launch_at = self._last_recorded_launch_at()
+        if last_launch_at <= 0:
+            return 0.0
+        return max(0.0, (last_launch_at + delay) - ts)
+
+    def _wait_for_launch_delay_ready(self, reason: str = "launch") -> bool:
+        last_log_at = 0.0
+        reason_s = str(reason or "launch")
+        while self.running and not self._stop_event.is_set():
+            remain = self._seconds_until_launch_delay_ready()
+            if remain <= 0.0:
+                return True
+
+            now = time.time()
+            if last_log_at <= 0.0 or (now - last_log_at) >= 5.0:
+                try:
+                    self._log(f"[LaunchDelay] {reason_s}: waiting {remain:.1f}s before next launch")
+                except Exception:
+                    pass
+                last_log_at = now
+
+            if self._stop_event.wait(min(1.0, max(0.1, remain))):
+                break
+        return False
+
+    def _wait_for_launch_slot_ready(self, reason: str = "launch") -> bool:
+        if not self._wait_for_launch_delay_ready(reason):
+            return False
+        return self._wait_for_launch_gate_ready()
+
     def _clear_launch_gate(self, uid: Optional[str] = None) -> None:
         try:
             with self._launch_tracking_lock:
@@ -3137,11 +4196,45 @@ class WorkerThread(QThread):
                 self._launch_gate_started_at = 0.0
                 self._launch_gate_min_delay_s = 0.0
                 self._launch_gate_log_confirmed_uid = None
+                self._launch_gate_log_baseline = None
                 self._last_gate_log_refresh_at = 0.0
         except Exception:
             pass
 
-    def _register_successful_launch(self, uid: str, launched_at: Optional[float] = None) -> None:
+    def _capture_user_log_baseline(self, uid: str) -> dict:
+        uid_s = str(uid)
+        baseline = {"path": "", "size": 0, "mtime": 0.0}
+        try:
+            st = self.user_states.get(uid_s, {}) or {}
+            info = st.get("user_info", {}) if isinstance(st, dict) else {}
+            if not isinstance(info, dict):
+                info = {}
+            uname = str(info.get("username", "") or "").strip().lower()
+            if not uname:
+                return baseline
+            path = find_log_for_username(uname, allow_fallback=False)
+            if not path or not os.path.isfile(path):
+                return baseline
+            baseline["path"] = str(path)
+            try:
+                baseline["size"] = int(os.path.getsize(path))
+            except Exception:
+                baseline["size"] = 0
+            try:
+                baseline["mtime"] = float(os.path.getmtime(path))
+            except Exception:
+                baseline["mtime"] = 0.0
+        except Exception:
+            pass
+        return baseline
+
+    def _register_successful_launch(
+        self,
+        uid: str,
+        launched_at: Optional[float] = None,
+        *,
+        log_baseline: Optional[dict] = None,
+    ) -> None:
         uid_s = str(uid)
         try:
             ts = time.time() if launched_at is None else float(launched_at)
@@ -3156,14 +4249,24 @@ class WorkerThread(QThread):
                     self._launch_gate_started_at = ts
                     self._launch_gate_min_delay_s = max(0.0, float(min_delay))
                     self._launch_gate_log_confirmed_uid = None
+                    self._launch_gate_log_baseline = dict(log_baseline or {})
                 else:
                     self._launch_gate_uid = None
                     self._launch_gate_started_at = 0.0
                     self._launch_gate_min_delay_s = 0.0
                     self._launch_gate_log_confirmed_uid = None
+                    self._launch_gate_log_baseline = None
                 self._last_gate_log_refresh_at = 0.0
         except Exception:
             pass
+        try:
+            st = self.user_states.get(uid_s, {})
+            if isinstance(st, dict):
+                st["multiscope_log_recovered"] = False
+                st["multiscope_log_recover_retry_after"] = 0.0
+        except Exception:
+            pass
+        self._sync_global_launch_timer(ts)
         if self.launch_wait_for_log_mode:
             self._log_launch_gate_debug(
                 f"set:{uid_s}",
@@ -3173,13 +4276,26 @@ class WorkerThread(QThread):
 
     def _mark_user_log_confirmed(self, uid: str) -> None:
         uid_s = str(uid)
+        try:
+            with self._launch_tracking_lock:
+                if self._launch_gate_uid != uid_s:
+                    return
+                if self._launch_gate_log_confirmed_uid == uid_s:
+                    return
+                gate_started = float(self._launch_gate_started_at or 0.0)
+                baseline = dict(self._launch_gate_log_baseline or {})
+        except Exception:
+            return
+
+        if not self._user_has_strict_log_match(uid_s, baseline=baseline, gate_started=gate_started):
+            return
+
         marked = False
         try:
             with self._launch_tracking_lock:
-                if self._launch_gate_uid == uid_s:
-                    if self._launch_gate_log_confirmed_uid != uid_s:
-                        self._launch_gate_log_confirmed_uid = uid_s
-                        marked = True
+                if self._launch_gate_uid == uid_s and self._launch_gate_log_confirmed_uid != uid_s:
+                    self._launch_gate_log_confirmed_uid = uid_s
+                    marked = True
         except Exception:
             pass
         if marked:
@@ -3222,7 +4338,13 @@ class WorkerThread(QThread):
         except Exception:
             pass
 
-    def _user_has_strict_log_match(self, uid: str) -> bool:
+    def _user_has_strict_log_match(
+        self,
+        uid: str,
+        *,
+        baseline: Optional[dict] = None,
+        gate_started: Optional[float] = None,
+    ) -> bool:
         try:
             st = self.user_states.get(str(uid), {}) or {}
             info = st.get("user_info", {}) if isinstance(st, dict) else {}
@@ -3231,7 +4353,43 @@ class WorkerThread(QThread):
             uname = str(info.get("username", "") or "").strip().lower()
             if not uname:
                 return False
-            return bool(find_log_for_username(uname, allow_fallback=False))
+            path = find_log_for_username(uname, allow_fallback=False)
+            if not path or not os.path.isfile(path):
+                return False
+
+            baseline = baseline if isinstance(baseline, dict) else None
+            if baseline:
+                base_path = str(baseline.get("path") or "")
+                try:
+                    current_size = int(os.path.getsize(path))
+                except Exception:
+                    current_size = 0
+                try:
+                    current_mtime = float(os.path.getmtime(path))
+                except Exception:
+                    current_mtime = 0.0
+                try:
+                    base_size = int(baseline.get("size", 0) or 0)
+                except Exception:
+                    base_size = 0
+                try:
+                    base_mtime = float(baseline.get("mtime", 0.0) or 0.0)
+                except Exception:
+                    base_mtime = 0.0
+
+                if base_path and os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(base_path)):
+                    return current_size > base_size or current_mtime > base_mtime
+
+            try:
+                started = float(gate_started or 0.0)
+            except Exception:
+                started = 0.0
+            if started > 0:
+                try:
+                    return float(os.path.getmtime(path)) >= started
+                except Exception:
+                    return False
+            return True
         except Exception:
             return False
 
@@ -3264,11 +4422,13 @@ class WorkerThread(QThread):
                 gate_started = float(self._launch_gate_started_at or 0.0)
                 gate_min = float(self._launch_gate_min_delay_s or 0.0)
                 gate_confirmed = (self._launch_gate_log_confirmed_uid == self._launch_gate_uid)
+                gate_baseline = dict(self._launch_gate_log_baseline or {})
         except Exception:
             gate_uid = None
             gate_started = 0.0
             gate_min = 0.0
             gate_confirmed = False
+            gate_baseline = {}
 
         if not gate_uid:
             return True
@@ -3344,6 +4504,12 @@ class WorkerThread(QThread):
             seen = strict_log_matches.get(gate_uid, None)
             if seen is not None:
                 seen = bool(seen)
+        if bool(seen):
+            seen = self._user_has_strict_log_match(
+                gate_uid,
+                baseline=gate_baseline,
+                gate_started=gate_started,
+            )
         if not bool(seen):
             # Refresh the username->log map opportunistically while waiting so
             # the gate can react quickly to newly written logs.
@@ -3360,7 +4526,11 @@ class WorkerThread(QThread):
                     self._last_gate_log_refresh_at = ts
                 except Exception:
                     pass
-            seen = bool(seen) or self._user_has_strict_log_match(gate_uid)
+            seen = bool(seen) or self._user_has_strict_log_match(
+                gate_uid,
+                baseline=gate_baseline,
+                gate_started=gate_started,
+            )
 
         if bool(seen):
             self._log_launch_gate_debug(
@@ -3390,7 +4560,7 @@ class WorkerThread(QThread):
             "blocking launch until latest launched user is confirmed in logs",
             min_interval_s=0.0,
         )
-        while self.running:
+        while self.running and not self._stop_event.is_set():
             if self._is_launch_gate_ready():
                 waited = max(0.0, time.time() - wait_started)
                 self._log_launch_gate_debug(
@@ -3399,7 +4569,8 @@ class WorkerThread(QThread):
                     min_interval_s=0.0,
                 )
                 return True
-            time.sleep(0.1)
+            if self._stop_event.wait(0.1):
+                break
         self._log_launch_gate_debug(
             "wait_loop:stop",
             "aborted while waiting because worker stopped",
@@ -3469,7 +4640,28 @@ class WorkerThread(QThread):
 
         ok = False
         try:
-            ok = bool(fn(uid_s))
+            process_created_at = 0.0
+            tracker = getattr(getattr(self, "manager", None), "process_tracker", None)
+            if tracker is not None:
+                for pid in (tracker.user_processes.get(uid_s, []) or []):
+                    try:
+                        created_at = float(tracker.creation_timestamps.get(pid, 0.0) or 0.0)
+                    except Exception:
+                        created_at = 0.0
+                    if created_at <= 0.0:
+                        try:
+                            import psutil
+                            created_at = float(psutil.Process(int(pid)).create_time())
+                        except Exception:
+                            created_at = 0.0
+                    if created_at > process_created_at:
+                        process_created_at = created_at
+            ok = bool(
+                fn(
+                    uid_s,
+                    process_created_at=process_created_at if process_created_at > 0.0 else None,
+                )
+            )
         except Exception:
             ok = False
 
@@ -3642,6 +4834,16 @@ class WorkerThread(QThread):
             state["spare_pool"] = []
 
         try:
+            state["active_pool_order"] = list(getattr(self, "active_pool_order", []) or [])
+        except Exception:
+            state["active_pool_order"] = []
+
+        try:
+            state["spare_pool_order"] = list(getattr(self, "spare_pool_order", []) or [])
+        except Exception:
+            state["spare_pool_order"] = []
+
+        try:
             state["handoff_for"] = dict(getattr(self, "handoff_for", {}) or {})
         except Exception:
             state["handoff_for"] = {}
@@ -3665,6 +4867,11 @@ class WorkerThread(QThread):
             state["last_launch"] = dict(getattr(self, "last_launch", {}) or {})
         except Exception:
             state["last_launch"] = {}
+
+        try:
+            state["last_global_launch_at"] = self._last_recorded_launch_at()
+        except Exception:
+            state["last_global_launch_at"] = 0.0
 
         try:
             state["spares_mode"] = bool(getattr(self, "spares_mode", False))
@@ -3913,12 +5120,52 @@ class WorkerThread(QThread):
         if isinstance(snap_ll, dict):
             self.last_launch = {str(uid): float(ts) for uid, ts in snap_ll.items() if str(uid) in valid_uids}
 
+        try:
+            restored_global_launch = float(resume_state.get("last_global_launch_at", 0) or 0)
+        except Exception:
+            restored_global_launch = 0.0
+        try:
+            latest_launch = max(restored_global_launch, self._last_recorded_launch_at())
+            if latest_launch > 0:
+                self._sync_global_launch_timer(latest_launch)
+        except Exception:
+            pass
+
         snap_active = resume_state.get("active_pool")
         snap_spare = resume_state.get("spare_pool")
         if isinstance(snap_active, (list, tuple, set)):
             self.active_pool = {str(uid) for uid in snap_active if str(uid) in valid_uids}
         if isinstance(snap_spare, (list, tuple, set)):
             self.spare_pool = {str(uid) for uid in snap_spare if str(uid) in valid_uids}
+        snap_active_order = resume_state.get("active_pool_order")
+        snap_spare_order = resume_state.get("spare_pool_order")
+        if isinstance(snap_active_order, (list, tuple)):
+            self.active_pool_order = [
+                str(uid) for uid in snap_active_order
+                if str(uid) in valid_uids and str(uid) in self.active_pool
+            ]
+        if isinstance(snap_spare_order, (list, tuple)):
+            self.spare_pool_order = [
+                str(uid) for uid in snap_spare_order
+                if str(uid) in valid_uids and str(uid) in self.spare_pool
+            ]
+        try:
+            missing_active = [uid for uid in self.active_pool if uid not in set(self.active_pool_order)]
+            self.active_pool_order.extend(
+                sort_user_ids_by_launch_priority(
+                    missing_active,
+                    lambda u: (self.user_states.get(str(u), {}) or {}).get("user_info", {}),
+                )
+            )
+            missing_spare = [uid for uid in self.spare_pool if uid not in set(self.spare_pool_order)]
+            self.spare_pool_order.extend(
+                sort_user_ids_by_launch_priority(
+                    missing_spare,
+                    lambda u: (self.user_states.get(str(u), {}) or {}).get("user_info", {}),
+                )
+            )
+        except Exception:
+            pass
 
         snap_handoff = resume_state.get("handoff_for") or {}
         if isinstance(snap_handoff, dict):
@@ -3932,6 +5179,24 @@ class WorkerThread(QThread):
             overlap = set(self.active_pool) & set(self.spare_pool)
             if overlap:
                 self.spare_pool -= overlap
+        except Exception:
+            pass
+
+        try:
+            for uid, st in list(self.user_states.items()):
+                uid_s = str(uid)
+                if uid_s not in valid_uids or not isinstance(st, dict):
+                    continue
+                info = st.get("user_info", {}) if isinstance(st, dict) else {}
+                if not isinstance(info, dict):
+                    info = {}
+                if bool(info.get("bad", False) or info.get("cap", False) or info.get("disabled", False)):
+                    continue
+                status_s = str(st.get("status", "") or "").strip().lower()
+                if status_s in ("initializing", "restarting") and not self._is_user_live(uid_s):
+                    st["requires_restart"] = True
+                    st["inactive_since"] = None
+                    st["status"] = "Offline"
         except Exception:
             pass
 
@@ -4005,10 +5270,13 @@ class WorkerThread(QThread):
         flagged_count = sum(1 for _uid, info in source_items if info.get("bad", False) or info.get("cap", False))
         disabled_count = sum(1 for _uid, info in source_items if info.get("disabled", False))
 
-        good_sorted = sorted(
-            uid for uid, info in source_items
-            if not (info.get("bad", False) or info.get("cap", False)) and not info.get("disabled", False)
-        )
+        good_sorted = [
+            str(uid)
+            for uid, info in sort_user_items_by_launch_priority(source_items)
+            if isinstance(info, dict)
+            and not (info.get("bad", False) or info.get("cap", False))
+            and not info.get("disabled", False)
+        ]
 
         if self.spares_mode:
             n = len(good_sorted)
@@ -4017,8 +5285,10 @@ class WorkerThread(QThread):
         else:
             target_active = len(good_sorted)
 
-        self.active_pool = set(good_sorted[:target_active])
-        self.spare_pool  = set(good_sorted[target_active:])
+        self.active_pool_order = list(good_sorted[:target_active])
+        self.spare_pool_order = list(good_sorted[target_active:])
+        self.active_pool = set(self.active_pool_order)
+        self.spare_pool  = set(self.spare_pool_order)
 
         self._log(
             f"Pools set - spares_mode={self.spares_mode} active={len(self.active_pool)} "
@@ -4028,7 +5298,15 @@ class WorkerThread(QThread):
 
     def _eligible_spares(self):
         now = time.time()
-        for uid in sorted(self.spare_pool):
+        ordered_spares = [uid for uid in getattr(self, "spare_pool_order", []) if uid in self.spare_pool]
+        missing_spares = [uid for uid in self.spare_pool if uid not in set(ordered_spares)]
+        ordered_spares.extend(
+            sort_user_ids_by_launch_priority(
+                missing_spares,
+                lambda u: (self.user_states.get(str(u), {}) or {}).get("user_info", {}),
+            )
+        )
+        for uid in ordered_spares:
             st = self.user_states.get(uid)
             # Skip if flagged in live state OR in settings (covers recent flips + reloads)
             is_bad_live = bool(st and st.get("user_info", {}).get("bad", False))
@@ -4293,12 +5571,14 @@ class WorkerThread(QThread):
         self._reserve_server(server_label, spare_uid, "handoff")
 
         cookie = override.get("cookie", "")
+        launch_started = time.time()
+        log_baseline = self._capture_user_log_baseline(spare_uid)
         ok = self.launcher.start_game_session(spare_uid, cookie, override)
         if ok:
             self.handoff_for[donor_uid] = spare_uid
             now2 = time.time()
             self.user_states[spare_uid]["last_launch"] = now2
-            self._register_successful_launch(spare_uid, now2)
+            self._register_successful_launch(spare_uid, launch_started, log_baseline=log_baseline)
             self._log(
                 f"Spare {spare_uid} pre-joined {donor_uid}'s server"
                 + (f" (owner-pref: {donor_owner})" if donor_owner else "")
@@ -4326,6 +5606,15 @@ class WorkerThread(QThread):
         if spare_uid in self.spare_pool:
             self.spare_pool.remove(spare_uid)
             self.active_pool.add(spare_uid)
+        try:
+            self.active_pool_order = [u for u in getattr(self, "active_pool_order", []) if u != donor_uid and u in self.active_pool]
+            self.spare_pool_order = [u for u in getattr(self, "spare_pool_order", []) if u != spare_uid and u in self.spare_pool]
+            if spare_uid in self.active_pool and spare_uid not in self.active_pool_order:
+                self.active_pool_order.append(spare_uid)
+            if donor_uid in self.spare_pool and donor_uid not in self.spare_pool_order:
+                self.spare_pool_order.append(donor_uid)
+        except Exception:
+            pass
         self.handoff_for.pop(donor_uid, None)
         st = self.user_states.get(donor_uid, {})
         if st:
@@ -4687,7 +5976,20 @@ class WorkerThread(QThread):
             except Exception:
                 pass
 
-            launch_list = sorted(self.active_pool) if self.spares_mode else [uid for uid, _ in self.manager.settings.items()]
+            if self.spares_mode:
+                launch_list = [uid for uid in getattr(self, "active_pool_order", []) if uid in self.active_pool]
+                missing_active = [uid for uid in self.active_pool if uid not in set(launch_list)]
+                launch_list.extend(
+                    sort_user_ids_by_launch_priority(
+                        missing_active,
+                        lambda u: self.manager.settings.get(str(u), {}),
+                    )
+                )
+            else:
+                launch_list = [
+                    str(uid)
+                    for uid, _info in sort_user_items_by_launch_priority(self.manager.settings.items())
+                ]
             total = len(launch_list)
 
             for i, uid in enumerate(launch_list):
@@ -4719,6 +6021,8 @@ class WorkerThread(QThread):
                 attempted = False
                 try:
                     attempted = True
+                    launch_started = time.time()
+                    log_baseline = self._capture_user_log_baseline(uid)
                     ok = bool(self.launcher.start_game_session(uid, cookie, info, skip_cleanup=True))
                     now2 = time.time()
                     try:
@@ -4727,7 +6031,7 @@ class WorkerThread(QThread):
                             self.user_states[uid]["inactive_since"] = None
                             self.user_states[uid]["requires_restart"] = False
                             self.user_states[uid]["status"] = "Restarting"
-                            self._register_successful_launch(uid, now2)
+                            self._register_successful_launch(uid, launch_started, log_baseline=log_baseline)
                         else:
                             self.user_states[uid]["requires_restart"] = True
                             if self.user_states[uid].get("status") not in ("Bad", "CAP", "Disabled"):
@@ -4756,10 +6060,11 @@ class WorkerThread(QThread):
                 if (not self.launch_wait_for_log_mode) and attempted and i < total - 1:
                     ticks = max(0, int(self.initial_delay * 10))  # 0.1s steps for responsive stop()
                     for _ in range(ticks):
-                        if not self.running:
+                        if not self.running or self._stop_event.is_set():
                             break
-                        time.sleep(0.1)
-                    if not self.running:
+                        if self._stop_event.wait(0.1):
+                            break
+                    if not self.running or self._stop_event.is_set():
                         break
         except Exception as e:
             self._log(f"[RampUp] error: {e}")
@@ -4778,6 +6083,8 @@ class WorkerThread(QThread):
             self._log(f"[ManualRestart] skipped uid={user_id}: manager not ready or user missing")
             return False
         try:
+            if not self._wait_for_launch_slot_ready(f"manual restart uid={user_id}"):
+                return False
             self._log(f"[ManualRestart] uid={user_id} closing current Roblox process and relaunching")
             # cancel in-flight mapping on manual restart
             self.handoff_for.pop(user_id, None)
@@ -4787,6 +6094,8 @@ class WorkerThread(QThread):
                     self.process_mgr.terminate_process(pid, self.manager.process_tracker)
             info = self.user_states[user_id]["user_info"]
             cookie = info.get("cookie", "") if isinstance(info, dict) else info
+            launch_started = time.time()
+            log_baseline = self._capture_user_log_baseline(user_id)
             ok = self.launcher.start_game_session(user_id, cookie, info, skip_cleanup=True)
             if ok:
                 now2 = time.time()
@@ -4795,7 +6104,7 @@ class WorkerThread(QThread):
                 self.user_states[user_id]["skip_reconnect_on_disconnect"] = False
                 self.user_states[user_id]["status"] = "Restarting"
                 self.user_states[user_id]["last_launch"] = now2
-                self._register_successful_launch(user_id, now2)
+                self._register_successful_launch(user_id, launch_started, log_baseline=log_baseline)
                 self._log(f"[ManualRestart] uid={user_id} relaunch started successfully")
             else:
                 self._log(f"[ManualRestart] uid={user_id} relaunch failed; see preceding launch log entries")
@@ -4812,6 +6121,8 @@ class WorkerThread(QThread):
         if not self.manager or user_id not in self.user_states:
             return False
         try:
+            if not self._wait_for_launch_slot_ready(f"manual launch uid={user_id}"):
+                return False
             # cancel in-flight mapping on manual launch
             self.handoff_for.pop(user_id, None)
 
@@ -4822,6 +6133,8 @@ class WorkerThread(QThread):
 
             info = user_info if isinstance(user_info, dict) else {}
             cookie = str(info.get("cookie", "") or "")
+            launch_started = time.time()
+            log_baseline = self._capture_user_log_baseline(user_id)
             ok = bool(self.launcher.start_game_session(user_id, cookie, info, skip_cleanup=bool(skip_cleanup)))
             if ok:
                 now2 = time.time()
@@ -4830,7 +6143,7 @@ class WorkerThread(QThread):
                 self.user_states[user_id]["skip_reconnect_on_disconnect"] = False
                 self.user_states[user_id]["status"] = "Restarting"
                 self.user_states[user_id]["last_launch"] = now2
-                self._register_successful_launch(user_id, now2)
+                self._register_successful_launch(user_id, launch_started, log_baseline=log_baseline)
             return ok
         except Exception:
             return False
@@ -4860,16 +6173,29 @@ class WorkerThread(QThread):
     def run(self):
         if not self.initialize_manager():
             return
+        try:
+            self._stop_event.clear()
+        except Exception:
+            pass
         self.running = True
         # Safety: if spare mode is on but pools haven’t been computed yet, do it now.
         if self.spares_mode and not self.active_pool:
             self._recompute_pools()
 
-        # Start launching in the background so ms.tick is fully active now
-        self._ramp_thread = threading.Thread(target=self._ramp_up_launches, name="JARAM-RampUp", daemon=True)
-        self._ramp_thread.start()
+        # Start launching in the background only for a fresh manager start. A resume
+        # snapshot should continue through the relaunch scheduler so launch_delay is honored.
+        if bool(getattr(self, "_resuming_from_snapshot", False)):
+            self._boot_phase = False
+            try:
+                self.manager.process_tracker.initialization_mode = False
+            except Exception:
+                pass
+            self._log("[RampUp] resume snapshot restored; initial launch ramp skipped")
+        else:
+            self._ramp_thread = threading.Thread(target=self._ramp_up_launches, name="JARAM-RampUp", daemon=True)
+            self._ramp_thread.start()
 
-        while self.running:
+        while self.running and not self._stop_event.is_set():
             try:
                 self._drain_action_queue()
                 now = time.time()
@@ -5248,6 +6574,8 @@ class WorkerThread(QThread):
 
                     # --- end pre-connect watchdog ---
 
+                    antiafk_last_action_at = self._get_antiafk_last_action_at(uid)
+
                     # status shape
                     ttl_list = []
                     min_ttl = None
@@ -5282,6 +6610,7 @@ class WorkerThread(QThread):
                                 "server": self.manager.process_tracker.user_server.get(uid, ""),
                                 "ps_link": ps_link,
                                 "server_owner": server_owner,
+                                "antiafk_last_action_at": antiafk_last_action_at,
                             }
                             continue
 
@@ -5318,7 +6647,32 @@ class WorkerThread(QThread):
                         "server": self.manager.process_tracker.user_server.get(uid, ""),
                         "ps_link": ps_link,
                         "server_owner": server_owner,
+                        "antiafk_last_action_at": antiafk_last_action_at,
                     }
+
+                # MultiScope uses the newest live process creation time to
+                # reject disconnect lines left behind by an older launch.
+                for uid, runtime_status in status.items():
+                    if not isinstance(runtime_status, dict):
+                        continue
+                    creation_times = []
+                    for pid in (runtime_status.get("pids") or []):
+                        try:
+                            created_at = float(
+                                self.manager.process_tracker.creation_timestamps.get(pid, 0.0) or 0.0
+                            )
+                        except Exception:
+                            created_at = 0.0
+                        if created_at <= 0.0:
+                            try:
+                                import psutil
+                                created_at = float(psutil.Process(int(pid)).create_time())
+                            except Exception:
+                                created_at = 0.0
+                        if created_at > 0.0:
+                            creation_times.append(created_at)
+                    if creation_times:
+                        runtime_status["process_created_at"] = max(creation_times)
 
                 try:
                     self._is_launch_gate_ready(
@@ -5504,14 +6858,15 @@ class WorkerThread(QThread):
 
                     restartables = [u for u in restartables if _eligible_now(u)]
 
-                    # Prefer accounts expected in active_pool, then apply round-robin starting point
-                    restartables.sort(key=lambda u: (u not in self.active_pool, u))
-                    if restartables:
-                        # advance cursor into the sorted list (wrap around)
-                        self._restart_cursor = self._restart_cursor % len(restartables)
-                        ordered = restartables[self._restart_cursor:] + restartables[:self._restart_cursor]
-                    else:
-                        ordered = []
+                    # Prefer active-pool accounts, then higher launch priority.
+                    restartables.sort(
+                        key=lambda u: (
+                            u not in self.active_pool,
+                            -launch_priority_value((self.user_states.get(u, {}) or {}).get("user_info", {})),
+                            u,
+                        )
+                    )
+                    ordered = restartables
 
                     # Only attempt one launch per window; disable relaunches during boot
                     _global_gate = self.initial_delay if self._boot_phase else self.manager.timeouts["launch_delay"]
@@ -5540,12 +6895,12 @@ class WorkerThread(QThread):
                             if conflict:
                                 # Back off this uid for a bit so it doesn't starve others
                                 self._skip_until_by_user[uid] = now + 20
-                                # Move the round-robin cursor past this uid for next time
-                                self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
                                 # Try the next candidate
                                 continue
 
                             # Safe to try launching
+                            launch_started = time.time()
+                            log_baseline = self._capture_user_log_baseline(uid)
                             if self.launcher.start_game_session(uid, cookie, info):
                                 now2 = time.time()
                                 self.user_states[uid]["inactive_since"]   = None
@@ -5553,15 +6908,13 @@ class WorkerThread(QThread):
                                 self.user_states[uid]["status"]           = "Restarting"
                                 self.user_states[uid]["last_launch"]      = now2
                                 self.timing_trackers['relaunch']          = now2
-                                self._register_successful_launch(uid, now2)
-                                # Move round-robin forward from the *next* uid
-                                self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
+                                self._register_successful_launch(uid, launch_started, log_baseline=log_baseline)
+                                self._restart_cursor = 0
                                 launched = True
                                 break
                             else:
                                 # Launch failed for some other reason — short backoff on this uid
                                 self._skip_until_by_user[uid] = now + 10
-                                self._restart_cursor = (self._restart_cursor + 1) % max(1, len(ordered))
                                 # keep trying next candidate in this tick
 
                         # If none launched, do not reset relaunch timer (we’ll retry next tick with new order)
@@ -5571,7 +6924,7 @@ class WorkerThread(QThread):
                 except Exception as e:
                     self._log(f"[Relaunch] scheduler error: {e!r}")
 
-                time.sleep(self.manager.check_intervals['main_tick'])
+                self._stop_event.wait(self.manager.check_intervals['main_tick'])
             except Exception as e:
                 try:
                     self._log(f"[WorkerLoop] crash prevented: {e!r}")
@@ -5579,8 +6932,22 @@ class WorkerThread(QThread):
                     self._log(traceback.format_exc())
                 except Exception:
                     pass
-                time.sleep(0.2)
+                if self._stop_event.wait(0.2):
+                    break
                 continue
+
+        try:
+            t = getattr(self, "_ramp_thread", None)
+            if t and t.is_alive():
+                self._log("[RampUp] waiting for launch thread to finish before worker stops")
+                t.join(timeout=1.0)
+                if t.is_alive():
+                    self._log("[RampUp] launch thread still unwinding; continuing shutdown without blocking")
+        except Exception as e:
+            try:
+                self._log(f"[RampUp] join error during worker stop: {e!r}")
+            except Exception:
+                pass
     
     def _enforce_one_per_server(self):
         p = self.manager.process_tracker
@@ -5663,11 +7030,11 @@ class WorkerThread(QThread):
 
     def stop(self, *, shutdown_ms: bool = True):
         self.running = False  # make the loop exit ASAP
-        if shutdown_ms and getattr(self, "ms", None) and hasattr(self.ms, "shutdown"):
-            try:
-                self.ms.shutdown()
-            except Exception:
-                pass
+        # MultiScope shutdown is handled by the GUI after any needed state snapshot.
+        try:
+            self._stop_event.set()
+        except Exception:
+            pass
         if self.manager and self.manager.timeout_monitor:
             try:
                 self.manager.timeout_monitor.stop()
@@ -6240,6 +7607,7 @@ class UserManagementDialogLegacy(QDialog):
             "cookie": cookie,
             "bad": False,
             "cap": False,
+            "launch_priority": coerce_launch_priority(existing.get("launch_priority", DEFAULT_LAUNCH_PRIORITY)),
             "discord_user_ids": normalize_discord_ids(existing.get("discord_user_ids")),
         }
 
@@ -6361,6 +7729,7 @@ class UserManagementDialogLegacy(QDialog):
                 "cookie": cookie,
                 "bad": False,
                 "cap": False,
+                "launch_priority": DEFAULT_LAUNCH_PRIORITY,
                 "discord_user_ids": [],
             }
 
@@ -6608,6 +7977,8 @@ class UserManagementDialog(QDialog):
         header_obj.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header_obj.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         header_obj.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self._manage_users_activity_delegate = _ActivityDotDelegate(self.users_table)
+        self.users_table.setItemDelegateForColumn(4, self._manage_users_activity_delegate)
 
         left_layout.addWidget(self.users_table)
         splitter.addWidget(left)
@@ -6918,8 +8289,12 @@ class UserManagementDialog(QDialog):
                 link_item.setToolTip(psl)
             self.users_table.setItem(r, 3, link_item)
             desc_item = QTableWidgetItem(desc_preview)
+            desc_item.setData(_ACTIVITY_TIMESTAMP_ROLE, _coerce_activity_timestamp(info.get("last_launch", 0.0)))
+            activity_tip = _activity_tooltip(info.get("last_launch", 0.0))
             if description:
-                desc_item.setToolTip(description)
+                desc_item.setToolTip(f"{description}\n\n{activity_tip}")
+            else:
+                desc_item.setToolTip(activity_tip)
             self.users_table.setItem(r, 4, desc_item)
 
         try:
@@ -6931,6 +8306,7 @@ class UserManagementDialog(QDialog):
         self._sync_edit_with_selection()
 
     def save_and_close(self) -> None:
+        self._merge_latest_activity_from_disk()
         if self.config_manager.save_users(self.original_config):
             self.accept()
         else:
@@ -6939,6 +8315,25 @@ class UserManagementDialog(QDialog):
             if err:
                 msg = msg + "\n\n" + err
             QMessageBox.critical(self, "Error", msg)
+
+    def _merge_latest_activity_from_disk(self) -> None:
+        try:
+            latest = self.config_manager.load_users() or {}
+        except Exception:
+            latest = {}
+        if not isinstance(latest, dict) or not isinstance(self.original_config, dict):
+            return
+        for uid, info in list(self.original_config.items()):
+            if not isinstance(info, dict):
+                continue
+            disk_info = latest.get(str(uid))
+            if not isinstance(disk_info, dict):
+                continue
+            local_ts = _coerce_activity_timestamp(info.get("last_launch", 0.0))
+            disk_ts = _coerce_activity_timestamp(disk_info.get("last_launch", 0.0))
+            if disk_ts > local_ts:
+                info["last_launch"] = disk_ts
+                self.original_config[str(uid)] = info
 
     def _confirm_close_without_saving(self) -> None:
         reply = QMessageBox.warning(
@@ -7045,11 +8440,15 @@ class UserManagementDialog(QDialog):
         skip_disabled = []
         skip_flagged = []
         skip_no_cookie = []
+        skip_online = []
         launch_list: list[str] = []
 
         for uid in uids:
             info = self.original_config.get(uid, {}) if isinstance(self.original_config, dict) else {}
             if not isinstance(info, dict):
+                continue
+            if self._is_uid_online_in_manager(uid) or self._is_uid_online_in_stopped_state(uid):
+                skip_online.append(uid)
                 continue
             if bool(info.get("disabled", False)):
                 skip_disabled.append(uid)
@@ -7064,8 +8463,13 @@ class UserManagementDialog(QDialog):
                 continue
             launch_list.append(uid)
 
+        launch_list = sort_user_ids_by_launch_priority(
+            launch_list,
+            lambda u: (self.original_config.get(str(u), {}) if isinstance(self.original_config, dict) else {}),
+        )
+
         if not launch_list:
-            QMessageBox.information(self, "Nothing To Launch", "No selected users are launchable (disabled/flagged/missing cookie for cookie-mode users).")
+            QMessageBox.information(self, "Nothing To Launch", "No selected users are launchable (already online/disabled/flagged/missing cookie for cookie-mode users).")
             return
 
         if len(launch_list) > 1:
@@ -7081,11 +8485,7 @@ class UserManagementDialog(QDialog):
         if self._manager_running():
             parent = self.parent()
             wt = getattr(parent, "worker_thread", None)
-            online_skipped = 0
             for uid in launch_list:
-                if self._is_uid_online_in_manager(uid):
-                    online_skipped += 1
-                    continue
                 try:
                     info0 = self.original_config.get(uid, {}) if isinstance(self.original_config, dict) else {}
                     launch_info = dict(info0) if isinstance(info0, dict) else {}
@@ -7106,8 +8506,8 @@ class UserManagementDialog(QDialog):
                         self._ui_log(f"[ManualLaunch] uid={uid} failed: worker action queue unavailable")
                 except Exception as e:
                     self._ui_log(f"[ManualLaunch] uid={uid} failed: {e}")
-            if online_skipped:
-                self._ui_log(f"[ManualLaunch] Skipped {online_skipped} already-online user(s).")
+            if skip_online:
+                self._ui_log(f"[ManualLaunch] Skipped {len(skip_online)} already-online user(s).")
             return
 
         # Manager is off: manual launching on a background thread.
@@ -7119,7 +8519,11 @@ class UserManagementDialog(QDialog):
         def _run():
             try:
                 launcher = self._get_manual_launcher()
-                for uid in launch_list:
+                try:
+                    manual_launch_delay = max(0.0, float(getattr(launcher, "launch_delay", 0) or 0))
+                except Exception:
+                    manual_launch_delay = 0.0
+                for idx, uid in enumerate(launch_list):
                     info0 = self.original_config.get(uid, {}) if isinstance(self.original_config, dict) else {}
                     launch_info = dict(info0) if isinstance(info0, dict) else {}
                     if server_link:
@@ -7138,15 +8542,19 @@ class UserManagementDialog(QDialog):
                         launcher.start_game_session(uid, cookie, launch_info, skip_cleanup=False)
                     except Exception as e:
                         self._ui_log(f"[ManualLaunch] uid={uid} error: {e}")
-                    time.sleep(0.8)
+                    if idx < len(launch_list) - 1 and manual_launch_delay > 0:
+                        self._ui_log(f"[ManualLaunch] waiting {manual_launch_delay:.1f}s before next launch")
+                        time.sleep(manual_launch_delay)
                 self._ui_log(f"[ManualLaunch] done ({len(launch_list)} users)")
             finally:
                 QTimer.singleShot(0, lambda: self.launch_roblox_btn.setEnabled(True))
 
         threading.Thread(target=_run, daemon=True).start()
 
-        if skip_disabled or skip_flagged or skip_no_cookie:
+        if skip_disabled or skip_flagged or skip_no_cookie or skip_online:
             parts = []
+            if skip_online:
+                parts.append(f"already_online={len(skip_online)}")
             if skip_disabled:
                 parts.append(f"disabled={len(skip_disabled)}")
             if skip_flagged:
@@ -7314,7 +8722,11 @@ class UserManagementDialog(QDialog):
                     desc_item = QTableWidgetItem()
                     self.users_table.setItem(row, 4, desc_item)
                 desc_item.setText(preview)
-                desc_item.setToolTip(desc if desc else "")
+                info = self.original_config.get(str(row_uid), {}) if isinstance(self.original_config, dict) else {}
+                ts = info.get("last_launch", 0.0) if isinstance(info, dict) else 0.0
+                desc_item.setData(_ACTIVITY_TIMESTAMP_ROLE, _coerce_activity_timestamp(ts))
+                activity_tip = _activity_tooltip(ts)
+                desc_item.setToolTip(f"{desc}\n\n{activity_tip}" if desc else activity_tip)
         except Exception:
             # Fallback: refresh if anything goes wrong.
             try:
@@ -7523,10 +8935,12 @@ class UserManagementDialog(QDialog):
             "place": place,
             "cookie": cookie,
             "server_type": self._derive_server_type(private_server_link, place),
+            "last_launch": 0.0,
             "bad": bad,
             "cap": cap,
             "disabled": disabled,
             "alternate_launch": alternate,
+            "launch_priority": DEFAULT_LAUNCH_PRIORITY,
             "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
             "discord_user_ids": [],
         }
@@ -7609,6 +9023,7 @@ class UserManagementDialog(QDialog):
                 "cap": cap,
                 "disabled": disabled,
                 "alternate_launch": alternate,
+                "launch_priority": coerce_launch_priority(existing.get("launch_priority", DEFAULT_LAUNCH_PRIORITY)),
                 "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
                 "discord_user_ids": normalize_discord_ids(existing.get("discord_user_ids")),
             }
@@ -7846,13 +9261,13 @@ class UserManagementDialog(QDialog):
                         self._ui_log(f"[Browser] uid={uid} failed: Chrome remote debug not reachable (port={port}).")
                         return
 
-                from selenium import webdriver
                 from selenium.webdriver.chrome.options import Options
+                from selenium.webdriver.chrome.webdriver import WebDriver as ChromeWebDriver
 
                 opts = Options()
                 opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{int(port)}")
 
-                driver = webdriver.Chrome(options=opts)
+                driver = ChromeWebDriver(options=opts)
                 try:
                     driver.get("https://www.roblox.com/")
                 except Exception:
@@ -7981,6 +9396,33 @@ class UserManagementDialog(QDialog):
             return any(wt.process_mgr.verify_process_active(pid) for pid in pids)
         except Exception:
             return False
+
+    def _is_uid_online_in_stopped_state(self, uid: str) -> bool:
+        parent = self.parent()
+        state = getattr(parent, "_stopped_worker_state", None)
+        if not isinstance(state, dict):
+            return False
+        tracker = state.get("process_tracker") or {}
+        if not isinstance(tracker, dict):
+            return False
+        user_processes = tracker.get("user_processes") or {}
+        if not isinstance(user_processes, dict):
+            return False
+        pids = user_processes.get(str(uid), []) or []
+        if not isinstance(pids, (list, tuple, set)):
+            pids = [pids]
+        try:
+            import psutil
+        except Exception:
+            return False
+        for pid in pids:
+            try:
+                proc = psutil.Process(int(pid))
+                if str(proc.name()).lower() == "robloxplayerbeta.exe":
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _get_manual_launcher(self) -> GameLauncher:
         if self._manual_launcher is not None:
@@ -8291,6 +9733,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     antiafk_state_signal = Signal(bool)
     antiafk_touch_signal = Signal(int)
     antiafk_pre_action_signal = Signal(float)
+    multi_instance_result_signal = Signal(bool, bool, str)
+    multi_instance_fix_result_signal = Signal(bool, str)
     autoitem_log_signal = Signal(str)
     autoitem_mouse_block_signal = Signal(bool)
     bes_log_signal = Signal(str)
@@ -8303,6 +9747,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.worker_thread = None
         self._manager_paused: bool = False
         self._paused_worker_state: Optional[dict] = None
+        self._stopped_worker_state: Optional[dict] = None
         self._paused_at: Optional[float] = None
         self.ocr_worker: Optional[OCRWorker] = None
         self.ocr_roi: Optional[Tuple[float, float, float, float]] = None
@@ -8329,6 +9774,29 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._utilities_dialog: Optional[QDialog] = None
         self._ram_export_widget: Optional[QWidget] = None
         self._utilities_widget: Optional[QWidget] = None
+        self._multi_instance_dialog: Optional[QDialog] = None
+        self._multi_instance_checkbox: Optional[QCheckBox] = None
+        self._multi_instance_status_label: Optional[QLabel] = None
+        self._multi_instance_setting_label: Optional[QLabel] = None
+        self._multi_instance_guard_label: Optional[QLabel] = None
+        self._multi_instance_process_label: Optional[QLabel] = None
+        self._multi_instance_issue_label: Optional[QLabel] = None
+        self._multi_instance_fix_btn: Optional[QPushButton] = None
+        self._multi_instance_refresh_btn: Optional[QPushButton] = None
+        self._multi_instance_enabled: bool = False
+        self._multi_instance_guard_active: bool = False
+        self._multi_instance_needs_repair: bool = False
+        self._multi_instance_last_error: str = ""
+        self._multi_instance_process_count: int = 0
+        self._multi_instance_last_process_count: Optional[int] = None
+        self._multi_instance_last_refresh_attempt_at: float = 0.0
+        self._multi_instance_operation_pending: bool = False
+        self._multi_instance_notify_on_failure: bool = False
+        self._multi_instance_pending_action: str = ""
+        self._multi_instance_prompted: bool = False
+        self._multi_instance_fix_in_progress: bool = False
+        self._multi_instance_fix_resume_manager: bool = False
+        self._multi_instance_fix_deadline: float = 0.0
         self.process_data = {}
         self.user_data = {}
         self._hourly_users_report_last_sent_at: float = 0.0
@@ -8339,6 +9807,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._users_table_dirty: bool = False
         self._users_table_refresh_pending: bool = False
         self._users_table_force_full: bool = False
+        self._accounts_list_users_mtime: float = -1.0
 
         self._multiscope_table_dirty: bool = False
         self._multiscope_table_refresh_pending: bool = False
@@ -8424,18 +9893,24 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._auto_item_hwnd_cache_lock = threading.Lock()
         self._ms_biome_by_server: Dict[str, str] = {}
         self._ms_in_menu_by_server: Dict[str, Optional[bool]] = {}
+        self._ms_in_menu_ts_by_server: Dict[str, float] = {}
         self._ms_biome_by_uid: Dict[str, str] = {}
         self._ms_in_menu_by_uid: Dict[str, Optional[bool]] = {}
+        self._ms_in_menu_ts_by_uid: Dict[str, float] = {}
         self._ms_biome_lock = threading.Lock()
         self._last_multiscope_rows: Optional[list] = None
         self._ms_resume_grace_until: float = 0.0
         self._auto_item_antiafk_was_running: bool = False
+        self._auto_item_antiafk_pause_depth: int = 0
+        self._auto_item_antiafk_pause_lock = threading.Lock()
 
         # Anti-AFK "last touch" bookkeeping (touch = Anti-AFK action OR Auto-Item action).
         self._antiafk_touch_lock = threading.Lock()
         self._antiafk_last_touch_by_uid: Dict[str, float] = {}
+        self._antiafk_last_action_by_uid: Dict[str, float] = {}
         self._antiafk_pid_to_uid: Dict[int, str] = {}
         self._antiafk_disconnected_pids: Set[int] = set()
+        self._antiafk_auto_action_overdue_min: float = _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT
 
         # BES limiter controller (optional; Windows-only)
         self._loading_bes_settings = False
@@ -8463,6 +9938,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._auto_item_hotkey_hwnd: int = 0
         self._auto_item_hotkey_registered: bool = False
         self.discord_control_service: Optional[DiscordBotService] = None
+        self.discord_user_link_manager = None
         self.discord_control_tab_index: Optional[int] = None
         self.discord_control_status_label: Optional[QLabel] = None
         self.discord_control_status_detail_label: Optional[QLabel] = None
@@ -8490,6 +9966,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.antiafk_state_signal.connect(self._on_antiafk_state_changed)
         self.antiafk_touch_signal.connect(self._on_antiafk_touch)
         self.antiafk_pre_action_signal.connect(self._on_antiafk_pre_action)
+        self.multi_instance_result_signal.connect(self._on_multi_instance_operation_finished)
+        self.multi_instance_fix_result_signal.connect(self._on_multi_instance_fix_kill_finished)
         self.autoitem_log_signal.connect(self._on_autoitem_status)
         self.autoitem_mouse_block_signal.connect(self._on_autoitem_mouse_block)
         self.bes_log_signal.connect(self._on_bes_log)
@@ -8746,6 +10224,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         extras_menu.addSeparator()
 
+        multi_instance_action = extras_menu.addAction("Roblox Multi-Instance")
+        multi_instance_action.setToolTip("Allow multiple Roblox Player instances to run at the same time")
+        multi_instance_action.triggered.connect(self.show_multi_instance_window)
+
         ram_export_action = extras_menu.addAction("RAM Export")
         ram_export_action.triggered.connect(self.show_ram_export_window)
 
@@ -8773,6 +10255,521 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             show_tutorial = False
         self._apply_tutorial_menu_visibility(show_tutorial)
+
+    def show_multi_instance_window(self) -> None:
+        """Show the Extras dialog used to control Roblox's singleton guard."""
+        self._refresh_multi_instance_process_snapshot()
+        dialog = getattr(self, "_multi_instance_dialog", None)
+        if dialog is not None:
+            try:
+                self._update_multi_instance_dialog()
+                dialog.show()
+                dialog.raise_()
+                dialog.activateWindow()
+                return
+            except Exception:
+                self._multi_instance_dialog = None
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Roblox Multi-Instance")
+        dialog.setModal(False)
+        dialog.setMinimumWidth(560)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("Roblox Multi-Instance")
+        title_font = QFont()
+        title_font.setPointSize(16)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        description = QLabel(
+            "J.JARAM keeps Roblox's singleton guard active so multiple accounts can run at once. "
+            "If Roblox was opened before the guard was ready, use Fix to close those sessions "
+            "and recreate the guard cleanly."
+        )
+        description.setWordWrap(True)
+        description.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(description)
+
+        checkbox = QCheckBox("Enable Roblox multi-instancing")
+        checkbox.setChecked(bool(getattr(self, "_multi_instance_enabled", False)))
+        checkbox.toggled.connect(self._set_multi_instance_enabled)
+        layout.addWidget(checkbox)
+        self._multi_instance_checkbox = checkbox
+
+        status_group = QGroupBox("Current status")
+        status_layout = QGridLayout(status_group)
+        status_layout.setHorizontalSpacing(18)
+        status_layout.setVerticalSpacing(8)
+
+        status_layout.addWidget(QLabel("Setting:"), 0, 0)
+        self._multi_instance_setting_label = QLabel()
+        status_layout.addWidget(self._multi_instance_setting_label, 0, 1)
+
+        status_layout.addWidget(QLabel("Singleton guard:"), 1, 0)
+        self._multi_instance_guard_label = QLabel()
+        status_layout.addWidget(self._multi_instance_guard_label, 1, 1)
+
+        status_layout.addWidget(QLabel("Roblox processes:"), 2, 0)
+        self._multi_instance_process_label = QLabel()
+        status_layout.addWidget(self._multi_instance_process_label, 2, 1)
+
+        status_layout.addWidget(QLabel("Overall:"), 3, 0)
+        self._multi_instance_status_label = QLabel()
+        self._multi_instance_status_label.setWordWrap(True)
+        status_layout.addWidget(self._multi_instance_status_label, 3, 1)
+        status_layout.setColumnStretch(1, 1)
+        layout.addWidget(status_group)
+
+        self._multi_instance_issue_label = QLabel()
+        self._multi_instance_issue_label.setWordWrap(True)
+        self._multi_instance_issue_label.setStyleSheet(
+            f"color:{ModernStyle.TEXT_PRIMARY}; background-color:{ModernStyle.SURFACE_VARIANT}; "
+            f"border:1px solid {ModernStyle.WARNING}; border-radius:6px; padding:10px;"
+        )
+        layout.addWidget(self._multi_instance_issue_label)
+
+        button_row = QHBoxLayout()
+        self._multi_instance_refresh_btn = QPushButton("Refresh Guard")
+        self._multi_instance_refresh_btn.clicked.connect(self._refresh_multi_instance_clicked)
+        button_row.addWidget(self._multi_instance_refresh_btn)
+
+        self._multi_instance_fix_btn = QPushButton("Fix: Close Roblox && Refresh")
+        self._multi_instance_fix_btn.setProperty("class", "danger")
+        self._multi_instance_fix_btn.clicked.connect(self._fix_multi_instance)
+        button_row.addWidget(self._multi_instance_fix_btn)
+        button_row.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.close)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+        self._multi_instance_dialog = dialog
+        self._update_multi_instance_dialog()
+        # Size only after the layout is populated. Resizing earlier can request
+        # a geometry smaller than Qt's final DPI-scaled minimum and causes
+        # QWindowsWindow::setGeometry warnings on high-DPI monitors.
+        dialog.adjustSize()
+        size_hint = dialog.sizeHint()
+        dialog.resize(max(580, size_hint.width()), max(440, size_hint.height() + 24))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    @staticmethod
+    def _roblox_process_pids() -> List[int]:
+        pids: List[int] = []
+        try:
+            import psutil
+
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    info = proc.info or {}
+                    if str(info.get("name") or "").lower() != "robloxplayerbeta.exe":
+                        continue
+                    pid = int(info.get("pid") or 0)
+                    if pid > 0:
+                        pids.append(pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError, ValueError):
+                    continue
+        except Exception:
+            return []
+        return sorted(set(pids))
+
+    def _refresh_multi_instance_process_snapshot(self) -> int:
+        count = len(self._roblox_process_pids())
+        self._multi_instance_process_count = int(count)
+        return int(count)
+
+    def _update_multi_instance_dialog(self) -> None:
+        enabled = bool(getattr(self, "_multi_instance_enabled", False))
+        guard_active = bool(getattr(self, "_multi_instance_guard_active", False))
+        needs_repair = bool(getattr(self, "_multi_instance_needs_repair", False))
+        pending = bool(getattr(self, "_multi_instance_operation_pending", False))
+        fixing = bool(getattr(self, "_multi_instance_fix_in_progress", False))
+        process_count = int(getattr(self, "_multi_instance_process_count", 0) or 0)
+
+        checkbox = getattr(self, "_multi_instance_checkbox", None)
+        if checkbox is not None:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(enabled)
+            checkbox.setEnabled(not pending and not fixing)
+            checkbox.blockSignals(False)
+
+        setting_label = getattr(self, "_multi_instance_setting_label", None)
+        if setting_label is not None:
+            setting_label.setText("Enabled" if enabled else "Disabled")
+            setting_label.setStyleSheet(
+                f"color:{ModernStyle.SECONDARY if enabled else ModernStyle.TEXT_SECONDARY}; font-weight:bold;"
+            )
+
+        guard_label = getattr(self, "_multi_instance_guard_label", None)
+        if guard_label is not None:
+            if guard_active:
+                guard_text, guard_color = "Active", ModernStyle.SECONDARY
+            elif enabled and needs_repair:
+                guard_text, guard_color = "Needs repair", ModernStyle.ERROR
+            elif enabled:
+                guard_text, guard_color = "Checking", ModernStyle.WARNING
+            else:
+                guard_text, guard_color = "Inactive", ModernStyle.TEXT_SECONDARY
+            guard_label.setText(guard_text)
+            guard_label.setStyleSheet(f"color:{guard_color}; font-weight:bold;")
+
+        process_label = getattr(self, "_multi_instance_process_label", None)
+        if process_label is not None:
+            suffix = "process" if process_count == 1 else "processes"
+            process_label.setText(f"{process_count} running {suffix}")
+
+        status_label = getattr(self, "_multi_instance_status_label", None)
+        if status_label is not None:
+            if fixing:
+                text, color = "Closing Roblox and rebuilding the guard…", ModernStyle.WARNING
+            elif pending:
+                text, color = "Refreshing the singleton guard…", ModernStyle.WARNING
+            elif not enabled:
+                text, color = "Multi-instancing is turned off.", ModernStyle.TEXT_SECONDARY
+            elif needs_repair:
+                text, color = "Action required before another Roblox instance can launch.", ModernStyle.ERROR
+            elif guard_active:
+                text, color = "Ready for multiple Roblox instances.", ModernStyle.SECONDARY
+            else:
+                text, color = "The singleton guard is not active.", ModernStyle.WARNING
+            status_label.setText(text)
+            status_label.setStyleSheet(f"color:{color}; font-weight:bold;")
+
+        issue_label = getattr(self, "_multi_instance_issue_label", None)
+        if issue_label is not None:
+            if enabled and needs_repair:
+                detail = str(getattr(self, "_multi_instance_last_error", "") or "").strip()
+                issue = (
+                    "Roblox was already open without a compatible multi-instance guard. "
+                    "Click Fix to close every Roblox process and recreate the guard."
+                )
+                if detail:
+                    issue += f"\n\n{detail}"
+                issue_label.setText(issue)
+                issue_label.show()
+            else:
+                issue_label.hide()
+
+        refresh_btn = getattr(self, "_multi_instance_refresh_btn", None)
+        if refresh_btn is not None:
+            refresh_btn.setEnabled(enabled and not pending and not fixing)
+        fix_btn = getattr(self, "_multi_instance_fix_btn", None)
+        if fix_btn is not None:
+            fix_btn.setEnabled(enabled and not pending and not fixing)
+
+    def _multi_instance_error_message(self, error_code: int) -> str:
+        try:
+            error_code = int(error_code)
+        except Exception:
+            error_code = 0
+        if error_code == 6:
+            return "An existing Roblox process owns ROBLOX_singletonEvent."
+        if error_code == 5:
+            return "Windows denied access to the Roblox singleton guard. Try running J.JARAM as administrator."
+        if error_code:
+            return f"Windows could not create the Roblox singleton guard (error {error_code})."
+        return "The Roblox singleton guard could not be created."
+
+    def _set_multi_instance_enabled(self, enabled: bool) -> None:
+        """Enable or release the Roblox singleton mutex in the Anti-AFK worker."""
+        enabled = bool(enabled)
+        if bool(getattr(self, "_multi_instance_operation_pending", False)):
+            return
+
+        self._multi_instance_enabled = enabled
+        self._multi_instance_needs_repair = False
+        self._multi_instance_last_error = ""
+        if not enabled:
+            self._multi_instance_prompted = False
+        self._save_antiafk_settings()
+        self._refresh_multi_instance_process_snapshot()
+        self._update_multi_instance_dialog()
+        self._request_multi_instance_operation(
+            enabled,
+            refresh=False,
+            interactive=True,
+            action="enable" if enabled else "disable",
+        )
+
+    def _request_multi_instance_operation(
+        self,
+        enabled: bool,
+        *,
+        refresh: bool,
+        interactive: bool,
+        action: str,
+    ) -> None:
+        if bool(getattr(self, "_multi_instance_operation_pending", False)):
+            return
+        antiafk = getattr(self, "antiafk", None)
+        if antiafk is None:
+            self._multi_instance_guard_active = False
+            self._multi_instance_needs_repair = bool(enabled)
+            self._multi_instance_last_error = "The Anti-AFK worker that owns the guard is unavailable."
+            self._update_multi_instance_dialog()
+            return
+
+        self._multi_instance_operation_pending = True
+        self._multi_instance_notify_on_failure = bool(interactive)
+        self._multi_instance_pending_action = str(action or "refresh")
+        if enabled:
+            self._multi_instance_last_refresh_attempt_at = time.monotonic()
+        self._update_multi_instance_dialog()
+
+        def _operation() -> None:
+            success = False
+            message = ""
+            try:
+                if enabled:
+                    if refresh:
+                        success = bool(antiafk.refresh_multi_instance())
+                    else:
+                        success = bool(antiafk.enable_multi_instance())
+                else:
+                    success = bool(antiafk.disable_multi_instance())
+                if success:
+                    antiafk.apply_host_config(multi_instance_enabled=enabled)
+                    message = "Roblox multi-instance guard active" if enabled else "Roblox multi-instancing disabled"
+                else:
+                    try:
+                        error_code = int(antiafk.multi_instance_last_error())
+                    except Exception:
+                        error_code = 0
+                    message = self._multi_instance_error_message(error_code)
+            except Exception as exc:
+                message = str(exc)
+            self.multi_instance_result_signal.emit(enabled, success, message)
+
+        try:
+            self._antiafk_thread_pool.start(_FunctionRunnable(_operation))
+        except Exception:
+            threading.Thread(target=_operation, daemon=True).start()
+
+    def _on_multi_instance_operation_finished(self, requested: bool, success: bool, message: str) -> None:
+        action = str(getattr(self, "_multi_instance_pending_action", "") or "")
+        self._multi_instance_operation_pending = False
+        self._multi_instance_pending_action = ""
+        self._refresh_multi_instance_process_snapshot()
+
+        if success:
+            self._multi_instance_enabled = bool(requested)
+            self._multi_instance_guard_active = bool(requested)
+            self._multi_instance_needs_repair = False
+            self._multi_instance_last_error = ""
+            self._multi_instance_prompted = False
+            self._save_antiafk_settings()
+            self.add_log(f"[Extras] {message}")
+        else:
+            if requested:
+                # Keep the desired setting enabled so Fix can repair the active session.
+                self._multi_instance_enabled = True
+                self._multi_instance_guard_active = False
+                self._multi_instance_needs_repair = bool(self._multi_instance_process_count > 0)
+                self._multi_instance_last_error = str(message or "Operation failed.")
+                self._save_antiafk_settings()
+                if self._multi_instance_needs_repair:
+                    self._prompt_multi_instance_repair()
+            else:
+                self._multi_instance_last_error = str(message or "Operation failed.")
+
+        if action == "fix":
+            self._multi_instance_fix_in_progress = False
+            if success and bool(getattr(self, "_multi_instance_fix_resume_manager", False)):
+                QTimer.singleShot(250, self._resume_manager_after_multi_instance_fix)
+            elif not success and bool(getattr(self, "_multi_instance_fix_resume_manager", False)):
+                self.add_log("[Extras] Multi-instance repair failed; manager left paused.")
+            self._multi_instance_fix_resume_manager = False
+
+        self._multi_instance_notify_on_failure = False
+        self._update_multi_instance_dialog()
+
+    def _restore_multi_instance_state(self) -> None:
+        """Recreate the mutex after the Anti-AFK worker starts."""
+        antiafk = getattr(self, "antiafk", None)
+        if antiafk is None:
+            return
+        try:
+            self._multi_instance_enabled = bool(
+                (getattr(antiafk, "config", {}) or {}).get("multi_instance_enabled", False)
+            )
+        except Exception:
+            self._multi_instance_enabled = False
+        process_count = self._refresh_multi_instance_process_snapshot()
+        self._multi_instance_last_process_count = int(process_count)
+        if self._multi_instance_enabled:
+            self._request_multi_instance_operation(
+                True,
+                refresh=False,
+                interactive=False,
+                action="startup",
+            )
+        else:
+            self._update_multi_instance_dialog()
+
+    def _check_multi_instance_process_state(self) -> None:
+        dialog = getattr(self, "_multi_instance_dialog", None)
+        dialog_visible = bool(dialog is not None and dialog.isVisible())
+        if not bool(getattr(self, "_multi_instance_enabled", False)) and not dialog_visible:
+            return
+
+        previous = getattr(self, "_multi_instance_last_process_count", None)
+        current = self._refresh_multi_instance_process_snapshot()
+        self._multi_instance_last_process_count = int(current)
+        self._update_multi_instance_dialog()
+
+        if not bool(getattr(self, "_multi_instance_enabled", False)):
+            return
+        if self._multi_instance_operation_pending or self._multi_instance_fix_in_progress:
+            return
+
+        if current == 0:
+            self._multi_instance_prompted = False
+            transitioned_to_zero = previous is not None and int(previous) > 0
+            retry_due = (
+                not self._multi_instance_guard_active
+                and (time.monotonic() - float(self._multi_instance_last_refresh_attempt_at or 0.0)) >= 5.0
+            )
+            if transitioned_to_zero or retry_due:
+                self._request_multi_instance_operation(
+                    True,
+                    refresh=True,
+                    interactive=False,
+                    action="process_exit",
+                )
+            return
+
+        if not self._multi_instance_guard_active:
+            self._multi_instance_needs_repair = True
+            if not self._multi_instance_last_error:
+                self._multi_instance_last_error = "The active Roblox session does not have J.JARAM's guard."
+            self._prompt_multi_instance_repair()
+
+    def _prompt_multi_instance_repair(self) -> None:
+        if bool(getattr(self, "_multi_instance_prompted", False)):
+            self._update_multi_instance_dialog()
+            return
+        self._multi_instance_prompted = True
+        self.show_multi_instance_window()
+
+    def _refresh_multi_instance_clicked(self) -> None:
+        if not bool(getattr(self, "_multi_instance_enabled", False)):
+            return
+        self._refresh_multi_instance_process_snapshot()
+        self._request_multi_instance_operation(
+            True,
+            refresh=True,
+            interactive=True,
+            action="refresh",
+        )
+
+    def _fix_multi_instance(self) -> None:
+        if self._multi_instance_operation_pending or self._multi_instance_fix_in_progress:
+            return
+        if not bool(getattr(self, "_multi_instance_enabled", False)):
+            return
+
+        process_count = self._refresh_multi_instance_process_snapshot()
+        was_running = bool(self.worker_thread and self.worker_thread.isRunning())
+        if process_count > 0:
+            manager_note = (
+                "\n\nThe manager will pause and resume automatically after the repair."
+                if was_running
+                else ""
+            )
+            reply = QMessageBox.question(
+                self,
+                "Fix Roblox Multi-Instance",
+                f"This will close all {process_count} running Roblox process(es), then recreate "
+                f"the multi-instance guard.{manager_note}\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        self._multi_instance_fix_in_progress = True
+        self._multi_instance_fix_resume_manager = False
+        self._multi_instance_last_error = ""
+        self._update_multi_instance_dialog()
+
+        if was_running:
+            self.pause_manager()
+            if self.worker_thread and self.worker_thread.isRunning():
+                self._multi_instance_fix_in_progress = False
+                self._multi_instance_last_error = "The manager could not be paused, so Roblox was not closed."
+                self._update_multi_instance_dialog()
+                QMessageBox.warning(self, "Fix Roblox Multi-Instance", self._multi_instance_last_error)
+                return
+            self._multi_instance_fix_resume_manager = True
+
+        if process_count <= 0:
+            self._request_multi_instance_operation(
+                True,
+                refresh=True,
+                interactive=True,
+                action="fix",
+            )
+            return
+
+        def _kill_all() -> None:
+            try:
+                ProcessManager(excluded_pid=0).terminate_process(None, None)
+                self.multi_instance_fix_result_signal.emit(True, "")
+            except Exception as exc:
+                self.multi_instance_fix_result_signal.emit(False, str(exc))
+
+        try:
+            self._antiafk_thread_pool.start(_FunctionRunnable(_kill_all))
+        except Exception:
+            threading.Thread(target=_kill_all, daemon=True).start()
+
+    def _on_multi_instance_fix_kill_finished(self, success: bool, message: str) -> None:
+        if not success:
+            self._multi_instance_fix_in_progress = False
+            self._multi_instance_last_error = str(message or "Failed to close Roblox processes.")
+            self._update_multi_instance_dialog()
+            QMessageBox.warning(self, "Fix Roblox Multi-Instance", self._multi_instance_last_error)
+            return
+        self._stopped_worker_state = None
+        self._multi_instance_fix_deadline = time.monotonic() + 20.0
+        self._wait_for_roblox_exit_then_refresh()
+
+    def _wait_for_roblox_exit_then_refresh(self) -> None:
+        process_count = self._refresh_multi_instance_process_snapshot()
+        self._update_multi_instance_dialog()
+        if process_count <= 0:
+            self._multi_instance_last_process_count = 0
+            self._request_multi_instance_operation(
+                True,
+                refresh=True,
+                interactive=True,
+                action="fix",
+            )
+            return
+        if time.monotonic() >= float(getattr(self, "_multi_instance_fix_deadline", 0.0) or 0.0):
+            self._multi_instance_fix_in_progress = False
+            self._multi_instance_last_error = f"{process_count} Roblox process(es) did not close."
+            self._multi_instance_needs_repair = True
+            self._update_multi_instance_dialog()
+            QMessageBox.warning(self, "Fix Roblox Multi-Instance", self._multi_instance_last_error)
+            return
+        QTimer.singleShot(250, self._wait_for_roblox_exit_then_refresh)
+
+    def _resume_manager_after_multi_instance_fix(self) -> None:
+        if self._manager_paused and self._paused_worker_state:
+            self.add_log("[Extras] Multi-instance repaired; resuming manager.")
+            self.resume_manager()
+            return
+        self.add_log("[Extras] Multi-instance repaired; restarting manager with fresh state.")
+        self.stop_manager(timeout_ms=1000, preserve_state=False, shutdown_ms=False)
+        self.start_manager()
 
     def _apply_tutorial_menu_visibility(self, show: bool) -> None:
         try:
@@ -9611,6 +11608,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.accounts_list.setColumnWidth(1, 120)
         self.accounts_list.setColumnWidth(4, 90)
         self.accounts_list.setColumnWidth(5, 80)
+        self._accounts_activity_delegate = _ActivityDotDelegate(self.accounts_list)
+        self.accounts_list.setItemDelegateForColumn(3, self._accounts_activity_delegate)
         self.accounts_list.verticalHeader().setDefaultSectionSize(35)
         try:
             self.accounts_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -9669,10 +11668,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.launch_debug_chk = QCheckBox("Launch Debug", self)
         self.launch_debug_chk.setChecked(False)  # hidden by default
         controls_layout.addWidget(self.launch_debug_chk)
-
-        self.launch_gate_debug_chk = QCheckBox("Launch Gate Debug", self)
-        self.launch_gate_debug_chk.setChecked(False)
-        controls_layout.addWidget(self.launch_gate_debug_chk)
          
         self.auto_scroll_checkbox = QCheckBox("Auto-scroll")
         self.auto_scroll_checkbox.setChecked(True)
@@ -9979,6 +11974,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.antiafk_menu_autoreconnect_chk = QCheckBox("Use AutoReconnect when in main menu")
         settings_layout.addWidget(self.antiafk_menu_autoreconnect_chk, 3, 0, 1, 2)
 
+        self.antiafk_debug_timing_chk = QCheckBox("Debug timings")
+        self.antiafk_debug_timing_chk.setToolTip(
+            "Log Anti-AFK sweep, batch, and action-step durations to the Anti-AFK log."
+        )
+        settings_layout.addWidget(self.antiafk_debug_timing_chk, 4, 0, 1, 2)
+
         layout.addWidget(settings_group)
 
         alerts_group = QGroupBox("Alerts")
@@ -10105,10 +12106,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._loading_antiafk_settings = True
         try:
             cfg = self.antiafk.config or {}
+            self._multi_instance_enabled = bool(cfg.get("multi_instance_enabled", False))
             self.antiafk_interval_spin.setValue(int(cfg.get("antiafk_interval", 120)))
             self.antiafk_action_combo.setCurrentText(cfg.get("antiafk_action", "space"))
             self.antiafk_alt_delay_spin.setValue(int(cfg.get("antiafk_alt_delay_ms", 400)))
             self.antiafk_menu_autoreconnect_chk.setChecked(bool(cfg.get("antiafk_menu_autoreconnect", False)))
+            self.antiafk_debug_timing_chk.setChecked(bool(cfg.get("antiafk_dev_mode", False)))
             self.antiafk_enable_chk.setChecked(bool(cfg.get("antiafk_enabled", False)))
             self.antiafk_alert_sound_chk.setChecked(bool(cfg.get("antiafk_alert_sound", False)))
             self.antiafk_alert_tooltip_chk.setChecked(bool(cfg.get("antiafk_alert_tooltip", False)))
@@ -10133,6 +12136,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.antiafk_action_combo.currentTextChanged.connect(self._on_antiafk_ui_changed)
         self.antiafk_alt_delay_spin.valueChanged.connect(self._on_antiafk_ui_changed)
         self.antiafk_menu_autoreconnect_chk.toggled.connect(self._on_antiafk_ui_changed)
+        self.antiafk_debug_timing_chk.toggled.connect(self._on_antiafk_ui_changed)
         self.antiafk_alert_sound_chk.toggled.connect(self._on_antiafk_ui_changed)
         self.antiafk_alert_tooltip_chk.toggled.connect(self._on_antiafk_ui_changed)
         self.antiafk_alert_lead_spin.valueChanged.connect(self._on_antiafk_ui_changed)
@@ -10143,6 +12147,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         # Ensure initial engine config (including multi-instance) is applied
         self._on_antiafk_ui_changed()
+        QTimer.singleShot(0, self._restore_multi_instance_state)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -10617,6 +12622,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         now_ts = time.time()
         with self._antiafk_touch_lock:
             self._antiafk_last_touch_by_uid[str(uid)] = float(now_ts)
+            self._antiafk_last_action_by_uid[str(uid)] = float(now_ts)
+        try:
+            wt = getattr(self, "worker_thread", None)
+            fn = getattr(wt, "record_antiafk_action", None)
+            if callable(fn):
+                fn(str(uid), float(now_ts))
+        except Exception:
+            pass
 
     def _on_antiafk_pre_action(self, seconds_until_action: float) -> None:
         try:
@@ -10641,6 +12654,47 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if show_tooltip:
             text = "Anti-AFK action now" if seconds <= 0.0 else f"Anti-AFK action in {seconds:.1f}s"
             self._show_antiafk_center_tooltip(text, int(max(1000.0, seconds * 1000.0)))
+
+    @staticmethod
+    def _clamp_antiafk_overdue_minutes(value) -> float:
+        try:
+            minutes = float(value)
+        except Exception:
+            minutes = _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT
+        return max(1.0, min(15.0, minutes))
+
+    def _set_antiafk_auto_action_overdue_minutes(self, value) -> float:
+        minutes = self._clamp_antiafk_overdue_minutes(value)
+        try:
+            self._antiafk_auto_action_overdue_min = float(minutes)
+        except Exception:
+            pass
+        return minutes
+
+    def _antiafk_auto_action_overdue_minutes(self) -> float:
+        try:
+            return self._clamp_antiafk_overdue_minutes(
+                getattr(self, "_antiafk_auto_action_overdue_min", _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT)
+            )
+        except Exception:
+            pass
+
+        try:
+            cfg = getattr(getattr(self, "antiafk", None), "config", {}) or {}
+            return self._clamp_antiafk_overdue_minutes(
+                cfg.get("antiafk_auto_action_overdue_min", _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT)
+            )
+        except Exception:
+            return _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT
+
+    def _antiafk_auto_action_overdue_seconds(self) -> float:
+        return self._antiafk_auto_action_overdue_minutes() * 60.0
+
+    def _format_antiafk_overdue_minutes_label(self) -> str:
+        minutes = self._antiafk_auto_action_overdue_minutes()
+        if abs(minutes - round(minutes)) < 0.05:
+            return f"{int(round(minutes))}m"
+        return f"{minutes:.1f}m"
 
     def _run_antiafk_async(self, func_name: str, *args, **kwargs):
         antiafk = getattr(self, "antiafk", None)
@@ -10681,15 +12735,23 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             alt_delay_ms = int(self.antiafk_alt_delay_spin.value())
             menu_autoreconnect = bool(self.antiafk_menu_autoreconnect_chk.isChecked())
             unthrottle_enabled = bool(getattr(self, "antiafk_unthrottle_chk", None) and self.antiafk_unthrottle_chk.isChecked())
+            try:
+                with self._bes_cfg_lock:
+                    bes_cfg = dict(self._bes_cfg_cache or {})
+            except Exception:
+                bes_cfg = {}
+            effective_unthrottle_enabled = bool(unthrottle_enabled and bool(bes_cfg.get("enabled", False)))
             unthrottle_batch_size = int(getattr(self, "antiafk_unthrottle_batch_spin", None) and self.antiafk_unthrottle_batch_spin.value() or 5)
             unthrottle_lead_s = float(getattr(self, "antiafk_unthrottle_lead_spin", None) and self.antiafk_unthrottle_lead_spin.value() or 0.0)
             alert_sound_enabled = bool(getattr(self, "antiafk_alert_sound_chk", None) and self.antiafk_alert_sound_chk.isChecked())
             alert_tooltip_enabled = bool(getattr(self, "antiafk_alert_tooltip_chk", None) and self.antiafk_alert_tooltip_chk.isChecked())
             alert_lead_s = float(getattr(self, "antiafk_alert_lead_spin", None) and self.antiafk_alert_lead_spin.value() or 0.0)
+            debug_timings_enabled = bool(getattr(self, "antiafk_debug_timing_chk", None) and self.antiafk_debug_timing_chk.isChecked())
             enabled_flag = bool(self.antiafk_enable_chk.isChecked())
 
             # Push new settings into the AntiAFK engine so behavior changes immediately.
             self.antiafk.apply_host_config(
+                multi_instance_enabled=bool(getattr(self, "_multi_instance_enabled", False)),
                 interval=interval,
                 action=action,
                 alt_delay_ms=alt_delay_ms,
@@ -10697,11 +12759,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 alert_sound_enabled=alert_sound_enabled,
                 alert_tooltip_enabled=alert_tooltip_enabled,
                 alert_lead_s=alert_lead_s,
-                unthrottle_enabled=unthrottle_enabled,
+                unthrottle_enabled=effective_unthrottle_enabled,
                 unthrottle_batch_size=unthrottle_batch_size,
                 unthrottle_lead_s=unthrottle_lead_s,
+                dev_mode=debug_timings_enabled,
             )
-
             # If the manager is running, keep Anti-AFK running state in sync with the toggle.
             if self._is_manager_running():
                 self._run_antiafk_async("toggle_antiafk", enabled_flag)
@@ -10721,10 +12783,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         antiafk_cfg = settings.get("antiafk", {}) or {}
         try:
+            antiafk_cfg["multi_instance_enabled"] = bool(
+                getattr(self, "_multi_instance_enabled", antiafk_cfg.get("multi_instance_enabled", False))
+            )
             antiafk_cfg["antiafk_interval"] = int(self.antiafk_interval_spin.value())
             antiafk_cfg["antiafk_action"] = self.antiafk_action_combo.currentText()
             antiafk_cfg["antiafk_alt_delay_ms"] = int(self.antiafk_alt_delay_spin.value())
             antiafk_cfg["antiafk_menu_autoreconnect"] = bool(self.antiafk_menu_autoreconnect_chk.isChecked())
+            antiafk_cfg["antiafk_dev_mode"] = bool(
+                getattr(self, "antiafk_debug_timing_chk", None) and self.antiafk_debug_timing_chk.isChecked()
+            )
             antiafk_cfg["antiafk_enabled"] = bool(self.antiafk_enable_chk.isChecked())
             antiafk_cfg["antiafk_alert_sound"] = bool(
                 getattr(self, "antiafk_alert_sound_chk", None) and self.antiafk_alert_sound_chk.isChecked()
@@ -10766,6 +12834,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.antiafk_action_combo.setCurrentText(defaults.get("antiafk_action", "space"))
             self.antiafk_alt_delay_spin.setValue(int(defaults.get("antiafk_alt_delay_ms", 400)))
             self.antiafk_menu_autoreconnect_chk.setChecked(bool(defaults.get("antiafk_menu_autoreconnect", False)))
+            self.antiafk_debug_timing_chk.setChecked(bool(defaults.get("antiafk_dev_mode", False)))
             self.antiafk_enable_chk.setChecked(bool(defaults.get("antiafk_enabled", False)))
             self.antiafk_alert_sound_chk.setChecked(bool(defaults.get("antiafk_alert_sound", False)))
             self.antiafk_alert_tooltip_chk.setChecked(bool(defaults.get("antiafk_alert_tooltip", False)))
@@ -10803,6 +12872,41 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._run_antiafk_async("toggle_antiafk", False)
         self._schedule_antiafk_save()
 
+    def _menu_state_is_fresh_for_pid(self, pid: int, menu_ts: float, tracker=None) -> bool:
+        try:
+            pid_i = int(pid)
+        except Exception:
+            return False
+        if pid_i <= 0:
+            return False
+
+        try:
+            menu_ts_f = float(menu_ts or 0.0)
+        except Exception:
+            menu_ts_f = 0.0
+        if menu_ts_f <= 0.0:
+            return False
+
+        created_ts = 0.0
+        try:
+            creation_map = getattr(tracker, "creation_timestamps", {}) if tracker is not None else {}
+            if isinstance(creation_map, dict):
+                created_ts = float(creation_map.get(pid_i) or creation_map.get(str(pid_i)) or 0.0)
+        except Exception:
+            created_ts = 0.0
+
+        if created_ts <= 0.0:
+            try:
+                import psutil
+                created_ts = float(psutil.Process(pid_i).create_time())
+            except Exception:
+                created_ts = 0.0
+
+        if created_ts <= 0.0:
+            return False
+
+        return menu_ts_f >= (created_ts - 0.5)
+
     def _is_pid_in_menu(self, pid: int):
         """
         Best-effort check: return True if the Roblox PID appears to be in the main menu
@@ -10825,13 +12929,27 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             return None
 
-        uid = tracker.process_owners.get(pid)
+        uid = None
+        try:
+            with self._antiafk_touch_lock:
+                uid = self._antiafk_pid_to_uid.get(pid)
+        except Exception:
+            uid = None
+        if not uid:
+            uid = tracker.process_owners.get(pid)
         if not uid:
             return None
-
-        server_label = tracker.user_server.get(uid, "")
-        if not server_label:
+        uid_s = str(uid).strip()
+        if not uid_s:
             return None
+
+        server_label = tracker.user_server.get(uid_s, "") or tracker.user_server.get(uid, "")
+        if not server_label:
+            try:
+                runtime = (self.user_data or {}).get(uid_s, {}) or {}
+                server_label = str(runtime.get("server", "") or "").strip()
+            except Exception:
+                server_label = ""
 
         ms = getattr(wt, "ms", None)
         if not ms:
@@ -10843,11 +12961,68 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return None
 
         for row in rows:
-            if row.get("server", "") == server_label:
-                val = row.get("in_menu")
-                # Treat unknown as in-menu to avoid misclassification.
+            if not isinstance(row, dict):
+                continue
+            users = row.get("users", []) or []
+            if not isinstance(users, (list, tuple, set)):
+                users = []
+            users_set = {str(u).strip() for u in users if str(u).strip()}
+            if uid_s not in users_set:
+                continue
+
+            in_menu_by_uid = row.get("in_menu_by_uid")
+            if not isinstance(in_menu_by_uid, dict):
+                in_menu_by_uid = {}
+            menu_ts_by_uid = row.get("last_menu_ts_by_uid")
+            if not isinstance(menu_ts_by_uid, dict):
+                menu_ts_by_uid = {}
+
+            if uid_s in in_menu_by_uid:
+                val = in_menu_by_uid.get(uid_s, None)
                 if val is None:
                     return True
+                try:
+                    menu_ts = float(menu_ts_by_uid.get(uid_s, 0.0) or 0.0)
+                except Exception:
+                    menu_ts = 0.0
+                if not self._menu_state_is_fresh_for_pid(pid, menu_ts, tracker):
+                    return None
+                return bool(val)
+
+            # Server-level state is safe only when this scope represents one user.
+            # Shared scopes can carry another user's latest menu flag.
+            if len(users_set) <= 1:
+                val = row.get("in_menu")
+                if val is None:
+                    return True
+                try:
+                    menu_ts = float(row.get("last_menu_ts", 0.0) or 0.0)
+                except Exception:
+                    menu_ts = 0.0
+                if not self._menu_state_is_fresh_for_pid(pid, menu_ts, tracker):
+                    return None
+                return bool(val)
+
+            return None
+
+        if server_label:
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("server", "") != server_label and row.get("server_key", "") != server_label:
+                    continue
+                users = row.get("users", []) or []
+                if isinstance(users, (list, tuple, set)) and len(users) > 1:
+                    return None
+                val = row.get("in_menu")
+                if val is None:
+                    return True
+                try:
+                    menu_ts = float(row.get("last_menu_ts", 0.0) or 0.0)
+                except Exception:
+                    menu_ts = 0.0
+                if not self._menu_state_is_fresh_for_pid(pid, menu_ts, tracker):
+                    return None
                 return bool(val)
 
         return None
@@ -10863,7 +13038,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             cfg = {}
 
-        if not bool(cfg.get("enabled", False)):
+        try:
+            snap = ctl.snapshot()
+            controller_enabled = bool((snap or {}).get("enabled", False))
+        except Exception:
+            snap = {}
+            controller_enabled = bool(cfg.get("enabled", False))
+
+        if not controller_enabled:
             return False
 
         try:
@@ -10871,7 +13053,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             hold_s = 0.0
 
-        ok_any = False
+        pid_list: List[int] = []
+        seen: Set[int] = set()
         for pid in (pids or []):
             try:
                 pid_i = int(pid)
@@ -10879,13 +13062,61 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 continue
             if pid_i <= 0:
                 continue
+            if pid_i in seen:
+                continue
+            seen.add(pid_i)
+            pid_list.append(pid_i)
+
+        if not pid_list:
+            return False
+
+        try:
+            hold_many = getattr(ctl, "hold_unthrottled_many", None)
+            if callable(hold_many):
+                res = hold_many(pid_list, float(hold_s), owner="antiafk")
+                if res is False:
+                    return False
+                try:
+                    snap = ctl.snapshot()
+                    owners = (snap or {}).get("hold_owners", None)
+                    if owners is not None and isinstance(owners, dict) and int(owners.get("antiafk", 0) or 0) <= 0:
+                        try:
+                            self.antiafk_log_signal.emit(
+                                "[Anti-AFK] BES pacify hold verification failed: no active antiafk hold after request."
+                            )
+                        except Exception:
+                            pass
+                        return False
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+
+        ok_any = False
+        for pid_i in pid_list:
             try:
-                ctl.hold_unthrottled(pid_i, float(hold_s))
+                ctl.hold_unthrottled(pid_i, float(hold_s), owner="antiafk")
                 ok_any = True
             except Exception:
                 continue
 
-        return ok_any
+        if not ok_any:
+            return False
+        try:
+            snap = ctl.snapshot()
+            owners = (snap or {}).get("hold_owners", None)
+            if owners is not None and isinstance(owners, dict) and int(owners.get("antiafk", 0) or 0) <= 0:
+                try:
+                    self.antiafk_log_signal.emit(
+                        "[Anti-AFK] BES pacify hold verification failed: no active antiafk hold after fallback request."
+                    )
+                except Exception:
+                    pass
+                return False
+        except Exception:
+            pass
+        return True
 
     def _antiafk_bes_release_hold(self, pids) -> bool:
         ctl = getattr(self, "bes_controller", None)
@@ -10898,10 +13129,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             cfg = {}
 
-        if not bool(cfg.get("enabled", False)):
+        try:
+            snap = ctl.snapshot()
+            controller_enabled = bool((snap or {}).get("enabled", False))
+        except Exception:
+            controller_enabled = bool(cfg.get("enabled", False))
+
+        if not controller_enabled:
             return False
 
-        ok_any = False
+        pid_list: List[int] = []
+        seen: Set[int] = set()
         for pid in (pids or []):
             try:
                 pid_i = int(pid)
@@ -10909,8 +13147,26 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 continue
             if pid_i <= 0:
                 continue
+            if pid_i in seen:
+                continue
+            seen.add(pid_i)
+            pid_list.append(pid_i)
+
+        if not pid_list:
+            return False
+
+        try:
+            release_many = getattr(ctl, "release_hold_many", None)
+            if callable(release_many):
+                res = release_many(pid_list, owner="antiafk")
+                return bool(res is not False)
+        except Exception:
+            pass
+
+        ok_any = False
+        for pid_i in pid_list:
             try:
-                ctl.release_hold(pid_i)
+                ctl.release_hold(pid_i, owner="antiafk")
                 ok_any = True
             except Exception:
                 continue
@@ -11330,6 +13586,47 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 return ""
 
+        def _menu_state_is_fresh_for_current_pid(uid: str, menu_ts: float) -> bool:
+            try:
+                menu_ts_f = float(menu_ts or 0.0)
+            except Exception:
+                menu_ts_f = 0.0
+            if menu_ts_f <= 0.0:
+                return False
+
+            try:
+                runtime = (self.user_data or {}).get(uid, {}) or {}
+                pids = runtime.get("pids", []) or []
+                if not isinstance(pids, (list, tuple)):
+                    pids = [pids]
+                pid = int(pids[0]) if pids else 0
+            except Exception:
+                pid = 0
+            if pid <= 0:
+                return False
+
+            created_ts = 0.0
+            try:
+                wt = getattr(self, "worker_thread", None)
+                manager = getattr(wt, "manager", None)
+                if manager is None:
+                    manager = getattr(self, "manager", None)
+                tracker = getattr(manager, "process_tracker", None)
+                creation_map = getattr(tracker, "creation_timestamps", {}) if tracker is not None else {}
+                if isinstance(creation_map, dict):
+                    created_ts = float(creation_map.get(pid) or creation_map.get(str(pid)) or 0.0)
+            except Exception:
+                created_ts = 0.0
+            if created_ts <= 0.0:
+                try:
+                    created_ts = float(psutil.Process(int(pid)).create_time())
+                except Exception:
+                    created_ts = 0.0
+            if created_ts <= 0.0:
+                return False
+
+            return menu_ts_f >= (created_ts - 0.5)
+
         def _in_menu_provider(uid: str) -> Optional[bool]:
             try:
                 runtime = (self.user_data or {}).get(uid, {}) or {}
@@ -11340,15 +13637,21 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     uid_key = str(uid).strip()
                     if uid_key and uid_key in (self._ms_in_menu_by_uid or {}):
                         val = self._ms_in_menu_by_uid.get(uid_key, None)
+                        menu_ts = float((self._ms_in_menu_ts_by_uid or {}).get(uid_key, 0.0) or 0.0)
                         if val is None:
                             return None
-                        return bool(val)
+                        if bool(val):
+                            return True
+                        return False if _menu_state_is_fresh_for_current_pid(uid_key, menu_ts) else None
                     if server not in (self._ms_in_menu_by_server or {}):
                         return None
                     val = self._ms_in_menu_by_server.get(server, None)
+                    menu_ts = float((self._ms_in_menu_ts_by_server or {}).get(server, 0.0) or 0.0)
                     if val is None:
                         return None
-                    return bool(val)
+                    if bool(val):
+                        return True
+                    return False if _menu_state_is_fresh_for_current_pid(str(uid).strip(), menu_ts) else None
             except Exception:
                 return None
 
@@ -11365,6 +13668,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 return str(info.get("username") or uid)
             except Exception:
                 return str(uid)
+
+        def _log_filename_provider(uid: str) -> str:
+            try:
+                username = _username_provider(str(uid))
+                path = find_log_for_username(str(username or "").strip(), allow_fallback=False)
+                return Path(str(path)).name if path else ""
+            except Exception:
+                return ""
 
         def _server_label_provider(uid: str) -> str:
             try:
@@ -11421,12 +13732,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 filter_ids = [str(fid).strip() for fid in (condition.get("filter_ids") or []) if str(fid).strip()]
             except Exception:
                 filter_ids = []
+            ocr_pool = None
+            try:
+                worker = getattr(self, "ocr_worker", None)
+                if worker is not None and worker.isRunning():
+                    ocr_pool = getattr(worker, "_ocr_pool", None)
+            except Exception:
+                ocr_pool = None
             text = read_window_ocr_text_once(
                 int(hwnd),
                 roi=roi,
                 ocr_settings=cfg,
                 filter_ids=filter_ids,
                 color_filters=condition.get("color_filters") if isinstance(condition.get("color_filters"), list) else None,
+                ocr_pool=ocr_pool,
             )
             try:
                 if bool(cfg.get("log_ocr_text", False)):
@@ -11437,12 +13756,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 pass
             return str(text or "")
 
+        def _kill_user_callback(uid: str) -> bool:
+            uid_s = str(uid or "").strip()
+            if not uid_s:
+                return False
+            return bool(self._queue_worker_action("kill_user_processes", uid_s))
+
         self.auto_item_engine = AutoItemEngine(
             pid_provider=_pid_provider,
             hwnd_provider=_hwnd_provider,
             biome_provider=_biome_provider,
             in_menu_provider=_in_menu_provider,
             username_provider=_username_provider,
+            log_filename_provider=_log_filename_provider,
             server_label_provider=_server_label_provider,
             ps_link_provider=_ps_link_provider,
             discord_ping_provider=_discord_ping_provider,
@@ -11454,6 +13780,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pre_action_hook=self._auto_item_pre_action_hook,
             post_action_hook=self._auto_item_post_action_hook,
             ocr_text_provider=_ocr_text_provider,
+            kill_user_callback=_kill_user_callback,
         )
         try:
             self.auto_item_engine.start()
@@ -11470,8 +13797,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         """
         True when at least one connected user is overdue (or will be overdue soon) for an Anti-AFK touch.
 
-        within_s=0  => already overdue (>=10m since last touch)
-        within_s=45 => within 45s of becoming overdue (>= 9m15s since last touch)
+        within_s=0  => already overdue (configured threshold since last touch)
+        within_s=45 => within 45s of becoming overdue
         """
         antiafk = getattr(self, "antiafk", None)
         if not antiafk:
@@ -11493,7 +13820,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             window = 0.0
 
-        overdue_age_s = 600.0
+        overdue_age_s = self._antiafk_auto_action_overdue_seconds()
         cutoff_age = overdue_age_s - window
         if cutoff_age < 0.0:
             cutoff_age = 0.0
@@ -11533,6 +13860,18 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def _auto_item_is_antiafk_overdue(self) -> bool:
         return self._auto_item_is_antiafk_overdue_within(0.0)
 
+    def _auto_item_antiafk_running_fresh(self, antiafk) -> bool:
+        try:
+            rpc = getattr(antiafk, "_rpc", None)
+            if callable(rpc):
+                return bool(rpc("get_running", timeout_s=1.0))
+        except Exception:
+            pass
+        try:
+            return bool(getattr(antiafk, "antiafk_running", False))
+        except Exception:
+            return False
+
     def _auto_item_pause_antiafk(self):
         """
         Pause Anti-AFK while Auto-Item is interacting with Roblox.
@@ -11540,28 +13879,37 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         Note: we avoid relying solely on the cached `antiafk_running` state (it can be stale if the
         worker process is lagging). Prefer asking the engine to pause and use its return value.
         """
-        self._auto_item_antiafk_was_running = False
-
         antiafk = getattr(self, "antiafk", None)
         if not antiafk:
             return True
 
-        # If Anti-AFK isn't running/enabled, there is nothing to pause (and nothing to protect).
+        # If Anti-AFK is not enabled for this manager run, there is nothing to pause.
         try:
             if not (
                 self._is_manager_running()
                 and bool(getattr(self, "antiafk_enable_chk", None) and self.antiafk_enable_chk.isChecked())
-                and bool(getattr(antiafk, "antiafk_running", False))
             ):
                 return True
         except Exception:
             return True
 
-        # If any connected user is overdue for an Anti-AFK touch, don't pause for this cycle.
-        if self._auto_item_is_antiafk_overdue():
+        # If any connected user is overdue, or close enough that an Auto-Actions run could push it
+        # overdue, don't pause for this cycle.
+        pause_guard_s = max(0.0, float(_AUTO_ACTION_ANTIAFK_PAUSE_GUARD_S))
+        already_overdue = self._auto_item_is_antiafk_overdue()
+        near_overdue = False if already_overdue else self._auto_item_is_antiafk_overdue_within(pause_guard_s)
+        if already_overdue or near_overdue:
             try:
+                threshold = self._format_antiafk_overdue_minutes_label()
+                if already_overdue:
+                    reason = f"Anti-AFK overdue (threshold {threshold} on at least one connected user)"
+                else:
+                    reason = (
+                        f"Anti-AFK due within {pause_guard_s:.0f}s "
+                        f"(threshold {threshold} on at least one connected user)"
+                    )
                 self.autoitem_log_signal.emit(
-                    "[Auto-Actions] Anti-AFK overdue (>=10m on at least one connected user); skipping pause this cycle."
+                    f"[Auto-Actions] {reason}; skipping pause this cycle."
                 )
             except Exception:
                 pass
@@ -11574,6 +13922,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 paused_ok = False
             if not paused_ok:
+                if not self._auto_item_antiafk_running_fresh(antiafk):
+                    return True
+
                 try:
                     if hasattr(antiafk, "resume_antiafk"):
                         antiafk.resume_antiafk()
@@ -11587,10 +13938,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 except Exception:
                     pass
 
-                self._auto_item_antiafk_was_running = False
                 return False
 
-            self._auto_item_antiafk_was_running = True
+            with self._auto_item_antiafk_pause_lock:
+                self._auto_item_antiafk_was_running = True
+                self._auto_item_antiafk_pause_depth = max(0, int(self._auto_item_antiafk_pause_depth or 0)) + 1
+            try:
+                self.autoitem_log_signal.emit("[Auto-Actions] Anti-AFK paused for Auto-Actions.")
+            except Exception:
+                pass
             return True
 
         # Legacy fallback: fully stop before Auto-Item interactions (only if it looks like it's running).
@@ -11601,7 +13957,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return True
 
         try:
-            self._auto_item_antiafk_was_running = True
             t = getattr(antiafk, "antiafk_thread", None)
             antiafk.stop_antiafk()
             try:
@@ -11609,43 +13964,77 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     t.join()
             except Exception:
                 pass
+            with self._auto_item_antiafk_pause_lock:
+                self._auto_item_antiafk_was_running = True
+                self._auto_item_antiafk_pause_depth = max(0, int(self._auto_item_antiafk_pause_depth or 0)) + 1
         except Exception:
-            self._auto_item_antiafk_was_running = False
             return False
 
         return True
 
     def _auto_item_resume_antiafk(self):
+        should_resume = False
+        with self._auto_item_antiafk_pause_lock:
+            depth = max(0, int(getattr(self, "_auto_item_antiafk_pause_depth", 0) or 0))
+            if depth > 1:
+                self._auto_item_antiafk_pause_depth = depth - 1
+                return
+            should_resume = bool(self._auto_item_antiafk_was_running or depth > 0)
+            self._auto_item_antiafk_pause_depth = 0
+            self._auto_item_antiafk_was_running = False
+
+        if not should_resume:
+            return
+
+        antiafk = getattr(self, "antiafk", None)
+        if antiafk is None:
+            return
+
         try:
-            if (
-                self._auto_item_antiafk_was_running
-                and getattr(self, "antiafk", None)
-                and self._is_manager_running()
+            if not (
+                self._is_manager_running()
                 and bool(getattr(self, "antiafk_enable_chk", None) and self.antiafk_enable_chk.isChecked())
             ):
-                # Prefer resume when supported, without relying on cached `antiafk_running`.
-                antiafk = getattr(self, "antiafk", None)
-                if antiafk is None:
-                    return
+                return
+        except Exception:
+            return
 
-                if hasattr(antiafk, "resume_antiafk"):
+        resumed = False
+        if hasattr(antiafk, "resume_antiafk"):
+            for delay_s in (0.0, 0.25, 1.0):
+                if delay_s > 0.0:
+                    time.sleep(delay_s)
+                try:
+                    resumed = bool(antiafk.resume_antiafk())
+                except Exception:
                     resumed = False
-                    try:
-                        resumed = bool(antiafk.resume_antiafk())
-                    except Exception:
-                        resumed = False
-                    if not resumed:
-                        antiafk.start_antiafk()
-                else:
+                if resumed:
+                    break
+                try:
+                    if not self._auto_item_antiafk_running_fresh(antiafk):
+                        break
+                except Exception:
+                    pass
+
+        if not resumed:
+            try:
+                if not self._auto_item_antiafk_running_fresh(antiafk):
                     antiafk.start_antiafk()
+                    resumed = self._auto_item_antiafk_running_fresh(antiafk)
+            except Exception:
+                resumed = False
+
+        try:
+            if resumed:
+                self.autoitem_log_signal.emit("[Auto-Actions] Anti-AFK resumed after Auto-Actions.")
+            else:
+                self.autoitem_log_signal.emit("[Auto-Actions] Failed to resume Anti-AFK after Auto-Actions.")
         except Exception:
             pass
-        finally:
-            self._auto_item_antiafk_was_running = False
 
     def _auto_item_pre_action_hook(self, uid: str, pid: int) -> float:
         """
-        Auto Item hook: temporarily disable BES throttling a few seconds before actions.
+        Auto Action hook: temporarily disable BES throttling a few seconds before actions.
         Returns the requested lead time (seconds) so the engine can wait before clicking.
         """
         ctl = getattr(self, "bes_controller", None)
@@ -11668,14 +14057,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         # Hold long enough to cover the full click/type sequence; post-action hook will release early.
         try:
-            ctl.hold_unthrottled(int(pid), max(0.0, lead_s) + 120.0)
+            ctl.hold_unthrottled(int(pid), max(0.0, lead_s) + 120.0, owner="auto_item")
         except Exception:
             pass
 
         return max(0.0, float(lead_s))
 
     def _auto_item_post_action_hook(self, uid: str, pid: int) -> None:
-        """Auto Item hook: release BES unthrottle hold after actions (with small grace)."""
+        """Auto Action hook: release BES unthrottle hold after actions (with small grace)."""
         ctl = getattr(self, "bes_controller", None)
 
         try:
@@ -11691,13 +14080,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 grace_s = 0.0
 
             try:
-                ctl.release_hold(int(pid))
+                ctl.release_hold(int(pid), owner="auto_item")
             except Exception:
                 pass
 
             if grace_s > 0.0:
                 try:
-                    ctl.hold_unthrottled(int(pid), float(grace_s))
+                    ctl.hold_unthrottled(int(pid), float(grace_s), owner="auto_item")
                 except Exception:
                     pass
 
@@ -12073,6 +14462,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def _update_users_btn_text(self, btn: QPushButton):
         raw = btn.property("users")
+        mode = _normalize_user_filter_mode(btn.property("user_filter_mode"))
+        btn.setProperty("user_filter_mode", mode)
+
         def _discord_edit_note() -> str:
             try:
                 if _bm_relaxed():
@@ -12085,13 +14477,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return ""
 
         # Semantics:
-        # - None / missing => All users
-        # - []            => No users
-        # - [uids...]     => Only those users
+        # - whitelist + None / missing => all users
+        # - whitelist + []             => no users
+        # - whitelist + [uids...]      => only those users
+        # - blacklist + []/None        => all users
+        # - blacklist + [uids...]      => everyone except those users
         if raw is None:
             btn.setProperty("users", None)
-            btn.setText("All users")
-            btn.setToolTip("Targets every checked user in the Users panel." + _discord_edit_note())
+            if mode == "blacklist":
+                btn.setText("Blacklist empty")
+                btn.setToolTip("Targets every checked user in the Users panel. No users are blocked." + _discord_edit_note())
+            else:
+                btn.setText("All users")
+                btn.setToolTip("Targets every checked user in the Users panel." + _discord_edit_note())
             return
         if not isinstance(raw, (list, tuple, set)):
             # Be tolerant of Qt container/variant types (e.g., QStringList).
@@ -12101,19 +14499,27 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 raw = list(raw)  # type: ignore[arg-type]
             except Exception:
                 btn.setProperty("users", None)
-                btn.setText("All users")
-                btn.setToolTip("Targets every checked user in the Users panel." + _discord_edit_note())
+                if mode == "blacklist":
+                    btn.setText("Blacklist empty")
+                    btn.setToolTip("Targets every checked user in the Users panel. No users are blocked." + _discord_edit_note())
+                else:
+                    btn.setText("All users")
+                    btn.setToolTip("Targets every checked user in the Users panel." + _discord_edit_note())
                 return
 
         users = [str(u).strip() for u in (raw or []) if str(u).strip()]
         btn.setProperty("users", users)
         discord_edit_note = _discord_edit_note()
         if not users:
-            btn.setText("No users")
-            btn.setToolTip(
-                "This row will not run for any user until at least one user is assigned."
-                + discord_edit_note
-            )
+            if mode == "blacklist":
+                btn.setText("Blacklist empty")
+                btn.setToolTip("Targets every checked user in the Users panel. No users are blocked." + discord_edit_note)
+            else:
+                btn.setText("No users")
+                btn.setToolTip(
+                    "This row will not run for any user until at least one user is assigned."
+                    + discord_edit_note
+                )
             return
 
         user_names: List[str] = []
@@ -12126,8 +14532,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 user_names.append(str((user_cfg.get(uid, {}) or {}).get("username") or uid))
             except Exception:
                 user_names.append(str(uid))
-        btn.setText("1 user" if len(users) == 1 else f"{len(users)} users")
-        btn.setToolTip("Assigned users: " + ", ".join(user_names) + discord_edit_note)
+        if mode == "blacklist":
+            btn.setText("1 blocked" if len(users) == 1 else f"{len(users)} blocked")
+            btn.setToolTip("Blocked users: " + ", ".join(user_names) + discord_edit_note)
+        else:
+            btn.setText("1 user" if len(users) == 1 else f"{len(users)} users")
+            btn.setToolTip("Assigned users: " + ", ".join(user_names) + discord_edit_note)
 
     def _update_alert_btn_text(self, btn: QPushButton):
         try:
@@ -12224,6 +14634,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             raw_current = btn.property("users")
         except Exception:
             raw_current = None
+        mode = _normalize_user_filter_mode(btn.property("user_filter_mode"))
         try:
             discord_user_edit_enabled = bool(btn.property("discord_user_edit_enabled"))
         except Exception:
@@ -12241,18 +14652,31 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             users = {}
 
-        all_uids: List[str] = [str(uid) for uid in sorted(users.keys())]
+        all_uids: List[str] = [str(uid).strip() for uid in sorted(users.keys()) if str(uid).strip()]
+        all_uid_set = set(all_uids)
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Row Users")
-        dlg.resize(440, 520)
+        dlg.resize(500, 560)
         self._auto_item_apply_dialog_style(dlg)
         v = QVBoxLayout(dlg)
 
-        hint = QLabel("Choose exactly which users this action row is allowed to run against.")
+        hint = QLabel("Choose users for this action row's mode.")
         hint.setProperty("role", "hint")
         hint.setWordWrap(True)
         v.addWidget(hint)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode:"))
+        mode_combo = QComboBox()
+        mode_combo.addItem("Whitelist", "whitelist")
+        mode_combo.addItem("Blacklist", "blacklist")
+        mode_combo.setToolTip("Whitelist allows only selected users. Blacklist allows everyone except selected users.")
+        mode_idx = mode_combo.findData(mode)
+        mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+        mode_row.addWidget(mode_combo)
+        mode_row.addStretch()
+        v.addLayout(mode_row)
 
         discord_edit_chk: Optional[QCheckBox] = None
         if _bm_relaxed():
@@ -12290,11 +14714,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             """
         )
 
-        # Semantics:
-        # - current is None => All users selected in UI
-        # - current is []   => None selected in UI
-        # - current list    => that subset selected
-        sel = set(all_uids) if current is None else set(current or [])
+        if mode == "blacklist":
+            sel = set(current or [])
+        else:
+            sel = set(all_uids) if current is None else set(current or [])
 
         for uid in sorted(users.keys(), key=lambda u: (users.get(u, {}) or {}).get("username", str(u))):
             info = users.get(uid, {}) or {}
@@ -12305,8 +14728,74 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if str(uid) in sel:
                 it.setSelected(True)
 
-        sel_all_btn.clicked.connect(lambda: (lst.selectAll(), lst.setFocus()))
-        sel_none_btn.clicked.connect(lambda: (lst.clearSelection(), lst.setFocus()))
+        helper_label = QLabel()
+        helper_label.setProperty("role", "hint")
+        helper_label.setWordWrap(True)
+        helper_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        mode_state = {"value": mode}
+
+        def _selected_uids() -> List[str]:
+            out: List[str] = []
+            for idx in range(lst.count()):
+                item = lst.item(idx)
+                if item is None or not item.isSelected():
+                    continue
+                uid = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                if uid:
+                    out.append(uid)
+            return out
+
+        def _set_selected_uids(uids) -> None:
+            wanted = {str(uid).strip() for uid in (uids or []) if str(uid).strip()}
+            for idx in range(lst.count()):
+                item = lst.item(idx)
+                if item is None:
+                    continue
+                uid = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                item.setSelected(uid in wanted)
+            lst.setFocus()
+
+        def _refresh_user_hint() -> None:
+            selected_set = set(_selected_uids())
+            current_mode = _normalize_user_filter_mode(mode_combo.currentData())
+            if current_mode == "blacklist":
+                if not selected_set:
+                    helper_label.setText("Blacklist is empty. This row targets every checked user in the Users panel.")
+                else:
+                    helper_label.setText(
+                        f"{len(selected_set)} user" + (" is" if len(selected_set) == 1 else "s are")
+                        + " blocked. This row targets everyone except selected users."
+                    )
+                return
+            if all_uid_set and selected_set == all_uid_set:
+                helper_label.setText("All users selected. This row targets every checked user in the Users panel.")
+            elif selected_set:
+                helper_label.setText(
+                    f"{len(selected_set)} user" + (" is" if len(selected_set) == 1 else "s are")
+                    + " allowed for this row."
+                )
+            else:
+                helper_label.setText("No users selected. This row will not run until at least one user is assigned.")
+
+        def _mode_changed(_idx: int) -> None:
+            old_mode = _normalize_user_filter_mode(mode_state.get("value", "whitelist"))
+            new_mode = _normalize_user_filter_mode(mode_combo.currentData())
+            if old_mode == new_mode:
+                _refresh_user_hint()
+                return
+            selected_set = set(_selected_uids())
+            mode_state["value"] = new_mode
+            if old_mode == "whitelist" and new_mode == "blacklist" and all_uid_set and selected_set == all_uid_set:
+                _set_selected_uids([])
+            elif old_mode == "blacklist" and new_mode == "whitelist" and not selected_set:
+                _set_selected_uids(all_uids)
+            else:
+                _refresh_user_hint()
+
+        sel_all_btn.clicked.connect(lambda: _set_selected_uids(all_uids))
+        sel_none_btn.clicked.connect(lambda: _set_selected_uids([]))
+        mode_combo.currentIndexChanged.connect(_mode_changed)
+        lst.itemSelectionChanged.connect(_refresh_user_hint)
 
         def _open_row_paste_values() -> None:
             row = self._auto_item_row_for_button(btn, column=4)
@@ -12318,27 +14807,25 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         paste_values_btn.clicked.connect(_open_row_paste_values)
 
         v.addWidget(lst)
+        if not users:
+            v.addWidget(QLabel("No users are available in users.json."))
+        v.addWidget(helper_label)
+        _refresh_user_hint()
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(dlg.accept)
         bb.rejected.connect(dlg.reject)
         v.addWidget(bb)
 
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            chosen: List[str] = []
-            for i in lst.selectedItems():
-                try:
-                    uid = str(i.data(Qt.ItemDataRole.UserRole) or "").strip()
-                except Exception:
-                    uid = ""
-                if uid:
-                    chosen.append(uid)
-
+            chosen = _selected_uids()
             chosen_set = set(chosen)
-            if all_uids and len(chosen_set) >= len(set(all_uids)):
-                # All selected => store None (meaning all users)
+            mode = _normalize_user_filter_mode(mode_combo.currentData())
+            btn.setProperty("user_filter_mode", mode)
+            if mode == "blacklist":
+                btn.setProperty("users", chosen)
+            elif all_uid_set and chosen_set == all_uid_set:
                 btn.setProperty("users", None)
             else:
-                # None selected => store [] (meaning no users)
                 btn.setProperty("users", chosen)
             if discord_edit_chk is not None:
                 btn.setProperty("discord_user_edit_enabled", bool(discord_edit_chk.isChecked()))
@@ -13078,6 +15565,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "tick_interval": float(self.auto_item_tick_spin.value()),
             "click_delay": float(self.auto_item_delay_spin.value()),
             "disable_mouse_move": bool(getattr(self, "auto_item_disable_mouse_chk", None) and self.auto_item_disable_mouse_chk.isChecked()),
+            "menu_debug": bool(getattr(self, "auto_item_menu_debug_chk", None) and self.auto_item_menu_debug_chk.isChecked()),
             "toggle_hotkey": (self.auto_item_hotkey_edit.keySequence().toString().strip() if getattr(self, "auto_item_hotkey_edit", None) else ""),
             "users": users,
             "coords": coords,
@@ -13174,6 +15662,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         cfg = self._get_auto_item_settings_from_ui()
         settings["auto_item"] = cfg
+        legacy_antiafk = settings.get("antiafk")
+        if isinstance(legacy_antiafk, dict):
+            legacy_antiafk.pop("antiafk_auto_action_overdue_min", None)
         try:
             self.config_manager.save_settings(settings)
         except Exception:
@@ -13539,7 +16030,33 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             action_type = "drag"
         elif action_type in ("discord_webhook", "send_webhook", "webhook_send"):
             action_type = "webhook"
-        if action_type not in ("click", "key", "paste", "scroll", "drag", "wait", "webhook", "if", "else", "end", "break", "loop"):
+        elif action_type in (
+            "kill",
+            "kill_user",
+            "kill_user_processes",
+            "terminate_user",
+            "restart",
+            "restart_user",
+            "restart_user_session",
+            "relaunch",
+            "relaunch_user",
+        ):
+            action_type = "kill_user"
+        if action_type not in (
+            "click",
+            "key",
+            "paste",
+            "scroll",
+            "drag",
+            "wait",
+            "webhook",
+            "kill_user",
+            "if",
+            "else",
+            "end",
+            "break",
+            "loop",
+        ):
             return None
 
         def _point_from(value: Any) -> Optional[dict]:
@@ -13641,6 +16158,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 ),
             )
         )
+        link_id = str(
+            raw.get("link_id")
+            or raw.get("action_link_id")
+            or raw.get("linked_group_id")
+            or raw.get("linked_action_group")
+            or ""
+        ).strip()
 
         return {
             "name": str(raw.get("name") or fallback_name or action_type.replace("_", " ").title()).strip()
@@ -13679,6 +16203,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 if str(raw.get("scroll_direction") or raw.get("direction") or "").strip().lower() == "up"
                 else "down"
             ),
+            "link_id": link_id,
             "condition": condition,
         }
 
@@ -13788,6 +16313,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "behavior": self._normalize_auto_item_behavior(raw.get("behavior"), legacy=raw),
             "users": copy.deepcopy(raw.get("users")) if "users" in raw else None,
             "users_explicit": bool(raw.get("users_explicit", False)),
+            "user_filter_mode": _normalize_user_filter_mode(raw.get("user_filter_mode", "whitelist")),
             "discord_user_edit_enabled": bool(raw.get("discord_user_edit_enabled", False)),
             "alert_enabled": bool(raw.get("alert_enabled", False)),
             "alert_webhook": str(raw.get("alert_webhook") or raw.get("alert_webhook_url") or "").strip(),
@@ -13964,7 +16490,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "enabled": bool(base.get("enabled", False)),
             "tick_interval": float(base.get("tick_interval", 1.0) or 1.0),
             "click_delay": float(base.get("click_delay", 0.2) or 0.2),
+            "antiafk_auto_action_overdue_min": self._clamp_antiafk_overdue_minutes(
+                base.get("antiafk_auto_action_overdue_min", _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT)
+            ),
             "disable_mouse_move": bool(base.get("disable_mouse_move", False)),
+            "menu_debug": bool(base.get("menu_debug", False)),
             "toggle_hotkey": str(base.get("toggle_hotkey", "Ctrl+Alt+Space") or "Ctrl+Alt+Space"),
             "users": [str(uid).strip() for uid in (base.get("users") or []) if str(uid).strip()],
             "presets": preset_list,
@@ -14040,6 +16570,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "drag": "Drag",
                 "wait": "Wait",
                 "webhook": "Webhook",
+                "kill_user": "Kill User",
                 "if": "If",
                 "else": "Else",
                 "end": "End Block",
@@ -14455,6 +16986,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "tolerance": 10,
                 "select_all": True,
                 "scroll_direction": "down",
+                "link_id": "",
                 "condition": self._default_auto_item_condition(enabled=(action_type == "if")),
             }
         action_type = str(action.get("type") or action_type or "").strip().lower()
@@ -14471,6 +17003,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "scroll": "Scroll",
             "drag": "Drag",
             "webhook": "Webhook",
+            "kill_user": "Kill User",
             "wait": "Wait",
             "if": "If",
             "else": "Else",
@@ -14492,6 +17025,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "scroll": "A scroll action moves the mouse to a captured point and scrolls either up or down there.",
             "drag": "A drag action holds a mouse button from one captured point to another over a configured duration.",
             "webhook": "A webhook action sends a Discord webhook message when this step is reached.",
+            "kill_user": "A kill user action terminates this row's active Roblox processes and stops this action string.",
             "wait": "A wait step pauses this action string for the configured amount of time.",
             "if": "An if step chooses whether to enter the following block from a color or OCR conditional.",
             "else": "An else step runs only when the nearest matching if condition failed.",
@@ -15232,6 +17766,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "tolerance": 0,
             "select_all": True,
             "scroll_direction": "down",
+            "link_id": str(action.get("link_id") or "").strip(),
             "condition": self._default_auto_item_condition(enabled=False),
         }
         if condition_supported:
@@ -15315,7 +17850,77 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self._auto_item_apply_main_table_style(table)
+
+        class _LinkedActionDelegate(QStyledItemDelegate):
+            def paint(self, painter, option, index):
+                super().paint(painter, option, index)
+                color = index.data(AUTO_ACTION_LINK_BORDER_ROLE)
+                if not color:
+                    return
+                qcolor = QColor(str(color))
+                if not qcolor.isValid():
+                    return
+                painter.save()
+                try:
+                    pen = QPen(qcolor)
+                    pen.setWidth(3)
+                    painter.setPen(pen)
+                    rect = option.rect.adjusted(1, 1, -1, -1)
+                    painter.drawLine(rect.topLeft(), rect.topRight())
+                    painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+                    if index.column() == 0:
+                        painter.drawLine(rect.topLeft(), rect.bottomLeft())
+                    if index.column() == max(0, table.columnCount() - 1):
+                        painter.drawLine(rect.topRight(), rect.bottomRight())
+                finally:
+                    painter.restore()
+
+        linked_delegate = _LinkedActionDelegate(table)
+        table.setItemDelegate(linked_delegate)
+        table._linked_action_delegate = linked_delegate
         layout.addWidget(table)
+
+        link_palette = [
+            "#E53935",
+            "#43A047",
+            "#1E88E5",
+            "#FB8C00",
+            "#8E24AA",
+            "#00ACC1",
+            "#D81B60",
+            "#7CB342",
+            "#5E35B1",
+            "#FDD835",
+            "#6D4C41",
+            "#3949AB",
+        ]
+
+        def _action_link_id(action: dict) -> str:
+            return str((action or {}).get("link_id") or "").strip()
+
+        def _link_group_counts() -> Dict[str, int]:
+            counts: Dict[str, int] = {}
+            for action in working:
+                link_id = _action_link_id(action)
+                if link_id:
+                    counts[link_id] = counts.get(link_id, 0) + 1
+            return counts
+
+        def _link_color_map(counts: Dict[str, int]) -> Dict[str, str]:
+            colors: Dict[str, str] = {}
+            for action in working:
+                link_id = _action_link_id(action)
+                if not link_id or counts.get(link_id, 0) < 2 or link_id in colors:
+                    continue
+                colors[link_id] = link_palette[len(colors) % len(link_palette)]
+            return colors
+
+        def _prune_single_action_links() -> None:
+            counts = _link_group_counts()
+            for action in working:
+                link_id = _action_link_id(action)
+                if link_id and counts.get(link_id, 0) < 2:
+                    action["link_id"] = ""
 
         def _details(action: dict) -> str:
             kind = str(action.get("type") or "")
@@ -15355,6 +17960,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 if len(msg) > 48:
                     msg = msg[:45] + "..."
                 return f"Webhook {'configured' if has_url else 'missing URL'}: '{msg or '(default message)'}'{cond_suffix}"
+            if kind == "kill_user":
+                return f"Kill active user's processes{cond_suffix}"
             if kind == "if":
                 return f"If {cond_summary or '(condition not configured)'}"
             if kind == "loop":
@@ -15389,6 +17996,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return f"No point{cond_suffix}"
 
         def _refresh() -> None:
+            _prune_single_action_links()
+            link_counts = _link_group_counts()
+            link_colors = _link_color_map(link_counts)
             table.setRowCount(len(working))
             for row, action in enumerate(working):
                 try:
@@ -15401,6 +18011,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     "drag": "Drag",
                     "wait": "Wait",
                     "webhook": "Webhook",
+                    "kill_user": "Kill User",
                     "if": "If",
                     "else": "Else",
                     "end": "End Block",
@@ -15411,11 +18022,25 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 type_item = QTableWidgetItem(type_labels.get(type_key, type_key.replace("_", " ").title()))
                 detail_text = _details(action)
                 detail_item = QTableWidgetItem(detail_text)
+                link_id = _action_link_id(action)
+                link_color = link_colors.get(link_id, "")
+                link_count = int(link_counts.get(link_id, 0) or 0)
                 for item in (name_item, type_item, detail_item):
-                    item.setToolTip(detail_text if item is detail_item else str(item.text() or ""))
+                    tooltip = detail_text if item is detail_item else str(item.text() or "")
+                    if link_color and link_count > 1:
+                        tooltip += (
+                            f"\nLinked group: editing this step updates {link_count - 1} "
+                            f"other {type_item.text()} step{'' if link_count == 2 else 's'}."
+                        )
+                    item.setData(AUTO_ACTION_LINK_BORDER_ROLE, link_color)
+                    item.setToolTip(tooltip)
                 table.setItem(row, 0, name_item)
                 table.setItem(row, 1, type_item)
                 table.setItem(row, 2, detail_item)
+            try:
+                table.viewport().update()
+            except Exception:
+                pass
 
         def _current_row() -> int:
             row = table.currentRow()
@@ -15476,8 +18101,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         add_else_btn = QPushButton("Add Else")
         add_end_btn = QPushButton("Add End Block")
         add_break_btn = QPushButton("Add Break")
+        add_kill_btn = QPushButton("Add Kill User")
         edit_btn = QPushButton("Edit")
         duplicate_btn = QPushButton("Duplicate")
+        link_btn = QPushButton("Link Selected")
+        unlink_btn = QPushButton("Unlink")
         remove_btn = QPushButton("Remove")
         up_btn = QPushButton("Move Up")
         down_btn = QPushButton("Move Down")
@@ -15494,8 +18122,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             add_else_btn,
             add_end_btn,
             add_break_btn,
+            add_kill_btn,
             edit_btn,
             duplicate_btn,
+            link_btn,
+            unlink_btn,
             remove_btn,
             up_btn,
             down_btn,
@@ -15520,19 +18151,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             add_else_btn,
             add_end_btn,
             add_break_btn,
+            add_kill_btn,
         ):
             add_control_row.addWidget(btn)
         add_control_row.addStretch()
         layout.addLayout(add_control_row)
 
         manage_row = QHBoxLayout()
-        for btn in (edit_btn, duplicate_btn, remove_btn, up_btn, down_btn):
+        for btn in (edit_btn, duplicate_btn, link_btn, unlink_btn, remove_btn, up_btn, down_btn):
             manage_row.addWidget(btn)
         manage_row.addStretch()
         layout.addLayout(manage_row)
 
         helper = QLabel(
-            "Double-click any step to edit it. Use Ctrl/Shift selection to move, duplicate, or remove multiple steps."
+            "Double-click any step to edit it. Select same-type steps and use Link Selected to keep future edits in sync."
         )
         helper.setProperty("role", "hint")
         helper.setWordWrap(True)
@@ -15562,6 +18194,25 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             current = working[row]
             result = self._edit_auto_item_action_step_dialog(str(current.get("type") or ""), current)
             if result is None:
+                return
+            link_id = _action_link_id(current)
+            if link_id:
+                result["link_id"] = link_id
+                action_type = str(result.get("type") or current.get("type") or "").strip().lower()
+                linked_rows = [
+                    idx
+                    for idx, action in enumerate(working)
+                    if _action_link_id(action) == link_id
+                    and str(action.get("type") or "").strip().lower() == action_type
+                ]
+                if row not in linked_rows:
+                    linked_rows.append(row)
+                for idx in linked_rows:
+                    replacement = copy.deepcopy(result)
+                    replacement["link_id"] = link_id
+                    working[idx] = replacement
+                _refresh()
+                _select_rows(sorted(linked_rows))
                 return
             working[row] = result
             _refresh()
@@ -15609,6 +18260,39 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 pass
 
+        def _link_selected() -> None:
+            rows = _selected_rows()
+            if len(rows) < 2:
+                QMessageBox.information(dlg, "Link Actions", "Select at least two actions of the same type to link.")
+                return
+            types = {str(working[row].get("type") or "").strip().lower() for row in rows}
+            if len(types) != 1:
+                QMessageBox.information(dlg, "Link Actions", "Only actions of the same type can be linked together.")
+                return
+            existing_links = [
+                _action_link_id(working[row])
+                for row in rows
+                if _action_link_id(working[row])
+            ]
+            unique_existing = sorted(set(existing_links))
+            link_id = unique_existing[0] if len(unique_existing) == 1 else ""
+            if not link_id:
+                link_id = f"link_{uuid.uuid4().hex[:10]}"
+            for row in rows:
+                working[row]["link_id"] = link_id
+            _refresh()
+            _select_rows(rows)
+
+        def _unlink_selected() -> None:
+            rows = _selected_rows()
+            if not rows:
+                return
+            for row in rows:
+                working[row]["link_id"] = ""
+            _prune_single_action_links()
+            _refresh()
+            _select_rows([row for row in rows if 0 <= row < len(working)])
+
         def _remove_selected() -> None:
             rows = _selected_rows()
             if not rows:
@@ -15633,8 +18317,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         add_else_btn.clicked.connect(lambda: _add("else"))
         add_end_btn.clicked.connect(lambda: _add("end"))
         add_break_btn.clicked.connect(lambda: _add("break"))
+        add_kill_btn.clicked.connect(lambda: _add("kill_user"))
         edit_btn.clicked.connect(_edit_selected)
         duplicate_btn.clicked.connect(_duplicate_selected)
+        link_btn.clicked.connect(_link_selected)
+        unlink_btn.clicked.connect(_unlink_selected)
         remove_btn.clicked.connect(_remove_selected)
         up_btn.clicked.connect(lambda: _move(-1))
         down_btn.clicked.connect(lambda: _move(1))
@@ -16088,6 +18775,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     "drag": "Drag",
                     "wait": "Wait",
                     "webhook": "Webhook",
+                    "kill_user": "Kill User",
                     "if": "If",
                     "else": "Else",
                     "end": "End Block",
@@ -16421,7 +19109,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         info_layout.addWidget(desc)
         sub_desc = QLabel(
             "Each row carries its own action string, OCR trigger bindings, cooldown/biome behavior, "
-            "optional user targeting, and pre-run alert settings."
+            "and optional user targeting"
         )
         sub_desc.setWordWrap(True)
         sub_desc.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
@@ -16454,14 +19142,29 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.auto_item_delay_spin.setValue(0.2)
         settings_layout.addWidget(self.auto_item_delay_spin, 2, 1)
 
+        settings_layout.addWidget(QLabel("Auto-Actions overdue threshold (minutes):"), 3, 0)
+        self.auto_item_antiafk_overdue_minutes_spin = QDoubleSpinBox()
+        self.auto_item_antiafk_overdue_minutes_spin.setRange(1.0, 15.0)
+        self.auto_item_antiafk_overdue_minutes_spin.setDecimals(1)
+        self.auto_item_antiafk_overdue_minutes_spin.setSingleStep(0.5)
+        self.auto_item_antiafk_overdue_minutes_spin.setValue(_ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT)
+        self.auto_item_antiafk_overdue_minutes_spin.setToolTip(
+            "Auto-Actions will stop pausing Anti-AFK when any connected user is near this age."
+        )
+        settings_layout.addWidget(self.auto_item_antiafk_overdue_minutes_spin, 3, 1)
+
         self.auto_item_disable_mouse_chk = QCheckBox("Disable user mouse movement during Auto-Actions")
-        settings_layout.addWidget(self.auto_item_disable_mouse_chk, 3, 0, 1, 2)
+        settings_layout.addWidget(self.auto_item_disable_mouse_chk, 4, 0, 1, 2)
         try:
             self._update_auto_item_disable_mouse_tooltip()
         except Exception:
             pass
 
-        settings_layout.addWidget(QLabel("Toggle hotkey:"), 4, 0)
+        self.auto_item_menu_debug_chk = QCheckBox("Log in-menu status when sequences activate")
+        self.auto_item_menu_debug_chk.setToolTip("Writes PID, HWND, Roblox log filename, biome, menu state, and menu-gate age before each Auto-Actions sequence plays.")
+        settings_layout.addWidget(self.auto_item_menu_debug_chk, 5, 0, 1, 2)
+
+        settings_layout.addWidget(QLabel("Toggle hotkey:"), 6, 0)
         self.auto_item_hotkey_edit = QKeySequenceEdit()
         self.auto_item_hotkey_edit.setToolTip("Global hotkey to toggle Auto-Actions enable/disable (default: Ctrl+Alt+Space).")
         try:
@@ -16469,7 +19172,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             pass
         self.auto_item_hotkey_edit.setMinimumWidth(220)
-        settings_layout.addWidget(self.auto_item_hotkey_edit, 4, 1)
+        settings_layout.addWidget(self.auto_item_hotkey_edit, 6, 1)
 
         layout.addWidget(settings_group)
 
@@ -16528,7 +19231,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         down_btn.clicked.connect(lambda: self._auto_item_move_selected(1))
         presets_btn = QPushButton("Presets")
         presets_btn.clicked.connect(self._open_auto_item_presets_dialog)
-        for btn in (add_item_btn, remove_item_btn, save_rows_btn, test_btn, up_btn, down_btn, presets_btn):
+        monitor_btn = QPushButton("Monitor")
+        monitor_btn.setToolTip("Open a live view of users, actions, cooldowns, triggers, and runtime status.")
+        monitor_btn.clicked.connect(self._open_auto_item_monitor)
+        for btn in (add_item_btn, remove_item_btn, save_rows_btn, test_btn, up_btn, down_btn, presets_btn, monitor_btn):
             items_btn_row.addWidget(btn)
         items_btn_row.addStretch()
         items_layout.addLayout(items_btn_row)
@@ -16608,6 +19314,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.auto_item_tick_spin.valueChanged.connect(self._on_auto_item_ui_changed)
         self.auto_item_delay_spin.valueChanged.connect(self._on_auto_item_ui_changed)
         self.auto_item_disable_mouse_chk.toggled.connect(self._on_auto_item_mouse_toggle_changed)
+        self.auto_item_menu_debug_chk.toggled.connect(self._on_auto_item_ui_changed)
+        self.auto_item_antiafk_overdue_minutes_spin.valueChanged.connect(self._on_auto_item_ui_changed)
         self.auto_item_hotkey_edit.keySequenceChanged.connect(self._on_auto_item_hotkey_changed)
 
         self._auto_item_refresh_users()
@@ -16615,6 +19323,39 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._ensure_auto_item_engine()
 
         self.tab_widget.addTab(scroll, "Auto Actions")
+
+    def _open_auto_item_monitor(self) -> None:
+        self._ensure_auto_item_engine()
+        engine = getattr(self, "auto_item_engine", None)
+        if engine is None or not hasattr(engine, "monitor_snapshot"):
+            QMessageBox.warning(self, "Auto Actions Monitor", "The Auto Actions engine is not available.")
+            return
+
+        try:
+            engine.update_config(self._get_auto_item_settings_from_ui())
+        except Exception:
+            pass
+
+        existing = getattr(self, "_auto_item_monitor_dialog", None)
+        if existing is not None:
+            try:
+                if existing.isVisible():
+                    existing.showNormal()
+                    existing.raise_()
+                    existing.activateWindow()
+                    return
+            except RuntimeError:
+                pass
+
+        dialog = _AutoActionsMonitorDialog(engine.monitor_snapshot, self)
+        self._auto_item_monitor_dialog = dialog
+
+        def _clear_monitor_reference(*_args) -> None:
+            if getattr(self, "_auto_item_monitor_dialog", None) is dialog:
+                self._auto_item_monitor_dialog = None
+
+        dialog.finished.connect(_clear_monitor_reference)
+        dialog.show()
 
     def _auto_item_focus_row(self, row: int, *, column: int = 1, position_at_bottom: bool = False) -> None:
         table = getattr(self, "auto_item_table", None)
@@ -17104,7 +19845,29 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             elif isinstance(raw_users, (list, tuple, set)):
                 users_list = [str(u).strip() for u in raw_users if str(u).strip()]
                 users_prop = users_list if users_list or bool(item.get("users_explicit", False)) else None
+            elif isinstance(raw_users, str):
+                try:
+                    parsed_users = json.loads(raw_users)
+                except Exception:
+                    parsed_users = [
+                        part.strip()
+                        for part in raw_users.replace("\r", "\n").replace("\n", ",").split(",")
+                        if part.strip()
+                    ]
+                if isinstance(parsed_users, (list, tuple, set)):
+                    users_list = [str(u).strip() for u in parsed_users if str(u).strip()]
+                else:
+                    users_list = [str(parsed_users).strip()] if str(parsed_users).strip() else []
+                users_prop = users_list if users_list or bool(item.get("users_explicit", False)) else None
+            else:
+                try:
+                    if not isinstance(raw_users, dict):
+                        users_list = [str(u).strip() for u in list(raw_users) if str(u).strip()]  # type: ignore[arg-type]
+                        users_prop = users_list if users_list or bool(item.get("users_explicit", False)) else None
+                except Exception:
+                    users_prop = None
             users_btn.setProperty("users", users_prop)
+            users_btn.setProperty("user_filter_mode", _normalize_user_filter_mode(item.get("user_filter_mode", "whitelist")))
             users_btn.setProperty("discord_user_edit_enabled", bool(item.get("discord_user_edit_enabled", False)))
             self._auto_item_apply_cell_button_style(users_btn)
             self._update_users_btn_text(users_btn)
@@ -17155,6 +19918,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             }
 
             if isinstance(users_btn, QPushButton):
+                user_filter_mode = _normalize_user_filter_mode(users_btn.property("user_filter_mode"))
+                item["user_filter_mode"] = user_filter_mode
                 raw_users = users_btn.property("users")
                 if raw_users is None:
                     item["users"] = None
@@ -17162,6 +19927,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 elif isinstance(raw_users, (list, tuple, set)):
                     item["users"] = [str(u).strip() for u in raw_users if str(u).strip()]
                     item["users_explicit"] = True
+                else:
+                    try:
+                        if not isinstance(raw_users, (str, dict)):
+                            item["users"] = [str(u).strip() for u in list(raw_users) if str(u).strip()]  # type: ignore[arg-type]
+                            item["users_explicit"] = True
+                    except Exception:
+                        item["users"] = None
+                        item["users_explicit"] = False
                 item["discord_user_edit_enabled"] = bool(users_btn.property("discord_user_edit_enabled"))
 
             if isinstance(alert_btn, QPushButton):
@@ -17180,7 +19953,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "enabled": bool(self.auto_item_enable_chk.isChecked()),
             "tick_interval": float(self.auto_item_tick_spin.value()),
             "click_delay": float(self.auto_item_delay_spin.value()),
+            "antiafk_auto_action_overdue_min": self._clamp_antiafk_overdue_minutes(
+                self.auto_item_antiafk_overdue_minutes_spin.value()
+            ),
             "disable_mouse_move": bool(getattr(self, "auto_item_disable_mouse_chk", None) and self.auto_item_disable_mouse_chk.isChecked()),
+            "menu_debug": bool(getattr(self, "auto_item_menu_debug_chk", None) and self.auto_item_menu_debug_chk.isChecked()),
             "toggle_hotkey": (self.auto_item_hotkey_edit.keySequence().toString().strip() if getattr(self, "auto_item_hotkey_edit", None) else ""),
             "users": users,
             "presets": [copy.deepcopy(p) for p in (getattr(self, "_auto_item_presets", []) or []) if isinstance(p, dict)],
@@ -17192,7 +19969,22 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             settings = self.config_manager.load_settings() or {}
         except Exception:
             settings = {}
-        return self._normalize_auto_item_cfg(settings.get("auto_item", {}) or {})
+        raw_cfg = settings.get("auto_item", {}) or {}
+        if not isinstance(raw_cfg, dict):
+            raw_cfg = {}
+        else:
+            raw_cfg = dict(raw_cfg)
+
+        # The threshold used to live with Anti-AFK settings. Read that value
+        # once as a fallback so existing installations keep their setting.
+        if "antiafk_auto_action_overdue_min" not in raw_cfg:
+            legacy_cfg = settings.get("antiafk", {}) or {}
+            if isinstance(legacy_cfg, dict) and "antiafk_auto_action_overdue_min" in legacy_cfg:
+                raw_cfg["antiafk_auto_action_overdue_min"] = legacy_cfg.get(
+                    "antiafk_auto_action_overdue_min"
+                )
+
+        return self._normalize_auto_item_cfg(raw_cfg)
 
     def _load_auto_item_settings(self):
         cfg = self._get_auto_item_cfg_from_disk()
@@ -17205,7 +19997,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.auto_item_enable_chk.setChecked(bool(merged.get("enabled", False)))
             self.auto_item_tick_spin.setValue(float(merged.get("tick_interval", 1.0) or 1.0))
             self.auto_item_delay_spin.setValue(float(merged.get("click_delay", 0.2) or 0.2))
+            self.auto_item_antiafk_overdue_minutes_spin.setValue(
+                self._clamp_antiafk_overdue_minutes(
+                    merged.get(
+                        "antiafk_auto_action_overdue_min",
+                        _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT,
+                    )
+                )
+            )
             self.auto_item_disable_mouse_chk.setChecked(bool(merged.get("disable_mouse_move", False)))
+            self.auto_item_menu_debug_chk.setChecked(bool(merged.get("menu_debug", False)))
             self._update_auto_item_disable_mouse_tooltip()
             try:
                 self.auto_item_hotkey_edit.setKeySequence(QKeySequence(hk))
@@ -17236,7 +20037,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.auto_item_enable_chk.setChecked(bool(defaults.get("enabled", False)))
             self.auto_item_tick_spin.setValue(float(defaults.get("tick_interval", 1.0) or 1.0))
             self.auto_item_delay_spin.setValue(float(defaults.get("click_delay", 0.2) or 0.2))
+            self.auto_item_antiafk_overdue_minutes_spin.setValue(
+                self._clamp_antiafk_overdue_minutes(
+                    defaults.get(
+                        "antiafk_auto_action_overdue_min",
+                        _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT,
+                    )
+                )
+            )
             self.auto_item_disable_mouse_chk.setChecked(bool(defaults.get("disable_mouse_move", False)))
+            self.auto_item_menu_debug_chk.setChecked(bool(defaults.get("menu_debug", False)))
             self._update_auto_item_disable_mouse_tooltip()
             try:
                 self.auto_item_hotkey_edit.setKeySequence(QKeySequence(hk))
@@ -17271,7 +20081,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.tab_widget.addTab(bes_widget, "BES")
             return
 
-        top_group = QGroupBox("BES - Battle Encoder Shirasé")
+        top_group = QGroupBox("BES - Battle Encoder Shirase")
         top_layout = QGridLayout(top_group)
 
         self.bes_enable_chk = QCheckBox("Enable throttling for all Roblox processes")
@@ -17285,8 +20095,24 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         top_layout.addWidget(self.bes_cycle_spin, 1, 1)
 
         self.bes_status_label = QLabel("Status: Disabled")
+        self.bes_status_label.setWordWrap(True)
+        self.bes_status_label.setMinimumWidth(0)
+        self.bes_status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.bes_status_label.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
         top_layout.addWidget(self.bes_status_label, 1, 2)
+
+        top_layout.addWidget(QLabel("Mode:"), 2, 0)
+        self.bes_mode_combo = QComboBox()
+        self.bes_mode_combo.addItem("All threads", "all_threads")
+        self.bes_mode_combo.addItem("Smart throttle", "smart")
+        top_layout.addWidget(self.bes_mode_combo, 2, 1)
+
+        top_layout.addWidget(QLabel("Smart threads / process:"), 3, 0)
+        self.bes_smart_count_spin = QSpinBox()
+        self.bes_smart_count_spin.setRange(1, 256)
+        self.bes_smart_count_spin.setValue(4)
+        self.bes_smart_count_spin.setToolTip("In Smart throttle mode, BES throttles only the highest-CPU Roblox threads per process.")
+        top_layout.addWidget(self.bes_smart_count_spin, 3, 1)
 
         layout.addWidget(top_group)
 
@@ -17328,7 +20154,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         layout.addWidget(exempt_group)
 
-        auto_group = QGroupBox("Auto Item Pacify")
+        auto_group = QGroupBox("Auto Action Pacify")
         auto_layout = QGridLayout(auto_group)
 
         auto_layout.addWidget(QLabel("Unthrottle lead time (seconds):"), 0, 0)
@@ -17347,7 +20173,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.bes_auto_grace_spin.setValue(1.0)
         auto_layout.addWidget(self.bes_auto_grace_spin, 1, 1)
 
-        hint = QLabel("Auto Item temporarily disables throttling before it starts clicking/typing.")
+        hint = QLabel("Auto Action temporarily disables throttling before it starts clicking/typing.")
         hint.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
         auto_layout.addWidget(hint, 2, 0, 1, 2)
 
@@ -17393,6 +20219,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         # Wire change events
         self.bes_enable_chk.toggled.connect(self._on_bes_enabled_toggled)
         self.bes_cycle_spin.valueChanged.connect(self._on_bes_ui_changed)
+        self.bes_mode_combo.currentIndexChanged.connect(self._on_bes_mode_changed)
+        self.bes_smart_count_spin.valueChanged.connect(self._on_bes_ui_changed)
         self.bes_menu_slider.valueChanged.connect(self._on_bes_slider_changed)
         self.bes_game_slider.valueChanged.connect(self._on_bes_slider_changed)
         self.bes_auto_lead_spin.valueChanged.connect(self._on_bes_ui_changed)
@@ -17478,7 +20306,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if lbl is None:
             return
         try:
-            lbl.setText(str(text))
+            status_text = str(text)
+            lbl.setText(status_text)
+            lbl.setToolTip(status_text)
             if warning:
                 lbl.setStyleSheet(f"color: {ModernStyle.WARNING};")
             else:
@@ -17490,6 +20320,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         try:
             self.bes_menu_val.setText(f"{int(self.bes_menu_slider.value())}%")
             self.bes_game_val.setText(f"{int(self.bes_game_slider.value())}%")
+        except Exception:
+            pass
+        self._on_bes_ui_changed()
+
+    def _on_bes_mode_changed(self, _idx: int = 0) -> None:
+        try:
+            mode = str(self.bes_mode_combo.currentData() or "all_threads")
+            self.bes_smart_count_spin.setEnabled(mode == "smart")
         except Exception:
             pass
         self._on_bes_ui_changed()
@@ -17506,6 +20344,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pass
 
         if enabled:
+            try:
+                chk = getattr(self, "antiafk_unthrottle_chk", None)
+                if chk is not None and not chk.isChecked():
+                    chk.setChecked(True)
+            except Exception:
+                pass
             try:
                 if self._bes_tick_timer is not None:
                     self._bes_tick_timer.start()
@@ -17527,6 +20371,50 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pass
 
         self._on_bes_ui_changed()
+        try:
+            self._on_antiafk_ui_changed()
+        except Exception:
+            pass
+
+    def _normalize_bes_cfg(self, cfg: Optional[Dict]) -> Dict:
+        cfg = dict(cfg or {})
+
+        def _int_value(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                value = int(cfg.get(key, default))
+            except Exception:
+                value = int(default)
+            return max(lo, min(hi, value))
+
+        def _float_value(key: str, default: float, lo: float, hi: float) -> float:
+            try:
+                value = float(cfg.get(key, default))
+            except Exception:
+                value = float(default)
+            return max(lo, min(hi, value))
+
+        mode = str(cfg.get("throttle_mode", "all_threads") or "all_threads").strip().lower()
+        if mode not in ("all_threads", "smart"):
+            mode = "all_threads"
+
+        exempt_raw = cfg.get("exempt_users", ["", "", ""])
+        if not isinstance(exempt_raw, list):
+            exempt_raw = ["", "", ""]
+        exempt = [str(v or "").strip() for v in exempt_raw[:3]]
+        while len(exempt) < 3:
+            exempt.append("")
+
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "cycle_ms": _int_value("cycle_ms", 50, 10, 1000),
+            "throttle_mode": mode,
+            "smart_thread_count": _int_value("smart_thread_count", 4, 1, 256),
+            "menu_throttle_percent": _int_value("menu_throttle_percent", 85, 0, 99),
+            "game_throttle_percent": _int_value("game_throttle_percent", 50, 0, 99),
+            "exempt_users": exempt,
+            "auto_item_lead_s": _float_value("auto_item_lead_s", 3.0, 0.0, 15.0),
+            "auto_item_grace_s": _float_value("auto_item_grace_s", 1.0, 0.0, 10.0),
+        }
 
     def _get_bes_settings_from_ui(self) -> Dict:
         exempt: List[str] = []
@@ -17539,15 +20427,24 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             exempt.append("")
         exempt = exempt[:3]
 
-        return {
+        try:
+            throttle_mode = str(getattr(self, "bes_mode_combo", None) and self.bes_mode_combo.currentData() or "all_threads")
+        except Exception:
+            throttle_mode = "all_threads"
+        if throttle_mode not in ("all_threads", "smart"):
+            throttle_mode = "all_threads"
+
+        return self._normalize_bes_cfg({
             "enabled": bool(getattr(self, "bes_enable_chk", None) and self.bes_enable_chk.isChecked()),
             "cycle_ms": int(getattr(self, "bes_cycle_spin", None) and self.bes_cycle_spin.value() or 50),
+            "throttle_mode": throttle_mode,
+            "smart_thread_count": int(getattr(self, "bes_smart_count_spin", None) and self.bes_smart_count_spin.value() or 4),
             "menu_throttle_percent": int(getattr(self, "bes_menu_slider", None) and self.bes_menu_slider.value() or 0),
             "game_throttle_percent": int(getattr(self, "bes_game_slider", None) and self.bes_game_slider.value() or 0),
             "exempt_users": exempt,
             "auto_item_lead_s": float(getattr(self, "bes_auto_lead_spin", None) and self.bes_auto_lead_spin.value() or 0.0),
             "auto_item_grace_s": float(getattr(self, "bes_auto_grace_spin", None) and self.bes_auto_grace_spin.value() or 0.0),
-        }
+        })
 
     def _load_bes_settings(self) -> None:
         try:
@@ -17555,29 +20452,35 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             settings = dict(self.config_manager.default_settings or {})
 
-        cfg = settings.get("bes", {}) or {}
         defaults = self.config_manager.default_settings.get("bes", {}) or {}
+        cfg = dict(defaults)
+        loaded_cfg = settings.get("bes", {}) or {}
+        if isinstance(loaded_cfg, dict):
+            cfg.update(loaded_cfg)
+        cfg = self._normalize_bes_cfg(cfg)
 
         self._loading_bes_settings = True
         try:
-            self.bes_enable_chk.setChecked(bool(cfg.get("enabled", defaults.get("enabled", False))))
-            self.bes_cycle_spin.setValue(int(cfg.get("cycle_ms", defaults.get("cycle_ms", 50))))
+            self.bes_enable_chk.setChecked(bool(cfg.get("enabled", False)))
+            self.bes_cycle_spin.setValue(int(cfg.get("cycle_ms", 50)))
 
-            menu_pct = int(cfg.get("menu_throttle_percent", defaults.get("menu_throttle_percent", 85)))
-            game_pct = int(cfg.get("game_throttle_percent", defaults.get("game_throttle_percent", 50)))
-            self.bes_menu_slider.setValue(max(0, min(99, menu_pct)))
-            self.bes_game_slider.setValue(max(0, min(99, game_pct)))
+            mode = str(cfg.get("throttle_mode", "all_threads") or "all_threads")
+            mode_idx = self.bes_mode_combo.findData(mode)
+            self.bes_mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+            self.bes_smart_count_spin.setValue(int(cfg.get("smart_thread_count", 4)))
+            self._on_bes_mode_changed(0)
+
+            menu_pct = int(cfg.get("menu_throttle_percent", 85))
+            game_pct = int(cfg.get("game_throttle_percent", 50))
+            self.bes_menu_slider.setValue(menu_pct)
+            self.bes_game_slider.setValue(game_pct)
             self.bes_menu_val.setText(f"{int(self.bes_menu_slider.value())}%")
             self.bes_game_val.setText(f"{int(self.bes_game_slider.value())}%")
 
-            self.bes_auto_lead_spin.setValue(float(cfg.get("auto_item_lead_s", defaults.get("auto_item_lead_s", 3.0))))
-            self.bes_auto_grace_spin.setValue(float(cfg.get("auto_item_grace_s", defaults.get("auto_item_grace_s", 1.0))))
+            self.bes_auto_lead_spin.setValue(float(cfg.get("auto_item_lead_s", 3.0)))
+            self.bes_auto_grace_spin.setValue(float(cfg.get("auto_item_grace_s", 1.0)))
 
-            exempt = cfg.get("exempt_users", defaults.get("exempt_users", ["", "", ""])) or ["", "", ""]
-            if not isinstance(exempt, list):
-                exempt = ["", "", ""]
-            while len(exempt) < 3:
-                exempt.append("")
+            exempt = cfg.get("exempt_users", ["", "", ""]) or ["", "", ""]
             for i, combo in enumerate(getattr(self, "bes_exempt_combos", None) or []):
                 uid = str(exempt[i] or "").strip()
                 if uid and combo.findData(uid) < 0:
@@ -17627,6 +20530,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 self.bes_controller.set_cycle_ms(int(cfg.get("cycle_ms", 50)))
             except Exception:
                 pass
+            try:
+                self.bes_controller.set_throttle_mode(str(cfg.get("throttle_mode", "all_threads") or "all_threads"))
+            except Exception:
+                pass
+            try:
+                self.bes_controller.set_smart_thread_count(int(cfg.get("smart_thread_count", 4) or 4))
+            except Exception:
+                pass
 
         if bool(cfg.get("enabled", False)):
             self._bes_tick()
@@ -17646,11 +20557,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self._save_bes_settings()
 
     def _reset_bes_to_defaults(self) -> None:
-        defaults = self.config_manager.default_settings.get("bes", {}) or {}
+        defaults = self._normalize_bes_cfg(self.config_manager.default_settings.get("bes", {}) or {})
         self._loading_bes_settings = True
         try:
             self.bes_enable_chk.setChecked(bool(defaults.get("enabled", False)))
             self.bes_cycle_spin.setValue(int(defaults.get("cycle_ms", 50)))
+            mode = str(defaults.get("throttle_mode", "all_threads") or "all_threads")
+            mode_idx = self.bes_mode_combo.findData(mode)
+            self.bes_mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+            self.bes_smart_count_spin.setValue(int(defaults.get("smart_thread_count", 4)))
+            self._on_bes_mode_changed(0)
             self.bes_menu_slider.setValue(int(defaults.get("menu_throttle_percent", 85)))
             self.bes_game_slider.setValue(int(defaults.get("game_throttle_percent", 50)))
             self.bes_menu_val.setText(f"{int(self.bes_menu_slider.value())}%")
@@ -17673,7 +20589,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
           - Only Roblox processes tracked per-user by the manager get a limiter worker.
           - Exempt users get 0% (no throttling).
           - In-menu vs outside-menu uses separate slider values.
-          - Active Auto Item holds force 0% temporarily (handled inside controller).
+          - Active Auto Action holds force 0% temporarily (handled inside controller).
         """
         ctl = self.bes_controller
         if ctl is None:
@@ -17689,12 +20605,24 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         cfg = self._get_bes_settings_from_ui()
         cycle_ms = int(cfg.get("cycle_ms", 50) or 50)
+        throttle_mode = str(cfg.get("throttle_mode", "all_threads") or "all_threads")
+        if throttle_mode not in ("all_threads", "smart"):
+            throttle_mode = "all_threads"
+        smart_thread_count = max(1, min(256, int(cfg.get("smart_thread_count", 4) or 4)))
         menu_pct = int(cfg.get("menu_throttle_percent", 0) or 0)
         game_pct = int(cfg.get("game_throttle_percent", 0) or 0)
         exempt = {str(u).strip() for u in (cfg.get("exempt_users") or []) if str(u).strip()}
 
         try:
             ctl.set_cycle_ms(cycle_ms)
+        except Exception:
+            pass
+        try:
+            ctl.set_throttle_mode(throttle_mode)
+        except Exception:
+            pass
+        try:
+            ctl.set_smart_thread_count(smart_thread_count)
         except Exception:
             pass
 
@@ -17758,8 +20686,29 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         try:
             ctl.apply(targets, names=names)
             snap = ctl.snapshot()
+            mode_value = str(snap.get("mode", throttle_mode) or throttle_mode)
+            mode_label = "Smart" if mode_value == "smart" else "All threads"
+            smart_value = int(snap.get("smart_threads", smart_thread_count) or smart_thread_count)
+            smart_suffix = f" - SmartThreads={smart_value}" if mode_value == "smart" else ""
+            holds = int(snap.get("holds", 0) or 0)
+            hold_entries = int(snap.get("hold_entries", holds) or 0)
+            effective_cycle = int(snap.get("effective_cycle_ms", cycle_ms) or cycle_ms)
+            open_failures = int(snap.get("thread_open_failures", 0) or 0)
+            suspend_failures = int(snap.get("suspend_failures", 0) or 0)
+            resume_failures = int(snap.get("resume_failures", 0) or 0)
+            sample_failures = int(snap.get("smart_sample_failures", 0) or 0)
+            thread_errors = open_failures + suspend_failures + resume_failures + sample_failures
             self._bes_update_status(
-                f"Status: Running • Tracked={len(tracked_pids)} • Live={len(targets)} • Throttled={throttled} • Holds={int(snap.get('holds', 0))}"
+                "Status: Running"
+                f" - Mode={mode_label}{smart_suffix}"
+                f" - TrackedPIDs={len(tracked_pids)}"
+                f" - LivePIDs={len(targets)}"
+                f" - ThrottledPIDs={throttled}"
+                f" - Holds={holds}/{hold_entries}"
+                f" - Cycle={effective_cycle}ms"
+                f" - ThreadErrors={thread_errors}"
+                f" (open={open_failures}, suspend={suspend_failures}, resume={resume_failures}, sample={sample_failures})",
+                warning=thread_errors > 0,
             )
         except Exception:
             self._bes_update_status("Status: Error", warning=True)
@@ -18163,6 +21112,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def _ocr_filter_uses_chat_area(self, filter_cfg: Optional[dict]) -> bool:
         return self._ocr_filter_shared_area_id(filter_cfg) == "chat"
 
+    def _ocr_filter_solo_ocr(self, filter_cfg: Optional[dict]) -> bool:
+        spec = filter_cfg or {}
+        for key in ("solo_ocr", "isolate_color_filter", "isolated_ocr"):
+            if key in spec:
+                return bool(spec.get(key))
+        return False
+
     def _ocr_shared_area_roi(
         self,
         area_id: str,
@@ -18234,6 +21190,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         cooldown_group = str(base.get("cooldown_group", default_spec.get("cooldown_group", "")) or "").strip()
         if not cooldown_group:
             cooldown_group = "merchant_filters" if behavior == "merchant" else filter_id
+        solo_ocr = self._ocr_filter_solo_ocr(base)
+        if not any(key in base for key in ("solo_ocr", "isolate_color_filter", "isolated_ocr")):
+            solo_ocr = self._ocr_filter_solo_ocr(default_spec)
         return {
             "id": filter_id,
             "name": name or str(default_spec.get("name") or filter_id),
@@ -18242,6 +21201,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "b": int(base.get("b", default_spec.get("b", 255)) or 0),
             "tol": int(base.get("tol", default_spec.get("tol", 60)) or 0),
             "enabled": bool(base.get("enabled", default_spec.get("enabled", True))),
+            "solo_ocr": solo_ocr,
             "target_text": str(base.get("target_text", default_spec.get("target_text", name)) or "").strip(),
             "cooldown_seconds": float(base.get("cooldown_seconds", default_spec.get("cooldown_seconds", 600)) or 0.0),
             "use_shared_area": bool(use_shared_area),
@@ -18314,6 +21274,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         "b": int(raw.get("b", default_spec.get("b", 255)) or 0),
                         "tol": int(raw.get("tol", default_spec.get("tol", 60)) or 0),
                         "enabled": bool(raw.get("enabled", True)),
+                        "solo_ocr": False,
                         "target_text": str(default_spec.get("target_text") or name or "").strip(),
                         "cooldown_seconds": float(legacy_cooldown),
                         "use_shared_area": bool(behavior == "merchant"),
@@ -18398,6 +21359,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "enabled": True,
             "target_text": "",
             "cooldown_seconds": 600,
+            "solo_ocr": False,
             "use_shared_area": False,
             "shared_area_id": "",
             "roi": self._ocr_empty_roi_cfg(),
@@ -19353,7 +22315,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         msg_te.setPlainText(str(spec.get("webhook_message", "") or ""))
         msg_te.setMinimumHeight(72)
         msg_te.setMaximumHeight(120)
-        msg_te.setToolTip("Available placeholders: {filter}, {username}, {owner}, {server_label}, {pid}, {ps_link}, {user_id}")
+        msg_te.setToolTip(
+            "Available placeholders: {filter}, {username}, {owner}, {server_label}, "
+            "{pid}, {ps_link}, {user_id}"
+        )
         form.addRow("Message:", msg_te)
 
         send_screenshot_chk = QCheckBox("Attach screenshot to webhook")
@@ -19368,6 +22333,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         repeat_alert_chk.setChecked(bool(spec.get("repeat_alert_sound", False)))
         repeat_alert_chk.setToolTip("Plays the same repeating alert sound used by Anti-AFK until stopped.")
         form.addRow("", repeat_alert_chk)
+
+        solo_ocr_chk = QCheckBox("Run OCR with only this filter's color")
+        solo_ocr_chk.setChecked(bool(spec.get("solo_ocr", False)))
+        solo_ocr_chk.setToolTip("When enabled, this filter runs in its own OCR pass and does not share color masks with other filters.")
+        form.addRow("", solo_ocr_chk)
 
         color_row = QWidget()
         color_layout = QHBoxLayout(color_row)
@@ -19449,6 +22419,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             popup_spec["webhook_message"] = msg_te.toPlainText()
             popup_spec["send_screenshot"] = bool(send_screenshot_chk.isChecked()) if not is_merchant else bool(spec.get("send_screenshot", True))
             popup_spec["repeat_alert_sound"] = bool(repeat_alert_chk.isChecked())
+            popup_spec["solo_ocr"] = bool(solo_ocr_chk.isChecked())
             popup_spec["r"] = int(r_sb.value())
             popup_spec["g"] = int(g_sb.value())
             popup_spec["b"] = int(b_sb.value())
@@ -19817,14 +22788,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._handle_ocr_status("running")
 
     def _stop_ocr_worker(self):
-        self._stop_ocr_worker_with_timeout(timeout_ms=3000)
-        self._handle_ocr_status("stopped")
+        stopped = self._stop_ocr_worker_with_timeout(timeout_ms=3000)
+        if stopped:
+            self._handle_ocr_status("stopped")
+        return stopped
 
-    def _stop_ocr_worker_with_timeout(self, *, timeout_ms: int = 3000) -> None:
+    def _stop_ocr_worker_with_timeout(self, *, timeout_ms: int = 3000) -> bool:
         worker = getattr(self, "ocr_worker", None)
         self._stop_ocr_filter_alert()
         if not worker:
-            return
+            return True
 
         try:
             worker.stop()
@@ -19836,8 +22809,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             timeout_i = 3000
 
-        # Wait for a clean stop; if it hangs, force-terminate but also try to tear down any pools
-        # so we don't leave orphaned processes/threads after closing JARAM.
+        # Wait for a clean stop. Avoid QThread.terminate(); it can kill Python,
+        # Qt, ONNX, or GDI code while native resources are held.
         stopped = False
         try:
             stopped = bool(worker.wait(max(0, timeout_i)))
@@ -19846,19 +22819,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         if not stopped:
             try:
-                self.add_log("[OCR] stop timed out; forcing terminate()")
-            except Exception:
-                pass
-            try:
-                worker.terminate()
-            except Exception:
-                pass
-            try:
-                worker.wait(1500)
+                self.add_log("[OCR] stop timed out; shutting down OCR executors and waiting again.")
             except Exception:
                 pass
 
-        # Best-effort: ensure any internal executors are shut down even if the thread was terminated.
+        # Best-effort: ensure any internal executors are shut down even if the thread is still unwinding.
         for name in ("_shutdown_ocr_pool", "_shutdown_send_pool", "_shutdown_send_executor"):
             try:
                 fn = getattr(worker, name, None)
@@ -19867,10 +22832,25 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 pass
 
+        if not stopped:
+            try:
+                stopped = bool(worker.wait(1500))
+            except Exception:
+                stopped = False
+
+        if not stopped:
+            try:
+                #; leaving it cooperative to avoid a hard crash.
+                self.add_log("[OCR] worker is still stopping")
+            except Exception:
+                pass
+            return False
+
         try:
             self.ocr_worker = None
         except Exception:
             pass
+        return True
 
     def _terminate_multiprocessing_children(self, *, timeout_s: float = 2.0) -> None:
         # Last-resort cleanup for any leftover multiprocessing children (OCR pool, multiscope, etc.).
@@ -19903,6 +22883,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 if remaining <= 0.0:
                     break
                 p.join(timeout=remaining)
+                exitcode = getattr(p, "exitcode", None)
+                if exitcode is not None:
+                    try:
+                        self.add_log(f"[Shutdown] child process {getattr(p, 'pid', '?')} exited with code {exitcode}.")
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -19915,6 +22901,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             try:
                 if p.is_alive():
                     p.terminate()
+                    try:
+                        self.add_log(f"[Shutdown] terminated lingering child process {getattr(p, 'pid', '?')}.")
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -20134,6 +23124,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "server_label": "",
             "ps_link": "",
             "owner": "",
+            "discord_ping": "",
             "has_user_log": False,
             "is_cap": False,
         }
@@ -20193,6 +23184,28 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             ctx["username"] = str(info.get("username", uid) or uid)
             ctx["ps_link"] = str(info.get("private_server_link", "") or "")
             ctx["is_cap"] = bool(info.get("cap", False))
+
+        uid_key = str(ctx.get("user_id") or "").strip()
+        if uid_key:
+            discord_ids: List[str] = []
+            try:
+                users_cfg = self.config_manager.peek_users()
+                info = users_cfg.get(uid_key, {}) if isinstance(users_cfg, dict) else {}
+                if isinstance(info, dict):
+                    discord_ids = normalize_discord_ids(info.get("discord_user_ids"))
+            except Exception:
+                discord_ids = []
+            if not discord_ids and wt and wt.manager:
+                try:
+                    info = wt.manager.settings.get(uid_key, {}) or {}
+                    if isinstance(info, dict):
+                        discord_ids = normalize_discord_ids(info.get("discord_user_ids"))
+                except Exception:
+                    discord_ids = []
+            discord_ping = " ".join(f"<@{discord_id}>" for discord_id in discord_ids if discord_id)
+            ctx["discord_ping"] = discord_ping
+            ctx["discord_user_ping"] = discord_ping
+            ctx["discord_mention"] = discord_ping
 
         uname_key = str(ctx.get("username") or "").strip().lower()
         if uname_key:
@@ -20313,6 +23326,204 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self._stop_ocr_filter_alert()
             self.ocr_status_label.setText("Status: Stopped")
             self.ocr_status_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY}; font-weight: bold;")
+
+    def _make_launch_priority_spin(self, value: object) -> QSpinBox:
+        spin = _AutoItemSpinBox()
+        spin.setRange(MIN_LAUNCH_PRIORITY, MAX_LAUNCH_PRIORITY)
+        spin.setValue(coerce_launch_priority(value))
+        spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        spin.setToolTip("Higher numbers launch first. Range: -3 to +3. Accounts with the same priority keep this table order.")
+        try:
+            spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+        except Exception:
+            pass
+        spin.setMinimumWidth(96)
+        spin.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        return spin
+
+    def _launch_priority_spin_at_row(self, table: QTableWidget, row: int) -> Optional[QSpinBox]:
+        editor = table.cellWidget(row, 2)
+        if isinstance(editor, QSpinBox):
+            return editor
+        if isinstance(editor, QWidget):
+            return editor.findChild(QSpinBox)
+        return None
+
+    def _launch_priority_status_segments(self, info: dict) -> List[str]:
+        if not isinstance(info, dict):
+            return ["Unknown"]
+        flags = []
+        if bool(info.get("disabled", False)):
+            flags.append("Disabled")
+        else:
+            flags.append("Enabled")
+        if bool(info.get("bad", False)):
+            flags.append("BAD")
+        if bool(info.get("cap", False)):
+            flags.append("CAP")
+        if bool(info.get("alternate_launch", False)):
+            flags.append("Alternate")
+        return flags
+
+    def _populate_launch_priority_table(self, users_config: Optional[dict] = None) -> None:
+        table = getattr(self, "launch_priority_table", None)
+        if table is None:
+            return
+        current_priorities = self._collect_launch_priorities_from_ui()
+        if not isinstance(users_config, dict):
+            try:
+                users_config = self.config_manager.load_users() or {}
+            except Exception:
+                users_config = {}
+        if not isinstance(users_config, dict):
+            users_config = {}
+
+        query = ""
+        try:
+            query = str(self.launch_priority_search_input.text() or "").strip().lower()
+        except Exception:
+            query = ""
+
+        rows = [
+            (str(uid), info)
+            for uid, info in (users_config or {}).items()
+            if isinstance(info, dict)
+            and (
+                not query
+                or query in str(uid).lower()
+                or query in str(info.get("username", f"User_{uid}") or "").lower()
+            )
+        ]
+        for uid, info in rows:
+            if uid in current_priorities:
+                info["launch_priority"] = current_priorities[uid]
+        rows = sort_user_items_by_launch_priority(rows)
+
+        try:
+            table.setUpdatesEnabled(False)
+        except Exception:
+            pass
+        table.setRowCount(len(rows))
+        for row, (uid, info) in enumerate(rows):
+            uid_item = QTableWidgetItem(uid)
+            uid_item.setData(Qt.ItemDataRole.UserRole, uid)
+            username_item = QTableWidgetItem(str(info.get("username", f"User_{uid}") or f"User_{uid}"))
+            status_segments = self._launch_priority_status_segments(info)
+            status_item = QTableWidgetItem(" / ".join(status_segments))
+            status_item.setData(_LAUNCH_PRIORITY_STATUS_ROLE, status_segments)
+            priority_spin = self._make_launch_priority_spin(info.get("launch_priority", DEFAULT_LAUNCH_PRIORITY))
+
+            for item in (uid_item, username_item, status_item):
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            table.setItem(row, 0, uid_item)
+            table.setItem(row, 1, username_item)
+            table.setCellWidget(row, 2, priority_spin)
+            table.setItem(row, 3, status_item)
+            try:
+                table.setRowHeight(row, 44)
+            except Exception:
+                pass
+
+        try:
+            table.setUpdatesEnabled(True)
+        except Exception:
+            pass
+
+    def _collect_launch_priorities_from_ui(self) -> dict:
+        try:
+            users_config = self.config_manager.load_users() or {}
+        except Exception:
+            users_config = {}
+        priorities = {
+            str(uid): coerce_launch_priority(info.get("launch_priority", DEFAULT_LAUNCH_PRIORITY))
+            for uid, info in (users_config or {}).items()
+            if isinstance(info, dict)
+        }
+        table = getattr(self, "launch_priority_table", None)
+        if table is None:
+            return priorities
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            if item is None:
+                continue
+            uid = str(item.data(Qt.ItemDataRole.UserRole) or item.text() or "").strip()
+            if not uid:
+                continue
+            spin = self._launch_priority_spin_at_row(table, row)
+            if isinstance(spin, QSpinBox):
+                priorities[uid] = coerce_launch_priority(spin.value())
+            else:
+                priorities[uid] = DEFAULT_LAUNCH_PRIORITY
+        return priorities
+
+    def _reset_launch_priorities_ui(self) -> None:
+        table = getattr(self, "launch_priority_table", None)
+        if table is None:
+            return
+        for row in range(table.rowCount()):
+            spin = self._launch_priority_spin_at_row(table, row)
+            if isinstance(spin, QSpinBox):
+                spin.setValue(DEFAULT_LAUNCH_PRIORITY)
+
+    def _save_launch_priorities_from_ui(self) -> bool:
+        priorities = self._collect_launch_priorities_from_ui()
+        if not priorities:
+            return True
+        try:
+            users_config = self.config_manager.load_users() or {}
+        except Exception:
+            users_config = {}
+        if not isinstance(users_config, dict):
+            users_config = {}
+
+        changed = False
+        for uid, priority in priorities.items():
+            info = users_config.get(str(uid))
+            if not isinstance(info, dict):
+                continue
+            normalized = coerce_launch_priority(priority)
+            if coerce_launch_priority(info.get("launch_priority", DEFAULT_LAUNCH_PRIORITY)) != normalized:
+                info["launch_priority"] = normalized
+                users_config[str(uid)] = info
+                changed = True
+
+        if not changed:
+            return True
+
+        if not self.config_manager.save_users(users_config):
+            err = ""
+            try:
+                err = self.config_manager.get_cookie_error()
+            except Exception:
+                err = ""
+            msg = "Failed to save launch priorities to users.json."
+            if err:
+                msg += "\n\n" + err
+            QMessageBox.critical(self, "Error", msg)
+            return False
+
+        try:
+            if self.worker_thread and self.worker_thread.isRunning():
+                for uid, priority in priorities.items():
+                    normalized = coerce_launch_priority(priority)
+                    info = self.worker_thread.manager.settings.get(str(uid), {})
+                    if isinstance(info, dict):
+                        info["launch_priority"] = normalized
+                    st = self.worker_thread.user_states.get(str(uid), {})
+                    st_info = st.get("user_info") if isinstance(st, dict) else None
+                    if isinstance(st_info, dict):
+                        st_info["launch_priority"] = normalized
+                self.worker_thread._recompute_pools()
+        except Exception:
+            pass
+
+        try:
+            self.refresh_accounts_list()
+        except Exception:
+            pass
+        return True
+
     def setup_settings_tab(self):
         settings_widget = QWidget()
         layout = QVBoxLayout(settings_widget)
@@ -20348,8 +23559,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         self.rbwin_geom_enforce_chk = QCheckBox("Auto-fix Roblox window size/position on launch")
         self.rbwin_geom_enforce_chk.setToolTip(
-            "When enabled, each Roblox window launched by J.JARAM is checked once.\n"
-            "If its size/position differs from the recorded geometry, it will be moved/resized to match."
+            "When enabled, each Roblox window launched by J.JARAM is checked for the recorded geometry.\n"
+            "If moving/resizing fails, it automatically retries once after 5 seconds."
         )
         win_geom_layout.addWidget(self.rbwin_geom_enforce_chk)
 
@@ -20404,7 +23615,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.kill_timeout_input.setEnabled(checked)
         self.kill_after_enable_chk.toggled.connect(_toggle_kill_inputs)
 
-        self.kill_timeout_input = QSpinBox(); self.kill_timeout_input.setRange(60, 7200); self.kill_timeout_input.setSuffix(" s")
+        self.kill_timeout_input = QSpinBox(); self.kill_timeout_input.setRange(60, 2_147_483_647); self.kill_timeout_input.setSuffix(" s")
         self.kill_timeout_input.setToolTip("Time until window auto-closes")
         timeout_layout.addRow("Kill After:", self.kill_timeout_input)
 
@@ -20522,6 +23733,113 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.misc_msedgewebview2_limiter_enabled_chk.setChecked(True)
         misc_layout.addRow(self.misc_msedgewebview2_limiter_enabled_chk)
         content_layout.addWidget(misc_box)
+
+        launch_priority_group = QGroupBox("Launch Priority")
+        launch_priority_layout = QVBoxLayout(launch_priority_group)
+        launch_priority_layout.setSpacing(10)
+        launch_priority_layout.setContentsMargins(12, 16, 12, 12)
+
+        launch_priority_hint = QLabel(
+            "Higher priority accounts launch first when multiple accounts are waiting to launch."
+        )
+        launch_priority_hint.setWordWrap(True)
+        launch_priority_hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        launch_priority_hint.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
+        launch_priority_layout.addWidget(launch_priority_hint)
+
+        self.launch_priority_search_input = QLineEdit()
+        self.launch_priority_search_input.setPlaceholderText("Search username or user ID")
+        self.launch_priority_search_input.setToolTip("Filter launch priority accounts by username or user ID.")
+        try:
+            self.launch_priority_search_input.setClearButtonEnabled(True)
+        except Exception:
+            pass
+        self.launch_priority_search_input.textChanged.connect(lambda _text: self._populate_launch_priority_table())
+        launch_priority_layout.addWidget(self.launch_priority_search_input)
+
+        self.launch_priority_table = QTableWidget()
+        self.launch_priority_table.setObjectName("launchPriorityTable")
+        self.launch_priority_table.setStyleSheet(
+            f"""
+            QTableWidget#launchPriorityTable::item {{
+                padding: 4px 8px;
+            }}
+            QTableWidget#launchPriorityTable QSpinBox {{
+                background-color: {ModernStyle.SURFACE};
+                color: {ModernStyle.TEXT_PRIMARY};
+                border: 2px solid {ModernStyle.BORDER};
+                border-radius: 6px;
+                padding: 4px 26px 4px 8px;
+            }}
+            QTableWidget#launchPriorityTable QSpinBox::up-button,
+            QTableWidget#launchPriorityTable QSpinBox::down-button {{
+                subcontrol-origin: border;
+                width: 20px;
+                border-left: 1px solid {ModernStyle.BORDER};
+                background-color: {ModernStyle.SURFACE_VARIANT};
+            }}
+            QTableWidget#launchPriorityTable QSpinBox::up-button {{
+                subcontrol-position: top right;
+                border-top-right-radius: 6px;
+                border-bottom: 1px solid {ModernStyle.BORDER};
+            }}
+            QTableWidget#launchPriorityTable QSpinBox::down-button {{
+                subcontrol-position: bottom right;
+                border-bottom-right-radius: 6px;
+                border-top: none;
+            }}
+            QTableWidget#launchPriorityTable QSpinBox::up-button:hover,
+            QTableWidget#launchPriorityTable QSpinBox::down-button:hover {{
+                background-color: {ModernStyle.BORDER};
+            }}
+            QTableWidget#launchPriorityTable QSpinBox::up-arrow,
+            QTableWidget#launchPriorityTable QSpinBox::down-arrow {{
+                image: none;
+                width: 0px;
+                height: 0px;
+            }}
+            """
+        )
+        self.launch_priority_table.setColumnCount(4)
+        self.launch_priority_table.setHorizontalHeaderLabels(["User ID", "Username", "Priority", "Status"])
+        self.launch_priority_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.launch_priority_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.launch_priority_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._launch_priority_status_delegate = _LaunchPriorityStatusDelegate(self.launch_priority_table)
+        self.launch_priority_table.setItemDelegateForColumn(3, self._launch_priority_status_delegate)
+        priority_row_height = 44
+        priority_visible_rows = 6
+        self.launch_priority_table.verticalHeader().setDefaultSectionSize(priority_row_height)
+        self.launch_priority_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        try:
+            priority_min_height = (
+                self.launch_priority_table.frameWidth() * 2
+                + self.launch_priority_table.horizontalHeader().sizeHint().height()
+                + (priority_row_height * priority_visible_rows)
+                + self.launch_priority_table.horizontalScrollBar().sizeHint().height()
+                + 8
+            )
+        except Exception:
+            priority_min_height = 260
+        self.launch_priority_table.setMinimumHeight(priority_min_height)
+        priority_header = self.launch_priority_table.horizontalHeader()
+        priority_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        priority_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        priority_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.launch_priority_table.setColumnWidth(2, 132)
+        priority_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        launch_priority_layout.addWidget(self.launch_priority_table)
+
+        launch_priority_buttons = QHBoxLayout()
+        launch_priority_refresh_btn = QPushButton("Refresh Accounts")
+        launch_priority_refresh_btn.clicked.connect(self._populate_launch_priority_table)
+        launch_priority_reset_btn = QPushButton("Reset Priorities")
+        launch_priority_reset_btn.clicked.connect(self._reset_launch_priorities_ui)
+        launch_priority_buttons.addWidget(launch_priority_refresh_btn)
+        launch_priority_buttons.addWidget(launch_priority_reset_btn)
+        launch_priority_buttons.addStretch()
+        launch_priority_layout.addLayout(launch_priority_buttons)
+        content_layout.addWidget(launch_priority_group)
 
         # ── Webhooks (Per-webhook biome filters) ─────────────────────────────────
         webhooks_group = QGroupBox("Biome Webhooks")
@@ -21627,7 +24945,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         discord_btn2.clicked.connect(lambda: self.open_url("https://discord.gg/6cuCu6ymkX"))
         support_layout2.addWidget(discord_btn2)
 
-        bes_label = QLabel("BES (Battle Encoder Shirasé):")
+        bes_label = QLabel("BES (Battle Encoder Shirase):")
         bes_label.setStyleSheet(f"color: {ModernStyle.TEXT_PRIMARY}; font-weight: bold; margin-top: 10px; margin-bottom: 5px;")
         support_layout2.addWidget(bes_label)
 
@@ -21982,7 +25300,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "/action <account> <action> [enabled]",
             "/clearflags <account>",
             "/restartall",
-            "/psl <account> [game_slug] [server_name] [estimated_value] [only_without_private_server_link]",
+            "/psl <account> [place_id] [game_slug] [server_name] [estimated_value] [only_without_private_server_link]",
             "/block <account> <target> [force]",
             "/unblock <account> <target> [force]",
         ]
@@ -21992,6 +25310,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "<account> can be a JARAM user ID or exact username.",
             "<action> can be an Auto Actions action number or exact action name.",
             "<target> can be a Roblox username or user ID.",
+            "<place_id> can be a Roblox place ID or game URL; omit it to use the account place.",
         ]
         doc.setPlainText(
             "Commands\n"
@@ -22114,6 +25433,34 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             }}
         """
 
+    def _get_discord_user_link_manager(self, *, create: bool = False):
+        manager = getattr(self, "discord_user_link_manager", None)
+        if manager is not None:
+            return manager
+        if not create:
+            return None
+        try:
+            module = importlib.import_module("discord_user_linking")
+            manager_cls = getattr(module, "DiscordUserLinkManager", None)
+            if manager_cls is None:
+                raise RuntimeError("discord_user_linking.py does not define DiscordUserLinkManager.")
+            manager = manager_cls(self)
+            self.discord_user_link_manager = manager
+            return manager
+        except ModuleNotFoundError as exc:
+            if str(getattr(exc, "name", "") or "") != "discord_user_linking":
+                try:
+                    self.add_log(f"[Discord Control] Discord user linking module failed to load: {exc}")
+                except Exception:
+                    pass
+            return None
+        except Exception as exc:
+            try:
+                self.add_log(f"[Discord Control] Discord user linking module unavailable: {exc}")
+            except Exception:
+                pass
+            return None
+
     def _update_discord_control_editor_state(
         self,
         discord_uid: str,
@@ -22121,29 +25468,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         *,
         total_accounts: int = 0,
     ) -> None:
-        label = getattr(self, "discord_control_selected_account_label", None)
-        summary = getattr(self, "discord_control_editor_summary_label", None)
-        uid_text = str(discord_uid or "").strip()
-        attached_count = len(entries or [])
-
-        if label is not None:
-            label.setText(
-                f"Editing Discord User ID: {uid_text}"
-                if uid_text
-                else "Editing Discord User ID: None"
-            )
-
-        if summary is not None:
-            if uid_text:
-                summary.setText(
-                    f"{attached_count} account(s) selected for this Discord user. "
-                    f"{max(int(total_accounts), 0)} JARAM account(s) are available to link below."
-                )
-            else:
-                summary.setText(
-                    f"{max(int(total_accounts), 0)} JARAM account(s) available. "
-                    "Select a Discord user from the table or paste an ID below to create a new mapping."
-                )
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.update_editor_state(discord_uid, entries, total_accounts=total_accounts)
 
     def _discord_control_uid_sort_key(self, value: str) -> Tuple[int, object]:
         text = str(value or "").strip()
@@ -22159,18 +25486,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         return (user_text, self._discord_control_uid_sort_key(uid))
 
     def _discord_control_selected_entries(self, users: dict) -> List[Tuple[str, str]]:
-        selected_ids = {str(uid) for uid in (getattr(self, "discord_control_selected_account_ids", set()) or set())}
-        if not isinstance(users, dict) or not selected_ids:
-            return []
-        entries: List[Tuple[str, str]] = []
-        for uid, info in users.items():
-            uid_s = str(uid)
-            if uid_s not in selected_ids:
-                continue
-            username = str(info.get("username") or f"User_{uid_s}") if isinstance(info, dict) else f"User_{uid_s}"
-            entries.append((uid_s, username))
-        entries.sort(key=lambda item: self._discord_control_account_sort_key(item[0], item[1]))
-        return entries
+        manager = self._get_discord_user_link_manager()
+        return manager.selected_entries(users) if manager is not None else []
 
     def _refresh_discord_control_picker_count(
         self,
@@ -22178,174 +25495,47 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         total_accounts: Optional[int] = None,
         visible_count: Optional[int] = None,
     ) -> None:
-        label = getattr(self, "discord_control_account_count_label", None)
-        if label is None:
-            return
-        selected_count = len(getattr(self, "discord_control_selected_account_ids", set()) or set())
-        picker = getattr(self, "discord_control_accounts_picker", None)
-        if visible_count is None and picker is not None:
-            visible_count = picker.count()
-        if total_accounts is None:
-            try:
-                users = self.config_manager.load_users() or {}
-                total_accounts = len(users) if isinstance(users, dict) else 0
-            except Exception:
-                total_accounts = visible_count or 0
-        filter_box = getattr(self, "discord_control_account_filter_input", None)
-        filter_text = str(filter_box.text() if filter_box is not None else "").strip()
-        if filter_text:
-            label.setText(f"{selected_count} attached / {int(visible_count or 0)} shown")
-        else:
-            label.setText(f"{selected_count} attached / {int(total_accounts or 0)} accounts")
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.refresh_picker_count(total_accounts=total_accounts, visible_count=visible_count)
 
     def _sync_discord_control_selected_account_ids_from_picker(self) -> Set[str]:
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            return manager.sync_selected_account_ids_from_picker()
         selected_ids = {str(uid) for uid in (getattr(self, "discord_control_selected_account_ids", set()) or set())}
-        picker = getattr(self, "discord_control_accounts_picker", None)
-        if picker is None:
-            self.discord_control_selected_account_ids = selected_ids
-            return selected_ids
-        for row in range(picker.count()):
-            item = picker.item(row)
-            if item is None:
-                continue
-            account_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
-            if not account_id:
-                continue
-            if item.checkState() == Qt.CheckState.Checked:
-                selected_ids.add(account_id)
-            else:
-                selected_ids.discard(account_id)
         self.discord_control_selected_account_ids = selected_ids
         return selected_ids
 
     def _select_discord_control_link_table_row(self, discord_uid: str) -> None:
-        table = getattr(self, "discord_control_links_table", None)
-        if table is None:
-            return
-        previous = table.blockSignals(True)
-        try:
-            table.clearSelection()
-            target = str(discord_uid or "").strip()
-            if not target:
-                return
-            for row in range(table.rowCount()):
-                item = table.item(row, 0)
-                if item is not None and str(item.text()).strip() == target:
-                    table.selectRow(row)
-                    return
-        finally:
-            table.blockSignals(previous)
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.select_link_table_row(discord_uid)
 
     def _begin_new_discord_control_link(self) -> None:
-        users = self.config_manager.load_users() or {}
-        total_accounts = len(users) if isinstance(users, dict) else 0
-        self.discord_control_selected_discord_user_id = None
-        self.discord_control_selected_account_ids = set()
-        self._discord_control_editor_updating = True
-        try:
-            table = getattr(self, "discord_control_links_table", None)
-            if table is not None:
-                table.clearSelection()
-            input_box = getattr(self, "discord_control_discord_user_id_input", None)
-            if input_box is not None:
-                input_box.clear()
-            filter_box = getattr(self, "discord_control_account_filter_input", None)
-            if filter_box is not None:
-                filter_box.clear()
-        finally:
-            self._discord_control_editor_updating = False
-        self._populate_discord_control_accounts_picker(users, selected_account_ids=set())
-        self._update_discord_control_editor_state("", [], total_accounts=total_accounts)
-        input_box = getattr(self, "discord_control_discord_user_id_input", None)
-        if input_box is not None:
-            input_box.setFocus()
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.begin_new_link()
 
     def _on_discord_control_editor_id_changed(self, _text: str = "") -> None:
-        if getattr(self, "_discord_control_editor_updating", False):
-            return
-        input_box = getattr(self, "discord_control_discord_user_id_input", None)
-        users = self.config_manager.load_users() or {}
-        total_accounts = len(users) if isinstance(users, dict) else 0
-        discord_uid = self._normalize_single_discord_user_id(input_box.text() if input_box is not None else "")
-        link_index = self._build_discord_control_link_index(users)
-        entries = link_index.get(discord_uid, []) if discord_uid else []
-        self.discord_control_selected_discord_user_id = discord_uid or None
-        self.discord_control_selected_account_ids = {uid for uid, _username in entries}
-        self._select_discord_control_link_table_row(discord_uid)
-        self._populate_discord_control_accounts_picker(
-            users,
-            selected_account_ids=self.discord_control_selected_account_ids,
-        )
-        self._update_discord_control_editor_state(
-            discord_uid,
-            self._discord_control_selected_entries(users),
-            total_accounts=total_accounts,
-        )
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.on_editor_id_changed(_text)
 
     def _on_discord_control_account_item_changed(self, item: QListWidgetItem) -> None:
-        if getattr(self, "_discord_control_editor_updating", False) or item is None:
-            return
-        account_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
-        if not account_id:
-            return
-        selected_ids = {str(uid) for uid in (getattr(self, "discord_control_selected_account_ids", set()) or set())}
-        if item.checkState() == Qt.CheckState.Checked:
-            selected_ids.add(account_id)
-        else:
-            selected_ids.discard(account_id)
-        self.discord_control_selected_account_ids = selected_ids
-        users = self.config_manager.load_users() or {}
-        input_box = getattr(self, "discord_control_discord_user_id_input", None)
-        discord_uid = self._normalize_single_discord_user_id(input_box.text() if input_box is not None else "")
-        self._refresh_discord_control_picker_count(
-            total_accounts=len(users) if isinstance(users, dict) else 0,
-        )
-        self._update_discord_control_editor_state(
-            discord_uid,
-            self._discord_control_selected_entries(users),
-            total_accounts=len(users) if isinstance(users, dict) else 0,
-        )
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.on_account_item_changed(item)
 
     def _refresh_discord_control_accounts_picker_filter(self) -> None:
-        if getattr(self, "_discord_control_editor_updating", False):
-            return
-        users = self.config_manager.load_users() or {}
-        self._sync_discord_control_selected_account_ids_from_picker()
-        self._populate_discord_control_accounts_picker(
-            users,
-            selected_account_ids=getattr(self, "discord_control_selected_account_ids", set()),
-        )
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.refresh_picker_filter()
 
     def _set_discord_control_accounts_picker_selection(self, selected: bool) -> None:
-        picker = getattr(self, "discord_control_accounts_picker", None)
-        if picker is None:
-            return
-        selected_ids = self._sync_discord_control_selected_account_ids_from_picker()
-        picker.blockSignals(True)
-        try:
-            for row in range(picker.count()):
-                item = picker.item(row)
-                if item is not None:
-                    account_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
-                    item.setCheckState(Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked)
-                    if account_id:
-                        if selected:
-                            selected_ids.add(account_id)
-                        else:
-                            selected_ids.discard(account_id)
-        finally:
-            picker.blockSignals(False)
-        self.discord_control_selected_account_ids = selected_ids
-        users = self.config_manager.load_users() or {}
-        input_box = getattr(self, "discord_control_discord_user_id_input", None)
-        discord_uid = self._normalize_single_discord_user_id(input_box.text() if input_box is not None else "")
-        total_accounts = len(users) if isinstance(users, dict) else 0
-        self._refresh_discord_control_picker_count(total_accounts=total_accounts)
-        self._update_discord_control_editor_state(
-            discord_uid,
-            self._discord_control_selected_entries(users),
-            total_accounts=total_accounts,
-        )
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.set_picker_selection(selected)
 
     def setup_discord_control_tab(self):
         self._ensure_discord_control_service()
@@ -22469,150 +25659,22 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         main_splitter.setChildrenCollapsible(False)
 
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(12)
-
-        accounts_box = QGroupBox("Linked Discord Users")
-        accounts_layout = QVBoxLayout(accounts_box)
-        accounts_layout.setSpacing(10)
-
-        accounts_header = QHBoxLayout()
-        self.discord_control_links_summary_label = QLabel("No Discord users linked yet.")
-        self.discord_control_links_summary_label.setProperty("discordRole", "panelNote")
-        self.discord_control_links_summary_label.setWordWrap(True)
-        accounts_header.addWidget(self.discord_control_links_summary_label, 1)
-
-        self.discord_control_refresh_links_btn = QPushButton("Refresh Links")
-        self.discord_control_refresh_links_btn.setStyleSheet(self._get_secondary_button_style())
-        self.discord_control_refresh_links_btn.clicked.connect(self._refresh_discord_control_accounts_table)
-        accounts_header.addWidget(self.discord_control_refresh_links_btn)
-
-        new_link_btn = QPushButton("New Link")
-        new_link_btn.setStyleSheet(self._get_secondary_button_style())
-        new_link_btn.clicked.connect(self._begin_new_discord_control_link)
-        accounts_header.addWidget(new_link_btn)
-        accounts_layout.addLayout(accounts_header)
-
-        self.discord_control_links_table = QTableWidget()
-        self.discord_control_links_table.setColumnCount(3)
-        self.discord_control_links_table.setHorizontalHeaderLabels(
-            ["Discord User ID", "Attached Accounts", "Count"]
-        )
-        self.discord_control_links_table.setStyleSheet(self._get_discord_control_table_style())
-        self.discord_control_links_table.setAlternatingRowColors(True)
-        self.discord_control_links_table.verticalHeader().setVisible(False)
-        self.discord_control_links_table.setShowGrid(False)
-        self.discord_control_links_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        try:
-            self.discord_control_links_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-            self.discord_control_links_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        except Exception:
-            pass
-        dheader = self.discord_control_links_table.horizontalHeader()
-        dheader.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        dheader.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        dheader.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.discord_control_links_table.itemSelectionChanged.connect(
-            self._on_discord_control_discord_user_selection_changed
-        )
-        accounts_layout.addWidget(self.discord_control_links_table)
-        left_layout.addWidget(accounts_box)
-        left_panel.setVisible(link_management_visible)
-        main_splitter.addWidget(left_panel)
-
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(12)
 
-        editor_box = QGroupBox("Link Editor")
-        editor_layout = QVBoxLayout(editor_box)
-        editor_layout.setSpacing(10)
-
-        self.discord_control_editor_summary_label = QLabel(
-            "Select a Discord user from the table or paste an ID below to create a new mapping."
-        )
-        self.discord_control_editor_summary_label.setProperty("discordRole", "panelNote")
-        self.discord_control_editor_summary_label.setWordWrap(True)
-        editor_layout.addWidget(self.discord_control_editor_summary_label)
-
-        self.discord_control_selected_account_label = QLabel("Editing Discord User ID: None")
-        self.discord_control_selected_account_label.setProperty("discordRole", "sectionTitle")
-        editor_layout.addWidget(self.discord_control_selected_account_label)
-
-        self.discord_control_discord_user_id_input = QLineEdit()
-        self.discord_control_discord_user_id_input.setPlaceholderText(
-            "Discord user ID to edit or create"
-        )
-        self.discord_control_discord_user_id_input.textChanged.connect(
-            self._on_discord_control_editor_id_changed
-        )
-        editor_layout.addWidget(self.discord_control_discord_user_id_input)
-
-        picker_hint = QLabel("Check the JARAM accounts attached to this Discord user ID.")
-        picker_hint.setProperty("discordRole", "muted")
-        editor_layout.addWidget(picker_hint)
-
-        self.discord_control_account_filter_input = QLineEdit()
-        self.discord_control_account_filter_input.setPlaceholderText("Filter accounts by username or ID")
-        self.discord_control_account_filter_input.textChanged.connect(
-            self._refresh_discord_control_accounts_picker_filter
-        )
-        editor_layout.addWidget(self.discord_control_account_filter_input)
-
-        picker_header = QHBoxLayout()
-        picker_title = QLabel("Attached JARAM Accounts")
-        picker_title.setProperty("discordRole", "sectionTitle")
-        picker_header.addWidget(picker_title)
-
-        self.discord_control_account_count_label = QLabel("0 attached")
-        self.discord_control_account_count_label.setProperty("discordRole", "muted")
-        picker_header.addWidget(self.discord_control_account_count_label)
-        picker_header.addStretch(1)
-
-        picker_select_all_btn = QPushButton("Check All")
-        picker_select_all_btn.setStyleSheet(self._get_secondary_button_style())
-        picker_select_all_btn.clicked.connect(
-            lambda: self._set_discord_control_accounts_picker_selection(True)
-        )
-        picker_header.addWidget(picker_select_all_btn)
-
-        picker_select_none_btn = QPushButton("Uncheck All")
-        picker_select_none_btn.setStyleSheet(self._get_secondary_button_style())
-        picker_select_none_btn.clicked.connect(
-            lambda: self._set_discord_control_accounts_picker_selection(False)
-        )
-        picker_header.addWidget(picker_select_none_btn)
-        editor_layout.addLayout(picker_header)
-
-        self.discord_control_accounts_picker = QListWidget()
-        try:
-            self.discord_control_accounts_picker.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        except Exception:
-            pass
-        self.discord_control_accounts_picker.setStyleSheet(self._get_discord_control_picker_style())
-        self.discord_control_accounts_picker.setMinimumHeight(220)
-        self.discord_control_accounts_picker.setAlternatingRowColors(False)
-        self.discord_control_accounts_picker.itemChanged.connect(
-            self._on_discord_control_account_item_changed
-        )
-        editor_layout.addWidget(self.discord_control_accounts_picker)
-
-        links_btn_row = QHBoxLayout()
-        self.discord_control_save_links_btn = QPushButton("Save Link")
-        self.discord_control_save_links_btn.setStyleSheet(self._get_primary_button_style())
-        self.discord_control_save_links_btn.clicked.connect(self._save_selected_discord_control_links)
-        links_btn_row.addWidget(self.discord_control_save_links_btn)
-        self.discord_control_clear_links_btn = QPushButton("Remove Link")
-        self.discord_control_clear_links_btn.setStyleSheet(self._get_discord_control_danger_button_style())
-        self.discord_control_clear_links_btn.clicked.connect(self._clear_selected_discord_control_links)
-        links_btn_row.addWidget(self.discord_control_clear_links_btn)
-        links_btn_row.addStretch(1)
-        editor_layout.addLayout(links_btn_row)
-        editor_box.setVisible(link_management_visible)
-        right_layout.addWidget(editor_box, 3)
+        link_manager = self._get_discord_user_link_manager(create=link_management_visible)
+        if link_manager is not None:
+            try:
+                link_manager.add_link_management_panels(
+                    main_splitter,
+                    right_layout,
+                    visible=link_management_visible,
+                )
+            except Exception as exc:
+                self.discord_user_link_manager = None
+                self.add_log(f"[Discord Control] Discord user linking UI unavailable: {exc}")
 
         commands_box = QGroupBox("Slash Command Reference")
         commands_layout = QVBoxLayout(commands_box)
@@ -22811,39 +25873,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             stop_btn.setEnabled(running_like)
 
     def _build_discord_control_link_index(self, users: Optional[dict] = None) -> Dict[str, List[Tuple[str, str]]]:
-        if users is None:
-            users = self.config_manager.load_users() or {}
-        if not isinstance(users, dict):
-            return {}
-
-        index: Dict[str, List[Tuple[str, str]]] = {}
-        for uid, info in users.items():
-            if not isinstance(info, dict):
-                continue
-            uid_s = str(uid)
-            username = str(info.get("username") or f"User_{uid_s}")
-            for discord_uid in normalize_discord_ids(info.get("discord_user_ids")):
-                index.setdefault(discord_uid, []).append((uid_s, username))
-
-        for discord_uid, entries in index.items():
-            index[discord_uid] = sorted(
-                entries,
-                key=lambda item: self._discord_control_account_sort_key(item[0], item[1]),
-            )
-
-        ordered_keys = sorted(index.keys(), key=self._discord_control_uid_sort_key)
-        return {key: index[key] for key in ordered_keys}
+        manager = self._get_discord_user_link_manager()
+        return manager.build_link_index(users) if manager is not None else {}
 
     def _normalize_single_discord_user_id(self, raw: object) -> str:
         ids = normalize_discord_ids(raw)
         return ids[0] if len(ids) == 1 else ""
 
     def _format_discord_control_link_summary(self, entries: List[Tuple[str, str]]) -> str:
-        parts = []
-        for uid, username in entries:
-            uname = str(username or uid).strip() or uid
-            parts.append(f"{uname} ({uid})")
-        return ", ".join(parts)
+        manager = self._get_discord_user_link_manager()
+        return manager.format_link_summary(entries) if manager is not None else ""
 
     def _populate_discord_control_accounts_picker(
         self,
@@ -22851,290 +25890,29 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         *,
         selected_account_ids: Optional[Set[str]] = None,
     ) -> None:
-        picker = getattr(self, "discord_control_accounts_picker", None)
-        if picker is None:
-            return
-        if selected_account_ids is not None:
-            self.discord_control_selected_account_ids = {str(uid) for uid in (selected_account_ids or set())}
-        selected_account_ids = {str(uid) for uid in (getattr(self, "discord_control_selected_account_ids", set()) or set())}
-
-        filter_box = getattr(self, "discord_control_account_filter_input", None)
-        query = str(filter_box.text() if filter_box is not None else "").strip().lower()
-
-        total_accounts = len(users) if isinstance(users, dict) else 0
-        picker.blockSignals(True)
-        visible_count = 0
-        try:
-            picker.clear()
-            if not isinstance(users, dict):
-                users = {}
-            else:
-                rows: List[Tuple[str, str]] = []
-                for uid, info in users.items():
-                    uid_s = str(uid)
-                    if isinstance(info, dict):
-                        username = str(info.get("username") or f"User_{uid_s}")
-                    else:
-                        username = f"User_{uid_s}"
-                    if query and query not in uid_s.lower() and query not in username.lower():
-                        continue
-                    rows.append((uid_s, username))
-                rows.sort(key=lambda item: self._discord_control_account_sort_key(item[0], item[1]))
-                for uid_s, username in rows:
-                    item = QListWidgetItem(f"{username} ({uid_s})")
-                    item.setData(Qt.ItemDataRole.UserRole, uid_s)
-                    try:
-                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                    except Exception:
-                        pass
-                    item.setCheckState(
-                        Qt.CheckState.Checked if uid_s in selected_account_ids else Qt.CheckState.Unchecked
-                    )
-                    picker.addItem(item)
-                    visible_count += 1
-        finally:
-            picker.blockSignals(False)
-        self._refresh_discord_control_picker_count(
-            total_accounts=total_accounts,
-            visible_count=visible_count,
-        )
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.populate_accounts_picker(users, selected_account_ids=selected_account_ids)
 
     def _refresh_discord_control_accounts_table(self) -> None:
-        table = getattr(self, "discord_control_links_table", None)
-        if table is None:
-            return
-
-        input_box = getattr(self, "discord_control_discord_user_id_input", None)
-        summary_label = getattr(self, "discord_control_links_summary_label", None)
-        selected_uid = str(getattr(self, "discord_control_selected_discord_user_id", "") or "").strip()
-        if not selected_uid and input_box is not None:
-            selected_uid = self._normalize_single_discord_user_id(input_box.text())
-
-        users = self.config_manager.load_users() or {}
-        link_index = self._build_discord_control_link_index(users)
-        total_accounts = len(users) if isinstance(users, dict) else 0
-        total_attachments = sum(len(entries) for entries in link_index.values())
-        if summary_label is not None:
-            if link_index:
-                summary_label.setText(
-                    f"{len(link_index)} Discord user(s) linked across {total_attachments} account attachment(s)."
-                )
-            else:
-                summary_label.setText(
-                    "No Discord user links saved yet. Use the editor on the right to attach accounts."
-                )
-
-        row_to_select = -1
-        previous = table.blockSignals(True)
-        try:
-            table.setRowCount(len(link_index))
-            for row, (discord_uid, entries) in enumerate(link_index.items()):
-                summary = self._format_discord_control_link_summary(entries)
-                table.setItem(row, 0, QTableWidgetItem(discord_uid))
-                accounts_item = QTableWidgetItem(summary or "None")
-                if summary:
-                    accounts_item.setToolTip(summary)
-                table.setItem(row, 1, accounts_item)
-                table.setItem(row, 2, QTableWidgetItem(str(len(entries))))
-                if selected_uid and discord_uid == selected_uid:
-                    row_to_select = row
-            table.clearSelection()
-            if row_to_select >= 0:
-                table.selectRow(row_to_select)
-        finally:
-            table.blockSignals(previous)
-
-        if selected_uid:
-            entries = link_index.get(selected_uid, [])
-            self.discord_control_selected_discord_user_id = selected_uid
-            self.discord_control_selected_account_ids = {uid for uid, _username in entries}
-            if input_box is not None and self._normalize_single_discord_user_id(input_box.text()) != selected_uid:
-                previous_input = input_box.blockSignals(True)
-                try:
-                    input_box.setText(selected_uid)
-                finally:
-                    input_box.blockSignals(previous_input)
-            self._populate_discord_control_accounts_picker(
-                users,
-                selected_account_ids=self.discord_control_selected_account_ids,
-            )
-            self._update_discord_control_editor_state(
-                selected_uid,
-                entries,
-                total_accounts=total_accounts,
-            )
-        else:
-            self.discord_control_selected_discord_user_id = None
-            self.discord_control_selected_account_ids = set()
-            self._populate_discord_control_accounts_picker(users, selected_account_ids=set())
-            self._update_discord_control_editor_state("", [], total_accounts=total_accounts)
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.refresh_accounts_table()
 
     def _on_discord_control_discord_user_selection_changed(self) -> None:
-        if getattr(self, "_discord_control_editor_updating", False):
-            return
-        table = getattr(self, "discord_control_links_table", None)
-        picker = getattr(self, "discord_control_accounts_picker", None)
-        input_box = getattr(self, "discord_control_discord_user_id_input", None)
-        if table is None or picker is None or input_box is None:
-            return
-        users = self.config_manager.load_users() or {}
-        total_accounts = len(users) if isinstance(users, dict) else 0
-        rows = table.selectionModel().selectedRows() if table.selectionModel() else []
-        if not rows:
-            self.discord_control_selected_discord_user_id = None
-            current_uid = self._normalize_single_discord_user_id(input_box.text())
-            if current_uid:
-                link_index = self._build_discord_control_link_index(users)
-                entries = link_index.get(current_uid, [])
-                self.discord_control_selected_account_ids = {uid for uid, _username in entries}
-                self._populate_discord_control_accounts_picker(
-                    users,
-                    selected_account_ids=self.discord_control_selected_account_ids,
-                )
-                self._update_discord_control_editor_state(
-                    current_uid,
-                    entries,
-                    total_accounts=total_accounts,
-                )
-            else:
-                self.discord_control_selected_account_ids = set()
-                self._populate_discord_control_accounts_picker(users, selected_account_ids=set())
-                self._update_discord_control_editor_state("", [], total_accounts=total_accounts)
-            return
-        row = rows[0].row()
-        item = table.item(row, 0)
-        discord_uid = str(item.text()).strip() if item is not None else ""
-        if not discord_uid:
-            return
-        link_index = self._build_discord_control_link_index(users)
-        entries = link_index.get(discord_uid, [])
-        self.discord_control_selected_discord_user_id = discord_uid
-        self.discord_control_selected_account_ids = {uid for uid, _username in entries}
-        self._discord_control_editor_updating = True
-        try:
-            input_box.setText(discord_uid)
-        finally:
-            self._discord_control_editor_updating = False
-        self._update_discord_control_editor_state(
-            discord_uid,
-            entries,
-            total_accounts=total_accounts,
-        )
-        self._populate_discord_control_accounts_picker(
-            users,
-            selected_account_ids=self.discord_control_selected_account_ids,
-        )
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.on_discord_user_selection_changed()
 
     def _save_selected_discord_control_links(self) -> None:
-        input_box = getattr(self, "discord_control_discord_user_id_input", None)
-        picker = getattr(self, "discord_control_accounts_picker", None)
-        if input_box is None or picker is None:
-            return
-
-        discord_uid = self._normalize_single_discord_user_id(input_box.text())
-        if not discord_uid:
-            QMessageBox.information(self, "Discord Control", "Enter or select one Discord user ID first.")
-            return
-
-        users = self.config_manager.load_users() or {}
-        if not isinstance(users, dict):
-            users = {}
-
-        self._sync_discord_control_selected_account_ids_from_picker()
-        valid_account_ids = {str(account_id) for account_id in users.keys()}
-        desired_set = {
-            str(account_id)
-            for account_id in (getattr(self, "discord_control_selected_account_ids", set()) or set())
-            if str(account_id) in valid_account_ids
-        }
-        desired_account_ids = [
-            str(account_id)
-            for account_id, info in sorted(
-                users.items(),
-                key=lambda item: self._discord_control_account_sort_key(
-                    str(item[0]),
-                    str(item[1].get("username") or f"User_{item[0]}") if isinstance(item[1], dict) else f"User_{item[0]}",
-                ),
-            )
-            if str(account_id) in desired_set
-        ]
-
-        changed = 0
-        for account_id, info in users.items():
-            if not isinstance(info, dict):
-                continue
-            linked_ids = normalize_discord_ids(info.get("discord_user_ids"))
-            has_link = discord_uid in linked_ids
-            wants_link = str(account_id) in desired_set
-            if wants_link and not has_link:
-                linked_ids.append(discord_uid)
-                info["discord_user_ids"] = normalize_discord_ids(linked_ids)
-                changed += 1
-            elif has_link and not wants_link:
-                info["discord_user_ids"] = [x for x in linked_ids if x != discord_uid]
-                changed += 1
-            users[str(account_id)] = info
-
-        if not self.config_manager.save_users(users):
-            err = self.config_manager.get_cookie_error()
-            QMessageBox.critical(self, "Discord Control", err or "Failed to save attached accounts.")
-            return
-
-        self.discord_control_selected_discord_user_id = discord_uid
-        self.discord_control_selected_account_ids = desired_set
-        previous_input = input_box.blockSignals(True)
-        try:
-            input_box.setText(discord_uid)
-        finally:
-            input_box.blockSignals(previous_input)
-        self._refresh_discord_control_accounts_table()
-        self.add_log(
-            f"[Discord Control] Updated attached accounts for Discord user {discord_uid} "
-            f"({len(desired_account_ids)} account(s), changed={changed})."
-        )
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.save_selected_links()
 
     def _clear_selected_discord_control_links(self) -> None:
-        input_box = getattr(self, "discord_control_discord_user_id_input", None)
-        picker = getattr(self, "discord_control_accounts_picker", None)
-        if input_box is None or picker is None:
-            return
-        discord_uid = self._normalize_single_discord_user_id(input_box.text())
-        if not discord_uid:
-            QMessageBox.information(self, "Discord Control", "Enter or select one Discord user ID first.")
-            return
-
-        users = self.config_manager.load_users() or {}
-        changed = 0
-        for account_id, info in users.items():
-            if not isinstance(info, dict):
-                continue
-            linked_ids = normalize_discord_ids(info.get("discord_user_ids"))
-            if discord_uid not in linked_ids:
-                continue
-            info["discord_user_ids"] = [x for x in linked_ids if x != discord_uid]
-            users[str(account_id)] = info
-            changed += 1
-
-        if not self.config_manager.save_users(users):
-            err = self.config_manager.get_cookie_error()
-            QMessageBox.critical(self, "Discord Control", err or "Failed to clear attached accounts.")
-            return
-
-        self.discord_control_selected_discord_user_id = discord_uid
-        self.discord_control_selected_account_ids = set()
-        picker.blockSignals(True)
-        try:
-            for row in range(picker.count()):
-                item = picker.item(row)
-                if item is not None:
-                    item.setCheckState(Qt.CheckState.Unchecked)
-        finally:
-            picker.blockSignals(False)
-        self._refresh_discord_control_accounts_table()
-        self.add_log(
-            f"[Discord Control] Cleared attached accounts for Discord user {discord_uid} "
-            f"(removed from {changed} account(s))."
-        )
+        manager = self._get_discord_user_link_manager()
+        if manager is not None:
+            manager.clear_selected_links()
 
     def _submit_discord_control_request(self, payload: dict, timeout: float = 15.0) -> dict:
         envelope = {
@@ -23405,6 +26183,100 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         matches.sort(key=lambda item: item[0])
         return {"ok": True, "rows": [entry for _rank, entry in matches[:limit]]}
 
+    def _discord_control_autocomplete_psl_place_ids(self, payload: dict) -> dict:
+        query = str((payload or {}).get("query") or "").strip().lower()
+        try:
+            limit = int((payload or {}).get("limit", 25))
+        except Exception:
+            limit = 25
+        limit = max(1, min(limit, 25))
+
+        users = self.config_manager.load_users() or {}
+        if not isinstance(users, dict):
+            users = {}
+
+        entries: Dict[str, dict] = {}
+        order = 0
+
+        def _add_place(place_id: object, name: object = "", *, priority: int = 3) -> None:
+            nonlocal order
+            clean_place_id = self._discord_control_extract_place_id(place_id)
+            if not clean_place_id:
+                return
+            label_name = re.sub(r"\s+", " ", str(name or "")).strip()[:100]
+            existing = entries.get(clean_place_id)
+            if existing is not None:
+                if label_name and not str(existing.get("name") or "").strip():
+                    existing["name"] = label_name
+                    existing["choice_name"] = _format_psl_place_history_label(existing)
+                existing["priority"] = min(int(existing.get("priority", priority)), priority)
+                return
+            entry = {
+                "place_id": clean_place_id,
+                "name": label_name,
+                "priority": priority,
+                "order": order,
+            }
+            entry["choice_name"] = _format_psl_place_history_label(entry)
+            entries[clean_place_id] = entry
+            order += 1
+
+        account_ref = str((payload or {}).get("account_ref") or "").strip()
+        if account_ref:
+            uid, info, _err = self._resolve_discord_control_account(users, account_ref)
+            if uid and isinstance(info, dict):
+                username = str(info.get("username") or uid)
+                _add_place(
+                    self._discord_control_account_place_id(info),
+                    f"{username} account place",
+                    priority=0,
+                )
+
+        try:
+            history = _load_psl_place_id_history()
+        except Exception:
+            history = []
+        for item in history:
+            if isinstance(item, dict):
+                _add_place(item.get("place_id"), item.get("name"), priority=1)
+            else:
+                _add_place(item, "", priority=1)
+
+        for uid, info in users.items():
+            if not isinstance(info, dict):
+                continue
+            username = str(info.get("username") or uid)
+            _add_place(self._discord_control_account_place_id(info), f"{username} account place", priority=2)
+
+        def _match_rank(entry: dict) -> Optional[Tuple[int, int, str, int]]:
+            place_id = str(entry.get("place_id") or "").strip()
+            label = str(entry.get("choice_name") or place_id).strip()
+            name = str(entry.get("name") or "").strip()
+            priority = int(entry.get("priority", 3))
+            order_value = int(entry.get("order", 0))
+            if not query:
+                return (priority, 3, name.lower() or place_id, order_value)
+            place_lc = place_id.lower()
+            name_lc = name.lower()
+            label_lc = label.lower()
+            if place_lc.startswith(query):
+                return (priority, 0, place_lc, order_value)
+            if name_lc.startswith(query):
+                return (priority, 1, name_lc, order_value)
+            if query in label_lc:
+                return (priority, 2, label_lc, order_value)
+            return None
+
+        matches: List[Tuple[Tuple[int, int, str, int], dict]] = []
+        for entry in entries.values():
+            rank = _match_rank(entry)
+            if rank is None:
+                continue
+            matches.append((rank, entry))
+
+        matches.sort(key=lambda item: item[0])
+        return {"ok": True, "places": [entry for _rank, entry in matches[:limit]]}
+
     def _save_discord_control_auto_item_cfg(self, cfg: dict) -> Tuple[bool, str]:
         clean = self._normalize_auto_item_cfg(cfg if isinstance(cfg, dict) else {})
         try:
@@ -23495,6 +26367,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         raw_users = row.get("users", None)
         users_explicit = bool(row.get("users_explicit", False))
+        user_filter_mode = _normalize_user_filter_mode(row.get("user_filter_mode", "whitelist"))
         explicit_users: List[str] = []
         if isinstance(raw_users, (list, tuple, set)):
             explicit_users = [str(value).strip() for value in raw_users if str(value).strip()]
@@ -23507,15 +26380,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         all_user_ids = self._discord_control_ordered_user_ids(users)
         all_user_set = set(all_user_ids)
-        row_targets_all = raw_users is None or (not explicit_users and not users_explicit)
-        if row_targets_all:
-            current_enabled = uid in all_user_set
-            next_user_set = set(all_user_ids)
-            unknown_existing: List[str] = []
-        else:
-            current_enabled = uid in set(explicit_users)
+        unknown_existing: List[str] = [value for value in explicit_users if value not in all_user_set]
+        if user_filter_mode == "blacklist":
+            current_enabled = uid not in set(explicit_users)
             next_user_set = set(explicit_users)
-            unknown_existing = [value for value in explicit_users if value not in all_user_set]
+        else:
+            row_targets_all = raw_users is None or (not explicit_users and not users_explicit)
+            if row_targets_all:
+                current_enabled = uid in all_user_set
+                next_user_set = set(all_user_ids)
+                unknown_existing = []
+            else:
+                current_enabled = uid in set(explicit_users)
+                next_user_set = set(explicit_users)
 
         target_raw = (payload or {}).get("enabled", None)
         target_enabled = (not current_enabled) if target_raw is None else self._discord_control_bool_option(target_raw, default=current_enabled)
@@ -23533,19 +26410,31 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "user_enabled": bool(target_enabled),
             }
 
-        if target_enabled:
-            next_user_set.add(uid)
-        else:
-            next_user_set.discard(uid)
-
-        if target_enabled and all_user_ids and next_user_set == all_user_set:
-            row["users"] = None
-            row["users_explicit"] = False
-        else:
+        if user_filter_mode == "blacklist":
+            if target_enabled:
+                next_user_set.discard(uid)
+            else:
+                next_user_set.add(uid)
             ordered = [value for value in all_user_ids if value in next_user_set]
             ordered.extend(value for value in unknown_existing if value in next_user_set and value not in ordered)
             row["users"] = ordered
             row["users_explicit"] = True
+            row["user_filter_mode"] = "blacklist"
+        else:
+            if target_enabled:
+                next_user_set.add(uid)
+            else:
+                next_user_set.discard(uid)
+
+            if target_enabled and all_user_ids and next_user_set == all_user_set:
+                row["users"] = None
+                row["users_explicit"] = False
+            else:
+                ordered = [value for value in all_user_ids if value in next_user_set]
+                ordered.extend(value for value in unknown_existing if value in next_user_set and value not in ordered)
+                row["users"] = ordered
+                row["users_explicit"] = True
+            row["user_filter_mode"] = "whitelist"
 
         items = cfg.get("items") if isinstance(cfg.get("items"), list) else []
         if 0 <= row_index < len(items):
@@ -23572,6 +26461,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "user_enabled": bool(target_enabled),
         }
 
+    def _discord_control_extract_place_id(self, value: object) -> str:
+        place_id = str(_extract_place_id_from_text(value) or "").strip()
+        return place_id if place_id.isdigit() else ""
+
     def _discord_control_account_place_id(self, info: dict) -> str:
         if not isinstance(info, dict):
             return ""
@@ -23583,14 +26476,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             info.get("private_server_link"),
         ]
         for raw in candidates:
-            text = str(raw or "").strip()
-            if not text:
-                continue
-            if text.isdigit():
-                return text
-            match = re.search(r"/games/(\d+)(?:/|$|\?)", text)
-            if match:
-                return match.group(1)
+            place_id = self._discord_control_extract_place_id(raw)
+            if place_id:
+                return place_id
         return ""
 
     def _discord_control_start_utility_worker(
@@ -23690,11 +26578,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if bool(info.get("bad", False)):
             return {"ok": False, "message": f"{username} ({uid}) is marked bad."}
 
-        place_id = self._discord_control_account_place_id(info)
+        raw_place_id = str((payload or {}).get("place_id") or "").strip()
+        place_id = self._discord_control_extract_place_id(raw_place_id)
+        if raw_place_id and not place_id:
+            return {
+                "ok": False,
+                "message": f"Place ID must be numeric or a Roblox game URL, got '{raw_place_id}'.",
+            }
+        if not place_id:
+            place_id = self._discord_control_account_place_id(info)
         if not place_id:
             return {
                 "ok": False,
-                "message": f"{username} ({uid}) has no place ID. Set the account place before running the PSL grabber.",
+                "message": f"{username} ({uid}) has no place ID. Set the account place or pass the psl place_id option.",
             }
 
         expected_value, value_err = self._discord_control_int_option(
@@ -23727,6 +26623,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             expected_price=int(expected_value),
             only_missing=only_missing,
         )
+        try:
+            _save_psl_place_id_history(place_id)
+        except Exception:
+            pass
         worker = _PSLWorker(opts, allowed_uids={uid})
         ok, msg = self._discord_control_start_utility_worker(
             worker,
@@ -23743,6 +26643,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "message": msg,
             "account_id": uid,
             "username": username,
+            "place_id": place_id,
         }
 
     def _discord_control_block_or_unblock_user(self, payload: dict, *, unblock: bool) -> dict:
@@ -23832,6 +26733,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "channel_id": str(payload.get("channel_id") or "").strip(),
             "channel_name": str(payload.get("channel_name") or "").strip(),
             "account_ref": str(payload.get("account_ref") or "").strip(),
+            "place_id": str(payload.get("place_id") or "").strip(),
             "row_ref": str(payload.get("row_ref") or "").strip(),
             "ok": bool(ok_value) if ok_value is not None else None,
             "message": message[:1000],
@@ -23839,6 +26741,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if response is not None:
             record["target_account_id"] = str(response.get("account_id") or "").strip()
             record["target_username"] = str(response.get("username") or "").strip()
+            if response.get("place_id") is not None:
+                record["place_id"] = str(response.get("place_id") or "").strip()
             if "row_index" in response:
                 record["row_index"] = response.get("row_index")
             if "row_name" in response:
@@ -23876,6 +26780,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return self._discord_control_autocomplete_accounts(payload, require_link=False)
         if action_type == "autocomplete_auto_action_rows":
             return self._discord_control_autocomplete_auto_action_rows(payload)
+        if action_type == "autocomplete_psl_place_ids":
+            return self._discord_control_autocomplete_psl_place_ids(payload)
         if action_type == "get_linked_account_status":
             response = self._discord_control_get_account_status(payload, require_link=True)
             self._discord_control_record_command_usage(payload, response=response)
@@ -24191,7 +27097,38 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             pass
 
+    def _resume_state_has_live_processes(self, state: Optional[dict]) -> bool:
+        if not isinstance(state, dict):
+            return False
+        tracker = state.get("process_tracker") or {}
+        if not isinstance(tracker, dict):
+            return False
+        user_processes = tracker.get("user_processes") or {}
+        if not isinstance(user_processes, dict):
+            return False
+        try:
+            import psutil
+        except Exception:
+            return False
+        for pids in user_processes.values():
+            if not isinstance(pids, (list, tuple, set)):
+                pids = [pids]
+            for pid in pids:
+                try:
+                    proc = psutil.Process(int(pid))
+                    if str(proc.name()).lower() == "robloxplayerbeta.exe":
+                        return True
+                except Exception:
+                    continue
+        return False
+
     def start_manager(self):
+        if bool(getattr(self, "_multi_instance_enabled", False)) and not bool(
+            getattr(self, "_multi_instance_guard_active", False)
+        ):
+            self._check_multi_instance_process_state()
+            self.show_multi_instance_window()
+            return
         if self._manager_paused and self._paused_worker_state and not (self.worker_thread and self.worker_thread.isRunning()):
             self.resume_manager()
             return
@@ -24226,8 +27163,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             QMessageBox.critical(self, "Config Error", f"Error reading user configuration: {e}")
             return
 
+        resume_state = None
+        try:
+            stopped_state = getattr(self, "_stopped_worker_state", None)
+            if self._resume_state_has_live_processes(stopped_state):
+                resume_state = copy.deepcopy(stopped_state)
+                self.add_log("[UI] Reusing stopped manager session state; existing Roblox windows will not be relaunched.")
+            else:
+                self._stopped_worker_state = None
+        except Exception:
+            resume_state = None
+
         self._clear_persisted_paused_manager_state()
-        self.worker_thread = WorkerThread(self.config_manager)
+        self.worker_thread = WorkerThread(self.config_manager, resume_state=resume_state)
         self.worker_thread.log_signal.connect(self.add_log)
         self.worker_thread.status_signal.connect(self.update_user_status)
         self.worker_thread.process_signal.connect(self.update_process_data)
@@ -24235,6 +27183,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.worker_thread.multiscope_signal.connect(self.update_multiscope)
 
         self.worker_thread.start()
+        if resume_state is not None:
+            self._stopped_worker_state = None
 
         if self.ocr_enable_chk.isChecked():
             self._start_ocr_worker()
@@ -24254,34 +27204,66 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._manager_paused = False
 
 
-    def stop_manager(self):
+    def _shutdown_worker_multiscope(self, worker) -> None:
+        try:
+            ms = getattr(worker, "ms", None)
+            if ms and hasattr(ms, "shutdown"):
+                ms.shutdown()
+        except Exception:
+            pass
+
+    def stop_manager(
+        self,
+        *,
+        timeout_ms: int = 10000,
+        preserve_state: bool = True,
+        shutdown_ms: bool = True,
+    ):
+        worker_stopped = True
+        stopped_state = None
         if self.worker_thread and self.worker_thread.isRunning():
-            self.worker_thread.stop()
-            # wait a few seconds for a clean shutdown; force-stop if hung
-            if not self.worker_thread.wait(5000):
-                self.add_log("[UI] Worker stop timed out; forcing terminate()")
-                try:
-                    self.worker_thread.terminate()
-                except Exception:
-                    pass
-                self.worker_thread.wait(1000)
+            wt = self.worker_thread
+            wt.stop(shutdown_ms=shutdown_ms)
+            # Wait for a clean shutdown. Do not force-terminate QThread; that can
+            # crash Qt/Python/native extension state without a traceback.
+            try:
+                wait_ms = max(0, int(timeout_ms))
+            except Exception:
+                wait_ms = 10000
+            if not wt.wait(wait_ms):
+                worker_stopped = False
+                self.add_log("[UI] Worker stop timed out; leaving cooperative stop pending.")
+            else:
+                if preserve_state:
+                    try:
+                        stopped_state = wt.export_state()
+                    except Exception:
+                        stopped_state = None
+                if shutdown_ms:
+                    self._shutdown_worker_multiscope(wt)
         self._stop_ocr_worker()
 
         # Always stop Anti-AFK when the manager stops
         if getattr(self, "antiafk", None):
             self._run_antiafk_async("toggle_antiafk", False)
 
-        self.start_btn.setEnabled(True)
+        self.start_btn.setEnabled(bool(worker_stopped))
         self.pause_btn.setEnabled(False)
         self.pause_btn.setText("Pause Manager")
-        self.stop_btn.setEnabled(False)
-        self.status_label.setText("Status: Stopped")
-        self.status_label.setStyleSheet(f"color: {ModernStyle.ERROR}; font-weight: bold;")
-        self.start_time = None
-        self._paused_at = None
-        self._paused_worker_state = None
-        self._manager_paused = False
-        self._clear_persisted_paused_manager_state()
+        self.stop_btn.setEnabled(not bool(worker_stopped))
+        if worker_stopped:
+            self.status_label.setText("Status: Stopped")
+            self.status_label.setStyleSheet(f"color: {ModernStyle.ERROR}; font-weight: bold;")
+            self.start_time = None
+            self._paused_at = None
+            self._paused_worker_state = None
+            self._manager_paused = False
+            self._stopped_worker_state = stopped_state if self._resume_state_has_live_processes(stopped_state) else None
+            self._clear_persisted_paused_manager_state()
+        else:
+            self.status_label.setText("Status: Stopping")
+            self.status_label.setStyleSheet(f"color: {ModernStyle.WARNING}; font-weight: bold;")
+        return bool(worker_stopped)
 
     def update_uptime(self):
         if self.start_time:
@@ -24309,17 +27291,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         wt = self.worker_thread
         try:
             wt.stop(shutdown_ms=False)
-            if not wt.wait(5000):
-                self.add_log("[UI] Worker pause timed out; forcing terminate()")
+            if not wt.wait(10000):
+                self.add_log("[UI] Worker pause timed out; pause cancelled while cooperative stop continues.")
                 try:
                     self._paused_worker_state = wt.export_state()
                 except Exception:
                     self._paused_worker_state = None
-                try:
-                    wt.terminate()
-                except Exception:
-                    pass
-                wt.wait(1000)
+                self.status_label.setText("Status: Stopping")
+                self.status_label.setStyleSheet(f"color: {ModernStyle.WARNING}; font-weight: bold;")
+                return
             else:
                 try:
                     self._paused_worker_state = wt.export_state()
@@ -24368,6 +27348,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.status_label.setStyleSheet(f"color: {ModernStyle.WARNING}; font-weight: bold;")
 
     def resume_manager(self):
+        if bool(getattr(self, "_multi_instance_enabled", False)) and not bool(
+            getattr(self, "_multi_instance_guard_active", False)
+        ):
+            self._check_multi_instance_process_state()
+            self.show_multi_instance_window()
+            return
         if self.worker_thread and self.worker_thread.isRunning():
             return
         if not (self._manager_paused and self._paused_worker_state):
@@ -24439,6 +27425,17 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 wt = getattr(self, "worker_thread", None)
                 if wt is not None and wt.isRunning():
                     self._refresh_users_antiafk_age_column()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "accounts_tab_index", None) is not None and self.tab_widget.currentIndex() == self.accounts_tab_index:
+                users_mtime = float(self.config_manager.get_users_mtime())
+                if users_mtime and users_mtime != float(getattr(self, "_accounts_list_users_mtime", -1.0)):
+                    self.refresh_accounts_list()
+        except Exception:
+            pass
+        try:
+            self._check_multi_instance_process_state()
         except Exception:
             pass
 
@@ -24572,6 +27569,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
             for uid_s in disconnected_uids:
                 self._antiafk_last_touch_by_uid.pop(uid_s, None)
+                self._antiafk_last_action_by_uid.pop(uid_s, None)
 
             for uid_s, pid_list in pids_by_uid.items():
                 if uid_s in disconnected_uids:
@@ -25197,14 +28195,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             chk = getattr(self, "multiscope_biome_chk", None)
             if not (chk and chk.isChecked()):
                 return
-        if message.startswith("[LaunchGate]"):
-            chk = getattr(self, "launch_gate_debug_chk", None)
-            if chk is not None and not chk.isChecked():
-                return
         if (
             not bool(getattr(self, "launch_debug_chk", None) and self.launch_debug_chk.isChecked())
             and (
                 message.startswith("[LAUNCH")
+                or message.startswith("[LaunchGate]")
                 or message.startswith("[PIDWAIT")
                 or message.startswith("[PID DEAD]")
                 or message.startswith("[WindowCheck] killing")
@@ -25362,6 +28357,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         label = self._settings_label_map.get(path)
         if label:
             return label
+        if path.startswith("launch_priorities."):
+            uid = path.split(".", 1)[1]
+            return f"Launch Priority ({uid})"
         return path
 
     def _format_webhook_ref_for_diff(self, url: str, name: str) -> str:
@@ -25642,6 +28640,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "window_limit": int(self.settings_window_limit_input.value()),
             "spares_mode": bool(self.spares_mode_chk.isChecked()),
             "spares_fraction": str(self.spares_split_cmb.currentText()),
+            "launch_priorities": self._collect_launch_priorities_from_ui(),
             "roblox_window_geometry": {
                 "enforce_on_launch": bool(self.rbwin_geom_enforce_chk.isChecked()) if hasattr(self, "rbwin_geom_enforce_chk") else False,
                 "x": int((getattr(self, "_roblox_window_geometry", {}) or {}).get("x", 0) or 0),
@@ -25804,6 +28803,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
         if self.settings_tab_index is None:
             return
+        if new_index == self.settings_tab_index and prev_index != self.settings_tab_index:
+            try:
+                self._populate_launch_priority_table()
+                self._settings_baseline = self._get_settings_tab_snapshot()
+            except Exception:
+                pass
+            return
         if prev_index != self.settings_tab_index or new_index == self.settings_tab_index:
             return
 
@@ -25845,6 +28851,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.settings_window_limit_input.setValue(settings.get("window_limit", 1))
         self.spares_mode_chk.setChecked(bool(settings.get("spares_mode", False)))
         self.spares_split_cmb.setCurrentText(settings.get("spares_fraction", "1/2"))
+        self._populate_launch_priority_table()
 
         # ---------- Roblox Window Geometry ----------
         rwg = settings.get("roblox_window_geometry", {}) or {}
@@ -26207,6 +29214,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         settings = self.config_manager.load_settings()
 
+        if not self._save_launch_priorities_from_ui():
+            return False
+
         # ---------- Basic ----------
         settings["window_limit"] = self.settings_window_limit_input.value()
         settings["spares_mode"]  = bool(self.spares_mode_chk.isChecked())
@@ -26393,6 +29403,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         misc_cfg.get("skip_webhook_unknown_context", False)
                     )
                 self.ocr_worker.update_settings(settings.get("ocr", {}), ms_cfg)
+            try:
+                self._populate_launch_priority_table()
+            except Exception:
+                pass
             QMessageBox.information(self, "Success", "Settings saved and applied!")
             try:
                 self._settings_baseline = self._get_settings_tab_snapshot()
@@ -26603,7 +29617,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def show_about(self):
         config_info = self.config_manager.get_config_info()
         QMessageBox.about(self, "About J.JARAM",
-                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x60\n\n"
+                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x71\n\n"
                          "Advanced multi-account Roblox session manager\n"
                          "with automated log based monitoring and process management.\n\n"
                          "Built with PySide6 and modern design principles.\n\n"
@@ -26673,6 +29687,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if isinstance(info, dict) and (info.get("bad", False) or info.get("cap", False) or info.get("disabled", False)):
                 continue
             restartables.append(uid)
+
+        restartables = sort_user_ids_by_launch_priority(
+            restartables,
+            lambda u: (
+                ((self.worker_thread.user_states or {}).get(str(u), {}) or {}).get("user_info", {})
+                if self.worker_thread
+                else {}
+            ),
+        )
 
         if not restartables:
             msg = "No online sessions were found to restart."
@@ -26744,8 +29767,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
 
         if killed:
+            self._stopped_worker_state = None
             self.add_log("[UI] Killed all Roblox processes (manager stopped).")
         else:
+            self._stopped_worker_state = None
             self.add_log("[UI] No Roblox processes found to kill.")
 
     def cleanup_processes(self):
@@ -27072,8 +30097,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "private_server_link": private_link if server_type == "private" else "",
             "place": place if server_type == "public" else "",
             "cookie": cookie,
+            "last_launch": 0.0,
             "disabled": disabled,
             "alternate_launch": alternate,
+            "launch_priority": DEFAULT_LAUNCH_PRIORITY,
             "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
             "cap": False,
             "discord_user_ids": [],
@@ -27105,6 +30132,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 bad_flag = False
                 cap_flag = False
                 is_alternate = False
+            last_launch = user_info.get("last_launch", 0.0) if isinstance(user_info, dict) else 0.0
 
             self.accounts_list.setItem(row, 0, QTableWidgetItem(user_id))
             username_item = QTableWidgetItem(username)
@@ -27128,6 +30156,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 status_item.setForeground(QColor(ModernStyle.ERROR))
             else:
                 status_item.setForeground(QColor("#66FF66"))
+            status_item.setData(_ACTIVITY_TIMESTAMP_ROLE, _coerce_activity_timestamp(last_launch))
+            status_item.setToolTip(f"{status_text}\n\n{_activity_tooltip(last_launch)}")
             self.accounts_list.setItem(row, 3, status_item)
 
             edit_btn = QPushButton("Edit")
@@ -27144,6 +30174,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             )
             delete_btn.clicked.connect(lambda _, uid=user_id: self.delete_account(uid))
             self.accounts_list.setCellWidget(row, 5, delete_btn)
+        try:
+            self._accounts_list_users_mtime = float(self.config_manager.get_users_mtime())
+        except Exception:
+            self._accounts_list_users_mtime = 0.0
         try:
             self._refresh_discord_control_accounts_table()
         except Exception:
@@ -27252,10 +30286,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "private_server_link": private_link if server_type == "private" else "",
             "place": place if server_type == "public" else "",
             "cookie": cookie,
+            "last_launch": _coerce_activity_timestamp(existing.get("last_launch", 0.0)),
             "disabled": disabled,
             "bad": bad_flag,
             "cap": existing.get("cap", False),
             "alternate_launch": alternate,
+            "launch_priority": coerce_launch_priority(existing.get("launch_priority", DEFAULT_LAUNCH_PRIORITY)),
             "skip_reconnect_on_log_disconnect": skip_reconnect_on_log_disconnect,
             "discord_user_ids": normalize_discord_ids(existing.get("discord_user_ids")),
         }
@@ -27675,96 +30711,149 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if not self._queue_worker_action("kill_user_processes", user_id):
                 QMessageBox.warning(self, "Kill Failed", "Failed to queue kill action.")
 
+    def _shutdown_discord_control_utility_workers(self, *, timeout_ms: int = 5000) -> bool:
+        ok = True
+        workers = getattr(self, "_discord_control_utility_workers", None)
+        if not isinstance(workers, list):
+            return True
+
+        for worker in list(workers):
+            try:
+                cancel = getattr(worker, "cancel", None)
+                if callable(cancel):
+                    cancel()
+            except Exception:
+                pass
+            try:
+                if worker.isRunning() and not worker.wait(max(0, int(timeout_ms))):
+                    ok = False
+                    self.add_log("[Discord Control] utility worker is still running; close cancelled.")
+                    continue
+            except Exception:
+                ok = False
+                continue
+            try:
+                if worker in workers:
+                    workers.remove(worker)
+            except Exception:
+                pass
+
+        if not workers:
+            self._discord_control_utility_busy = False
+            active_worker = getattr(self, "_active_worker", None)
+            try:
+                active_running = bool(active_worker is not None and active_worker.isRunning())
+            except Exception:
+                active_running = False
+            if not active_running:
+                self._util_busy = False
+        return ok
+
+    def _shutdown_background_services(self, *, closing: bool = False) -> bool:
+        ok = True
+        ocr_timeout_ms = 2500 if closing else 10000
+        worker_timeout_ms = 1500 if closing else 5000
+        auto_item_timeout_s = 1.0 if closing else 5.0
+        mouse_blocker_timeout_s = 0.5 if closing else 2.0
+        discord_timeout_s = 2.0 if closing else 5.0
+        threadpool_timeout_ms = 500 if closing else 2000
+        child_timeout_s = 1.0 if closing else 2.0
+
+        if self.ocr_worker and self.ocr_worker.isRunning():
+            ok = self._stop_ocr_worker_with_timeout(timeout_ms=ocr_timeout_ms) and ok
+
+        cookie_extractor = getattr(self, "cookie_extractor", None)
+        if cookie_extractor is not None:
+            try:
+                if not cookie_extractor.shutdown(timeout_ms=worker_timeout_ms):
+                    ok = False
+                    self.add_log("[Cookie] browser/cookie worker is still running; close cancelled.")
+            except Exception:
+                ok = False
+
+        try:
+            if not shutdown_UTILITIES_tab(self, timeout_ms=worker_timeout_ms):
+                ok = False
+                self.add_log("[Utilities] worker is still running; close cancelled.")
+        except Exception:
+            ok = False
+
+        if not self._shutdown_discord_control_utility_workers(timeout_ms=worker_timeout_ms):
+            ok = False
+
+        if getattr(self, "antiafk", None):
+            try:
+                self.antiafk.shutdown()
+            except Exception:
+                pass
+
+        if getattr(self, "auto_item_engine", None):
+            try:
+                self.auto_item_engine.stop(timeout_s=auto_item_timeout_s)
+                if hasattr(self.auto_item_engine, "is_running") and self.auto_item_engine.is_running():
+                    ok = False
+                    self.add_log("[Auto Actions] engine is still running; close cancelled.")
+            except Exception:
+                pass
+
+        try:
+            from auto_actions_automation import shutdown_user_mouse_blocker
+            shutdown_user_mouse_blocker(timeout_s=mouse_blocker_timeout_s)
+        except Exception:
+            pass
+
+        if getattr(self, "bes_controller", None):
+            try:
+                self.bes_controller.shutdown()
+            except Exception:
+                pass
+        if getattr(self, "trimmer_tab", None):
+            try:
+                self.trimmer_tab.shutdown()
+            except Exception:
+                pass
+        if getattr(self, "discord_control_service", None):
+            try:
+                self.discord_control_service.stop(timeout=discord_timeout_s)
+            except Exception:
+                pass
+        try:
+            self._unregister_auto_item_hotkey()
+        except Exception:
+            pass
+        try:
+            QThreadPool.globalInstance().waitForDone(threadpool_timeout_ms)
+        except Exception:
+            pass
+        try:
+            self._terminate_multiprocessing_children(timeout_s=child_timeout_s)
+        except Exception:
+            pass
+
+        return ok
+
     def closeEvent(self, event):
         if self.worker_thread and self.worker_thread.isRunning():
             reply = QMessageBox.question(self, "Confirm Exit",
                                        "The manager is still running. Do you want to stop it and exit?",
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self.stop_manager()
-                if self.ocr_worker and self.ocr_worker.isRunning():
-                    self._stop_ocr_worker_with_timeout(timeout_ms=10000)
-                if getattr(self, "antiafk", None):
-                    try:
-                        self.antiafk.shutdown()
-                    except Exception:
-                        pass
-                if getattr(self, "auto_item_engine", None):
-                    try:
-                        self.auto_item_engine.stop()
-                    except Exception:
-                        pass
-                if getattr(self, "bes_controller", None):
-                    try:
-                        self.bes_controller.shutdown()
-                    except Exception:
-                        pass
-                if getattr(self, "trimmer_tab", None):
-                    try:
-                        self.trimmer_tab.shutdown()
-                    except Exception:
-                        pass
-                if getattr(self, "discord_control_service", None):
-                    try:
-                        self.discord_control_service.stop(timeout=5.0)
-                    except Exception:
-                        pass
-                try:
-                    self._unregister_auto_item_hotkey()
-                except Exception:
-                    pass
-                try:
-                    QThreadPool.globalInstance().waitForDone(2000)
-                except Exception:
-                    pass
-                try:
-                    self._terminate_multiprocessing_children(timeout_s=2.0)
-                except Exception:
-                    pass
-                event.accept()
-            else:
+            if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
-        else:
-            if self.ocr_worker and self.ocr_worker.isRunning():
-                self._stop_ocr_worker_with_timeout(timeout_ms=10000)
-            if getattr(self, "antiafk", None):
-                try:
-                    self.antiafk.shutdown()
-                except Exception:
-                    pass
-            if getattr(self, "auto_item_engine", None):
-                try:
-                    self.auto_item_engine.stop()
-                except Exception:
-                    pass
-            if getattr(self, "bes_controller", None):
-                try:
-                    self.bes_controller.shutdown()
-                except Exception:
-                    pass
-            if getattr(self, "trimmer_tab", None):
-                try:
-                    self.trimmer_tab.shutdown()
-                except Exception:
-                    pass
-            if getattr(self, "discord_control_service", None):
-                try:
-                    self.discord_control_service.stop(timeout=5.0)
-                except Exception:
-                    pass
-            try:
-                self._unregister_auto_item_hotkey()
-            except Exception:
-                pass
-            try:
-                QThreadPool.globalInstance().waitForDone(2000)
-            except Exception:
-                pass
-            try:
-                self._terminate_multiprocessing_children(timeout_s=2.0)
-            except Exception:
-                pass
-            event.accept()
+                return
+            self.stop_manager(timeout_ms=3000, preserve_state=False)
+
+        shutdown_ok = self._shutdown_background_services(closing=True)
+        worker_stopped = not (self.worker_thread and self.worker_thread.isRunning())
+        if not shutdown_ok or not worker_stopped:
+            QMessageBox.warning(
+                self,
+                "Still Shutting Down",
+                "One or more background workers are still stopping. Please wait a moment and close again.",
+            )
+            event.ignore()
+            return
+
+        event.accept()
     
     def setup_multiscope_tab(self):
         multiscope_widget = QWidget()
@@ -27967,16 +31056,29 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             with self._ms_biome_lock:
                 self._ms_biome_by_server = {}
                 self._ms_in_menu_by_server = {}
+                self._ms_in_menu_ts_by_server = {}
                 self._ms_biome_by_uid = {}
                 self._ms_in_menu_by_uid = {}
+                self._ms_in_menu_ts_by_uid = {}
                 for row in (rows or []):
                     server_label = str(row.get("server", "") or "").strip()
                     server_key = str(row.get("server_key", server_label) or "").strip()
                     biome = str(row.get("last_biome", row.get("biome", "")) or "").strip().upper()
+                    try:
+                        menu_ts = float(row.get("last_menu_ts", 0.0) or 0.0)
+                    except Exception:
+                        menu_ts = 0.0
+                    in_menu_by_uid = row.get("in_menu_by_uid")
+                    if not isinstance(in_menu_by_uid, dict):
+                        in_menu_by_uid = None
+                    menu_ts_by_uid = row.get("last_menu_ts_by_uid")
+                    if not isinstance(menu_ts_by_uid, dict):
+                        menu_ts_by_uid = None
                     if server_key:
                         self._ms_biome_by_server[server_key] = biome
                         val = row.get("in_menu", None)
                         self._ms_in_menu_by_server[server_key] = None if val is None else bool(val)
+                        self._ms_in_menu_ts_by_server[server_key] = menu_ts if val is not None else 0.0
                     users_list = row.get("users", []) or []
                     val = row.get("in_menu", None)
                     in_menu_val = None if val is None else bool(val)
@@ -27984,8 +31086,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         uid_str = str(uid).strip()
                         if not uid_str:
                             continue
+                        if in_menu_by_uid is not None and uid_str in in_menu_by_uid:
+                            raw_uid_val = in_menu_by_uid.get(uid_str, None)
+                            uid_in_menu_val = None if raw_uid_val is None else bool(raw_uid_val)
+                            try:
+                                uid_menu_ts = float((menu_ts_by_uid or {}).get(uid_str, 0.0) or 0.0)
+                            except Exception:
+                                uid_menu_ts = 0.0
+                        else:
+                            uid_in_menu_val = in_menu_val
+                            uid_menu_ts = menu_ts if val is not None else 0.0
                         self._ms_biome_by_uid[uid_str] = biome
-                        self._ms_in_menu_by_uid[uid_str] = in_menu_val
+                        self._ms_in_menu_by_uid[uid_str] = uid_in_menu_val
+                        self._ms_in_menu_ts_by_uid[uid_str] = uid_menu_ts if uid_in_menu_val is not None else 0.0
         except Exception:
             pass
 
@@ -28171,7 +31284,7 @@ def main():
     app = QApplication(sys.argv)
 
     app.setApplicationName("J.JARAM")
-    app.setApplicationVersion("JX 2x60")
+    app.setApplicationVersion("JX 2x71")
     app.setOrganizationName("Jirach1")
     # Qt 6 ships a Windows 11 style that can change widget visuals. Force the
     # Windows 10-era style for consistent UI across OS versions.

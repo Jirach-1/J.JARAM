@@ -1,45 +1,844 @@
 """
 Auto Actions automation engine for JARAM.
 
-This keeps the existing low-level click/paste helpers from the legacy
-auto-item module, but switches the rule model over to named action strings
-triggered by OCR filters.
+This owns the low-level click/paste/window helpers used by the Auto-Actions
+rule engine.
 """
 
 from __future__ import annotations
 
+import atexit
 import copy
 import ctypes
 import datetime as _dt
 import difflib
+import json
 import re
 import threading
 import time
+from contextlib import contextmanager
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import win32api
 import win32con
 import win32gui
+import win32process
 
-from auto_item_automation import (
-    RelPoint,
-    _abs_from_rel,
-    _auto_item_alerts_unlocked,
-    _block_user_mouse_movement_during_actions,
-    _bring_window_foreground,
-    _color_close,
-    _hex_to_rgb,
-    _mouse_left_click,
-    _mouse_move_instant,
-    _normalize_user_id_list,
-    _post_webhook,
-    _screen_pixel_rgb,
-    _send_ctrl_a,
-    _send_unicode_text,
-    _set_window_topmost,
-    _window_topmost_during,
-    autoit,
-)
+try:
+    import autoit  # type: ignore
+except Exception:  # pragma: no cover
+    autoit = None  # type: ignore
+
+try:
+    from PIL import ImageGrab
+except Exception:  # pragma: no cover
+    ImageGrab = None  # type: ignore
+
+
+@dataclass(frozen=True)
+class RelPoint:
+    """Point stored as percentage of the Roblox window client area."""
+
+    x: float
+    y: float
+
+
+def _normalize_user_id_list(raw: object) -> Optional[List[str]]:
+    """
+    Normalize a per-rule users filter to a list of string UIDs.
+
+    Returns:
+      - None: no filter
+      - []: explicit empty selection
+      - [uids...]: explicit filter list
+    """
+    if raw is None:
+        return None
+
+    seq: Iterable
+    if isinstance(raw, (list, tuple, set)):
+        seq = raw
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            parts = [p.strip() for p in s.replace("\r", "\n").replace("\n", ",").split(",")]
+            seq = [p for p in parts if p]
+        else:
+            if isinstance(parsed, (list, tuple, set)):
+                seq = parsed
+            else:
+                seq = [parsed]
+    else:
+        try:
+            if isinstance(raw, dict):
+                return None
+            seq = list(raw)  # type: ignore[arg-type]
+        except Exception:
+            return None
+
+    return [str(u).strip() for u in seq if str(u).strip()]
+
+
+def _clamp01(v: float) -> float:
+    try:
+        if v < 0.0:
+            return 0.0
+        if v > 1.0:
+            return 1.0
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _hex_to_rgb(color_hex: str) -> Tuple[int, int, int]:
+    s = (color_hex or "").strip()
+    if s.startswith("#"):
+        s = s[1:]
+    if len(s) != 6:
+        return (0, 0, 0)
+    try:
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except Exception:
+        return (0, 0, 0)
+
+
+def _color_close(a: Tuple[int, int, int], b: Tuple[int, int, int], tol: int) -> bool:
+    tol = int(tol or 0)
+    return all(abs(int(x) - int(y)) <= tol for x, y in zip(a, b))
+
+
+def _client_origin_and_size(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
+    try:
+        left, top = win32gui.ClientToScreen(hwnd, (0, 0))
+        _l, _t, right, bottom = win32gui.GetClientRect(hwnd)
+        width = int(right - _l)
+        height = int(bottom - _t)
+        if width <= 0 or height <= 0:
+            return None
+        return int(left), int(top), width, height
+    except Exception:
+        return None
+
+
+def _abs_from_rel(hwnd: int, p: RelPoint) -> Optional[Tuple[int, int]]:
+    base = _client_origin_and_size(hwnd)
+    if not base:
+        return None
+    left, top, width, height = base
+    x = left + int(_clamp01(p.x) * width)
+    y = top + int(_clamp01(p.y) * height)
+    return x, y
+
+
+_BLOCK_USER_MOUSE_MOVE_ENABLED: bool = False
+_ALLOWED_MOVE_X: int = 0
+_ALLOWED_MOVE_Y: int = 0
+_ALLOWED_MOVE_UNTIL: float = 0.0
+_ULONG_PTR = getattr(wintypes, "ULONG_PTR", ctypes.c_size_t)
+_LRESULT = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
+_WPARAM = getattr(wintypes, "WPARAM", ctypes.c_size_t)
+_LPARAM = getattr(wintypes, "LPARAM", ctypes.c_ssize_t)
+
+
+def _note_program_mouse_target(x: int, y: int, *, hold_s: float = 0.25) -> None:
+    """
+    Tell the low-level mouse hook which cursor positions are expected from automation.
+    """
+    global _ALLOWED_MOVE_X, _ALLOWED_MOVE_Y, _ALLOWED_MOVE_UNTIL
+    try:
+        _ALLOWED_MOVE_X = int(x)
+        _ALLOWED_MOVE_Y = int(y)
+        _ALLOWED_MOVE_UNTIL = float(time.monotonic()) + float(max(0.0, hold_s))
+    except Exception:
+        pass
+
+
+def _mouse_move_instant(x: int, y: int) -> None:
+    x = int(x)
+    y = int(y)
+
+    if autoit is None:
+        return
+
+    try:
+        _note_program_mouse_target(x, y)
+        autoit.mouse_move(x, y, speed=0)
+    except Exception:
+        pass
+
+
+class _LL_POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class _MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt", _LL_POINT),
+        ("mouseData", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", _ULONG_PTR),
+    ]
+
+
+class _UserMouseMoveBlocker:
+    """
+    Low-level mouse hook that blocks physical mouse movement while actions run.
+    """
+
+    WH_MOUSE_LL = 14
+    WM_MOUSEMOVE = 0x0200
+    WM_NCMOUSEMOVE = 0x00A0
+    WM_QUIT = 0x0012
+    LLMHF_INJECTED = 0x00000001
+    LLMHF_LOWER_IL_INJECTED = 0x00000002
+
+    LowLevelMouseProc = ctypes.WINFUNCTYPE(_LRESULT, ctypes.c_int, _WPARAM, _LPARAM)
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._refcount = 0
+        self._warned = False
+        self._failed = False
+        self._last_error: int = 0
+
+        self._thread: Optional[threading.Thread] = None
+        self._thread_id: int = 0
+        self._hook = None
+        self._ready = threading.Event()
+
+        self._user32 = None
+        self._kernel32 = None
+
+        self._proc = self.LowLevelMouseProc(self._hook_proc)
+
+    def acquire(self, *, log_fn: Optional[Callable[[str], None]] = None) -> bool:
+        global _BLOCK_USER_MOUSE_MOVE_ENABLED
+        with self._lock:
+            if self._failed:
+                if log_fn and not self._warned:
+                    self._warned = True
+                    msg = "[Auto-Actions] Mouse-move block is unavailable on this system/build."
+                    if int(self._last_error or 0) != 0:
+                        msg += f" (winerr={int(self._last_error)})"
+                    log_fn(msg)
+                return False
+
+            ok = self._ensure_hook_installed()
+            if not ok:
+                self._failed = True
+                if log_fn and not self._warned:
+                    self._warned = True
+                    msg = "[Auto-Actions] Failed to enable mouse-move block (hook install failed)."
+                    if int(self._last_error or 0) != 0:
+                        msg += f" (winerr={int(self._last_error)})"
+                    log_fn(msg)
+                return False
+
+            self._refcount += 1
+            _BLOCK_USER_MOUSE_MOVE_ENABLED = True
+            return True
+
+    def release(self) -> None:
+        global _BLOCK_USER_MOUSE_MOVE_ENABLED
+        should_shutdown = False
+        with self._lock:
+            if self._refcount <= 0:
+                _BLOCK_USER_MOUSE_MOVE_ENABLED = False
+                return
+            self._refcount -= 1
+            if self._refcount <= 0:
+                _BLOCK_USER_MOUSE_MOVE_ENABLED = False
+                should_shutdown = True
+        if should_shutdown:
+            self.shutdown(timeout_s=1.0)
+
+    def shutdown(self, timeout_s: float = 2.0) -> None:
+        global _BLOCK_USER_MOUSE_MOVE_ENABLED
+        thread: Optional[threading.Thread] = None
+        with self._lock:
+            self._refcount = 0
+            _BLOCK_USER_MOUSE_MOVE_ENABLED = False
+            thread = self._thread
+            thread_id = int(self._thread_id or 0)
+            user32 = self._user32
+            if user32 is not None and thread_id:
+                try:
+                    user32.PostThreadMessageW.argtypes = [
+                        wintypes.DWORD,
+                        wintypes.UINT,
+                        _WPARAM,
+                        _LPARAM,
+                    ]
+                    user32.PostThreadMessageW.restype = wintypes.BOOL
+                except Exception:
+                    pass
+                try:
+                    user32.PostThreadMessageW(thread_id, self.WM_QUIT, 0, 0)
+                except Exception:
+                    pass
+
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=max(0.0, float(timeout_s)))
+            except Exception:
+                pass
+
+        with self._lock:
+            if thread and thread.is_alive() and self._hook and self._user32 is not None:
+                try:
+                    self._user32.UnhookWindowsHookEx(self._hook)
+                except Exception:
+                    pass
+                self._hook = None
+            if self._thread is thread and (thread is None or not thread.is_alive()):
+                self._thread = None
+
+    def _ensure_hook_installed(self) -> bool:
+        if self._hook:
+            return True
+
+        if self._thread and self._thread.is_alive():
+            self._ready.wait(timeout=1.0)
+            return bool(self._hook)
+
+        self._ready.clear()
+        self._thread = threading.Thread(target=self._thread_main, name="AutoActionMouseMoveBlocker", daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=1.0)
+        return bool(self._hook)
+
+    def _thread_main(self) -> None:
+        hook = None
+        try:
+            self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+            self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            try:
+                self._kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+                self._kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+                self._kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+                self._user32.SetWindowsHookExW.argtypes = [
+                    ctypes.c_int,
+                    self.LowLevelMouseProc,
+                    wintypes.HINSTANCE,
+                    wintypes.DWORD,
+                ]
+                self._user32.SetWindowsHookExW.restype = ctypes.c_void_p
+                self._user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+                self._user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+                self._user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, _WPARAM, _LPARAM]
+                self._user32.CallNextHookEx.restype = _LRESULT
+
+                self._user32.PeekMessageW.argtypes = [
+                    ctypes.POINTER(wintypes.MSG),
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.UINT,
+                    wintypes.UINT,
+                ]
+                self._user32.PeekMessageW.restype = wintypes.BOOL
+                self._user32.GetMessageW.argtypes = [
+                    ctypes.POINTER(wintypes.MSG),
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.UINT,
+                ]
+                self._user32.GetMessageW.restype = ctypes.c_int
+                self._user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+                self._user32.TranslateMessage.restype = wintypes.BOOL
+                self._user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+                self._user32.DispatchMessageW.restype = _LRESULT
+            except Exception:
+                pass
+
+            try:
+                self._thread_id = int(self._kernel32.GetCurrentThreadId())
+            except Exception:
+                self._thread_id = 0
+
+            try:
+                msg = wintypes.MSG()
+                self._user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, 0)
+            except Exception:
+                pass
+
+            try:
+                hmod = self._kernel32.GetModuleHandleW(None)
+            except Exception:
+                hmod = 0
+
+            try:
+                ctypes.set_last_error(0)
+            except Exception:
+                pass
+            hook = self._user32.SetWindowsHookExW(int(self.WH_MOUSE_LL), self._proc, hmod, 0)
+            self._hook = hook
+            if not hook:
+                try:
+                    self._last_error = int(ctypes.get_last_error() or 0)
+                except Exception:
+                    self._last_error = 0
+            else:
+                self._last_error = 0
+        except Exception:
+            hook = None
+            self._hook = None
+            self._thread_id = 0
+        finally:
+            self._ready.set()
+
+        if not hook:
+            return
+
+        try:
+            msg = wintypes.MSG()
+            while True:
+                res = self._user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+                if res == 0 or res == -1:
+                    break
+                try:
+                    self._user32.TranslateMessage(ctypes.byref(msg))
+                    self._user32.DispatchMessageW(ctypes.byref(msg))
+                except Exception:
+                    pass
+        finally:
+            try:
+                if self._hook:
+                    self._user32.UnhookWindowsHookEx(self._hook)
+            except Exception:
+                pass
+            self._hook = None
+
+    def _hook_proc(self, nCode: int, wParam: int, lParam: int):
+        user32 = self._user32
+        if user32 is None:
+            try:
+                user32 = ctypes.windll.user32
+            except Exception:
+                user32 = None
+
+        if nCode < 0 or not _BLOCK_USER_MOUSE_MOVE_ENABLED:
+            if user32 is not None:
+                try:
+                    return user32.CallNextHookEx(0, nCode, wParam, lParam)
+                except Exception:
+                    return 0
+            return 0
+
+        msg = int(wParam)
+        if msg not in (self.WM_MOUSEMOVE, self.WM_NCMOUSEMOVE):
+            if user32 is not None:
+                try:
+                    return user32.CallNextHookEx(0, nCode, wParam, lParam)
+                except Exception:
+                    return 0
+            return 0
+
+        try:
+            info = ctypes.cast(lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+            flags = int(info.flags)
+            if flags & (self.LLMHF_INJECTED | self.LLMHF_LOWER_IL_INJECTED):
+                if user32 is not None:
+                    return user32.CallNextHookEx(0, nCode, wParam, lParam)
+                return 0
+
+            now = float(time.monotonic())
+            if now <= float(_ALLOWED_MOVE_UNTIL):
+                dx = abs(int(info.pt.x) - int(_ALLOWED_MOVE_X))
+                dy = abs(int(info.pt.y) - int(_ALLOWED_MOVE_Y))
+                if dx <= 3 and dy <= 3:
+                    if user32 is not None:
+                        return user32.CallNextHookEx(0, nCode, wParam, lParam)
+                    return 0
+        except Exception:
+            if user32 is not None:
+                try:
+                    return user32.CallNextHookEx(0, nCode, wParam, lParam)
+                except Exception:
+                    return 0
+            return 0
+
+        return 1
+
+
+_USER_MOUSE_BLOCKER: Optional[_UserMouseMoveBlocker] = None
+_USER_MOUSE_BLOCKER_LOCK = threading.Lock()
+
+
+def shutdown_user_mouse_blocker(timeout_s: float = 2.0) -> None:
+    blocker: Optional[_UserMouseMoveBlocker]
+    with _USER_MOUSE_BLOCKER_LOCK:
+        blocker = _USER_MOUSE_BLOCKER
+    if blocker is not None:
+        try:
+            blocker.shutdown(timeout_s=timeout_s)
+        except Exception:
+            pass
+
+
+atexit.register(shutdown_user_mouse_blocker)
+
+
+@contextmanager
+def _block_user_mouse_movement_during_actions(
+    enabled: bool,
+    *,
+    log_fn: Optional[Callable[[str], None]] = None,
+    notify_fn: Optional[Callable[[bool], None]] = None,
+):
+    if not bool(enabled):
+        yield
+        return
+
+    global _USER_MOUSE_BLOCKER
+    with _USER_MOUSE_BLOCKER_LOCK:
+        if _USER_MOUSE_BLOCKER is None:
+            _USER_MOUSE_BLOCKER = _UserMouseMoveBlocker()
+        blocker = _USER_MOUSE_BLOCKER
+
+    acquired = False
+    try:
+        acquired = bool(blocker.acquire(log_fn=log_fn))
+        if acquired:
+            if notify_fn is not None:
+                try:
+                    notify_fn(True)
+                except Exception:
+                    pass
+            else:
+                _auto_action_mouse_block_tooltip(True)
+        yield
+    finally:
+        if acquired:
+            if notify_fn is not None:
+                try:
+                    notify_fn(False)
+                except Exception:
+                    pass
+            else:
+                _auto_action_mouse_block_tooltip(False)
+        if acquired:
+            try:
+                blocker.release()
+            except Exception:
+                pass
+
+
+def _mouse_focus_wiggle(hwnd: int, x: int, y: int) -> None:
+    """
+    Tiny pre-click wiggle to help the game/window pick up the cursor and focus.
+    """
+    if autoit is None:
+        return
+
+    x = int(x)
+    y = int(y)
+
+    bounds = _client_origin_and_size(hwnd) if hwnd else None
+    if bounds:
+        left, top, width, height = bounds
+        min_x = int(left)
+        min_y = int(top)
+        max_x = int(left + max(1, int(width)) - 1)
+        max_y = int(top + max(1, int(height)) - 1)
+
+        def _clamp(px: int, py: int) -> Tuple[int, int]:
+            return (int(max(min_x, min(max_x, int(px)))), int(max(min_y, min(max_y, int(py)))))
+
+    else:
+
+        def _clamp(px: int, py: int) -> Tuple[int, int]:
+            return int(px), int(py)
+
+    dx, dy = 2, 1
+    seq = [(x + dx, y + dy), (x - dx, y - dy), (x, y)]
+    try:
+        for i, (px, py) in enumerate(seq):
+            cx, cy = _clamp(px, py)
+            _note_program_mouse_target(int(cx), int(cy))
+            autoit.mouse_move(int(cx), int(cy), speed=0)
+            if i < len(seq) - 1:
+                time.sleep(0)
+    except Exception:
+        pass
+
+    try:
+        _note_program_mouse_target(int(x), int(y))
+        autoit.mouse_move(int(x), int(y), speed=0)
+    except Exception:
+        pass
+
+
+def _mouse_left_click(hwnd: int, x: int, y: int) -> None:
+    x = int(x)
+    y = int(y)
+
+    if autoit is None:
+        return
+
+    try:
+        if hwnd and win32gui.IsWindow(hwnd) and win32gui.GetForegroundWindow() != hwnd:
+            _bring_window_foreground(hwnd)
+            time.sleep(0.01)
+    except Exception:
+        pass
+
+    def _force_left_up() -> None:
+        try:
+            ctypes.windll.user32.mouse_event(int(win32con.MOUSEEVENTF_LEFTUP), 0, 0, 0, 0)
+        except Exception:
+            pass
+
+    _mouse_move_instant(x, y)
+    _mouse_focus_wiggle(hwnd, x, y)
+
+    try:
+        autoit.mouse_down("left")
+        time.sleep(0.01)
+    except Exception:
+        pass
+    finally:
+        try:
+            autoit.mouse_up("left")
+        except Exception:
+            pass
+        _force_left_up()
+
+
+def _send_ctrl_a() -> None:
+    if autoit is not None:
+        try:
+            autoit.send("^a")
+        except Exception:
+            pass
+
+
+def _auto_action_mouse_block_tooltip(show: bool) -> None:
+    if autoit is None:
+        return
+    try:
+        if not show:
+            autoit.tooltip("")
+            return
+
+        try:
+            cx, cy = win32api.GetCursorPos()
+            x = int(cx) + 16
+            y = int(cy) + 16
+        except Exception:
+            x = 10
+            y = 10
+        autoit.tooltip("User mouse movement is disabled during Auto-Actions.", int(x), int(y))
+    except Exception:
+        pass
+
+
+_AUTO_ACTION_CLIPBOARD_LOCK = threading.RLock()
+_AUTO_ACTION_CLIPBOARD_SCOPE = threading.local()
+_AUTO_ACTION_CLIPBOARD_RESTORE_DELAY_S = 0.35
+
+
+def _auto_action_clip_get_safe(*, buf_size: int = 256) -> Optional[str]:
+    if autoit is None:
+        return None
+    try:
+        return autoit.clip_get(buf_size=max(256, int(buf_size)))
+    except Exception:
+        return None
+
+
+def _auto_action_clip_put_wait(value: str, *, timeout_s: float = 0.25) -> bool:
+    if autoit is None:
+        return False
+    try:
+        autoit.clip_put(value)
+    except Exception:
+        return False
+
+    deadline = time.monotonic() + float(timeout_s or 0.0)
+    buf_size = max(256, len(value) + 1)
+    while time.monotonic() < deadline:
+        if _auto_action_clip_get_safe(buf_size=buf_size) == value:
+            return True
+        time.sleep(0.01)
+    return _auto_action_clip_get_safe(buf_size=buf_size) == value
+
+
+@contextmanager
+def _preserve_clipboard_during_auto_action_sequence(enabled: bool):
+    """
+    Preserve clipboard text once around a complete Auto-Actions sequence.
+
+    Individual paste steps must leave their value available because Ctrl+V is
+    consumed asynchronously by the target window. Restoring after each step
+    can therefore make a later paste read the preceding value on slower hosts.
+    """
+    if autoit is None or not bool(enabled):
+        yield
+        return
+
+    with _AUTO_ACTION_CLIPBOARD_LOCK:
+        original = _auto_action_clip_get_safe(buf_size=65536)
+        previous_scope = getattr(_AUTO_ACTION_CLIPBOARD_SCOPE, "state", None)
+        state = {"changed": False}
+        _AUTO_ACTION_CLIPBOARD_SCOPE.state = state
+        try:
+            yield
+        finally:
+            try:
+                if bool(state["changed"]) and original is not None:
+                    # Give the final Ctrl+V time to consume its value before
+                    # restoring the clipboard captured at sequence start.
+                    time.sleep(_AUTO_ACTION_CLIPBOARD_RESTORE_DELAY_S)
+                    _auto_action_clip_put_wait(original, timeout_s=0.35)
+            finally:
+                if previous_scope is None:
+                    try:
+                        del _AUTO_ACTION_CLIPBOARD_SCOPE.state
+                    except AttributeError:
+                        pass
+                else:
+                    _AUTO_ACTION_CLIPBOARD_SCOPE.state = previous_scope
+
+
+def _send_unicode_text(text: str) -> None:
+    """
+    Paste text via AutoIt, leaving clipboard restoration to the sequence scope.
+    """
+    if autoit is None:
+        return
+
+    s = str(text or "")
+
+    with _AUTO_ACTION_CLIPBOARD_LOCK:
+        try:
+            if not _auto_action_clip_put_wait(s, timeout_s=0.35):
+                raise RuntimeError("clipboard put did not stick")
+
+            scope = getattr(_AUTO_ACTION_CLIPBOARD_SCOPE, "state", None)
+            if scope is not None:
+                scope["changed"] = True
+
+            time.sleep(0.02)
+            autoit.send("^v")
+            time.sleep(0.12)
+        except Exception:
+            try:
+                autoit.send(s, mode=1)
+            except Exception:
+                pass
+
+
+def _bring_window_foreground(hwnd: int) -> bool:
+    """
+    Best-effort foreground activation for the given window.
+    """
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return False
+
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+        def _toggle_topmost() -> None:
+            try:
+                flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+                was_topmost = _is_window_topmost(hwnd)
+                win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0, flags)
+                if not was_topmost:
+                    try:
+                        win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        current_thread_id: Optional[int] = None
+        window_thread_id: Optional[int] = None
+        try:
+            current_thread_id = win32api.GetCurrentThreadId()
+            window_thread_id = win32process.GetWindowThreadProcessId(hwnd)[0]
+            ctypes.windll.user32.AttachThreadInput(current_thread_id, window_thread_id, True)
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        finally:
+            if current_thread_id is not None and window_thread_id is not None:
+                try:
+                    ctypes.windll.user32.AttachThreadInput(current_thread_id, window_thread_id, False)
+                except Exception:
+                    pass
+
+        try:
+            if win32gui.GetForegroundWindow() != hwnd:
+                _toggle_topmost()
+                try:
+                    current_thread_id = win32api.GetCurrentThreadId()
+                    window_thread_id = win32process.GetWindowThreadProcessId(hwnd)[0]
+                    ctypes.windll.user32.AttachThreadInput(current_thread_id, window_thread_id, True)
+                    win32gui.BringWindowToTop(hwnd)
+                    win32gui.SetForegroundWindow(hwnd)
+                finally:
+                    try:
+                        if current_thread_id is not None and window_thread_id is not None:
+                            ctypes.windll.user32.AttachThreadInput(current_thread_id, window_thread_id, False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return True
+    except Exception:
+        return False
+
+
+def _is_window_topmost(hwnd: int) -> bool:
+    try:
+        exstyle = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        return bool(int(exstyle) & int(win32con.WS_EX_TOPMOST))
+    except Exception:
+        return False
+
+
+def _set_window_topmost(hwnd: int, topmost: bool) -> None:
+    try:
+        flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+        insert_after = win32con.HWND_TOPMOST if bool(topmost) else win32con.HWND_NOTOPMOST
+        win32gui.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _window_topmost_during(hwnd: int):
+    original = _is_window_topmost(hwnd)
+    _set_window_topmost(hwnd, True)
+    try:
+        yield
+    finally:
+        _set_window_topmost(hwnd, original)
+
+
+def _screen_pixel_rgb(x: int, y: int) -> Optional[Tuple[int, int, int]]:
+    if ImageGrab is None:
+        return None
+    try:
+        img = ImageGrab.grab(bbox=(int(x), int(y), int(x) + 1, int(y) + 1))
+        return tuple(img.getpixel((0, 0))[:3])  # type: ignore[return-value]
+    except Exception:
+        return None
 
 try:
     from ocr_worker import capture_window_image as _capture_window_image
@@ -47,7 +846,46 @@ except Exception:  # pragma: no cover
     _capture_window_image = None  # type: ignore[assignment]
 
 
-APP_FOOTER = "J.JARAM JX 2x27"
+try:
+    from auto_action_alerts import (
+        AutoActionAlertRequest as _AutoActionAlertRequest,
+        AutoActionAlertService as _AutoActionAlertService,
+        MAX_PENDING_PRE_SEQUENCE_ALERTS as _MAX_PENDING_PRE_SEQUENCE_ALERTS,
+        PRE_SEQUENCE_ALERT_LOOKAHEAD_S as _PRE_SEQUENCE_ALERT_LOOKAHEAD_S,
+    )
+except Exception:  # pragma: no cover - Auto-Actions must run without alerts.
+    _AutoActionAlertRequest = None  # type: ignore[assignment]
+    _MAX_PENDING_PRE_SEQUENCE_ALERTS = 5
+    _PRE_SEQUENCE_ALERT_LOOKAHEAD_S = 60.0
+
+    class _AutoActionAlertService:  # type: ignore[no-redef]
+        available = False
+
+        def pre_sequence_alert_enabled(self, *, enabled: bool, webhook_url: str, lead_s: float) -> bool:
+            return False
+
+        def antiafk_delay_reason(self, overdue_within_provider: Optional[Callable[[float], bool]], lead_s: float) -> str:
+            return ""
+
+        def antiafk_overdue_reason(self, overdue_within_provider: Optional[Callable[[float], bool]]) -> str:
+            return ""
+
+        def send_pre_sequence_alert(self, request: Any) -> bool:
+            return False
+
+        def send_step_webhook(self, *, webhook_url: str, message: str) -> bool:
+            return False
+
+
+class _MenuGateBlocked(Exception):
+    pass
+
+
+def _normalize_user_filter_mode(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if value in {"blacklist", "blocklist", "exclude", "denylist", "deny"}:
+        return "blacklist"
+    return "whitelist"
 
 
 @dataclass(frozen=True)
@@ -293,7 +1131,33 @@ def _normalize_action_step(raw: Any, *, fallback_name: str = "") -> Optional[Act
         kind = "drag"
     elif kind in ("discord_webhook", "send_webhook", "webhook_send"):
         kind = "webhook"
-    if kind not in ("click", "key", "paste", "scroll", "drag", "wait", "webhook", "if", "else", "end", "break", "loop"):
+    elif kind in (
+        "kill",
+        "kill_user",
+        "kill_user_processes",
+        "terminate_user",
+        "restart",
+        "restart_user",
+        "restart_user_session",
+        "relaunch",
+        "relaunch_user",
+    ):
+        kind = "kill_user"
+    if kind not in (
+        "click",
+        "key",
+        "paste",
+        "scroll",
+        "drag",
+        "wait",
+        "webhook",
+        "kill_user",
+        "if",
+        "else",
+        "end",
+        "break",
+        "loop",
+    ):
         return None
 
     name = str(raw.get("name") or fallback_name or kind.replace("_", " ").title()).strip()
@@ -482,48 +1346,6 @@ def _normalize_behavior(raw: Any, legacy: Optional[Dict[str, Any]] = None) -> Di
         "repeat_count": repeat_count,
         "trigger_type": trigger_type,
         "filter_ids": filter_ids,
-    }
-
-
-def _build_action_alert_embed(
-    *,
-    action_name: str,
-    username: str,
-    server_label: str,
-    ps_link: str,
-    use_at_epoch: float,
-) -> dict:
-    import datetime as _dt
-
-    unix = int(use_at_epoch)
-    iso = _dt.datetime.fromtimestamp(unix, tz=_dt.timezone.utc).isoformat()
-
-    ts_full = f"<t:{unix}:D>  -  <t:{unix}:T>"
-    ts_rel = f"<t:{unix}:R>"
-
-    server = str(server_label or "").strip() or "N/A"
-    ps = str(ps_link or "").strip()
-    if ps:
-        ps_line = f"**Private Server:** [Private Server Link]({ps})"
-    else:
-        ps_line = f"**Private Server:** `{server}`"
-
-    uname = str(username or "").strip() or "Unknown"
-    action_disp = str(action_name or "").strip() or "Unnamed Action"
-
-    description = (
-        f"**Account:** `{uname}`\n"
-        f"**Action:** `{action_disp}`\n"
-        f"**Time:** {ts_full} ({ts_rel})\n"
-        f"{ps_line}"
-    )
-
-    return {
-        "title": "Auto-Actions Alert",
-        "description": description,
-        "color": 0xF59E0B,
-        "timestamp": iso,
-        "footer": {"text": f"{APP_FOOTER}  -  {server}"},
     }
 
 
@@ -867,6 +1689,7 @@ class AutoActionEngine:
         biome_provider: Callable[[str], str],
         in_menu_provider: Optional[Callable[[str], Optional[bool]]] = None,
         username_provider: Optional[Callable[[str], str]] = None,
+        log_filename_provider: Optional[Callable[[str], str]] = None,
         server_label_provider: Optional[Callable[[str], str]] = None,
         ps_link_provider: Optional[Callable[[str], str]] = None,
         discord_ping_provider: Optional[Callable[[str], str]] = None,
@@ -878,12 +1701,14 @@ class AutoActionEngine:
         pre_action_hook: Optional[Callable[[str, int], float]] = None,
         post_action_hook: Optional[Callable[[str, int], None]] = None,
         ocr_text_provider: Optional[Callable[[int, Dict[str, Any]], str]] = None,
+        kill_user_callback: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self._pid_provider = pid_provider
         self._hwnd_provider = hwnd_provider
         self._biome_provider = biome_provider
         self._in_menu_provider = in_menu_provider
         self._username_provider = username_provider
+        self._log_filename_provider = log_filename_provider
         self._server_label_provider = server_label_provider
         self._ps_link_provider = ps_link_provider
         self._discord_ping_provider = discord_ping_provider
@@ -895,6 +1720,8 @@ class AutoActionEngine:
         self._pre_action_hook = pre_action_hook
         self._post_action_hook = post_action_hook
         self._ocr_text_provider = ocr_text_provider
+        self._kill_user_callback = kill_user_callback
+        self._alert_service = _AutoActionAlertService()
 
         self._cfg_lock = threading.Lock()
         self._cfg: Dict[str, Any] = {"enabled": False}
@@ -906,12 +1733,18 @@ class AutoActionEngine:
         self._state_lock = threading.Lock()
         self._next_ready: Dict[str, Dict[int, float]] = {}
         self._pending_use_at: Dict[str, Dict[int, float]] = {}
+        self._pending_alert_send_at: Dict[str, Dict[int, float]] = {}
+        self._pending_trigger_seq: Dict[str, Dict[int, int]] = {}
         self._last_trigger_seq: Dict[str, Dict[int, int]] = {}
         self._completed_pids: Dict[str, Dict[int, set[int]]] = {}
         self._rule_signature: Dict[str, Dict[int, int]] = {}
-        self._not_in_menu_since: Dict[str, float] = {}
+        self._not_in_menu_since: Dict[Tuple[str, int], float] = {}
         self._trigger_events: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._trigger_seq: int = 0
+        self._last_antiafk_alert_log_ts: float = 0.0
+        self._last_alert_queue_limit_log_ts: float = 0.0
+        self._last_alert_send_at: float = 0.0
+        self._active_action: Optional[Tuple[str, int]] = None
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -929,10 +1762,157 @@ class AutoActionEngine:
         thread = self._thread
         if thread and thread.is_alive():
             thread.join(timeout=max(0.0, float(timeout_s)))
+        shutdown_user_mouse_blocker(timeout_s=1.0)
 
     def update_config(self, cfg: Dict[str, Any]) -> None:
         with self._cfg_lock:
             self._cfg = copy.deepcopy(cfg or {})
+
+    def monitor_snapshot(self) -> Dict[str, Any]:
+        """Return a thread-safe, presentation-neutral snapshot for runtime monitors."""
+        cfg = self._cfg_snapshot()
+        now = time.time()
+        users = [str(uid).strip() for uid in (cfg.get("users") or []) if str(uid).strip()]
+
+        with self._state_lock:
+            next_ready = copy.deepcopy(self._next_ready)
+            pending_use = copy.deepcopy(self._pending_use_at)
+            pending_send = copy.deepcopy(self._pending_alert_send_at)
+            consumed = copy.deepcopy(self._last_trigger_seq)
+            completed = copy.deepcopy(self._completed_pids)
+            trigger_events = copy.deepcopy(self._trigger_events)
+            not_in_menu_since = dict(self._not_in_menu_since)
+            active_action = self._active_action
+
+        rows: List[Dict[str, Any]] = []
+        for uid in users:
+            try:
+                pid = int(self._pid_provider(uid) or 0)
+            except Exception:
+                pid = 0
+            try:
+                biome = str(self._biome_provider(uid) or "").strip()
+            except Exception:
+                biome = ""
+            try:
+                in_menu = self._in_menu_provider(uid) if self._in_menu_provider is not None else None
+            except Exception:
+                in_menu = None
+
+            for idx, rule in self._rules_from_cfg(cfg, uid=uid):
+                idx_i = int(idx)
+                ready_at = float((next_ready.get(uid) or {}).get(idx_i, 0.0) or 0.0)
+                use_at = float((pending_use.get(uid) or {}).get(idx_i, 0.0) or 0.0)
+                send_at_raw = (pending_send.get(uid) or {}).get(idx_i)
+                send_at = float(send_at_raw or 0.0) if send_at_raw is not None else None
+                is_completed = bool(
+                    pid > 0
+                    and pid in ((completed.get(uid) or {}).get(idx_i, set()) or set())
+                )
+
+                latest_trigger: Optional[Dict[str, Any]] = None
+                if rule.trigger_type == "ocr_filter":
+                    user_events = trigger_events.get(uid) or {}
+                    for filter_id in rule.trigger_filter_ids:
+                        event = user_events.get(str(filter_id))
+                        if event and (
+                            latest_trigger is None
+                            or int(event.get("seq", 0) or 0) > int(latest_trigger.get("seq", 0) or 0)
+                        ):
+                            latest_trigger = event
+                latest_trigger_seq = int((latest_trigger or {}).get("seq", 0) or 0)
+                consumed_seq = int((consumed.get(uid) or {}).get(idx_i, 0) or 0)
+
+                status = "ready"
+                status_detail = "Ready"
+                remaining_s = 0.0
+                if active_action == (uid, idx_i):
+                    status = "running"
+                    status_detail = "Running"
+                elif not bool(cfg.get("enabled", False)):
+                    status = "disabled"
+                    status_detail = "Engine disabled"
+                elif not bool(rule.enabled):
+                    status = "disabled"
+                    status_detail = "Row disabled"
+                elif pid <= 0:
+                    status = "blocked"
+                    status_detail = "No Roblox window"
+                elif in_menu is True:
+                    status = "blocked"
+                    status_detail = "In main menu"
+                elif in_menu is None:
+                    status = "blocked"
+                    status_detail = "Menu state unknown"
+                elif (now - float(not_in_menu_since.get(self._menu_gate_key(uid, pid), now))) < 10.0:
+                    status = "waiting"
+                    remaining_s = max(
+                        0.0,
+                        10.0 - (now - float(not_in_menu_since.get(self._menu_gate_key(uid, pid), now))),
+                    )
+                    status_detail = "Menu exit grace"
+                elif use_at > 0.0:
+                    if send_at is not None:
+                        status = "alert"
+                        remaining_s = max(0.0, send_at - now)
+                        status_detail = "Alert queued" if send_at > now else "Sending alert"
+                    else:
+                        status = "waiting"
+                        remaining_s = max(0.0, use_at - now)
+                        status_detail = "Action queued"
+                elif ready_at > now:
+                    status = "cooldown"
+                    remaining_s = ready_at - now
+                    status_detail = "Cooldown"
+                elif not self._eligible_in_biome(biome, rule):
+                    status = "blocked"
+                    status_detail = "Biome blocked"
+                elif rule.repeat_mode == "once_per_pid" and is_completed:
+                    status = "complete"
+                    status_detail = "Complete for PID"
+                elif rule.trigger_type == "ocr_filter" and rule.trigger_filter_ids:
+                    if latest_trigger_seq > consumed_seq:
+                        status = "triggered"
+                        status_detail = "OCR triggered"
+                    else:
+                        status = "waiting"
+                        status_detail = "Waiting for OCR"
+
+                rows.append(
+                    {
+                        "uid": uid,
+                        "username": self._username(uid),
+                        "action_index": idx_i,
+                        "action_name": str(rule.name),
+                        "action_enabled": bool(rule.enabled),
+                        "status": status,
+                        "status_detail": status_detail,
+                        "remaining_s": float(remaining_s),
+                        "cooldown_s": float(rule.cooldown_s),
+                        "ready_at": ready_at,
+                        "pending_use_at": use_at,
+                        "pending_send_at": send_at,
+                        "pid": pid,
+                        "biome": biome,
+                        "in_menu": in_menu,
+                        "trigger_type": str(rule.trigger_type),
+                        "trigger_filter_ids": list(rule.trigger_filter_ids),
+                        "last_trigger_at": float((latest_trigger or {}).get("ts", 0.0) or 0.0),
+                        "repeat_mode": str(rule.repeat_mode),
+                        "repeat_count": int(rule.repeat_count),
+                        "allowed_biomes": list(rule.allowed_biomes),
+                    }
+                )
+
+        return {
+            "timestamp": now,
+            "engine_running": self.is_running(),
+            "enabled": bool(cfg.get("enabled", False)),
+            "selected_user_count": len(users),
+            "row_count": len(rows),
+            "active_action": active_action,
+            "rows": rows,
+        }
 
     def record_ocr_filter_trigger(self, uid: str, pid: int, filter_id: str, filter_name: str = "") -> None:
         uid_s = str(uid or "").strip()
@@ -1003,13 +1983,18 @@ class AutoActionEngine:
             if uid_s is not None:
                 raw_users = raw.get("users", None)
                 users_explicit = bool(raw.get("users_explicit", False))
-                allowed_users = _normalize_user_id_list(raw_users)
-                if isinstance(allowed_users, list):
-                    if allowed_users:
-                        if uid_s not in allowed_users:
+                selected_users = _normalize_user_id_list(raw_users)
+                user_filter_mode = _normalize_user_filter_mode(raw.get("user_filter_mode", "whitelist"))
+                if isinstance(selected_users, list):
+                    if user_filter_mode == "blacklist":
+                        if selected_users and uid_s in selected_users:
                             continue
-                    elif users_explicit:
-                        continue
+                    else:
+                        if selected_users:
+                            if uid_s not in selected_users:
+                                continue
+                        elif users_explicit:
+                            continue
 
             actions_raw = raw.get("actions") or []
             if not isinstance(actions_raw, list):
@@ -1063,30 +2048,143 @@ class AutoActionEngine:
             return False
         return biome_s in allowed
 
-    def _menu_gate_allows(self, uid: str, min_not_in_menu_s: float) -> bool:
+    @staticmethod
+    def _menu_gate_key(uid: str, pid: int) -> Tuple[str, int]:
+        return (str(uid or "").strip(), int(pid or 0))
+
+    def _prune_menu_gate_for_uid_locked(self, uid: str, pid: int) -> None:
+        uid_s = str(uid or "").strip()
+        pid_i = int(pid or 0)
+        for key in list(self._not_in_menu_since.keys()):
+            try:
+                key_uid, key_pid = key
+            except Exception:
+                self._not_in_menu_since.pop(key, None)
+                continue
+            if str(key_uid) == uid_s and int(key_pid or 0) != pid_i:
+                self._not_in_menu_since.pop(key, None)
+
+    def _menu_gate_allows(self, uid: str, pid: int, min_not_in_menu_s: float) -> bool:
         if self._in_menu_provider is None:
+            return False
+        uid_s, pid_i = self._menu_gate_key(uid, pid)
+        if not uid_s or pid_i <= 0:
             return False
 
         try:
-            in_menu = self._in_menu_provider(str(uid))
+            in_menu = self._in_menu_provider(uid_s)
         except Exception:
             in_menu = None
 
         now = time.time()
         with self._state_lock:
+            self._prune_menu_gate_for_uid_locked(uid_s, pid_i)
+            key = self._menu_gate_key(uid_s, pid_i)
             if in_menu is None or bool(in_menu):
-                self._not_in_menu_since.pop(str(uid), None)
+                self._not_in_menu_since.pop(key, None)
                 return False
 
             if float(min_not_in_menu_s) <= 0.0:
-                self._not_in_menu_since.setdefault(str(uid), now)
+                self._not_in_menu_since.setdefault(key, now)
                 return True
 
-            started = self._not_in_menu_since.get(str(uid))
+            started = self._not_in_menu_since.get(key)
             if started is None:
-                self._not_in_menu_since[str(uid)] = now
+                self._not_in_menu_since[key] = now
                 return False
             return (now - float(started)) >= float(min_not_in_menu_s)
+
+    def _currently_not_in_menu(self, uid: str, pid: Optional[int] = None) -> bool:
+        if self._in_menu_provider is None:
+            return False
+        try:
+            in_menu = self._in_menu_provider(str(uid))
+        except Exception:
+            in_menu = None
+        if in_menu is None:
+            return False
+        return not bool(in_menu)
+
+    def _raise_if_menu_blocked(self, uid: str, pid: Optional[int] = None) -> None:
+        uid_s = str(uid or "").strip()
+        if not uid_s:
+            return
+        if not self._currently_not_in_menu(uid_s, pid):
+            with self._state_lock:
+                if pid is None:
+                    for key in list(self._not_in_menu_since.keys()):
+                        try:
+                            key_uid = key[0]
+                        except Exception:
+                            key_uid = ""
+                        if str(key_uid) == uid_s:
+                            self._not_in_menu_since.pop(key, None)
+                else:
+                    pid_i = int(pid or 0)
+                    self._prune_menu_gate_for_uid_locked(uid_s, pid_i)
+                    self._not_in_menu_since.pop(self._menu_gate_key(uid_s, pid_i), None)
+            raise _MenuGateBlocked("user appears to be in the main menu (or status unknown)")
+
+    def _menu_gate_elapsed_s(self, uid: str, pid: int) -> Optional[float]:
+        try:
+            key = self._menu_gate_key(uid, int(pid or 0))
+        except Exception:
+            return None
+        with self._state_lock:
+            started = self._not_in_menu_since.get(key)
+        if started is None:
+            return None
+        try:
+            return max(0.0, time.time() - float(started))
+        except Exception:
+            return None
+
+    def _read_in_menu_state(self, uid: str) -> Optional[bool]:
+        if self._in_menu_provider is None:
+            return None
+        try:
+            val = self._in_menu_provider(str(uid))
+        except Exception:
+            return None
+        return None if val is None else bool(val)
+
+    def _read_log_filename(self, uid: str) -> str:
+        if self._log_filename_provider is None:
+            return ""
+        try:
+            return str(self._log_filename_provider(str(uid)) or "").strip()
+        except Exception:
+            return ""
+
+    def _log_menu_activation_debug(
+        self,
+        *,
+        uid: str,
+        pid: int,
+        hwnd: int,
+        biome: str,
+        row_index: int,
+        rule: ActionRule,
+        min_not_in_menu_s: float,
+        phase: str = "activate",
+    ) -> None:
+        in_menu = self._read_in_menu_state(uid)
+        if in_menu is None:
+            menu_s = "unknown"
+        else:
+            menu_s = "True" if bool(in_menu) else "False"
+        elapsed = self._menu_gate_elapsed_s(uid, pid)
+        if elapsed is None:
+            gate_s = f"unset/{float(min_not_in_menu_s):.1f}s"
+        else:
+            gate_s = f"{float(elapsed):.2f}s/{float(min_not_in_menu_s):.1f}s"
+        log_file = self._read_log_filename(uid) or "unknown"
+        self._log(
+            f"[Auto-Actions Menu-Debug] {phase}: uid={uid} pid={int(pid or 0)} "
+            f"hwnd={int(hwnd or 0)} row={int(row_index) + 1} rule='{rule.name}' "
+            f"in_menu={menu_s} gate={gate_s} log_file='{log_file}'"
+            + (f" biome={biome}" if biome else "")
+        )
 
     def _latest_trigger_event(self, uid: str, rule: ActionRule) -> Optional[Dict[str, Any]]:
         if rule.trigger_type != "ocr_filter" or not rule.trigger_filter_ids:
@@ -1101,40 +2199,80 @@ class AutoActionEngine:
                 latest = event
         return latest
 
-    def _schedule_alert(self, uid: str, rule: ActionRule) -> None:
-        if not (rule.alert_enabled and rule.alert_webhook and float(rule.alert_lead_s) > 0.0):
-            return
-        if not _auto_item_alerts_unlocked():
-            return
-
-        use_at = time.time() + float(rule.alert_lead_s)
-        payload = {
-            "content": str(rule.alert_message or ""),
-            "embeds": [
-                _build_action_alert_embed(
-                    action_name=rule.name,
-                    username=self._username(uid),
-                    server_label=self._server_label(uid),
-                    ps_link=self._ps_link(uid),
-                    use_at_epoch=use_at,
+    def _rule_pre_alert_enabled(self, rule: ActionRule) -> bool:
+        try:
+            return bool(
+                self._alert_service.pre_sequence_alert_enabled(
+                    enabled=bool(rule.alert_enabled),
+                    webhook_url=str(rule.alert_webhook or ""),
+                    lead_s=float(rule.alert_lead_s),
                 )
-            ],
-        }
+            )
+        except Exception:
+            return False
 
+    def _alert_antiafk_delay_reason(self, rule: ActionRule) -> str:
         try:
-            threading.Thread(
-                target=_post_webhook,
-                args=(str(rule.alert_webhook), payload),
-                daemon=True,
-                name="AutoActionWebhook",
-            ).start()
+            return str(
+                self._alert_service.antiafk_delay_reason(
+                    self._antiafk_overdue_within_provider,
+                    float(rule.alert_lead_s),
+                )
+                or ""
+            ).strip()
+        except Exception:
+            return ""
+
+    def _alert_antiafk_overdue_reason(self) -> str:
+        try:
+            return str(
+                self._alert_service.antiafk_overdue_reason(self._antiafk_overdue_within_provider) or ""
+            ).strip()
+        except Exception:
+            return ""
+
+    def _log_alert_delay(self, reason: str) -> None:
+        reason_s = str(reason or "").strip()
+        if not reason_s:
+            return
+        try:
+            now_ts = time.time()
+            if (now_ts - float(self._last_antiafk_alert_log_ts)) < 30.0:
+                return
+            self._last_antiafk_alert_log_ts = float(now_ts)
+            self._log(f"[Auto-Actions] {reason_s}; delaying pre-sequence alerts until timing is safe.")
         except Exception:
             pass
 
+    def _schedule_alert(self, uid: str, rule: ActionRule, *, use_at: float) -> bool:
+        if _AutoActionAlertRequest is None:
+            return False
         try:
-            self._log(f"[Auto-Actions] {uid}: alert scheduled for '{rule.name}' in {float(rule.alert_lead_s):.1f}s")
+            request = _AutoActionAlertRequest(
+                webhook_url=str(rule.alert_webhook or "").strip(),
+                message=str(rule.alert_message or ""),
+                action_name=str(rule.name or ""),
+                username=self._username(uid),
+                server_label=self._server_label(uid),
+                ps_link=self._ps_link(uid),
+                use_at_epoch=float(use_at),
+            )
+        except Exception:
+            return False
+
+        try:
+            sent = bool(self._alert_service.send_pre_sequence_alert(request))
+        except Exception:
+            sent = False
+        if not sent:
+            return False
+
+        try:
+            delay_s = max(0.0, float(use_at) - time.time())
+            self._log(f"[Auto-Actions] {uid}: alert scheduled for '{rule.name}' in {delay_s:.1f}s")
         except Exception:
             pass
+        return True
 
     def _mark_used(self, uid: str, pid: int, used: Sequence[Tuple[int, ActionRule]]) -> None:
         now = time.time()
@@ -1142,9 +2280,13 @@ class AutoActionEngine:
             next_ready = self._next_ready.setdefault(str(uid), {})
             completed = self._completed_pids.setdefault(str(uid), {})
             pending = self._pending_use_at.setdefault(str(uid), {})
+            pending_send = self._pending_alert_send_at.setdefault(str(uid), {})
+            pending_seq = self._pending_trigger_seq.setdefault(str(uid), {})
             for idx, rule in used:
                 next_ready[int(idx)] = now + max(0.0, float(rule.cooldown_s))
                 pending.pop(int(idx), None)
+                pending_send.pop(int(idx), None)
+                pending_seq.pop(int(idx), None)
                 if str(rule.repeat_mode) == "once_per_pid":
                     completed.setdefault(int(idx), set()).add(int(pid or 0))
 
@@ -1291,18 +2433,53 @@ class AutoActionEngine:
                 pass
             return
 
-        payload = {"content": self._webhook_message_for_step(step, uid, rule_name)}
+        message = self._webhook_message_for_step(step, uid, rule_name)
         try:
-            threading.Thread(
-                target=_post_webhook,
-                args=(url, payload),
-                daemon=True,
-                name="AutoActionStepWebhook",
-            ).start()
+            sent = bool(self._alert_service.send_step_webhook(webhook_url=url, message=message))
+        except Exception:
+            sent = False
+        if sent:
             try:
                 self._log(f"[Auto-Actions] {uid}: webhook step '{step.name}' sent.")
             except Exception:
                 pass
+        else:
+            try:
+                self._log(f"[Auto-Actions] {uid}: webhook step '{step.name}' skipped (webhook support unavailable).")
+            except Exception:
+                pass
+
+    def _kill_user_step(self, step: ActionStep, uid: str) -> None:
+        uid_s = str(uid or "").strip()
+        if not uid_s:
+            try:
+                self._log(f"[Auto-Actions] kill step '{step.name}' skipped (missing user id).")
+            except Exception:
+                pass
+            return
+
+        callback = self._kill_user_callback
+        if callback is None:
+            try:
+                self._log(f"[Auto-Actions] {uid_s}: kill step '{step.name}' skipped (kill callback unavailable).")
+            except Exception:
+                pass
+            return
+
+        try:
+            queued = bool(callback(uid_s))
+        except Exception as e:
+            try:
+                self._log(f"[Auto-Actions] {uid_s}: kill step '{step.name}' failed: {e!r}")
+            except Exception:
+                pass
+            return
+
+        try:
+            if queued:
+                self._log(f"[Auto-Actions] {uid_s}: kill step '{step.name}' queued process termination.")
+            else:
+                self._log(f"[Auto-Actions] {uid_s}: kill step '{step.name}' could not queue process termination.")
         except Exception:
             pass
 
@@ -1320,6 +2497,11 @@ class AutoActionEngine:
             return False
 
         if step.kind == "break":
+            return True
+
+        if step.kind == "kill_user":
+            self._kill_user_step(step, uid)
+            time.sleep(max(0.03, float(click_delay)))
             return True
 
         if step.kind == "webhook":
@@ -1406,6 +2588,7 @@ class AutoActionEngine:
         *,
         click_delay: float,
         uid: str = "",
+        pid: Optional[int] = None,
         rule_name: str = "",
     ) -> bool:
         return self._run_steps_range(
@@ -1415,6 +2598,7 @@ class AutoActionEngine:
             len(actions),
             click_delay=click_delay,
             uid=uid,
+            pid=pid,
             rule_name=rule_name,
         )
 
@@ -1427,12 +2611,14 @@ class AutoActionEngine:
         *,
         click_delay: float,
         uid: str = "",
+        pid: Optional[int] = None,
         rule_name: str = "",
     ) -> bool:
         pc = 0
         pc = max(0, int(start_idx))
         end = max(0, min(len(actions), int(end_idx)))
         while pc < end:
+            self._raise_if_menu_blocked(uid, pid)
             step = actions[pc]
             kind = str(step.kind or "")
             if kind == "if":
@@ -1446,6 +2632,7 @@ class AutoActionEngine:
                         true_end,
                         click_delay=click_delay,
                         uid=uid,
+                        pid=pid,
                         rule_name=rule_name,
                     ):
                         return True
@@ -1458,6 +2645,7 @@ class AutoActionEngine:
                             block_end,
                             click_delay=click_delay,
                             uid=uid,
+                            pid=pid,
                             rule_name=rule_name,
                         ):
                             return True
@@ -1474,6 +2662,7 @@ class AutoActionEngine:
                             block_end,
                             click_delay=click_delay,
                             uid=uid,
+                            pid=pid,
                             rule_name=rule_name,
                         ):
                             return True
@@ -1494,26 +2683,33 @@ class AutoActionEngine:
         rule: ActionRule,
         *,
         uid: str = "",
+        pid: Optional[int] = None,
         click_delay: float,
         times: int,
         block_user_mouse_move: bool = False,
     ) -> None:
+        self._raise_if_menu_blocked(uid, pid)
         with _window_topmost_during(hwnd), _block_user_mouse_movement_during_actions(
             bool(block_user_mouse_move),
             log_fn=self._log,
             notify_fn=self._mouse_block_notify,
+        ), _preserve_clipboard_during_auto_action_sequence(
+            any(str(step.kind or "") == "paste" for step in rule.actions)
         ):
             _bring_window_foreground(hwnd)
             _set_window_topmost(hwnd, True)
             time.sleep(max(0.02, float(click_delay) * 0.5))
+            self._raise_if_menu_blocked(uid, pid)
 
             repeats = max(1, int(times or 1))
             for _ in range(repeats):
+                self._raise_if_menu_blocked(uid, pid)
                 if self._run_steps_once(
                     hwnd,
                     rule.actions,
                     click_delay=click_delay,
                     uid=uid,
+                    pid=pid,
                     rule_name=rule.name,
                 ):
                     break
@@ -1527,6 +2723,8 @@ class AutoActionEngine:
         if not valid_indices:
             self._next_ready.pop(uid, None)
             self._pending_use_at.pop(uid, None)
+            self._pending_alert_send_at.pop(uid, None)
+            self._pending_trigger_seq.pop(uid, None)
             self._last_trigger_seq.pop(uid, None)
             self._completed_pids.pop(uid, None)
             self._rule_signature.pop(uid, None)
@@ -1535,6 +2733,8 @@ class AutoActionEngine:
         for mapping in (
             self._next_ready.get(uid),
             self._pending_use_at.get(uid),
+            self._pending_alert_send_at.get(uid),
+            self._pending_trigger_seq.get(uid),
             self._last_trigger_seq.get(uid),
             self._completed_pids.get(uid),
             self._rule_signature.get(uid),
@@ -1545,16 +2745,410 @@ class AutoActionEngine:
                 if int(idx) not in valid_indices:
                     mapping.pop(int(idx), None)
 
+    @staticmethod
+    def _estimate_steps_duration(actions: Sequence[ActionStep], *, click_delay: float) -> float:
+        delay = max(0.01, float(click_delay or 0.0))
+        total = 0.0
+        pc = 0
+        while pc < len(actions):
+            step = actions[pc]
+            kind = str(step.kind or "")
+            if kind == "if":
+                else_idx, block_end = AutoActionEngine._find_if_bounds(actions, pc)
+                true_end = else_idx if else_idx is not None else block_end
+                true_s = AutoActionEngine._estimate_steps_duration(actions[pc + 1 : true_end], click_delay=delay)
+                false_s = 0.0
+                if else_idx is not None:
+                    false_s = AutoActionEngine._estimate_steps_duration(actions[else_idx + 1 : block_end], click_delay=delay)
+                total += max(true_s, false_s, delay)
+                pc = block_end + 1
+                continue
+            if kind == "loop":
+                block_end = AutoActionEngine._find_block_end_index(actions, pc)
+                inner_s = AutoActionEngine._estimate_steps_duration(actions[pc + 1 : block_end], click_delay=delay)
+                total += max(1, int(step.loop_count or 1)) * max(inner_s, delay)
+                pc = block_end + 1
+                continue
+            if kind in ("else", "end", "endif", "end_if", "end_loop", "end_block"):
+                pc += 1
+                continue
+
+            if kind == "wait":
+                total += max(0.0, float(step.wait_s or 0.0)) + max(0.03, delay)
+            elif kind == "drag":
+                total += max(0.0, float(step.drag_duration_s or 0.0)) + max(0.03, delay)
+            elif kind == "key":
+                total += max(0.0, float(step.key_hold_s or 0.0)) + max(0.03, delay)
+            elif kind in ("paste", "webhook", "scroll", "kill_user"):
+                total += max(0.03, delay)
+            else:
+                total += max(0.01, delay)
+            pc += 1
+        return max(0.0, total)
+
+    def _estimate_rule_slot_s(self, rule: ActionRule, *, click_delay: float) -> float:
+        try:
+            repeats = self._execution_count(rule)
+        except Exception:
+            repeats = 1
+        try:
+            prep_s = max(0.02, float(click_delay or 0.0) * 0.5)
+        except Exception:
+            prep_s = 0.1
+        try:
+            actions_s = self._estimate_steps_duration(tuple(rule.actions or ()), click_delay=float(click_delay or 0.0))
+        except Exception:
+            actions_s = max(0.2, float(click_delay or 0.2))
+        return max(1.0, prep_s + max(1, int(repeats or 1)) * actions_s + 0.25)
+
+    def _pending_alert_count_locked(self) -> int:
+        total = 0
+        for per_user in self._pending_use_at.values():
+            if isinstance(per_user, dict):
+                total += len(per_user)
+        return int(total)
+
+    def _pending_sent_alert_tail_use_at_locked(self, *, exclude_uid: str = "", exclude_idx: Optional[int] = None) -> float:
+        tail = 0.0
+        exclude_uid_s = str(exclude_uid or "")
+        exclude_idx_i = int(exclude_idx) if exclude_idx is not None else None
+        for pending_uid, per_user in self._pending_use_at.items():
+            if not isinstance(per_user, dict):
+                continue
+            send_map = self._pending_alert_send_at.get(str(pending_uid)) or {}
+            for pending_idx, value in per_user.items():
+                try:
+                    pending_idx_i = int(pending_idx)
+                except Exception:
+                    continue
+                if str(pending_uid) == exclude_uid_s and exclude_idx_i is not None and pending_idx_i == exclude_idx_i:
+                    continue
+                if pending_idx_i in send_map:
+                    continue
+                try:
+                    tail = max(tail, float(value))
+                except Exception:
+                    continue
+        return float(tail)
+
+    def _has_sent_alert_countdown_locked(self, *, exclude_uid: str = "", exclude_idx: Optional[int] = None) -> bool:
+        return self._pending_sent_alert_tail_use_at_locked(exclude_uid=exclude_uid, exclude_idx=exclude_idx) > 0.0
+
+    def _has_earlier_sent_alert_locked(self, uid: str, idx: int, use_at: float) -> bool:
+        current = (float(use_at), str(uid), int(idx))
+        for pending_uid, per_user in self._pending_use_at.items():
+            if not isinstance(per_user, dict):
+                continue
+            send_map = self._pending_alert_send_at.get(str(pending_uid)) or {}
+            for pending_idx, value in per_user.items():
+                try:
+                    pending_idx_i = int(pending_idx)
+                except Exception:
+                    continue
+                if str(pending_uid) == str(uid) and pending_idx_i == int(idx):
+                    continue
+                if pending_idx_i in send_map:
+                    continue
+                try:
+                    other = (float(value), str(pending_uid), pending_idx_i)
+                except Exception:
+                    continue
+                if other < current:
+                    return True
+        return False
+
+    def _planned_alert_times_locked(
+        self,
+        rule: ActionRule,
+        *,
+        now: float,
+        click_delay: float,
+    ) -> Tuple[float, float]:
+        try:
+            lead_s = max(0.0, float(rule.alert_lead_s or 0.0))
+        except Exception:
+            lead_s = 0.0
+
+        try:
+            slot_s = self._estimate_rule_slot_s(rule, click_delay=click_delay)
+        except Exception:
+            slot_s = 1.0
+        slot_s = max(1.0, float(slot_s))
+
+        latest_use_at = 0.0
+        for per_user in self._pending_use_at.values():
+            if not isinstance(per_user, dict):
+                continue
+            for value in per_user.values():
+                try:
+                    latest_use_at = max(latest_use_at, float(value))
+                except Exception:
+                    continue
+
+        latest_send_at = float(getattr(self, "_last_alert_send_at", 0.0) or 0.0)
+        for per_user in self._pending_alert_send_at.values():
+            if not isinstance(per_user, dict):
+                continue
+            for value in per_user.values():
+                try:
+                    latest_send_at = max(latest_send_at, float(value))
+                except Exception:
+                    continue
+
+        use_at = max(float(now) + lead_s, latest_use_at + slot_s)
+        send_at = max(float(now), use_at - lead_s, latest_send_at + 1.0)
+        use_at = max(use_at, send_at + lead_s)
+        return float(send_at), float(use_at)
+
+    def _can_reserve_alert_locked(self, *, now: float, send_at: float) -> bool:
+        try:
+            max_pending = max(1, int(_MAX_PENDING_PRE_SEQUENCE_ALERTS))
+        except Exception:
+            max_pending = 5
+        if self._pending_alert_count_locked() >= max_pending:
+            self._log_alert_queue_limit("queue depth")
+            return False
+
+        try:
+            lookahead_s = max(1.0, float(_PRE_SEQUENCE_ALERT_LOOKAHEAD_S))
+        except Exception:
+            lookahead_s = 60.0
+        if float(send_at) > float(now) + lookahead_s:
+            self._log_alert_queue_limit("lookahead")
+            return False
+
+        return True
+
+    def _log_alert_queue_limit(self, reason: str) -> None:
+        try:
+            now_ts = time.time()
+            if (now_ts - float(self._last_alert_queue_limit_log_ts)) < 30.0:
+                return
+            self._last_alert_queue_limit_log_ts = float(now_ts)
+            if str(reason or "") == "lookahead":
+                self._log(
+                    f"[Auto-Actions] Alert queue lookahead is full; leaving later alerts unreserved until they are within {float(_PRE_SEQUENCE_ALERT_LOOKAHEAD_S):.0f}s."
+                )
+            else:
+                self._log(
+                    f"[Auto-Actions] Alert queue is at {int(_MAX_PENDING_PRE_SEQUENCE_ALERTS)} pending reservation(s); leaving later alerts unreserved."
+                )
+        except Exception:
+            pass
+
+    def _reserve_alert_locked(
+        self,
+        uid: str,
+        idx: int,
+        rule: ActionRule,
+        *,
+        now: float,
+        seq: int,
+        click_delay: float,
+    ) -> Tuple[float, float]:
+        send_at, use_at = self._planned_alert_times_locked(rule, now=now, click_delay=click_delay)
+
+        self._pending_use_at.setdefault(str(uid), {})[int(idx)] = float(use_at)
+        self._pending_alert_send_at.setdefault(str(uid), {})[int(idx)] = float(send_at)
+        if int(seq or 0) > 0:
+            self._pending_trigger_seq.setdefault(str(uid), {})[int(idx)] = int(seq)
+        else:
+            self._pending_trigger_seq.setdefault(str(uid), {}).pop(int(idx), None)
+
+        return float(send_at), float(use_at)
+
+    @staticmethod
+    def _alert_lead_s(rule: ActionRule) -> float:
+        try:
+            return max(0.0, float(rule.alert_lead_s or 0.0))
+        except Exception:
+            return 0.0
+
+    def _remove_pending_alert_locked(self, uid: str, idx: int) -> None:
+        uid_s = str(uid)
+        idx_i = int(idx)
+        pending = self._pending_use_at.get(uid_s)
+        if isinstance(pending, dict):
+            pending.pop(idx_i, None)
+            if not pending:
+                self._pending_use_at.pop(uid_s, None)
+        send_map = self._pending_alert_send_at.get(uid_s)
+        if isinstance(send_map, dict):
+            send_map.pop(idx_i, None)
+            if not send_map:
+                self._pending_alert_send_at.pop(uid_s, None)
+        seq_map = self._pending_trigger_seq.get(uid_s)
+        if isinstance(seq_map, dict):
+            seq_map.pop(idx_i, None)
+            if not seq_map:
+                self._pending_trigger_seq.pop(uid_s, None)
+
+    def _dispatch_next_due_alert(self, cfg: Dict[str, Any], users: Sequence[str], *, click_delay: float) -> bool:
+        now = time.time()
+        try:
+            if now < float(self._last_alert_send_at or 0.0) + 1.0:
+                return False
+        except Exception:
+            pass
+
+        user_order = {str(uid): pos for pos, uid in enumerate(users or [])}
+        candidates: List[Tuple[float, float, int, str, int, ActionRule]] = []
+
+        with self._state_lock:
+            for uid in users or []:
+                uid_s = str(uid)
+                rules_by_idx = {int(idx): rule for idx, rule in self._rules_from_cfg(cfg, uid=uid_s)}
+                pending = self._pending_use_at.get(uid_s) or {}
+                send_map = self._pending_alert_send_at.get(uid_s) or {}
+                for raw_idx, raw_send_at in list(send_map.items()):
+                    try:
+                        idx_i = int(raw_idx)
+                    except Exception:
+                        continue
+                    rule = rules_by_idx.get(idx_i)
+                    if rule is None or idx_i not in pending:
+                        self._remove_pending_alert_locked(uid_s, idx_i)
+                        continue
+                    if (self._rule_signature.get(uid_s) or {}).get(idx_i) != hash(rule):
+                        self._remove_pending_alert_locked(uid_s, idx_i)
+                        continue
+                    try:
+                        send_at = float(raw_send_at)
+                    except Exception:
+                        self._remove_pending_alert_locked(uid_s, idx_i)
+                        continue
+                    if now < send_at:
+                        continue
+                    try:
+                        use_at = float(pending.get(idx_i, now))
+                    except Exception:
+                        use_at = now
+                    candidates.append((send_at, use_at, int(user_order.get(uid_s, 999999)), uid_s, idx_i, rule))
+
+        if not candidates:
+            return False
+
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]))
+
+        for _send_at, _use_at, _order, uid, idx, rule in candidates:
+            send_payload: Optional[Tuple[str, int, ActionRule, float]] = None
+            with self._state_lock:
+                pending = self._pending_use_at.get(str(uid)) or {}
+                send_map = self._pending_alert_send_at.get(str(uid)) or {}
+                if int(idx) not in pending or int(idx) not in send_map:
+                    continue
+
+                if not self._rule_pre_alert_enabled(rule):
+                    self._remove_pending_alert_locked(str(uid), int(idx))
+                    continue
+
+                reason = self._alert_antiafk_delay_reason(rule)
+                if reason:
+                    self._log_alert_delay(reason)
+                    lead_s = self._alert_lead_s(rule)
+                    retry_send_at = now + 5.0
+                    pending[int(idx)] = retry_send_at + lead_s
+                    send_map[int(idx)] = retry_send_at
+                    return False
+
+                try:
+                    current_send_at = float(send_map.get(int(idx), now))
+                except Exception:
+                    current_send_at = now
+                try:
+                    use_at = float(pending.get(int(idx), now))
+                except Exception:
+                    use_at = now
+
+                lead_s = self._alert_lead_s(rule)
+                slot_s = self._estimate_rule_slot_s(rule, click_delay=float(click_delay or 0.0))
+                sent_tail = self._pending_sent_alert_tail_use_at_locked(exclude_uid=str(uid), exclude_idx=int(idx))
+                if sent_tail > 0.0:
+                    use_at = max(use_at, sent_tail + slot_s)
+                if now > current_send_at:
+                    use_at = max(use_at, now + lead_s)
+
+                target_send_at = max(now, use_at - lead_s)
+                if target_send_at > now + 0.25:
+                    pending[int(idx)] = float(use_at)
+                    send_map[int(idx)] = float(target_send_at)
+                    return False
+
+                pending[int(idx)] = float(use_at)
+                send_payload = (str(uid), int(idx), rule, float(use_at))
+
+            if send_payload is None:
+                continue
+
+            send_uid, send_idx, send_rule, send_use_at = send_payload
+            sent = self._schedule_alert(send_uid, send_rule, use_at=send_use_at)
+            with self._state_lock:
+                pending = self._pending_use_at.get(send_uid) or {}
+                if send_idx in pending and abs(float(pending.get(send_idx, 0.0)) - float(send_use_at)) < 0.5:
+                    if sent:
+                        send_map = self._pending_alert_send_at.setdefault(send_uid, {})
+                        send_map.pop(send_idx, None)
+                        if not send_map:
+                            self._pending_alert_send_at.pop(send_uid, None)
+                        self._last_alert_send_at = max(float(self._last_alert_send_at), time.time())
+                    else:
+                        self._remove_pending_alert_locked(send_uid, send_idx)
+            return bool(sent)
+
+        return False
+
+    def _cancel_overdue_pending_alerts(self, uid: str, *, now: Optional[float] = None, reason: str = "") -> None:
+        try:
+            now_ts = float(now if now is not None else time.time())
+        except Exception:
+            now_ts = time.time()
+
+        canceled = 0
+        with self._state_lock:
+            pending = self._pending_use_at.get(str(uid))
+            if not pending:
+                return
+            pending_send = self._pending_alert_send_at.get(str(uid)) or {}
+            pending_seq = self._pending_trigger_seq.get(str(uid)) or {}
+            for idx, use_at in list(pending.items()):
+                try:
+                    if now_ts < float(use_at):
+                        continue
+                except Exception:
+                    continue
+                pending.pop(int(idx), None)
+                pending_send.pop(int(idx), None)
+                pending_seq.pop(int(idx), None)
+                canceled += 1
+            if not pending:
+                self._pending_use_at.pop(str(uid), None)
+            if pending_send:
+                self._pending_alert_send_at[str(uid)] = pending_send
+            else:
+                self._pending_alert_send_at.pop(str(uid), None)
+            if pending_seq:
+                self._pending_trigger_seq[str(uid)] = pending_seq
+            else:
+                self._pending_trigger_seq.pop(str(uid), None)
+
+        if canceled:
+            try:
+                why = f" ({reason})" if reason else ""
+                self._log(f"[Auto-Actions] {uid}: canceled overdue alert schedule{why}")
+            except Exception:
+                pass
+
     def _evaluate_rules_for_user(
         self,
         uid: str,
         pid: int,
         biome: str,
         rules: Sequence[Tuple[int, ActionRule]],
+        *,
+        click_delay: float = 0.2,
     ) -> List[Tuple[int, ActionRule]]:
         now = time.time()
         due: List[Tuple[int, ActionRule]] = []
-        alerts: List[ActionRule] = []
 
         with self._state_lock:
             valid = {int(idx) for idx, _rule in (rules or [])}
@@ -1562,6 +3156,8 @@ class AutoActionEngine:
 
             next_ready = self._next_ready.setdefault(str(uid), {})
             pending = self._pending_use_at.setdefault(str(uid), {})
+            pending_send = self._pending_alert_send_at.setdefault(str(uid), {})
+            pending_seq = self._pending_trigger_seq.setdefault(str(uid), {})
             consumed = self._last_trigger_seq.setdefault(str(uid), {})
             completed = self._completed_pids.setdefault(str(uid), {})
             signatures = self._rule_signature.setdefault(str(uid), {})
@@ -1573,24 +3169,78 @@ class AutoActionEngine:
                     signatures[idx_i] = sig
                     next_ready.pop(idx_i, None)
                     pending.pop(idx_i, None)
+                    pending_send.pop(idx_i, None)
+                    pending_seq.pop(idx_i, None)
                     consumed.pop(idx_i, None)
                     completed.pop(idx_i, None)
 
                 if not rule.enabled or not rule.actions:
                     pending.pop(idx_i, None)
+                    pending_send.pop(idx_i, None)
+                    pending_seq.pop(idx_i, None)
                     continue
 
                 if idx_i in pending:
-                    if now < float(pending.get(idx_i, 0.0)):
+                    if not self._rule_pre_alert_enabled(rule):
+                        pending.pop(idx_i, None)
+                        pending_send.pop(idx_i, None)
+                        pending_seq.pop(idx_i, None)
+                        continue
+
+                    send_at = pending_send.get(idx_i)
+                    if send_at is not None:
+                        if now < float(send_at):
+                            continue
+                        reason = self._alert_antiafk_delay_reason(rule)
+                        if reason:
+                            self._log_alert_delay(reason)
+                            pending.pop(idx_i, None)
+                            pending_send.pop(idx_i, None)
+                            seq = int(pending_seq.pop(idx_i, 0) or 0)
+                            send_at, _use_at = self._planned_alert_times_locked(
+                                rule,
+                                now=now,
+                                click_delay=float(click_delay or 0.0),
+                            )
+                            if not self._can_reserve_alert_locked(now=now, send_at=send_at):
+                                continue
+                            self._reserve_alert_locked(
+                                str(uid),
+                                idx_i,
+                                rule,
+                                now=now,
+                                seq=seq,
+                                click_delay=float(click_delay or 0.0),
+                            )
+                            continue
+                        # Global alert dispatch sends due webhooks in planned order.
+                        continue
+
+                    use_at = float(pending.get(idx_i, 0.0))
+                    if now < use_at:
+                        continue
+                    if self._has_earlier_sent_alert_locked(str(uid), idx_i, float(use_at)):
                         continue
                     pending.pop(idx_i, None)
+                    seq = int(pending_seq.pop(idx_i, 0) or 0)
                     if now < float(next_ready.get(idx_i, 0.0)):
                         continue
                     if not self._eligible_in_biome(biome, rule):
                         continue
                     if rule.repeat_mode == "once_per_pid" and int(pid or 0) in completed.get(idx_i, set()):
                         continue
+                    reason = self._alert_antiafk_overdue_reason()
+                    if reason:
+                        self._log_alert_delay(reason)
+                        continue
+                    if seq > 0:
+                        consumed[idx_i] = seq
                     due.append((idx_i, rule))
+                    continue
+
+                alert_enabled = self._rule_pre_alert_enabled(rule)
+
+                if self._has_sent_alert_countdown_locked():
                     continue
 
                 if rule.trigger_type != "ocr_filter" or not rule.trigger_filter_ids:
@@ -1601,9 +3251,26 @@ class AutoActionEngine:
                     if rule.repeat_mode == "once_per_pid" and int(pid or 0) in completed.get(idx_i, set()):
                         continue
 
-                    if rule.alert_enabled and rule.alert_webhook and float(rule.alert_lead_s) > 0.0:
-                        pending[idx_i] = now + max(0.0, float(rule.alert_lead_s))
-                        alerts.append(rule)
+                    if alert_enabled:
+                        reason = self._alert_antiafk_delay_reason(rule)
+                        if reason:
+                            self._log_alert_delay(reason)
+                            continue
+                        send_at, _use_at = self._planned_alert_times_locked(
+                            rule,
+                            now=now,
+                            click_delay=float(click_delay or 0.0),
+                        )
+                        if not self._can_reserve_alert_locked(now=now, send_at=send_at):
+                            continue
+                        send_at, use_at = self._reserve_alert_locked(
+                            str(uid),
+                            idx_i,
+                            rule,
+                            now=now,
+                            seq=0,
+                            click_delay=float(click_delay or 0.0),
+                        )
                         continue
 
                     due.append((idx_i, rule))
@@ -1617,8 +3284,6 @@ class AutoActionEngine:
                 if seq <= int(consumed.get(idx_i, 0) or 0):
                     continue
 
-                consumed[idx_i] = seq
-
                 if now < float(next_ready.get(idx_i, 0.0)):
                     continue
                 if not self._eligible_in_biome(biome, rule):
@@ -1626,15 +3291,30 @@ class AutoActionEngine:
                 if rule.repeat_mode == "once_per_pid" and int(pid or 0) in completed.get(idx_i, set()):
                     continue
 
-                if rule.alert_enabled and rule.alert_webhook and float(rule.alert_lead_s) > 0.0:
-                    pending[idx_i] = now + max(0.0, float(rule.alert_lead_s))
-                    alerts.append(rule)
+                if alert_enabled:
+                    reason = self._alert_antiafk_delay_reason(rule)
+                    if reason:
+                        self._log_alert_delay(reason)
+                        continue
+                    send_at, _use_at = self._planned_alert_times_locked(
+                        rule,
+                        now=now,
+                        click_delay=float(click_delay or 0.0),
+                    )
+                    if not self._can_reserve_alert_locked(now=now, send_at=send_at):
+                        continue
+                    send_at, use_at = self._reserve_alert_locked(
+                        str(uid),
+                        idx_i,
+                        rule,
+                        now=now,
+                        seq=seq,
+                        click_delay=float(click_delay or 0.0),
+                    )
                     continue
 
+                consumed[idx_i] = seq
                 due.append((idx_i, rule))
-
-        for rule in alerts:
-            self._schedule_alert(str(uid), rule)
         return due
 
     def _run(self) -> None:
@@ -1654,19 +3334,44 @@ class AutoActionEngine:
             if not enabled:
                 with self._state_lock:
                     self._pending_use_at.clear()
+                    self._pending_alert_send_at.clear()
+                    self._pending_trigger_seq.clear()
                 self._stop.wait(timeout=interval)
                 continue
 
             users = [str(uid).strip() for uid in (cfg.get("users") or []) if str(uid).strip()]
             click_delay = float(cfg.get("click_delay", 0.2) or 0.2)
             block_user_mouse_move = bool(cfg.get("disable_mouse_move", False))
+            menu_debug = bool(cfg.get("menu_debug", False))
             min_not_in_menu_s = 10.0
 
             if not users:
                 with self._state_lock:
                     self._pending_use_at.clear()
+                    self._pending_alert_send_at.clear()
+                    self._pending_trigger_seq.clear()
                 self._stop.wait(timeout=max(0.5, interval))
                 continue
+
+            try:
+                active_users = {str(uid) for uid in users}
+            except Exception:
+                active_users = set()
+            if active_users:
+                with self._state_lock:
+                    for pending_uid in list(self._pending_use_at.keys()):
+                        if str(pending_uid) not in active_users:
+                            self._pending_use_at.pop(str(pending_uid), None)
+                            self._pending_alert_send_at.pop(str(pending_uid), None)
+                            self._pending_trigger_seq.pop(str(pending_uid), None)
+
+            try:
+                self._dispatch_next_due_alert(cfg, users, click_delay=click_delay)
+            except Exception as e:
+                try:
+                    self._log(f"[Auto-Actions] alert dispatch error: {e}")
+                except Exception:
+                    pass
 
             did_any = False
             paused = False
@@ -1683,11 +3388,14 @@ class AutoActionEngine:
                     except Exception:
                         pass
 
+                    now_ts = time.time()
+
                     try:
                         pid = self._pid_provider(uid)
                     except Exception:
                         pid = None
                     if not pid:
+                        self._cancel_overdue_pending_alerts(uid, now=now_ts, reason="window missing")
                         continue
 
                     try:
@@ -1695,6 +3403,7 @@ class AutoActionEngine:
                     except Exception:
                         hwnd = None
                     if not hwnd:
+                        self._cancel_overdue_pending_alerts(uid, now=now_ts, reason="window missing")
                         continue
 
                     try:
@@ -1702,14 +3411,19 @@ class AutoActionEngine:
                     except Exception:
                         biome = ""
 
-                    if not self._menu_gate_allows(uid, min_not_in_menu_s):
+                    if not self._menu_gate_allows(uid, int(pid), min_not_in_menu_s):
+                        self._cancel_overdue_pending_alerts(uid, now=now_ts, reason="menu gate")
                         continue
 
                     rules = self._rules_from_cfg(cfg, uid=uid)
                     if not rules:
+                        with self._state_lock:
+                            self._pending_use_at.pop(str(uid), None)
+                            self._pending_alert_send_at.pop(str(uid), None)
+                            self._pending_trigger_seq.pop(str(uid), None)
                         continue
 
-                    due = self._evaluate_rules_for_user(uid, int(pid), biome, rules)
+                    due = self._evaluate_rules_for_user(uid, int(pid), biome, rules, click_delay=click_delay)
                     if not due:
                         continue
 
@@ -1723,7 +3437,9 @@ class AutoActionEngine:
                                 break
                             paused = True
                         except Exception:
-                            paused = False
+                            pause_denied = True
+                            self._log("[Auto-Actions] Failed to pause Anti-AFK; skipping this cycle.")
+                            break
 
                     lead_s = 0.0
                     if self._pre_action_hook is not None:
@@ -1735,20 +3451,40 @@ class AutoActionEngine:
                         self._stop.wait(timeout=max(0.0, float(lead_s)))
                         if self._stop.is_set():
                             break
+                    if not self._menu_gate_allows(uid, int(pid), min_not_in_menu_s):
+                        continue
 
                     try:
                         used: List[Tuple[int, ActionRule]] = []
                         with self._action_lock:
                             for idx, rule in due:
-                                self._run_rule_on_window(
-                                    int(hwnd),
-                                    rule,
-                                    uid=str(uid),
-                                    click_delay=click_delay,
-                                    times=self._execution_count(rule),
-                                    block_user_mouse_move=block_user_mouse_move,
-                                )
-                                used.append((idx, rule))
+                                with self._state_lock:
+                                    self._active_action = (str(uid), int(idx))
+                                try:
+                                    if menu_debug:
+                                        self._log_menu_activation_debug(
+                                            uid=str(uid),
+                                            pid=int(pid),
+                                            hwnd=int(hwnd),
+                                            biome=str(biome or ""),
+                                            row_index=int(idx),
+                                            rule=rule,
+                                            min_not_in_menu_s=min_not_in_menu_s,
+                                            phase="activate",
+                                        )
+                                    self._run_rule_on_window(
+                                        int(hwnd),
+                                        rule,
+                                        uid=str(uid),
+                                        pid=int(pid),
+                                        click_delay=click_delay,
+                                        times=self._execution_count(rule),
+                                        block_user_mouse_move=block_user_mouse_move,
+                                    )
+                                    used.append((idx, rule))
+                                finally:
+                                    with self._state_lock:
+                                        self._active_action = None
                         if used:
                             self._mark_used(uid, int(pid), used)
                             did_any = True
@@ -1757,6 +3493,8 @@ class AutoActionEngine:
                                 + ", ".join(str(rule.name) for _idx, rule in used)
                                 + (f" (biome={biome})" if biome else "")
                             )
+                    except _MenuGateBlocked as e:
+                        self._log(f"[Auto-Actions] {uid}: skipped; {e}.")
                     except Exception as e:
                         self._log(f"[Auto-Actions] {uid}: error during action playback: {e}")
                     finally:
@@ -1773,6 +3511,14 @@ class AutoActionEngine:
                         self._resume_antiafk()
                     except Exception:
                         pass
+
+            try:
+                self._dispatch_next_due_alert(cfg, users, click_delay=click_delay)
+            except Exception as e:
+                try:
+                    self._log(f"[Auto-Actions] alert dispatch error: {e}")
+                except Exception:
+                    pass
 
             try:
                 if not bool(self._cfg_snapshot().get("enabled", False)):
@@ -1826,28 +3572,49 @@ class AutoActionEngine:
 
         click_delay = float(cfg.get("click_delay", 0.2) or 0.2)
         block_user_mouse_move = bool(cfg.get("disable_mouse_move", False))
+        menu_debug = bool(cfg.get("menu_debug", False))
 
         paused = False
         try:
             if self._pause_antiafk:
                 try:
-                    paused = bool(self._pause_antiafk() is not False)
+                    pause_res = self._pause_antiafk()
                 except Exception:
-                    paused = False
+                    self._log("[Auto-Actions] Test: failed to pause Anti-AFK; aborting test.")
+                    return False
+                if pause_res is False:
+                    self._log("[Auto-Actions] Test: Anti-AFK pause was denied; aborting test.")
+                    return False
+                paused = True
 
             self._log(f"[Auto-Actions] Test: running {len(rules)} selected action row(s) once for {uid}...")
             with self._action_lock:
                 for _idx, rule in rules:
+                    if menu_debug:
+                        self._log_menu_activation_debug(
+                            uid=str(uid),
+                            pid=int(pid),
+                            hwnd=int(hwnd),
+                            biome="",
+                            row_index=int(_idx),
+                            rule=rule,
+                            min_not_in_menu_s=10.0,
+                            phase="test-activate",
+                        )
                     self._run_rule_on_window(
                         int(hwnd),
                         rule,
                         uid=str(uid),
+                        pid=int(pid),
                         click_delay=click_delay,
                         times=1,
                         block_user_mouse_move=block_user_mouse_move,
                     )
             self._log("[Auto-Actions] Test: complete.")
             return True
+        except _MenuGateBlocked as e:
+            self._log(f"[Auto-Actions] Test: skipped; {e}.")
+            return False
         except Exception as e:
             self._log(f"[Auto-Actions] Test: error: {e}")
             return False

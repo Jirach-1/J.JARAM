@@ -7,6 +7,15 @@ available, and falls back to the pure-Python implementation (`bes_limiter_py`).
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+_native_dir = Path(__file__).resolve().parent / "native"
+if _native_dir.is_dir():
+    native_s = str(_native_dir)
+    if native_s not in sys.path:
+        sys.path.insert(0, native_s)
+
 try:
     from bes_limiter_native import (  # type: ignore
         BESLimiterWorker,
@@ -17,7 +26,11 @@ try:
 
     _USING_NATIVE = True
 except Exception:  # pragma: no cover
-    print("error")
+    _legacy_dir = Path(__file__).resolve().parent / "Legacy"
+    if _legacy_dir.is_dir():
+        legacy_s = str(_legacy_dir)
+        if legacy_s not in sys.path:
+            sys.path.insert(0, legacy_s)
     from bes_limiter_py import (  # type: ignore
         BESLimiterWorker,
         BESMultiProcessController,
@@ -34,4 +47,3 @@ __all__ = [
     "list_thread_ids_for_pids",
     "_USING_NATIVE",
 ]
-

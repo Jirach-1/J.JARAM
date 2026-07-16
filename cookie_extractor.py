@@ -1,10 +1,12 @@
 import time
 import tempfile
+import re
 from typing import Optional, Callable
+from urllib.parse import urlsplit
 from PySide6.QtCore import QThread, Signal, QObject
 from PySide6.QtWidgets import QMessageBox, QProgressDialog
-from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.webdriver import WebDriver as ChromeWebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -20,6 +22,32 @@ except Exception:
     is_probably_roblosecurity = None
     ROBLOSECURITY_COOKIE_NAME = ".ROBLOSECURITY"
     normalize_roblosecurity_cookie_value = None
+
+
+_LOGIN_SUCCESS_ROUTES = frozenset({"home", "discover", "games", "catalog", "avatar"})
+_ROBLOX_LOCALE_SEGMENT = re.compile(r"^[a-z]{2,3}(?:-[a-z]{2})?$", re.IGNORECASE)
+
+
+def _is_roblox_login_success_url(url: str) -> bool:
+    """Return whether URL is a Roblox page users can reach after logging in."""
+    try:
+        parsed = urlsplit(str(url or "").strip())
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if hostname != "roblox.com" and not hostname.endswith(".roblox.com"):
+            return False
+
+        segments = [segment.lower() for segment in parsed.path.split("/") if segment]
+        if not segments:
+            return True
+
+        route_index = 1 if _ROBLOX_LOCALE_SEGMENT.fullmatch(segments[0]) else 0
+        return (
+            route_index < len(segments)
+            and segments[route_index] in _LOGIN_SUCCESS_ROUTES
+        )
+    except (TypeError, ValueError):
+        return False
+
 
 class CookieExtractionThread(QThread):
 
@@ -71,7 +99,7 @@ class CookieExtractionThread(QThread):
             options.add_argument("--window-size=1200,800")
 
             # Let Selenium Manager pick the correct ChromeDriver for your Chrome 142
-            self.driver = webdriver.Chrome(options=options)
+            self.driver = ChromeWebDriver(options=options)
 
             self.driver.implicitly_wait(10)
             self.driver.set_page_load_timeout(30)
@@ -118,20 +146,7 @@ class CookieExtractionThread(QThread):
                     consecutive_same_url_count = 0
                     last_url = current_url
 
-                login_success_indicators = [
-                    "roblox.com/home",
-                    "roblox.com/discover",
-                    "roblox.com/games",
-                    "roblox.com/catalog",
-                    "roblox.com/avatar"
-                ]
-
-                is_logged_in = ("login" not in current_url and
-                               "roblox.com" in current_url and
-                               any(indicator in current_url for indicator in login_success_indicators))
-
-                if not is_logged_in and current_url == "https://www.roblox.com/":
-                    is_logged_in = True
+                is_logged_in = _is_roblox_login_success_url(current_url)
 
                 if is_logged_in:
                     self.status_update.emit("Login detected! Verifying authentication...")
@@ -325,7 +340,7 @@ class BrowserLaunchThread(QThread):
             options.add_argument(f"--user-data-dir={profile_dir}")
 
         try:
-            self.driver = webdriver.Chrome(options=options)
+            self.driver = ChromeWebDriver(options=options)
         except WebDriverException as e:
             msg = str(e)
             # If the user-data-dir is locked (Chrome already open), fall back to a temp profile.
@@ -340,7 +355,7 @@ class BrowserLaunchThread(QThread):
                 except Exception:
                     pass
                 options2.add_argument(f"--user-data-dir={tmp_dir}")
-                self.driver = webdriver.Chrome(options=options2)
+                self.driver = ChromeWebDriver(options=options2)
             else:
                 raise
 
@@ -491,6 +506,49 @@ class CookieExtractor(QObject):
 
         if self.callback:
             self.callback(None)
+
+    def shutdown(self, timeout_ms: int = 5000) -> bool:
+        ok = True
+        try:
+            if self.progress_dialog:
+                self.progress_dialog.close()
+        except Exception:
+            pass
+
+        thread = self.extraction_thread
+        if thread is not None:
+            try:
+                thread.stop_extraction()
+            except Exception:
+                pass
+            try:
+                if thread.isRunning() and not thread.wait(max(0, int(timeout_ms))):
+                    ok = False
+            except Exception:
+                ok = False
+
+        for thread in list(getattr(self, "_browser_threads", []) or []):
+            try:
+                thread.stop()
+            except Exception:
+                pass
+            try:
+                if thread.isRunning() and not thread.wait(max(0, int(timeout_ms))):
+                    ok = False
+            except Exception:
+                ok = False
+
+        for driver in list(getattr(self, "_browser_drivers", []) or []):
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            try:
+                self._browser_drivers.remove(driver)
+            except Exception:
+                pass
+
+        return ok
 
     def open_logged_in_browser_async(
         self,

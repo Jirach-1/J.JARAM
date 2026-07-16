@@ -335,6 +335,14 @@ class DiscordBotService:
                 text = f"{row_number}. {name}" if row_number > 0 else name
             return text if len(text) <= 100 else f"{text[:97]}..."
 
+        def _psl_place_choice_name(entry: Dict[str, Any]) -> str:
+            text = str(entry.get("choice_name") or "").strip()
+            if not text:
+                place_id = str(entry.get("place_id") or "").strip()
+                name = str(entry.get("name") or "").strip()
+                text = f"{name} ({place_id})" if name and place_id else (place_id or name)
+            return text if len(text) <= 100 else f"{text[:97]}..."
+
         async def _account_autocomplete(
             interaction: Any,
             current: str,
@@ -401,6 +409,40 @@ class DiscordBotService:
                 )
             return choices[:25]
 
+        async def _psl_place_id_autocomplete(interaction: Any, current: str) -> List[Any]:
+            if not _author_is_admin(interaction.user):
+                return []
+
+            namespace = getattr(interaction, "namespace", None)
+            account_ref = str(getattr(namespace, "account", "") or "").strip()
+            payload: Dict[str, Any] = {
+                "type": "autocomplete_psl_place_ids",
+                "query": str(current or "").strip(),
+                "limit": 25,
+                "account_ref": account_ref,
+            }
+
+            response = service._request(payload, timeout=5.0)
+            if not response.get("ok", False):
+                return []
+
+            choices: List[Any] = []
+            seen_values = set()
+            for entry in response.get("places") or []:
+                if not isinstance(entry, dict):
+                    continue
+                value = str(entry.get("place_id") or "").strip()
+                if not value or value in seen_values:
+                    continue
+                seen_values.add(value)
+                choices.append(
+                    discord.app_commands.Choice(
+                        name=_psl_place_choice_name(entry),
+                        value=value[:100],
+                    )
+                )
+            return choices[:25]
+
         async def _admin_account_autocomplete(interaction: Any, current: str) -> List[Any]:
             if not _author_is_admin(interaction.user):
                 return []
@@ -457,7 +499,7 @@ class DiscordBotService:
                     [
                         "/clearflags <account>",
                         "/restartall",
-                        "/psl <account>",
+                        "/psl <account> [place_id] [game_slug] [server_name] [estimated_value] [only_without_private_server_link]",
                         "/block <account> <target>",
                         "/unblock <account> <target>",
                         "",
@@ -642,15 +684,20 @@ class DiscordBotService:
         @bot.tree.command(name="psl", description="Run private server link grabber for one JARAM account")
         @discord.app_commands.describe(
             account="JARAM user ID or exact username",
+            place_id="Optional Roblox place ID or game URL to use instead of the account place",
             game_slug="Optional Roblox game URL slug for the generated link",
             server_name="Optional VIP server name template; supports {username}, {uid}, and {ts}",
             estimated_value="Optional expected Robux price, usually 0",
             only_without_private_server_link="Skip the account when it already has a private server link",
         )
-        @discord.app_commands.autocomplete(account=_admin_account_autocomplete)
+        @discord.app_commands.autocomplete(
+            account=_admin_account_autocomplete,
+            place_id=_psl_place_id_autocomplete,
+        )
         async def jaram_psl(
             interaction: Any,
             account: str,
+            place_id: Optional[str] = None,
             game_slug: Optional[str] = None,
             server_name: Optional[str] = None,
             estimated_value: Optional[int] = None,
@@ -665,6 +712,7 @@ class DiscordBotService:
                 {
                     "type": "grab_private_server_link",
                     "account_ref": str(account or "").strip(),
+                    "place_id": str(place_id or "").strip(),
                     "game_slug": str(game_slug or "").strip(),
                     "server_name": str(server_name or "").strip(),
                     "estimated_value": estimated_value,

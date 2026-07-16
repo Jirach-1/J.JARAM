@@ -551,12 +551,21 @@ class MultiScopeProcessProxy:
         out = self._rpc("get_merchants_found_counts", window_seconds, timeout_s=0.25)
         return out if isinstance(out, dict) else {"counts": {}, "total": 0, "window_seconds": window_seconds}
 
-    def recover_user_log_tracking(self, uid: str) -> bool:
+    def recover_user_log_tracking(
+        self,
+        uid: str,
+        process_created_at: Optional[float] = None,
+    ) -> bool:
         uid_s = str(uid or "").strip()
         if not uid_s:
             return False
         try:
-            out = self._rpc("recover_user_log_tracking", uid_s, timeout_s=1.0)
+            out = self._rpc(
+                "recover_user_log_tracking",
+                uid_s,
+                process_created_at=process_created_at,
+                timeout_s=1.0,
+            )
             return bool(out)
         except Exception:
             return False

@@ -59,7 +59,7 @@ except Exception:
     WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
 
 
-APP_FOOTER = "J.JARAM JX 2x60"
+APP_FOOTER = "J.JARAM JX 2x71"
 HARD_EVERYONE_BIOMES = {"GLITCHED", "DREAMSPACE", "CYBERSPACE"}
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
@@ -92,11 +92,29 @@ def _normalize_user_filter_mode(value: object) -> str:
     return "whitelist"
 
 # Parse [BloxstrapRPC] JSON blobs strictly
+_LOG_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
 _R_RPC_MARK = "[BloxstrapRPC]"
 _R_JSON_START = re.compile(r"\{")
 
-def _extract_rpc_jsons_from_text(text: str) -> List[dict]:
-    out: List[dict] = []
+def _parse_log_ts_epoch(ts_text: str) -> Optional[float]:
+    try:
+        return float(datetime.fromisoformat(str(ts_text or "").replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+def _extract_log_ts_epoch_before(text: str, marker_index: int) -> Optional[float]:
+    try:
+        line_start = text.rfind("\n", 0, max(0, int(marker_index))) + 1
+        prefix = text[line_start:max(0, int(marker_index))]
+        m = _LOG_TS_RE.search(prefix)
+        if not m:
+            return None
+        return _parse_log_ts_epoch(m.group(0))
+    except Exception:
+        return None
+
+def _extract_rpc_entries_from_text(text: str) -> List[Tuple[dict, Optional[float]]]:
+    out: List[Tuple[dict, Optional[float]]] = []
     start = 0
     while True:
         i = text.find(_R_RPC_MARK, start)
@@ -126,15 +144,21 @@ def _extract_rpc_jsons_from_text(text: str) -> List[dict]:
                 end = len(text)
 
         blob = text[j:end]
+        rpc = None
         try:
-            out.append(json.loads(blob))
+            rpc = json.loads(blob)
         except Exception:
             try:
-                out.append(json.loads(blob.replace("'", '"')))
+                rpc = json.loads(blob.replace("'", '"'))
             except Exception:
                 pass
+        if isinstance(rpc, dict):
+            out.append((rpc, _extract_log_ts_epoch_before(text, i)))
         start = i + len(_R_RPC_MARK)
     return out
+
+def _extract_rpc_jsons_from_text(text: str) -> List[dict]:
+    return [rpc for rpc, _ts in _extract_rpc_entries_from_text(text)]
 
 def _extract_biome_from_rpc(rpc: dict) -> Optional[str]:
     """STRICT: use data.largeImage.hoverText only."""
@@ -278,7 +302,7 @@ def _iter_merchant_matches(text: str, mode: object) -> List[dict]:
 # Biome RPC lines - anchor timestamp exactly like merchants
 BIOME_RPC_RE = re.compile(
     r"^(?P<full_line>"
-    r"(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z)"
+    r"(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z)"
     r".*?\[BloxstrapRPC\]\s*(?P<json>\{.*?\})"
     r")$",
     re.IGNORECASE | re.MULTILINE
@@ -647,6 +671,8 @@ class ServerScope:
     last_merchant_ts: float = 0.0
     in_menu: Optional[bool] = None  # unknown until proven otherwise
     last_menu_ts: float = 0.0
+    in_menu_by_uid: Dict[str, Optional[bool]] = field(default_factory=dict)
+    last_menu_ts_by_uid: Dict[str, float] = field(default_factory=dict)
     events: int = 0
 
     # NEW: scheduling state
@@ -784,7 +810,7 @@ class MultiScopeEngine:
         self._ensure_found_stats_catalog()
 
         # -- Tailer pool / concurrency -----------------------------------------
-        self._max_workers = 32                      # tune: 24-32 recommended
+        self._max_workers = 50                      # tune: 24-32 recommended
         self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
         self._inflight = set()                      # uids currently being tailed
         self._inflight_lock = threading.Lock()
@@ -806,6 +832,7 @@ class MultiScopeEngine:
         self._menu_unknown_log_by_uid: Dict[str, str] = {}
         # Disconnect fallback: if in_menu stays unknown too long, recycle that user.
         self._menu_none_since_by_uid: Dict[str, float] = {}
+        self._menu_none_timeout_since_by_uid: Dict[str, float] = {}
         self._menu_none_disconnect_fired_by_uid: Set[str] = set()
         
         # NEW: per-biome notifier modes (biome -> "None" | "Message" | "Everyone")
@@ -820,7 +847,7 @@ class MultiScopeEngine:
         self._lock_forced_biomes: Set[str] = set()
 
         self._temp_block_sessions = {}  # uid -> expiry epoch (simple gate)
-        self._temp_block_disabled: bool = False
+        self._temp_block_disabled: bool = True
 
         # init watcher if available
         if WDObserver is not None:
@@ -1382,6 +1409,8 @@ class MultiScopeEngine:
                     | set(self._normpath_by_uid.keys())
                     | set(self._ignored_logs_by_uid.keys())
                     | set(self._menu_unknown_log_by_uid.keys())
+                    | set(self._menu_none_since_by_uid.keys())
+                    | set(self._menu_none_timeout_since_by_uid.keys())
                     | set(self._last_disconnect_sig_by_uid.keys())
                 )
                 if str(uid) not in user_ids_set
@@ -1391,6 +1420,8 @@ class MultiScopeEngine:
                 self._normpath_by_uid.pop(uid, None)
                 self._ignored_logs_by_uid.pop(uid, None)
                 self._menu_unknown_log_by_uid.pop(uid, None)
+                self._menu_none_since_by_uid.pop(uid, None)
+                self._menu_none_timeout_since_by_uid.pop(uid, None)
                 self._last_disconnect_sig_by_uid.pop(uid, None)
                 try:
                     if hasattr(self, "_last_switch_ts"):
@@ -1628,29 +1659,36 @@ class MultiScopeEngine:
 
         # seed last biome for scope (no notify) + do NOT set scope.last_biome,
         # so the first live RPC will emit a START normally.
-        rpcs = _extract_rpc_jsons_from_text(chunk)
-        if rpcs:
-            last = _extract_biome_from_rpc(rpcs[-1])
+        rpc_entries = _extract_rpc_entries_from_text(chunk)
+        if rpc_entries:
+            last = _extract_biome_from_rpc(rpc_entries[-1][0])
             if last:
                 key = self._server_key_for(uid)
                 self._scope(key).users.add(uid)
             latest_state = None
-            for rpc in rpcs:
+            latest_menu_ts: Optional[float] = None
+            for rpc, ts_epoch in rpc_entries:
                 st = _extract_in_menu_from_rpc(rpc)
-                if st is not None:
+                if st is not None and ts_epoch is not None:
+                    if latest_menu_ts is None or float(ts_epoch) >= float(latest_menu_ts):
+                        latest_state = st
+                        latest_menu_ts = float(ts_epoch)
+                elif st is not None and latest_menu_ts is None:
                     latest_state = st
-            if (not disconnect_hit) and latest_state is not None:
+            if (not disconnect_hit) and latest_state is not None and latest_menu_ts is not None:
                 key = self._server_key_for(uid)
                 scope = self._scope(key)
                 scope.in_menu = latest_state
-                scope.last_menu_ts = time.time()
+                scope.last_menu_ts = float(latest_menu_ts)
+                scope.in_menu_by_uid[str(uid)] = latest_state
+                scope.last_menu_ts_by_uid[str(uid)] = float(scope.last_menu_ts or 0.0)
                 try:
-                    self._log(f"[SCAN-TRACE] {uid}: warmstart in_menu={latest_state} server={key}")
+                    self._log(f"[SCAN-TRACE] {uid}: warmstart in_menu={latest_state} menu_ts={scope.last_menu_ts:.3f} server={key}")
                 except Exception:
                     pass
             else:
                 try:
-                    self._log(f"[SCAN-TRACE] {uid}: warmstart no in_menu found rpc={len(rpcs)}")
+                    self._log(f"[SCAN-TRACE] {uid}: warmstart no timestamped in_menu found rpc={len(rpc_entries)}")
                 except Exception:
                     pass
 
@@ -1669,6 +1707,8 @@ class MultiScopeEngine:
             key = self._server_key_for(uid)
             scope = self._scope(key)
             scope.in_menu = None
+            scope.in_menu_by_uid[str(uid)] = None
+            scope.last_menu_ts_by_uid[str(uid)] = 0.0
             scope.users.add(uid)
         except Exception:
             pass
@@ -1686,7 +1726,11 @@ class MultiScopeEngine:
         except Exception:
             pass
 
-    def recover_user_log_tracking(self, uid: str) -> bool:
+    def recover_user_log_tracking(
+        self,
+        uid: str,
+        process_created_at: Optional[float] = None,
+    ) -> bool:
         """
         Best-effort recovery path for a live user whose strict username->log match
         has reappeared after a disconnect. This clears stale detach state and
@@ -1696,12 +1740,33 @@ class MultiScopeEngine:
         if not uid_s:
             return False
 
+        # Recovery can run over RPC before the next status tick arrives. Seed
+        # the new PID time immediately so its warmstart cannot act on a
+        # disconnect from the process that was just replaced.
+        try:
+            created_at = float(process_created_at or 0.0)
+        except Exception:
+            created_at = 0.0
+        if created_at > 0.0:
+            try:
+                snapshot = dict(self._status_snapshot or {})
+                current_status = dict(snapshot.get(uid_s) or {})
+                current_status["process_created_at"] = created_at
+                snapshot[uid_s] = current_status
+                self._status_snapshot = snapshot
+            except Exception:
+                pass
+
         try:
             self._ignored_logs_by_uid.pop(uid_s, None)
         except Exception:
             pass
         try:
             self._menu_none_since_by_uid.pop(uid_s, None)
+        except Exception:
+            pass
+        try:
+            self._menu_none_timeout_since_by_uid.pop(uid_s, None)
         except Exception:
             pass
         try:
@@ -1796,16 +1861,19 @@ class MultiScopeEngine:
         except Exception:
             pass
 
+        last_start: Optional[int] = None
         last_end: Optional[int] = None
         last_payload = "detected in log"
 
         def _consider(match, payload: str) -> None:
-            nonlocal last_end, last_payload
+            nonlocal last_start, last_end, last_payload
             try:
+                start = int(match.start())
                 end = int(match.end())
             except Exception:
                 return
             if last_end is None or end >= last_end:
+                last_start = start
                 last_end = end
                 last_payload = payload
 
@@ -1830,7 +1898,7 @@ class MultiScopeEngine:
         except Exception:
             pass
 
-        if last_end is None:
+        if last_start is None or last_end is None:
             return False
 
         norm_path = ""
@@ -1847,6 +1915,19 @@ class MultiScopeEngine:
 
         prev = self._last_disconnect_sig_by_uid.get(str(uid))
         if prev and prev[0] == norm_path and abs_end <= int(prev[1]):
+            return False
+
+        # A warmstart can include a disconnect left in the log by the previous
+        # Roblox process. Only let a timestamped line affect the process that
+        # was alive when (or before) that line was written.
+        disconnect_ts = _extract_log_ts_epoch_before(text, last_start)
+        process_created_at = self._process_created_at_for_disconnect(uid)
+        if (
+            disconnect_ts is not None
+            and process_created_at is not None
+            and disconnect_ts < process_created_at
+        ):
+            self._last_disconnect_sig_by_uid[str(uid)] = (norm_path, abs_end)
             return False
 
         self._last_disconnect_sig_by_uid[str(uid)] = (norm_path, abs_end)
@@ -1919,6 +2000,9 @@ class MultiScopeEngine:
         return False
 
     def _maybe_start_temp_block(self, uid: str, reason: str):
+        if self._temp_block_disabled:
+            return
+
         now = time.time()
         exp = self._temp_block_sessions.get(uid, 0)
         if exp > now:
@@ -2471,32 +2555,39 @@ class MultiScopeEngine:
                     latest_ts = float(dt.timestamp())
                     latest_biome = str(biome_name).upper()
 
-            # Fallback: parse any RPC blobs even if the regex missed them (no timestamp)
+            # Fallback: parse any RPC blobs even if the regex missed them, keeping
+            # the timestamp from the containing log line when available.
             if latest_menu_ts is None or latest_ts is None or not latest_biome:
                 try:
-                    fallback_rpcs = _extract_rpc_jsons_from_text(parse_text)
+                    fallback_entries = _extract_rpc_entries_from_text(parse_text)
                 except Exception:
-                    fallback_rpcs = []
-                if fallback_rpcs:
+                    fallback_entries = []
+                if fallback_entries:
                     try:
-                        fallback_count = int(len(fallback_rpcs))
-                        if isinstance(fallback_rpcs[-1], dict):
-                            fallback_sample = fallback_rpcs[-1]
+                        fallback_count = int(len(fallback_entries))
+                        if isinstance(fallback_entries[-1][0], dict):
+                            fallback_sample = fallback_entries[-1][0]
                     except Exception:
                         fallback_count = 0
                         fallback_sample = None
-                    now_f = time.time()
-                    for rpc in fallback_rpcs:
-                        if latest_menu_ts is None:
+                    need_menu_fallback = latest_menu_ts is None
+                    need_biome_fallback = latest_ts is None or not latest_biome
+                    for rpc, ts_epoch in fallback_entries:
+                        if ts_epoch is None:
+                            continue
+                        ts_f = float(ts_epoch)
+                        if need_menu_fallback:
                             ms = _extract_in_menu_from_rpc(rpc)
                             if ms is not None:
-                                latest_menu_ts = now_f
-                                latest_menu_flag = ms
-                        if latest_ts is None or not latest_biome:
+                                if latest_menu_ts is None or ts_f >= float(latest_menu_ts):
+                                    latest_menu_ts = ts_f
+                                    latest_menu_flag = ms
+                        if need_biome_fallback:
                             b = _extract_biome_from_rpc(rpc)
                             if b:
-                                latest_ts = now_f
-                                latest_biome = str(b).upper()
+                                if latest_ts is None or ts_f >= float(latest_ts):
+                                    latest_ts = ts_f
+                                    latest_biome = str(b).upper()
 
             if not disconnect_hit:
                 if latest_menu_ts is not None:
@@ -2509,6 +2600,8 @@ class MultiScopeEngine:
                                 self._log(f"[SCAN-TRACE] {uid}: in_menu={scope.in_menu} server={server_key}")
                             except Exception:
                                 pass
+                    scope.in_menu_by_uid[str(uid)] = latest_menu_flag
+                    scope.last_menu_ts_by_uid[str(uid)] = float(latest_menu_ts or 0.0)
                     scope.users.add(uid)
                     self._clear_menu_unknown(uid)
                 else:
@@ -2621,6 +2714,7 @@ class MultiScopeEngine:
                         self._mark_menu_unknown(uid)
                         self._drop_user_log_tracking(uid, ignore_current=True)
                         self._menu_none_since_by_uid.pop(uid, None)
+                        self._menu_none_timeout_since_by_uid.pop(uid, None)
                         self._menu_none_disconnect_fired_by_uid.discard(uid)
                         continue
 
@@ -2634,6 +2728,7 @@ class MultiScopeEngine:
                     # Only apply while the user is actually running.
                     if not pids:
                         self._menu_none_since_by_uid.pop(uid, None)
+                        self._menu_none_timeout_since_by_uid.pop(uid, None)
                         self._menu_none_disconnect_fired_by_uid.discard(uid)
                         continue
 
@@ -2652,18 +2747,46 @@ class MultiScopeEngine:
 
                         if not has_user_log:
                             self._menu_none_since_by_uid.pop(uid, None)
+                            self._menu_none_timeout_since_by_uid.pop(uid, None)
                             self._menu_none_disconnect_fired_by_uid.discard(uid)
                         else:
                             since = self._menu_none_since_by_uid.get(uid)
                             if since is None:
                                 self._menu_none_since_by_uid[uid] = now_t
-                            elif (now_t - since) >= 120.0 and uid not in self._menu_none_disconnect_fired_by_uid:
-                                self._mark_menu_unknown(uid)
-                                self._drop_user_log_tracking(uid, ignore_current=True)
-                                self._emit_event("disconnect", uid, "in_menu_none_timeout=120")
-                                self._menu_none_disconnect_fired_by_uid.add(uid)
+                                self._menu_none_timeout_since_by_uid.pop(uid, None)
+                            else:
+                                try:
+                                    initial_ready_at = float(since) + 30.0
+                                except Exception:
+                                    initial_ready_at = now_t + 30.0
+
+                                if now_t < initial_ready_at:
+                                    self._menu_none_timeout_since_by_uid.pop(uid, None)
+                                else:
+                                    try:
+                                        antiafk_ts = float(st.get("antiafk_last_action_at", 0.0) or 0.0)
+                                    except Exception:
+                                        antiafk_ts = 0.0
+
+                                    if antiafk_ts < initial_ready_at:
+                                        self._menu_none_timeout_since_by_uid.pop(uid, None)
+                                    else:
+                                        timeout_since = self._menu_none_timeout_since_by_uid.get(uid)
+                                        if timeout_since is None:
+                                            timeout_since = max(float(initial_ready_at), float(antiafk_ts))
+                                            self._menu_none_timeout_since_by_uid[uid] = timeout_since
+
+                                        if (
+                                            (now_t - float(timeout_since)) >= 60.0
+                                            and uid not in self._menu_none_disconnect_fired_by_uid
+                                        ):
+                                            self._mark_menu_unknown(uid)
+                                            self._drop_user_log_tracking(uid, ignore_current=True)
+                                            self._emit_event("disconnect", uid, "in_menu_none_timeout=60")
+                                            self._menu_none_disconnect_fired_by_uid.add(uid)
                     else:
                         self._menu_none_since_by_uid.pop(uid, None)
+                        self._menu_none_timeout_since_by_uid.pop(uid, None)
                         self._menu_none_disconnect_fired_by_uid.discard(uid)
             except Exception:
                 pass
@@ -2695,6 +2818,11 @@ class MultiScopeEngine:
             now_t = time.time()
             for key, scope in list(self._scopes.items()):
                 scope.users = {u for u in scope.users if self._server_key_for(u) == key}
+                try:
+                    scope.in_menu_by_uid = {str(u): v for u, v in (scope.in_menu_by_uid or {}).items() if str(u) in scope.users}
+                    scope.last_menu_ts_by_uid = {str(u): float(v or 0.0) for u, v in (scope.last_menu_ts_by_uid or {}).items() if str(u) in scope.users}
+                except Exception:
+                    pass
                 quiet = (now_t - max(scope.last_biome_ts, scope.last_merchant_ts, 0)) > 600
                 if not scope.users and quiet:
                     self._scopes.pop(key, None)
@@ -2733,6 +2861,20 @@ class MultiScopeEngine:
                         "last_merchant_ts": float(getattr(s, "last_merchant_ts", 0.0) or 0.0),
                         "in_menu": (None if getattr(s, "in_menu", None) is None else bool(getattr(s, "in_menu", None))),
                         "last_menu_ts": float(getattr(s, "last_menu_ts", 0.0) or 0.0),
+                        "in_menu_by_uid": {
+                            str(u): (
+                                None
+                                if (getattr(s, "in_menu_by_uid", {}) or {}).get(str(u), None) is None
+                                else bool((getattr(s, "in_menu_by_uid", {}) or {}).get(str(u), None))
+                            )
+                            for u in users
+                            if str(u) in (getattr(s, "in_menu_by_uid", {}) or {})
+                        },
+                        "last_menu_ts_by_uid": {
+                            str(u): float((getattr(s, "last_menu_ts_by_uid", {}) or {}).get(str(u), 0.0) or 0.0)
+                            for u in users
+                            if str(u) in (getattr(s, "last_menu_ts_by_uid", {}) or {})
+                        },
                         "events": int(getattr(s, "events", 0) or 0),
                         "next_tail_at": float(getattr(s, "next_tail_at", 0.0) or 0.0),
                         "poll_rot": int(getattr(s, "poll_rot", 0) or 0),
@@ -2871,6 +3013,33 @@ class MultiScopeEngine:
                         pass
                     try:
                         scope.last_menu_ts = float(raw.get("last_menu_ts", scope.last_menu_ts) or 0.0)
+                    except Exception:
+                        pass
+                    try:
+                        menu_map = raw.get("in_menu_by_uid") or {}
+                        if isinstance(menu_map, dict):
+                            out = {}
+                            for map_uid, map_val in menu_map.items():
+                                uid_s = str(map_uid)
+                                if scope.users and uid_s not in scope.users:
+                                    continue
+                                out[uid_s] = None if map_val is None else bool(map_val)
+                            scope.in_menu_by_uid = out
+                    except Exception:
+                        pass
+                    try:
+                        ts_map = raw.get("last_menu_ts_by_uid") or {}
+                        if isinstance(ts_map, dict):
+                            out_ts = {}
+                            for map_uid, map_ts in ts_map.items():
+                                uid_s = str(map_uid)
+                                if scope.users and uid_s not in scope.users:
+                                    continue
+                                try:
+                                    out_ts[uid_s] = float(map_ts or 0.0)
+                                except Exception:
+                                    out_ts[uid_s] = 0.0
+                            scope.last_menu_ts_by_uid = out_ts
                     except Exception:
                         pass
                     try:
@@ -3020,11 +3189,28 @@ class MultiScopeEngine:
         now_t = time.time()
         for key, s in sorted(self._scopes.items(), key=lambda kv: kv[0]):
             server_label = self._display_server_label(key)
+            users = sorted(list(s.users))
+            in_menu_by_uid = {}
+            last_menu_ts_by_uid = {}
+            try:
+                for uid in users:
+                    uid_s = str(uid)
+                    if uid_s in (s.in_menu_by_uid or {}):
+                        val = (s.in_menu_by_uid or {}).get(uid_s, None)
+                        in_menu_by_uid[uid_s] = None if val is None else bool(val)
+                    if uid_s in (s.last_menu_ts_by_uid or {}):
+                        last_menu_ts_by_uid[uid_s] = float((s.last_menu_ts_by_uid or {}).get(uid_s, 0.0) or 0.0)
+            except Exception:
+                in_menu_by_uid = {}
+                last_menu_ts_by_uid = {}
             out.append({
                 "server": server_label,
                 "server_key": key,
-                "users": sorted(list(s.users)),
+                "users": users,
                 "in_menu": s.in_menu,
+                "last_menu_ts": float(getattr(s, "last_menu_ts", 0.0) or 0.0),
+                "in_menu_by_uid": in_menu_by_uid,
+                "last_menu_ts_by_uid": last_menu_ts_by_uid,
                 "last_biome": s.last_biome or "",
                 "biome_age": int(now_t - s.last_biome_ts) if s.last_biome_ts else None,
                 "last_merchant": s.last_merchant or "",
@@ -3083,6 +3269,21 @@ class MultiScopeEngine:
         # If the user was active recently, still allow the lookback (disconnect may have been written
         # before we switched to the newest log file, or after the PID already died).
         return bool(last_active and (now_t - last_active) <= 180.0)
+
+    def _process_created_at_for_disconnect(self, uid: str) -> Optional[float]:
+        """Return the newest live process creation time supplied by the manager."""
+        try:
+            st = (self._status_snapshot or {}).get(str(uid))
+        except Exception:
+            st = None
+        if not isinstance(st, dict):
+            return None
+
+        try:
+            created_at = float(st.get("process_created_at", 0.0) or 0.0)
+        except Exception:
+            created_at = 0.0
+        return created_at if created_at > 0.0 else None
     
     def _scope_dedupe_merchant_ts(self, scope_key: str, merchant: str, ts_epoch: float, window: float = 2.0) -> bool:
         """

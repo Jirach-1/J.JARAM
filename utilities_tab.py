@@ -17,7 +17,7 @@ import requests
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QLineEdit,
-    QPushButton, QPlainTextEdit, QCheckBox, QLabel, QScrollArea,
+    QPushButton, QPlainTextEdit, QCheckBox, QLabel, QScrollArea, QComboBox,
     QDialog, QProgressBar, QSizePolicy
 )
 
@@ -54,6 +54,9 @@ def _block_log_path() -> str:
 def _persistent_blocklist_path() -> str:
     return os.path.join(_appdata_dir(), "users_to_block.txt")
 
+def _settings_json_path() -> str:
+    return os.path.join(_appdata_dir(), "settings.json")
+
 # ---------------- Files ----------------
 def _load_json(path: str, default):
     try:
@@ -65,10 +68,18 @@ def _load_json(path: str, default):
         return default
 
 def _save_json(path: str, obj) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2)
-    os.replace(tmp, path)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+        raise
 
 _CONFIG_MANAGER = None
 
@@ -91,6 +102,23 @@ def _save_users(users: Dict[str, Any]) -> bool:
         except Exception:
             return False
     _save_json(_users_json_path(), users)
+    return True
+
+def _load_settings() -> Dict[str, Any]:
+    if _CONFIG_MANAGER is not None:
+        try:
+            return _CONFIG_MANAGER.load_settings() or {}
+        except Exception:
+            return {}
+    return _load_json(_settings_json_path(), {})
+
+def _save_settings(settings: Dict[str, Any]) -> bool:
+    if _CONFIG_MANAGER is not None:
+        try:
+            return bool(_CONFIG_MANAGER.save_settings(settings))
+        except Exception:
+            return False
+    _save_json(_settings_json_path(), settings)
     return True
 
 
@@ -192,19 +220,19 @@ def _coerce_targets_to_ids_and_names(lines: List[str], username_cache: Dict[str,
     return sorted(ids), id_to_raw, unresolved
 
 # ---------------- Selenium session ----------------
-from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.webdriver import WebDriver as ChromeWebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-def _make_driver(cookie: str, headless: bool) -> webdriver.Chrome:
+def _make_driver(cookie: str, headless: bool) -> ChromeWebDriver:
     opts = Options()
     if headless:
         opts.add_argument("--headless=new")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--start-maximized")
-    d = webdriver.Chrome(options=opts)
+    d = ChromeWebDriver(options=opts)
     d.get("https://www.roblox.com/")
     d.add_cookie({
         "name": ".ROBLOSECURITY",
@@ -672,8 +700,165 @@ def _api_unblock_user(session: requests.Session, cookie: str, target_user_id: st
 # ---------------- PSL helpers ----------------
 _PSL_PRIVATE_SERVERS_URL = "https://games.roblox.com/v1/games/{place_id}/private-servers"
 _PSL_UNIVERSE_URL = "https://apis.roblox.com/universes/v1/places/{place_id}/universe"
+_PSL_GAME_INFO_URL = "https://games.roblox.com/v1/games"
 _PSL_CREATE_URL = "https://games.roblox.com/v1/games/vip-servers/{universe_id}"
 _PSL_VIP_SERVER_URL = "https://games.roblox.com/v1/vip-servers/{vip_server_id}"
+_PSL_PLACE_ID_HISTORY_LIMIT = 20
+
+
+def _clean_psl_place_name(name: Any) -> str:
+    return re.sub(r"\s+", " ", str(name or "")).strip()[:100]
+
+
+def _extract_place_id_from_text(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.isdigit():
+        return raw
+    match = re.search(r"(?:/games/|placeId=)(\d+)", raw)
+    if match:
+        return match.group(1)
+    match = re.search(r"\((\d{3,})\)\s*$", raw)
+    if match:
+        return match.group(1)
+    match = re.search(r"(\d{3,})(?!.*\d)", raw)
+    if match:
+        return match.group(1)
+    return raw
+
+
+def _normalize_psl_place_id_history(raw: Any) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if isinstance(item, dict):
+            place_id = _extract_place_id_from_text(item.get("place_id") or item.get("id") or item.get("placeId"))
+            name = _clean_psl_place_name(item.get("name") or item.get("place_name") or item.get("placeName"))
+        else:
+            place_id = _extract_place_id_from_text(item)
+            name = ""
+        if not place_id or place_id in seen:
+            continue
+        seen.add(place_id)
+        out.append({"place_id": place_id, "name": name})
+        if len(out) >= _PSL_PLACE_ID_HISTORY_LIMIT:
+            break
+    return out
+
+
+def _load_psl_place_id_history() -> List[Dict[str, str]]:
+    settings = _load_settings()
+    utilities = settings.get("utilities") if isinstance(settings, dict) else {}
+    utilities = utilities if isinstance(utilities, dict) else {}
+    raw = utilities.get("psl_place_id_history")
+    if raw is None:
+        raw = settings.get("psl_place_id_history") if isinstance(settings, dict) else []
+    return _normalize_psl_place_id_history(raw)
+
+
+def _save_psl_place_id_history(place_id: str, place_name: str = "") -> List[Dict[str, str]]:
+    place_id = _extract_place_id_from_text(place_id)
+    if not place_id:
+        return _load_psl_place_id_history()
+
+    settings = _load_settings()
+    if not isinstance(settings, dict):
+        settings = {}
+    utilities = settings.get("utilities")
+    if not isinstance(utilities, dict):
+        utilities = {}
+
+    existing = _normalize_psl_place_id_history(utilities.get("psl_place_id_history", []))
+    if not existing and isinstance(settings.get("psl_place_id_history"), list):
+        existing = _normalize_psl_place_id_history(settings.get("psl_place_id_history"))
+
+    known_name = ""
+    kept: List[Dict[str, str]] = []
+    for item in existing:
+        if item.get("place_id") == place_id:
+            known_name = item.get("name") or ""
+            continue
+        kept.append(item)
+
+    entry = {
+        "place_id": place_id,
+        "name": _clean_psl_place_name(place_name) or known_name,
+    }
+    history = [entry] + kept
+    history = history[:_PSL_PLACE_ID_HISTORY_LIMIT]
+    utilities["psl_place_id_history"] = history
+    settings["utilities"] = utilities
+    _save_settings(settings)
+    return history
+
+
+def _format_psl_place_history_label(item: Dict[str, str]) -> str:
+    place_id = str((item or {}).get("place_id") or "").strip()
+    name = _clean_psl_place_name((item or {}).get("name"))
+    return f"{name} ({place_id})" if name else place_id
+
+
+def _populate_psl_place_id_combo(
+    combo: QComboBox,
+    history: List[Dict[str, str]],
+    current_place_id: str = "",
+) -> None:
+    current_place_id = _extract_place_id_from_text(current_place_id)
+    combo.blockSignals(True)
+    try:
+        combo.clear()
+        for item in history:
+            place_id = str(item.get("place_id") or "").strip()
+            if not place_id:
+                continue
+            idx = combo.count()
+            combo.addItem(_format_psl_place_history_label(item), place_id)
+            combo.setItemData(idx, _format_psl_place_history_label(item), Qt.ItemDataRole.ToolTipRole)
+
+        if current_place_id:
+            for idx in range(combo.count()):
+                if str(combo.itemData(idx) or "") == current_place_id:
+                    combo.setCurrentIndex(idx)
+                    break
+            combo.setEditText(current_place_id)
+        elif combo.count() > 0:
+            combo.setCurrentIndex(0)
+            combo.setEditText(str(combo.itemData(0) or combo.itemText(0)))
+        else:
+            combo.setEditText("")
+    finally:
+        combo.blockSignals(False)
+
+
+def _lookup_roblox_place_name(place_id: str) -> str:
+    place_id = _extract_place_id_from_text(place_id)
+    if not place_id or not place_id.isdigit():
+        return ""
+    try:
+        r = requests.get(_PSL_UNIVERSE_URL.format(place_id=place_id), timeout=8)
+        if r.status_code != 200:
+            return ""
+        data = r.json() if r.content else {}
+        if not isinstance(data, dict):
+            return ""
+        universe_id = data.get("universeId") or data.get("universeID") or data.get("id")
+        universe_id = str(universe_id or "").strip()
+        if not universe_id:
+            return ""
+
+        r = requests.get(_PSL_GAME_INFO_URL, params={"universeIds": universe_id}, timeout=8)
+        if r.status_code != 200:
+            return ""
+        data = r.json() if r.content else {}
+        games = data.get("data") if isinstance(data, dict) else []
+        if not isinstance(games, list) or not games:
+            return ""
+        return _clean_psl_place_name((games[0] or {}).get("name"))
+    except Exception:
+        return ""
 
 
 def _compose_ps_link(place_id: str, link_code: str, slug: str) -> str:
@@ -876,9 +1061,9 @@ def _api_get_existing_vip_server_id(
     if not isinstance(servers, list) or not servers:
         return "", cookie
 
-    vip_server_id = _extract_vip_server_id(servers[0])
+    vip_server_id = _extract_vip_server_id(servers[-1])
     if not vip_server_id:
-        raise RuntimeError("Private server lookup returned a server without vipServerId.")
+        raise RuntimeError("Private server lookup returned a last server without vipServerId.")
     return vip_server_id, cookie
 
 
@@ -1565,7 +1750,20 @@ def build_utilities_widget(self) -> QWidget:
     # PSL Grabber group
     psl_grp = QGroupBox("Private Server Link Grabber")
     psl_form = QFormLayout(psl_grp)
-    self.psl_place_id = QLineEdit()
+    self.psl_place_id = QComboBox()
+    self.psl_place_id.setEditable(True)
+    self.psl_place_id.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+    self.psl_place_id.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    try:
+        self.psl_place_id.lineEdit().setPlaceholderText("Place ID")
+    except Exception:
+        pass
+    _populate_psl_place_id_combo(self.psl_place_id, _load_psl_place_id_history())
+    self.psl_place_id.activated.connect(
+        lambda idx: self.psl_place_id.setEditText(
+            str(self.psl_place_id.itemData(idx) or _extract_place_id_from_text(self.psl_place_id.itemText(idx)))
+        )
+    )
     self.psl_game_slug = QLineEdit()
     self.psl_name_tmpl = QLineEdit("JARAM-{username}-{ts}")
     self.psl_expected_price = QLineEdit("0")
@@ -1930,8 +2128,9 @@ def build_utilities_widget(self) -> QWidget:
             self.append_log("[PSL] Estimated Roblox Value must be a non-negative integer.")
             self.psl_expected_price.setFocus()
             return
+        place_id = _extract_place_id_from_text(self.psl_place_id.currentText())
         opts = _PSLOpts(
-            place_id=self.psl_place_id.text().strip(),
+            place_id=place_id,
             game_slug=self.psl_game_slug.text().strip(),
             name_template=self.psl_name_tmpl.text().strip() or "JARAM-{username}-{ts}",
             expected_price=expected_price,
@@ -1940,6 +2139,16 @@ def build_utilities_widget(self) -> QWidget:
         if not opts.place_id:
             self.append_log("[PSL] PLACE_ID is required.")
             return
+
+        history = _load_psl_place_id_history()
+        known_name = ""
+        for item in history:
+            if item.get("place_id") == opts.place_id:
+                known_name = item.get("name") or ""
+                break
+        place_name = known_name or _lookup_roblox_place_name(opts.place_id)
+        history = _save_psl_place_id_history(opts.place_id, place_name)
+        _populate_psl_place_id_combo(self.psl_place_id, history, opts.place_id)
 
         w = _PSLWorker(
             opts,
@@ -1970,3 +2179,20 @@ def build_utilities_widget(self) -> QWidget:
 def setup_UTILITIES_tab(self):
     tab = build_utilities_widget(self)
     self.tab_widget.addTab(tab, "Utilities")
+
+
+def shutdown_UTILITIES_tab(self, timeout_ms: int = 5000) -> bool:
+    worker = getattr(self, "_active_worker", None)
+    if worker is None:
+        return True
+    try:
+        if hasattr(worker, "cancel"):
+            worker.cancel()
+    except Exception:
+        pass
+    try:
+        if worker.isRunning():
+            return bool(worker.wait(max(0, int(timeout_ms))))
+    except Exception:
+        return False
+    return True

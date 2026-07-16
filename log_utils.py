@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 # Folder that Roblox writes its client logs to
-ROBLOX_LOGS_DIR = os.path.join(os.getenv("LOCALAPPDATA"), "Roblox", "logs")
+ROBLOX_LOGS_DIR = os.path.join(os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local"), "Roblox", "logs")
 
 # User-name marker ― exactly the same pattern detection.py relies on
 _PAT_LOAD_FAIL = re.compile(r"Players\.([^.]+)\.")

@@ -30,6 +30,57 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
     start method.
     """
     native = None
+    multi_instance_handle = None
+    multi_instance_last_error = 0
+
+    try:
+        _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _kernel32.CreateMutexW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        _kernel32.CreateMutexW.restype = wintypes.HANDLE
+        _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        _kernel32.CloseHandle.restype = wintypes.BOOL
+    except Exception:
+        _kernel32 = None
+
+    def _enable_multi_instance_guard() -> bool:
+        nonlocal multi_instance_handle, multi_instance_last_error
+        if multi_instance_handle:
+            multi_instance_last_error = 0
+            return True
+        if _kernel32 is None:
+            multi_instance_last_error = 1
+            return False
+        try:
+            ctypes.set_last_error(0)
+            handle = _kernel32.CreateMutexW(None, True, "ROBLOX_singletonEvent")
+            if not handle:
+                multi_instance_last_error = int(ctypes.get_last_error() or 0)
+                return False
+            multi_instance_handle = handle
+            multi_instance_last_error = 0
+            return True
+        except Exception:
+            multi_instance_last_error = int(ctypes.get_last_error() or 1)
+            return False
+
+    def _disable_multi_instance_guard() -> bool:
+        nonlocal multi_instance_handle, multi_instance_last_error
+        try:
+            if multi_instance_handle and _kernel32 is not None:
+                _kernel32.CloseHandle(multi_instance_handle)
+        except Exception:
+            pass
+        multi_instance_handle = None
+        multi_instance_last_error = 0
+        return True
+
+    def _refresh_multi_instance_guard() -> bool:
+        _disable_multi_instance_guard()
+        return _enable_multi_instance_guard()
 
     def _emit_status(message: Any) -> None:
         try:
@@ -159,7 +210,7 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
                 hold_s = 0.0
             res = _cb_rpc(
                 {"type": "bes_hold_unthrottled", "pids": pid_list, "seconds": float(max(0.0, hold_s))},
-                timeout_s=5.0,
+                timeout_s=1.0,
                 default=False,
             )
             return bool(res)
@@ -171,7 +222,7 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
                 pid_list = []
             if not pid_list:
                 return False
-            res = _cb_rpc({"type": "bes_release_hold", "pids": pid_list}, timeout_s=5.0, default=False)
+            res = _cb_rpc({"type": "bes_release_hold", "pids": pid_list}, timeout_s=1.0, default=False)
             return bool(res)
 
         try:
@@ -245,6 +296,7 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
                     continue
 
                 if cmd == "shutdown":
+                    _disable_multi_instance_guard()
                     if native is not None:
                         try:
                             native.shutdown()
@@ -261,8 +313,30 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
                     kwargs = msg.get("kwargs") or {}
                     name_s = str(name)
 
-                    fn = getattr(native, name_s)
-                    result = fn(*args, **kwargs)
+                    if name_s == "enable_multi_instance":
+                        result = _enable_multi_instance_guard()
+                    elif name_s == "disable_multi_instance":
+                        result = _disable_multi_instance_guard()
+                    elif name_s == "refresh_multi_instance":
+                        result = _refresh_multi_instance_guard()
+                    elif name_s == "multi_instance_guard_active":
+                        result = bool(multi_instance_handle)
+                    elif name_s == "multi_instance_last_error":
+                        result = int(multi_instance_last_error)
+                    elif name_s == "toggle_multi_instance":
+                        result = _enable_multi_instance_guard()
+                        try:
+                            native.config["multi_instance_enabled"] = bool(result)
+                        except Exception:
+                            pass
+                        _emit_status(
+                            "Multi-instance support enabled"
+                            if result
+                            else "Failed to enable multi-instance mutex"
+                        )
+                    else:
+                        fn = getattr(native, name_s)
+                        result = fn(*args, **kwargs)
                     _reply(True, result)
                     continue
 
@@ -275,6 +349,7 @@ def _antiafk_worker_main(cmd_conn, cb_conn, event_queue, initial_config: Optiona
                     pass
                 _reply(False, None, tb)
     finally:
+        _disable_multi_instance_guard()
         if native is not None:
             try:
                 native.shutdown()
@@ -326,6 +401,7 @@ class AntiAFK:
         self._event_queue = self._ctx.Queue()
 
         self._cmd_lock = threading.Lock()
+        self._rpc_seq: int = 0
         self._shutdown_event = threading.Event()
         self._proc = self._ctx.Process(
             target=_antiafk_worker_main,
@@ -357,15 +433,27 @@ class AntiAFK:
     def antiafk_running(self) -> bool:
         return bool(self._running and self._proc is not None and self._proc.is_alive())
 
-    def _rpc(self, cmd: str, **payload: Any) -> Any:
+    def _rpc(self, cmd: str, *, timeout_s: float = 30.0, **payload: Any) -> Any:
         if self._shutdown_event.is_set():
             raise RuntimeError("AntiAFK is shut down")
         if not self._proc.is_alive():
             raise RuntimeError("AntiAFK worker process is not running")
 
         with self._cmd_lock:
-            self._cmd_conn.send({"id": 0, "cmd": cmd, **payload})
-            resp = self._cmd_conn.recv()
+            self._rpc_seq = (int(self._rpc_seq) + 1) & 0x7FFFFFFF
+            if self._rpc_seq <= 0:
+                self._rpc_seq = 1
+            req_id = self._rpc_seq
+            deadline = time.monotonic() + max(0.1, float(timeout_s))
+
+            self._cmd_conn.send({"id": req_id, "cmd": cmd, **payload})
+            while True:
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0 or not self._cmd_conn.poll(remaining_s):
+                    raise TimeoutError(f"AntiAFK worker call timed out: {cmd}")
+                resp = self._cmd_conn.recv()
+                if isinstance(resp, dict) and resp.get("id") == req_id:
+                    break
 
         if not isinstance(resp, dict) or not resp.get("ok", False):
             err = None
@@ -494,69 +582,113 @@ class AntiAFK:
         unthrottle_enabled: Optional[bool] = None,
         unthrottle_batch_size: Optional[int] = None,
         unthrottle_lead_s: Optional[float] = None,
+        dev_mode: Optional[bool] = None,
     ) -> None:
         kwargs = {}
+        legacy_kwargs = {}
         extra_updates = {}
         if multi_instance_enabled is not None:
             kwargs["multi_instance_enabled"] = bool(multi_instance_enabled)
+            legacy_kwargs["multi_instance_enabled"] = bool(multi_instance_enabled)
             self.config["multi_instance_enabled"] = bool(multi_instance_enabled)
         if interval is not None:
-            kwargs["interval"] = int(interval)
-            self.config["antiafk_interval"] = int(interval)
+            v = max(5, min(3600, int(interval)))
+            kwargs["interval"] = v
+            legacy_kwargs["interval"] = v
+            self.config["antiafk_interval"] = v
         if action is not None:
-            kwargs["action"] = str(action)
-            self.config["antiafk_action"] = str(action)
+            action_s = str(action)
+            action_key = action_s.lower()
+            if action_key in ("space", "ws", "zoom"):
+                v = action_key
+            elif action_key in ("autoreconnect", "auto_reconnect", "auto-reconnect"):
+                v = "AutoReconnect"
+            else:
+                v = "space"
+            kwargs["action"] = v
+            legacy_kwargs["action"] = v
+            self.config["antiafk_action"] = v
         if alt_delay_ms is not None:
-            kwargs["alt_delay_ms"] = int(alt_delay_ms)
-            self.config["antiafk_alt_delay_ms"] = int(alt_delay_ms)
+            v = max(10, min(5000, int(alt_delay_ms)))
+            kwargs["alt_delay_ms"] = v
+            legacy_kwargs["alt_delay_ms"] = v
+            self.config["antiafk_alt_delay_ms"] = v
         if menu_autoreconnect is not None:
             kwargs["menu_autoreconnect"] = bool(menu_autoreconnect)
+            legacy_kwargs["menu_autoreconnect"] = bool(menu_autoreconnect)
             self.config["antiafk_menu_autoreconnect"] = bool(menu_autoreconnect)
         if alert_sound_enabled is not None:
             v = bool(alert_sound_enabled)
-            extra_updates["antiafk_alert_sound"] = v
+            kwargs["alert_sound_enabled"] = v
             self.config["antiafk_alert_sound"] = v
         if alert_tooltip_enabled is not None:
             v = bool(alert_tooltip_enabled)
-            extra_updates["antiafk_alert_tooltip"] = v
+            kwargs["alert_tooltip_enabled"] = v
             self.config["antiafk_alert_tooltip"] = v
         if alert_lead_s is not None:
             try:
-                v = max(0.0, float(alert_lead_s))
+                v = max(0.0, min(60.0, float(alert_lead_s)))
             except Exception:
                 v = 0.0
-            extra_updates["antiafk_alert_lead_s"] = v
+            kwargs["alert_lead_s"] = v
             self.config["antiafk_alert_lead_s"] = v
         if unthrottle_enabled is not None:
             v = bool(unthrottle_enabled)
-            extra_updates["antiafk_unthrottle_enabled"] = v
+            kwargs["unthrottle_enabled"] = v
             self.config["antiafk_unthrottle_enabled"] = v
         if unthrottle_batch_size is not None:
             try:
-                v = max(1, int(unthrottle_batch_size))
+                v = max(1, min(50, int(unthrottle_batch_size)))
             except Exception:
                 v = 5
-            extra_updates["antiafk_unthrottle_batch_size"] = v
+            kwargs["unthrottle_batch_size"] = v
             self.config["antiafk_unthrottle_batch_size"] = v
         if unthrottle_lead_s is not None:
             try:
-                v = max(0.0, float(unthrottle_lead_s))
+                v = max(0.0, min(15.0, float(unthrottle_lead_s)))
             except Exception:
                 v = 0.0
-            extra_updates["antiafk_unthrottle_lead_s"] = v
+            kwargs["unthrottle_lead_s"] = v
             self.config["antiafk_unthrottle_lead_s"] = v
+        if dev_mode is not None:
+            v = bool(dev_mode)
+            kwargs["dev_mode"] = v
+            legacy_kwargs["dev_mode"] = v
+            self.config["antiafk_dev_mode"] = v
 
         # Feature removals: keep host config clean.
         self.config.pop("antiafk_user_safe", None)
         self.config.pop("antiafk_sequential_mode", None)
         self.config.pop("antiafk_sequential_delay", None)
 
-        self._call("apply_host_config", **kwargs)
         if extra_updates:
             try:
                 self._rpc("update_config", updates=extra_updates)
             except Exception:
                 pass
+        try:
+            self._call("apply_host_config", **kwargs)
+        except Exception:
+            # Compatibility for an older native module that has not been rebuilt yet.
+            fallback_updates = {
+                k: self.config[k]
+                for k in (
+                    "antiafk_alert_sound",
+                    "antiafk_alert_tooltip",
+                    "antiafk_alert_lead_s",
+                    "antiafk_unthrottle_enabled",
+                    "antiafk_unthrottle_batch_size",
+                    "antiafk_unthrottle_lead_s",
+                    "antiafk_dev_mode",
+                )
+                if k in self.config
+            }
+            if fallback_updates:
+                try:
+                    self._rpc("update_config", updates=fallback_updates)
+                except Exception:
+                    pass
+            self._call("apply_host_config", **legacy_kwargs)
 
     def toggle_antiafk(self, enable: Any = None) -> None:
         if enable is None:
@@ -583,10 +715,20 @@ class AntiAFK:
             self._running = False
 
     def pause_antiafk(self, wait: bool = True) -> bool:
-        return bool(self._call("pause_antiafk", bool(wait)))
+        result = bool(self._call("pause_antiafk", bool(wait)))
+        try:
+            self._running = bool(self._rpc("get_running", timeout_s=1.0))
+        except Exception:
+            pass
+        return result
 
     def resume_antiafk(self) -> bool:
-        return bool(self._call("resume_antiafk"))
+        result = bool(self._call("resume_antiafk"))
+        try:
+            self._running = bool(self._rpc("get_running", timeout_s=1.0))
+        except Exception:
+            pass
+        return result
 
     def shutdown(self) -> None:
         if self._shutdown_event.is_set():
@@ -665,6 +807,27 @@ class AntiAFK:
 
     def disable_multi_instance(self) -> bool:
         return bool(self._call("disable_multi_instance"))
+
+    def refresh_multi_instance(self) -> bool:
+        """Release and recreate the effective Roblox singleton guard."""
+        try:
+            return bool(self._call("refresh_multi_instance"))
+        except Exception:
+            # Compatibility with an older native module during development.
+            self.disable_multi_instance()
+            return self.enable_multi_instance()
+
+    def multi_instance_guard_active(self) -> bool:
+        try:
+            return bool(self._call("multi_instance_guard_active"))
+        except Exception:
+            return False
+
+    def multi_instance_last_error(self) -> int:
+        try:
+            return int(self._call("multi_instance_last_error") or 0)
+        except Exception:
+            return 0
 
     def toggle_multi_instance(self) -> None:
         self._call("toggle_multi_instance")
