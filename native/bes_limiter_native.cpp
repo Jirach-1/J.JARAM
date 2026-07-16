@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cctype>
 #include <ctime>
 #include <deque>
 #include <memory>
@@ -62,6 +63,24 @@ double wall_time_s() {
 double mono_time_s() {
   using clock = std::chrono::steady_clock;
   return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+std::uint64_t filetime_to_u64(const FILETIME& ft) {
+  ULARGE_INTEGER uli{};
+  uli.LowPart = ft.dwLowDateTime;
+  uli.HighPart = ft.dwHighDateTime;
+  return static_cast<std::uint64_t>(uli.QuadPart);
+}
+
+std::optional<std::uint64_t> query_thread_cpu_time_100ns(HANDLE h) {
+  FILETIME created{};
+  FILETIME exited{};
+  FILETIME kernel{};
+  FILETIME user{};
+  if (!::GetThreadTimes(h, &created, &exited, &kernel, &user)) {
+    return std::nullopt;
+  }
+  return filetime_to_u64(kernel) + filetime_to_u64(user);
 }
 
 int clamp_pct(int pct) {
@@ -147,7 +166,14 @@ std::unordered_map<int, std::vector<int>> list_thread_ids_for_pids_win(const std
 }
 
 HANDLE open_thread_handle_win(int tid) {
-  HANDLE h = ::OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, static_cast<DWORD>(tid));
+  HANDLE h = ::OpenThread(
+      THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid));
+  if (!h) {
+    h = ::OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, static_cast<DWORD>(tid));
+  }
+  if (!h) {
+    h = ::OpenThread(THREAD_SUSPEND_RESUME, FALSE, static_cast<DWORD>(tid));
+  }
   return h ? h : nullptr;
 }
 
@@ -193,6 +219,8 @@ struct PidState {
 
   std::unordered_map<int, HANDLE> handles;  // tid -> HANDLE
   std::unordered_map<int, int> depth;       // tid -> suspend depth created by us
+  std::unordered_map<int, std::uint64_t> cpu_last;  // tid -> last sampled kernel+user time
+  std::vector<int> smart_tids;              // hot-thread cache refreshed outside the duty-cycle path
   int total_depth{0};
 
   bool is_suspended{false};
@@ -343,11 +371,18 @@ class BESLimiterWorker {
     for (auto it = handles_.begin(); it != handles_.end();) {
       const int tid = it->first;
       if (tids.find(tid) == tids.end()) {
-        ::CloseHandle(it->second);
+        HANDLE h = it->second;
         const int depth = depth_.count(tid) ? depth_[tid] : 0;
         if (depth > 0) {
+          for (int i = 0; i < depth; ++i) {
+            const DWORD prev = ::ResumeThread(h);
+            if (prev == kInvalidSuspendCount) {
+              break;
+            }
+          }
           total_depth_ = std::max(0, total_depth_ - depth);
         }
+        ::CloseHandle(h);
         depth_.erase(tid);
         it = handles_.erase(it);
       } else {
@@ -433,11 +468,11 @@ class BESLimiterWorker {
         for (const auto& kv : handles_) {
           const int tid = kv.first;
           HANDLE h = kv.second;
-          const DWORD prev = ::SuspendThread(h);
-          if (prev != kInvalidSuspendCount) {
-            depth_[tid] = (depth_.count(tid) ? depth_[tid] : 0) + 1;
-            total_depth_ += 1;
-          }
+        const DWORD prev = ::SuspendThread(h);
+        if (prev != kInvalidSuspendCount) {
+          depth_[tid] = (depth_.count(tid) ? depth_[tid] : 0) + 1;
+          total_depth_ += 1;
+        }
         }
       }
 
@@ -526,13 +561,14 @@ class BESMultiProcessController {
     }
 
     if (!enabled) {
+      enabled_.store(false);
       stop_scheduler();
       disable_timer_resolution();
       {
         std::lock_guard<std::mutex> g(config_mutex_);
         desired_pcts_.clear();
         desired_names_.clear();
-        hold_until_.clear();
+        hold_until_by_owner_.clear();
         force_resume_.clear();
       }
       return;
@@ -543,31 +579,117 @@ class BESMultiProcessController {
   }
 
   void set_cycle_ms(int ms) {
-    cycle_ms_.store(std::max(10, ms));
+    const int next = std::max(10, ms);
+    const int cur = cycle_ms_.load();
+    if (cur == next) {
+      return;
+    }
+    cycle_ms_.store(next);
     wake_scheduler();
   }
 
-  void hold_unthrottled(int pid, double seconds) {
-    pid = static_cast<int>(pid);
-    const double until = wall_time_s() + std::max(0.0, seconds);
-    {
-      std::lock_guard<std::mutex> g(config_mutex_);
-      const double cur = hold_until_.count(pid) ? hold_until_[pid] : 0.0;
-      if (until > cur) {
-        hold_until_[pid] = until;
+  std::string throttle_mode() const {
+    return throttle_mode_.load() == 1 ? "smart" : "all_threads";
+  }
+
+  void set_throttle_mode(const std::string& mode) {
+    std::string normalized;
+    normalized.reserve(mode.size());
+    for (char ch : mode) {
+      if (ch == '-' || ch == ' ') {
+        normalized.push_back('_');
+      } else {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
       }
-      force_resume_.insert(pid);
     }
+
+    const int mode_i =
+        (normalized == "smart" || normalized == "smart_throttle" || normalized == "smart_threads") ? 1 : 0;
+    if (throttle_mode_.load() == mode_i) {
+      return;
+    }
+    throttle_mode_.store(mode_i);
     wake_scheduler();
   }
 
-  void release_hold(int pid) {
-    pid = static_cast<int>(pid);
+  int smart_thread_count() const {
+    return smart_thread_count_.load();
+  }
+
+  void set_smart_thread_count(int count) {
+    const int next = std::max(1, std::min(256, count));
+    if (smart_thread_count_.load() == next) {
+      return;
+    }
+    smart_thread_count_.store(next);
+    wake_scheduler();
+  }
+
+  bool hold_unthrottled(int pid, double seconds, const std::string& owner = "default") {
+    return hold_unthrottled_many(std::vector<int>{static_cast<int>(pid)}, seconds, owner);
+  }
+
+  bool hold_unthrottled_many(const std::vector<int>& pids, double seconds, const std::string& owner = "default") {
+    if (pids.empty() || !enabled_.load() || shutdown_.load()) {
+      return false;
+    }
+    const std::string owner_key = owner.empty() ? "default" : owner;
+    const double until = wall_time_s() + std::max(0.0, seconds);
+    bool changed = false;
     {
       std::lock_guard<std::mutex> g(config_mutex_);
-      hold_until_.erase(pid);
+      for (int raw_pid : pids) {
+        const int pid = static_cast<int>(raw_pid);
+        if (pid <= 0) {
+          continue;
+        }
+        auto& owner_holds = hold_until_by_owner_[pid];
+        const double cur = owner_holds.count(owner_key) ? owner_holds[owner_key] : 0.0;
+        if (until > cur) {
+          owner_holds[owner_key] = until;
+        }
+        force_resume_.insert(pid);
+        changed = true;
+      }
     }
-    wake_scheduler();
+    if (changed) {
+      wake_scheduler();
+    }
+    return changed;
+  }
+
+  bool release_hold(int pid, const std::string& owner = "default") {
+    return release_hold_many(std::vector<int>{static_cast<int>(pid)}, owner);
+  }
+
+  bool release_hold_many(const std::vector<int>& pids, const std::string& owner = "default") {
+    if (pids.empty()) {
+      return false;
+    }
+    const std::string owner_key = owner.empty() ? "default" : owner;
+    bool changed = false;
+    {
+      std::lock_guard<std::mutex> g(config_mutex_);
+      for (int raw_pid : pids) {
+        const int pid = static_cast<int>(raw_pid);
+        if (pid <= 0) {
+          continue;
+        }
+        auto it = hold_until_by_owner_.find(pid);
+        if (it == hold_until_by_owner_.end()) {
+          continue;
+        }
+        const std::size_t erased = it->second.erase(owner_key);
+        if (it->second.empty()) {
+          hold_until_by_owner_.erase(it);
+        }
+        changed = changed || erased > 0;
+      }
+    }
+    if (changed) {
+      wake_scheduler();
+    }
+    return changed;
   }
 
   void apply(const std::unordered_map<int, int>& target_pcts, py::object names_obj = py::none()) {
@@ -596,24 +718,36 @@ class BESMultiProcessController {
   py::dict snapshot() {
     const double now = wall_time_s();
     int holds_count = 0;
+    int hold_entries = 0;
     int active = 0;
     int desired_pids = 0;
     const int cycle_ms = cycle_ms_.load();
     const int effective_cycle_ms = effective_cycle_ms_.load();
     const bool enabled = enabled_.load();
+    std::unordered_map<std::string, int> hold_owner_counts;
 
     {
       std::lock_guard<std::mutex> g(config_mutex_);
       desired_pids = static_cast<int>(desired_pcts_.size());
-      for (const auto& kv : hold_until_) {
-        if (kv.second > now) {
+      std::unordered_map<int, double> effective_holds;
+      for (const auto& pid_kv : hold_until_by_owner_) {
+        double latest = 0.0;
+        for (const auto& owner_kv : pid_kv.second) {
+          if (owner_kv.second > now) {
+            hold_entries += 1;
+            hold_owner_counts[owner_kv.first] += 1;
+            latest = std::max(latest, owner_kv.second);
+          }
+        }
+        if (latest > now) {
+          effective_holds[pid_kv.first] = latest;
           holds_count += 1;
         }
       }
       for (const auto& kv : desired_pcts_) {
         const int pid = kv.first;
         const int pct = kv.second;
-        const double exp = hold_until_.count(pid) ? hold_until_[pid] : 0.0;
+        const double exp = effective_holds.count(pid) ? effective_holds[pid] : 0.0;
         if (exp > now) {
           continue;
         }
@@ -630,6 +764,18 @@ class BESMultiProcessController {
     out["pids"] = desired_pids;
     out["active"] = active;
     out["holds"] = holds_count;
+    out["hold_entries"] = hold_entries;
+    py::dict hold_owners;
+    for (const auto& kv : hold_owner_counts) {
+      hold_owners[py::str(kv.first)] = kv.second;
+    }
+    out["hold_owners"] = hold_owners;
+    out["mode"] = throttle_mode();
+    out["smart_threads"] = smart_thread_count();
+    out["thread_open_failures"] = thread_open_failures_.load();
+    out["suspend_failures"] = suspend_failures_.load();
+    out["resume_failures"] = resume_failures_.load();
+    out["smart_sample_failures"] = smart_sample_failures_.load();
     return out;
   }
 
@@ -718,6 +864,7 @@ class BESMultiProcessController {
       for (int i = 0; i < depth; ++i) {
         const DWORD prev = ::ResumeThread(h);
         if (prev == kInvalidSuspendCount) {
+          resume_failures_.fetch_add(1, std::memory_order_relaxed);
           break;
         }
         resumed += 1;
@@ -731,11 +878,14 @@ class BESMultiProcessController {
   }
 
   void close_all_handles(PidState& st) {
+    balanced_resume_all(st);
     for (const auto& kv : st.handles) {
       ::CloseHandle(kv.second);
     }
     st.handles.clear();
     st.depth.clear();
+    st.cpu_last.clear();
+    st.smart_tids.clear();
     st.total_depth = 0;
   }
 
@@ -749,12 +899,24 @@ class BESMultiProcessController {
     for (auto it = st.handles.begin(); it != st.handles.end();) {
       const int tid = it->first;
       if (tids_set.find(tid) == tids_set.end()) {
-        ::CloseHandle(it->second);
+        HANDLE h = it->second;
         const int depth = st.depth.count(tid) ? st.depth[tid] : 0;
         if (depth > 0) {
+          int resumed = 0;
+          for (int i = 0; i < depth; ++i) {
+            const DWORD prev = ::ResumeThread(h);
+            if (prev == kInvalidSuspendCount) {
+              resume_failures_.fetch_add(1, std::memory_order_relaxed);
+              break;
+            }
+            resumed += 1;
+          }
+          (void)resumed;
           st.total_depth = std::max(0, st.total_depth - depth);
         }
+        ::CloseHandle(h);
         st.depth.erase(tid);
+        st.cpu_last.erase(tid);
         it = st.handles.erase(it);
       } else {
         ++it;
@@ -767,11 +929,76 @@ class BESMultiProcessController {
       }
       HANDLE h = open_thread_handle_win(tid);
       if (!h) {
+        thread_open_failures_.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
       st.handles[tid] = h;
       st.depth.try_emplace(tid, 0);
     }
+  }
+
+  void refresh_smart_threads(PidState& st) {
+    struct RankedThread {
+      int tid{0};
+      std::uint64_t delta{0};
+      std::uint64_t total{0};
+    };
+
+    st.smart_tids.clear();
+    if (throttle_mode_.load() != 1 || st.handles.empty()) {
+      return;
+    }
+
+    std::vector<RankedThread> ranked;
+    ranked.reserve(st.handles.size());
+    for (const auto& kv : st.handles) {
+      const int tid = kv.first;
+      const std::optional<std::uint64_t> total_opt = query_thread_cpu_time_100ns(kv.second);
+      if (!total_opt.has_value()) {
+        smart_sample_failures_.fetch_add(1, std::memory_order_relaxed);
+        ranked.push_back(RankedThread{tid, 0, 0});
+        continue;
+      }
+
+      const std::uint64_t total = total_opt.value();
+      std::uint64_t delta = total;
+      const auto last_it = st.cpu_last.find(tid);
+      if (last_it != st.cpu_last.end() && total >= last_it->second) {
+        delta = total - last_it->second;
+      }
+      st.cpu_last[tid] = total;
+      ranked.push_back(RankedThread{tid, delta, total});
+    }
+
+    std::sort(ranked.begin(), ranked.end(), [](const RankedThread& a, const RankedThread& b) {
+      if (a.delta != b.delta) {
+        return a.delta > b.delta;
+      }
+      if (a.total != b.total) {
+        return a.total > b.total;
+      }
+      return a.tid < b.tid;
+    });
+
+    const int count = std::max(1, std::min(256, smart_thread_count_.load()));
+    const int limit = std::min<int>(count, static_cast<int>(ranked.size()));
+    st.smart_tids.reserve(static_cast<std::size_t>(limit));
+    for (int i = 0; i < limit; ++i) {
+      st.smart_tids.push_back(ranked[static_cast<std::size_t>(i)].tid);
+    }
+  }
+
+  std::vector<int> threads_to_suspend(PidState& st) {
+    if (throttle_mode_.load() == 1 && !st.smart_tids.empty()) {
+      return st.smart_tids;
+    }
+
+    std::vector<int> tids;
+    tids.reserve(st.handles.size());
+    for (const auto& kv : st.handles) {
+      tids.push_back(kv.first);
+    }
+    return tids;
   }
 
   int auto_scaled_cycle_ms(int active_pids) const {
@@ -812,6 +1039,7 @@ class BESMultiProcessController {
   }
 
   void wake_scheduler() {
+    wake_generation_.fetch_add(1, std::memory_order_release);
     {
       std::lock_guard<std::mutex> g(wake_mutex_);
       wake_flag_ = true;
@@ -874,17 +1102,29 @@ class BESMultiProcessController {
           break;
         }
 
-        for (auto it = hold_until_.begin(); it != hold_until_.end();) {
-          if (it->second <= now_wall) {
-            it = hold_until_.erase(it);
+        for (auto pid_it = hold_until_by_owner_.begin(); pid_it != hold_until_by_owner_.end();) {
+          auto& owner_holds = pid_it->second;
+          for (auto owner_it = owner_holds.begin(); owner_it != owner_holds.end();) {
+            if (owner_it->second <= now_wall) {
+              owner_it = owner_holds.erase(owner_it);
+            } else {
+              ++owner_it;
+            }
+          }
+          if (owner_holds.empty()) {
+            pid_it = hold_until_by_owner_.erase(pid_it);
           } else {
-            ++it;
+            double latest = 0.0;
+            for (const auto& owner_kv : owner_holds) {
+              latest = std::max(latest, owner_kv.second);
+            }
+            hold_until[pid_it->first] = latest;
+            ++pid_it;
           }
         }
 
         desired_pcts = desired_pcts_;
         desired_names = desired_names_;
-        hold_until = hold_until_;
         force_resume = force_resume_;
         force_resume_.clear();
       }
@@ -1052,6 +1292,7 @@ class BESMultiProcessController {
               continue;
             }
             sync_handles(*it->second, kv.second);
+            refresh_smart_threads(*it->second);
             it->second->last_refresh_monotonic = now_mono2;
           }
         } catch (const std::exception& e) {
@@ -1062,8 +1303,12 @@ class BESMultiProcessController {
         next_refresh = now_mono2 + refresh_interval_s_;
       }
 
+      const std::uint64_t event_wake_generation = wake_generation_.load(std::memory_order_acquire);
       double now_mono3 = mono_time_s();
       while (!events.empty() && events.top().when <= now_mono3) {
+        if (wake_generation_.load(std::memory_order_acquire) != event_wake_generation) {
+          break;
+        }
         const Event ev = events.top();
         events.pop();
 
@@ -1084,14 +1329,20 @@ class BESMultiProcessController {
         const auto [red_ms, green_ms] = compute_red_green_ms(effective_cycle_ms_.load(), st.pct);
         if (ev.action == 0) {
           int suspended = 0;
-          for (const auto& kvh : st.handles) {
-            const int tid = kvh.first;
-            HANDLE h = kvh.second;
+          const std::vector<int> suspend_tids = threads_to_suspend(st);
+          for (int tid : suspend_tids) {
+            const auto handle_it = st.handles.find(tid);
+            if (handle_it == st.handles.end()) {
+              continue;
+            }
+            HANDLE h = handle_it->second;
             const DWORD prev = ::SuspendThread(h);
             if (prev != kInvalidSuspendCount) {
               st.depth[tid] = (st.depth.count(tid) ? st.depth[tid] : 0) + 1;
               st.total_depth += 1;
               suspended += 1;
+            } else {
+              suspend_failures_.fetch_add(1, std::memory_order_relaxed);
             }
           }
           st.is_suspended = true;
@@ -1115,6 +1366,8 @@ class BESMultiProcessController {
               if (prev != kInvalidSuspendCount) {
                 st.depth[tid] = std::max(0, depth - 1);
                 st.total_depth = std::max(0, st.total_depth - 1);
+              } else {
+                resume_failures_.fetch_add(1, std::memory_order_relaxed);
               }
             }
           }
@@ -1147,6 +1400,8 @@ class BESMultiProcessController {
 
   std::atomic<int> cycle_ms_{50};
   std::atomic<int> effective_cycle_ms_{50};
+  std::atomic<int> throttle_mode_{0};  // 0=all_threads, 1=smart
+  std::atomic<int> smart_thread_count_{4};
   const bool auto_scale_cycle_{true};
   const bool stagger_phases_{true};
   const double refresh_interval_s_{1.0};
@@ -1163,13 +1418,17 @@ class BESMultiProcessController {
   std::mutex config_mutex_;
   std::unordered_map<int, int> desired_pcts_;
   std::unordered_map<int, std::string> desired_names_;
-  std::unordered_map<int, double> hold_until_;
+  std::unordered_map<int, std::unordered_map<std::string, double>> hold_until_by_owner_;
   std::unordered_set<int> force_resume_;
 
   std::atomic<bool> enabled_{false};
   std::atomic<bool> stop_{false};
   std::atomic<bool> shutdown_{false};
   std::atomic<bool> timer_res_enabled_{false};
+  std::atomic<std::uint64_t> thread_open_failures_{0};
+  std::atomic<std::uint64_t> suspend_failures_{0};
+  std::atomic<std::uint64_t> resume_failures_{0};
+  std::atomic<std::uint64_t> smart_sample_failures_{0};
 
   std::mutex sched_mutex_;
   std::thread sched_thread_;
@@ -1177,6 +1436,7 @@ class BESMultiProcessController {
   std::mutex wake_mutex_;
   std::condition_variable wake_cv_;
   bool wake_flag_{false};
+  std::atomic<std::uint64_t> wake_generation_{0};
 
   std::unordered_map<int, std::unique_ptr<PidState>> states_;
 };
@@ -1235,13 +1495,35 @@ PYBIND11_MODULE(bes_limiter_native, m) {
            py::arg("min_cycle_ms_per_pid") = 2)
       .def("set_enabled", &BESMultiProcessController::set_enabled, py::call_guard<py::gil_scoped_release>())
       .def("set_cycle_ms", &BESMultiProcessController::set_cycle_ms)
-      .def("hold_unthrottled", &BESMultiProcessController::hold_unthrottled)
-      .def("release_hold", &BESMultiProcessController::release_hold)
+      .def("set_throttle_mode", &BESMultiProcessController::set_throttle_mode, py::arg("mode"))
+      .def("set_smart_thread_count", &BESMultiProcessController::set_smart_thread_count, py::arg("count"))
+      .def("hold_unthrottled",
+           &BESMultiProcessController::hold_unthrottled,
+           py::arg("pid"),
+           py::arg("seconds"),
+           py::arg("owner") = "default")
+      .def("hold_unthrottled_many",
+           &BESMultiProcessController::hold_unthrottled_many,
+           py::arg("pids"),
+           py::arg("seconds"),
+           py::arg("owner") = "default")
+      .def("release_hold",
+           &BESMultiProcessController::release_hold,
+           py::arg("pid"),
+           py::arg("owner") = "default")
+      .def("release_hold_many",
+           &BESMultiProcessController::release_hold_many,
+           py::arg("pids"),
+           py::arg("owner") = "default")
       .def("apply",
            &BESMultiProcessController::apply,
            py::arg("target_pcts"),
            py::kw_only(),
            py::arg("names") = py::none())
       .def("snapshot", &BESMultiProcessController::snapshot)
+      .def_property("throttle_mode", &BESMultiProcessController::throttle_mode, &BESMultiProcessController::set_throttle_mode)
+      .def_property("smart_thread_count",
+                    &BESMultiProcessController::smart_thread_count,
+                    &BESMultiProcessController::set_smart_thread_count)
       .def("shutdown", &BESMultiProcessController::shutdown, py::call_guard<py::gil_scoped_release>());
 }

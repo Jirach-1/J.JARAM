@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -29,8 +30,7 @@ namespace {
   const DWORD err = ::GetLastError();
   std::ostringstream oss;
   oss << prefix << " (WinError " << err << ")";
-  PyErr_SetString(PyExc_OSError, oss.str().c_str());
-  throw py::error_already_set();
+  throw std::runtime_error(oss.str());
 }
 
 class ScopedHandle {
@@ -130,9 +130,8 @@ std::vector<std::string> trim_targets(std::string process_name, py::object thres
   if (!threshold_mb_obj.is_none()) {
     threshold_mb = threshold_mb_obj.cast<double>();
   }
-  py::gil_scoped_release release;  // <-- add this
-  
   const std::wstring target_w = utf8_to_wide(process_name);
+  py::gil_scoped_release release;
 
   ScopedHandle snap(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
   if (!snap) {
@@ -217,4 +216,3 @@ PYBIND11_MODULE(ram_limiter_native, m) {
   m.def("trim_targets", &trim_targets, py::arg("process_name"), py::arg("threshold_mb") = py::none(),
         "Trim all processes by name; returns log lines.");
 }
-
