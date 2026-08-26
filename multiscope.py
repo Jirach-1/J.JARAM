@@ -1,9 +1,9 @@
 ﻿# multiscope.py - MultiScopeEngine with strict switching + live cache refresh
-# STRICT: only switch to logs that contain the username marker (no guessing)
-# Watchdog observer refreshes the username-log cache immediately on changes
-# Immediate strict re-resolve for affected users (no 60s TTL wait)
-# 1s jittered fallback refresher (active users every tick; idle round-robin)
-# Anti-flap guard: only switch if candidate log is strictly newer by mtime
+# Strict mapping only: username markers are required; fallback is always explicit.
+# Filesystem events enqueue index refreshes; metadata polling is the fallback.
+# Affected paths are re-resolved independently from GUI status ticks.
+# One-second metadata fallback; every changed attached generation is tailed fairly.
+# Generation selection is ranked by the filename session timestamp.
 # Biome detection from [BloxstrapRPC] JSON (largeImage.hoverText)
 # Merchant detection independent of biomes
 # Embeds: 4 rows (Account / Detected by / Time / Private Server)
@@ -11,55 +11,34 @@
 # Handoff: previous biome Ended carried donor -> spare
 
 from __future__ import annotations
-import time as _t
+import base64
+import hashlib
 import os, re, json, time, threading, requests
 import requests.exceptions as _rq_exc
-from typing import Optional, Dict
 from pathlib import Path
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Callable, Dict, List, Optional, Set, Tuple, Any
+from datetime import datetime, timezone
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from log_utils import (
+    RobloxLogIndex,
     find_log_for_username,
-    refresh_username_log_map,
     R_DISC_REASON, R_DISC_NOTIFY, R_DISC_SENDING, R_CONN_LOST,
 )
-
-# IMPORTANT: we keep strictness; cache is refreshed on demand
-from log_utils import find_log_for_username, refresh_username_log_map
 
 _ACCESS_ENV_NAME = "".join(chr(c) for c in (74, 65, 82, 65, 77, 95, 85, 78, 76, 79, 67, 75))
 _ACCESS_MARKER_NAME = "".join(chr(c) for c in (74, 65, 82, 65, 77, 46, 98, 105, 117))
 
 # Optional biomes metadata (color, thumbnail). Fallbacks if missing.
 try:
-    from biomes import load_biomes_catalog, biome_meta, biome_duration, biome_names
+    from biomes import load_biomes_catalog, biome_meta, biome_names
     load_biomes_catalog()
 except Exception:
-    from typing import Tuple, Optional
     def biome_meta(name: str) -> Tuple[int, str]:
         return int(0x3BA55D), ""     # default color, empty thumbnail
-    def biome_duration(name: str) -> Optional[int]:
-        return None
     def biome_names() -> list[str]:
         return ["NORMAL"]
-# -- optional watcher deps -------------------------------------------------
-try:
-    from watchdog.observers import Observer as WDObserver
-    from watchdog.events import FileSystemEventHandler as WDFileSystemEventHandler
-except Exception:
-    WDObserver = None  # type: ignore[assignment]
-
-    # Use a different class name to avoid colliding with the alias
-    class _FallbackFileSystemEventHandler:
-        pass
-
-    # Alias the fallback to the expected name for the rest of the file
-    WDFileSystemEventHandler = _FallbackFileSystemEventHandler  # type: ignore[assignment]
-
-
-APP_FOOTER = "J.JARAM JX 2x71"
+APP_FOOTER = "J.JARAM JX 2x81"
 HARD_EVERYONE_BIOMES = {"GLITCHED", "DREAMSPACE", "CYBERSPACE"}
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
@@ -95,6 +74,31 @@ def _normalize_user_filter_mode(value: object) -> str:
 _LOG_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
 _R_RPC_MARK = "[BloxstrapRPC]"
 _R_JSON_START = re.compile(r"\{")
+_CURSOR_ANCHOR_BYTES = 256
+
+
+def _generation_identity_without_revision(generation_id: object) -> str:
+    """Return the stable path/filesystem-identity portion of a generation ID."""
+    value = str(generation_id or "")
+    head, separator, revision = value.rpartition(":")
+    if separator and revision.isdigit() and "|" in head:
+        return head
+    return value
+
+
+def _cursor_anchor(path: object, pos: object, *, length: int = _CURSOR_ANCHOR_BYTES) -> tuple[int, str]:
+    """Hash a bounded byte window immediately before a saved cursor."""
+    path_s = str(path or "")
+    pos_i = max(0, int(pos or 0))
+    take = min(max(0, int(length)), pos_i)
+    if not path_s or take <= 0:
+        return 0, ""
+    with open(path_s, "rb") as handle:
+        handle.seek(pos_i - take)
+        data = handle.read(take)
+    if len(data) != take:
+        return 0, ""
+    return take, hashlib.sha256(data).hexdigest()
 
 def _parse_log_ts_epoch(ts_text: str) -> Optional[float]:
     try:
@@ -113,48 +117,33 @@ def _extract_log_ts_epoch_before(text: str, marker_index: int) -> Optional[float
     except Exception:
         return None
 
-def _extract_rpc_entries_from_text(text: str) -> List[Tuple[dict, Optional[float]]]:
+def _extract_rpc_entries_from_text(
+    text: str,
+    *,
+    timestamp_hint: Optional[float] = None,
+    extract_timestamp: bool = True,
+) -> List[Tuple[dict, Optional[float]]]:
     out: List[Tuple[dict, Optional[float]]] = []
+    decoder = json.JSONDecoder()
     start = 0
     while True:
         i = text.find(_R_RPC_MARK, start)
         if i == -1:
             break
-        m = _R_JSON_START.search(text, i)
+        m = _R_JSON_START.search(text, i + len(_R_RPC_MARK))
         if not m:
             start = i + len(_R_RPC_MARK)
             continue
         j = m.start()
-
-        depth = 0
-        end = None
-        for k in range(j, len(text)):
-            ch = text[k]
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    end = k + 1
-                    break
-        if end is None:
-            # fall back line end
-            end = text.find("\n", j)
-            if end == -1:
-                end = len(text)
-
-        blob = text[j:end]
-        rpc = None
         try:
-            rpc = json.loads(blob)
+            rpc, consumed = decoder.raw_decode(text[j:])
         except Exception:
-            try:
-                rpc = json.loads(blob.replace("'", '"'))
-            except Exception:
-                pass
+            start = i + len(_R_RPC_MARK)
+            continue
         if isinstance(rpc, dict):
-            out.append((rpc, _extract_log_ts_epoch_before(text, i)))
-        start = i + len(_R_RPC_MARK)
+            ts_epoch = _extract_log_ts_epoch_before(text, i) if extract_timestamp else timestamp_hint
+            out.append((rpc, ts_epoch))
+        start = j + max(1, int(consumed))
     return out
 
 def _extract_rpc_jsons_from_text(text: str) -> List[dict]:
@@ -335,6 +324,7 @@ class _TempBlockSession(threading.Thread):
         self._blocked_ids = set()
         self._seen_ids = set()
         self._pending: list[tuple[str, str]] = []  # (username, roblox_id) carried across ticks
+        self._log_carry = b""
 
     # ---------- Jaram files ----------
     @staticmethod
@@ -495,12 +485,16 @@ class _TempBlockSession(threading.Thread):
     def _tail_new_players(self, f) -> list[tuple[str, str]]:
         """Read any new lines and return [(username, id), ...] that match."""
         found = []
-        while True:
-            at = f.tell()
-            line = f.readline()
-            if not line:
-                f.seek(at)
-                break
+        raw = f.read(256 * 1024)
+        if not raw:
+            return found
+        combined = self._log_carry + raw
+        parts = combined.split(b"\n")
+        self._log_carry = parts.pop() if parts else combined
+        if len(self._log_carry) > 1024 * 1024:
+            self._log_carry = b""
+        for line_raw in parts:
+            line = line_raw.rstrip(b"\r").decode("utf-8", errors="replace")
             if "Player added:" not in line:
                 continue
             m = re.search(r"Player added:\s+([A-Za-z0-9_]+)\s+(\d+)", line)
@@ -508,6 +502,12 @@ class _TempBlockSession(threading.Thread):
                 uname = m.group(1)
                 rid = m.group(2)
                 found.append((uname, rid))
+        if self._log_carry:
+            tail = self._log_carry.decode("utf-8", errors="replace")
+            match = re.search(r"Player added:\s+([A-Za-z0-9_]+)\s+(\d+)", tail)
+            if match:
+                found.append((match.group(1), match.group(2)))
+                self._log_carry = b""
         return found
 
     # ---------- Main ----------
@@ -532,7 +532,7 @@ class _TempBlockSession(threading.Thread):
             return
 
         try:
-            f = open(log_path, "r", encoding="utf-8", errors="ignore")
+            f = open(log_path, "rb")
         except Exception as e:
             self._log(f"[TempBlock] {self.uid}: cannot open log ({e})")
             try: session.close()
@@ -541,9 +541,9 @@ class _TempBlockSession(threading.Thread):
 
         # Seek to end so we only see new players after the spawn
         try:
-            f.seek(os.path.getsize(log_path))
-        except Exception:
             f.seek(0, os.SEEK_END)
+        except Exception:
+            pass
 
         # Load lookup once; we'll persist changes as they occur
         lookup = self._load_lookup()
@@ -675,47 +675,16 @@ class ServerScope:
     last_menu_ts_by_uid: Dict[str, float] = field(default_factory=dict)
     events: int = 0
 
-    # NEW: scheduling state
-    next_tail_at: float = 0.0     # epoch seconds when this scope should be polled again
-    poll_rot: int = 0             # round-robin index across users in this scope
-
 @dataclass
 class Cursor:
     path: Optional[str] = None
     pos: int = 0
-    carry: str = ""          
-
-
-    path: Optional[str] = None
-    pos: int = 0
-    carry: str = ""          
-
-# ------------------------------------------------------------------------------
-# Watch handler
-# ------------------------------------------------------------------------------
-
-class _LogDirHandler(WDFileSystemEventHandler):
-    """Notifies engine when files change in a watched directory (created/moved/modified)."""
-    def __init__(self, engine: "MultiScopeEngine", dirpath: str):
-        super().__init__()
-        self.engine = engine
-        self.dirpath = os.path.abspath(dirpath)
-
-    def on_created(self, event):  self._hit(event)
-    def on_moved(self, event):    self._hit(event)
-    def on_modified(self, event): self._hit(event)
-
-    def _hit(self, *_args, **_kwargs):
-        import time, os
-        now = time.time()
-        last = self.engine._watch_cooldown_by_dir.get(self.dirpath, 0.0)
-        if (now - last) < self.engine._watch_cooldown_sec:
-            return  # drop noisy burst
-        self.engine._watch_cooldown_by_dir[self.dirpath] = now
-
-        # do the actual refresh
-        self.engine._refresh_users_in_dir_immediate(self.dirpath)
-
+    carry: bytes = b""
+    generation_id: str = ""
+    session_started_at: float = 0.0
+    observed_size: int = 0
+    last_event_ts: float = 0.0
+    dropping_oversized: bool = False
 
 # ------------------------------------------------------------------------------
 # Engine
@@ -727,7 +696,9 @@ class MultiScopeEngine:
         u = label.upper()
         if u.startswith("DISCONNECTED") or u.startswith("OFFLINE"):
             return "Disconnected"  # single, friendly pool name
-        return label or "Unknown"
+        if u.startswith("PUBLIC:"):
+            return f"{label} #{uid}"
+        return label or f"Unknown #{uid}"
 
     def __init__(
         self,
@@ -748,15 +719,35 @@ class MultiScopeEngine:
         self._log = log_fn or (lambda _msg: None)
 
         self._cur: Dict[str, Cursor] = {}
+        self._tracked_uids: Set[str] = set()
+        # A configured account is not necessarily running. Once status (or a
+        # disconnect record) proves that an account is inactive, do not let
+        # autonomous discovery attach it to another stale log generation.
+        # Existing cursors are allowed to consume a final post-exit flush.
+        self._log_resolution_suspended_uids: Set[str] = set()
         self._scopes: Dict[str, ServerScope] = {}
+        self._log_index = RobloxLogIndex(enable_watcher=True)
+        self._ever_attached_uids: Set[str] = set()
+        self._retired_generations_by_uid: Dict[str, Set[str]] = {}
+        self._next_path_resolve_mono = 0.0
+        self._tail_rotation = 0
+        self._reader_stats = {
+            "bytes_read": 0,
+            "lines_read": 0,
+            "decode_errors": 0,
+            "oversized_lines": 0,
+            "read_failures": 0,
+            "truncations": 0,
+            "tail_cycles": 0,
+            "last_cycle_tailed_users": 0,
+            "backlog_users": 0,
+        }
+        self._reader_stats_lock = threading.Lock()
 
         # Handoff: donor_uid - spare_uid
         self._handoffs: Dict[str, str] = {}
         # Carry donor's last biome into spare to emit Ended
         self._handoff_prev_biome_for_spare: Dict[str, str] = {}
-
-        # Per-user: skip first biome event after attaching a log (avoid stale spam)
-        self._skip_first_event_by_uid: Set[str] = set()
 
         # Biome cadence per server
         self._biome_min_interval = 2.0
@@ -771,20 +762,10 @@ class MultiScopeEngine:
         self._merchant_detection_mode = MERCHANT_MODE_ASSET_ID
         self._disable_log_based_merchant_detection = False
 
-        # Merchant dedupe per uid -> merchant -> last full line  (legacy; no longer used)
         self._first_merchant_scan_done: Set[str] = set()
-        self._last_merchant_line_by_user: Dict[str, Dict[str, str]] = {}
                 
         # Merchant last-post timestamp per scope - merchant - epoch seconds
         self._last_merchant_ts_by_scope: Dict[str, Dict[str, float]] = {}
-
-        # Fallback refresher (Option B++)
-        self._next_log_refresh = 0.0
-        self._refresh_cursor = 0
-
-        # Watchdog
-        self._observer: Optional[Any] = None
-        self._watched_dirs: Set[str] = set()
 
         # Webhooks
         self._biome_webhooks: List[dict] = []
@@ -797,6 +778,9 @@ class MultiScopeEngine:
 
         # Disconnect dedupe: uid -> (normpath, absolute_end_offset)
         self._last_disconnect_sig_by_uid: Dict[str, Tuple[str, int]] = {}
+        self._seen_event_ranges: Dict[Tuple[str, int, int, str], None] = {}
+        self._seen_event_range_limit = 8192
+        self._event_claim_lock = threading.RLock()
 
         # Status snapshot for lookback gates (set in tick()).
         self._status_snapshot: Dict[str, dict] = {}
@@ -809,31 +793,38 @@ class MultiScopeEngine:
         self._load_found_stats()
         self._ensure_found_stats_catalog()
 
-        # -- Tailer pool / concurrency -----------------------------------------
-        self._max_workers = 50                      # tune: 24-32 recommended
-        self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
-        self._inflight = set()                      # uids currently being tailed
-        self._inflight_lock = threading.Lock()
-        
-        # NEW: dedicated webhook sender pool (keeps tailers non-blocking)
+        # Tail log files concurrently. A narrow per-scope lock preserves the
+        # ordering of biome/merchant/disconnect records for users which share a
+        # server without serializing ordinary log parsing.
+        # At 100 active logs, 64 workers trims the normal small-append cycle
+        # without materially changing the heavier parsing case.  Jobs are
+        # still bounded here so a large account list cannot create a thread
+        # per user.
+        self._tail_workers = 64
+        self._tail_executor = ThreadPoolExecutor(
+            max_workers=self._tail_workers,
+            thread_name_prefix="ms-tail",
+        )
+        self._tail_scope_locks: Dict[str, threading.RLock] = {}
+        self._tail_scope_locks_lock = threading.Lock()
+
+        # Webhook delivery remains off the reader pool.
         self._send_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ms-send")
 
-        # per-read cap to micro-batch bytes instead of reading all deltas at once
-        self._per_read_cap = 256 * 1024    # 256 KiB per dequeue
+        self._per_read_cap = 256 * 1024
+        self._global_read_cap = 4 * 1024 * 1024
+        self._max_line_bytes = 1024 * 1024
         
-        # Debounce settings for watchdog events
-        self._watch_cooldown_by_dir = {}   # dir -> last-hit-ts
-        self._watch_cooldown_sec = 2.0     # ignore hits closer than this
-        
-        self._normpath_by_uid: Dict[str, str] = {}
-        # Per-user log paths that were active when a disconnect fired.
-        # These are ignored on future resolves so we do not re-attach stale logs.
-        self._ignored_logs_by_uid: Dict[str, Set[str]] = {}
         self._menu_unknown_log_by_uid: Dict[str, str] = {}
         # Disconnect fallback: if in_menu stays unknown too long, recycle that user.
         self._menu_none_since_by_uid: Dict[str, float] = {}
         self._menu_none_timeout_since_by_uid: Dict[str, float] = {}
         self._menu_none_disconnect_fired_by_uid: Set[str] = set()
+        self._in_menu_none_timeout_seconds = 120.0
+        # Latest live-process creation time observed for each account.  This is
+        # deliberately runtime-only: a resumed/new process must prove its own
+        # menu state instead of inheriting it from a snapshot or prior log.
+        self._process_generation_by_uid: Dict[str, float] = {}
         
         # NEW: per-biome notifier modes (biome -> "None" | "Message" | "Everyone")
         self._biome_modes: Dict[str, str] = {}
@@ -849,19 +840,6 @@ class MultiScopeEngine:
         self._temp_block_sessions = {}  # uid -> expiry epoch (simple gate)
         self._temp_block_disabled: bool = True
 
-        # init watcher if available
-        if WDObserver is not None:
-            try:
-                obs = WDObserver()
-                obs.daemon = True
-                obs.start()
-                self._observer = obs
-                self._log("[MultiScope] Watcher enabled.")
-            except Exception:
-                self._observer = None
-                self._log("[MultiScope] Watcher failed to start; using timer refresh.")
-        else:
-            self._log("[MultiScope] watchdog not installed; using timer refresh only.")
     # -- Config ----------------------------------------------------------------
 
     def configure_webhooks(
@@ -881,6 +859,7 @@ class MultiScopeEngine:
         # NEW:
         biome_modes: Optional[Dict[str, str]] = None,
         skip_webhook_unknown_context: bool = False,
+        in_menu_none_timeout_seconds: float = 120.0,
     ) -> None:
         lock_enforced = self._is_bm_lock_enforced()
         lock_disabled = not lock_enforced
@@ -961,6 +940,13 @@ class MultiScopeEngine:
         self._bm_lock_confirmed = not lock_disabled
         self._lock_forced_biomes = forced_biomes
         self._skip_webhook_unknown_context = bool(skip_webhook_unknown_context)
+        try:
+            self._in_menu_none_timeout_seconds = max(
+                1.0,
+                min(86_400.0, float(in_menu_none_timeout_seconds)),
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._in_menu_none_timeout_seconds = 120.0
 
 
     # -- Persistent "found" counters -------------------------------------------
@@ -1323,295 +1309,165 @@ class MultiScopeEngine:
         return {"counts": counts, "total": total, "window_seconds": window_seconds}
 
 
-    # -- Watcher plumbing ------------------------------------------------------
-
-    def _watch_dir_for_path(self, path: str) -> None:
-        if not (self._observer and path):
-            return
-        try:
-            dirpath = os.path.abspath(os.path.dirname(path))
-            if dirpath and dirpath not in self._watched_dirs:
-                handler = _LogDirHandler(self, dirpath)
-                self._observer.schedule(handler, dirpath, recursive=False)
-                self._watched_dirs.add(dirpath)
-                self._log(f"[MultiScope] Watching dir: {dirpath}")
-        except Exception:
-            pass
-
-    def _refresh_users_in_dir_immediate(self, dirpath: str) -> None:
-        """Called by watcher thread - do a light pass and nudge the fast fallback."""
-        import os
-        with self._lock:
-            # 1) DO NOT rebuild the cache here. Let the 1s fallback tick refresh it.
-            #    (It already calls refresh_username_log_map() once per tick.)
-            #    This avoids redundant scans & log spam.  # see _maybe_refresh_paths()
-
-            # 2) Re-resolve users whose current log lives in this directory
-            count = 0
-            absdir = os.path.abspath(dirpath)
-            for uid, cur in list(self._cur.items()):
-                p = cur.path or ""
-                if p and os.path.abspath(os.path.dirname(p)) == absdir:
-                    self._resolve_current_log(uid, force=False)
-                    count += 1
-
-            # 3) Nudge the timer-based refresher to run ASAP (harmless, cheap)
-            self._next_log_refresh = 0.0
-
-            # 4) Only log when something changed, and throttle per-dir
-            if count:
-                self._throttled_log(
-                    key=f"watch-refresh:{absdir}",
-                    msg=f"[MultiScope] Watch hit - refreshed {count} user(s) for {dirpath}",
-                    every=10.0,   # at most once every 10s per directory
-                )
-
-    def _submit_tail(self, uid: str) -> bool:
-        """Enqueue one tail read for `uid` if not already in flight."""
-        with self._inflight_lock:
-            if uid in self._inflight:
-                return False
-            self._inflight.add(uid)
-
-        def _run():
-            try:
-                self._tail_one(uid)
-            finally:
-                with self._inflight_lock:
-                    self._inflight.discard(uid)
-
-        try:
-            self._executor.submit(_run)
-            return True
-        except Exception:
-            # Fall back to inline if executor is saturated/closing
-            try:
-                self._tail_one(uid)
-            finally:
-                with self._inflight_lock:
-                    self._inflight.discard(uid)
-            return True
-
     # -- User mapping / logs ---------------------------------------------------
 
     def update_users(self, user_ids: List[str]) -> None:
-        try:
-            refresh_username_log_map()  # build the strict map right now
-        except Exception:
-            pass
+        # Advance discovery once for the whole account set.  Resolving each
+        # username used to run another bounded scan, so a cold resume with many
+        # users could spend over a minute here before processing queued state.
+        self._log_index.poll(force=True)
         user_ids_set = {str(uid) for uid in (user_ids or [])}
+        self._tracked_uids = set(user_ids_set)
         with self._lock:
             # remove stale only
             stale_uids = {
                 str(uid)
                 for uid in (
                     set(self._cur.keys())
-                    | set(self._normpath_by_uid.keys())
-                    | set(self._ignored_logs_by_uid.keys())
+                    | set(self._retired_generations_by_uid.keys())
                     | set(self._menu_unknown_log_by_uid.keys())
                     | set(self._menu_none_since_by_uid.keys())
                     | set(self._menu_none_timeout_since_by_uid.keys())
+                    | set(self._process_generation_by_uid.keys())
                     | set(self._last_disconnect_sig_by_uid.keys())
+                    | set(self._log_resolution_suspended_uids)
+                    | {
+                        str(scope_uid)
+                        for scope in self._scopes.values()
+                        for scope_uid in scope.users
+                    }
                 )
                 if str(uid) not in user_ids_set
             }
             for uid in stale_uids:
-                self._cur.pop(uid, None)
-                self._normpath_by_uid.pop(uid, None)
-                self._ignored_logs_by_uid.pop(uid, None)
+                stale_cur = self._cur.pop(uid, None)
+                if stale_cur and stale_cur.generation_id:
+                    self._log_index.unpin(stale_cur.generation_id)
+                self._retired_generations_by_uid.pop(uid, None)
+                self._ever_attached_uids.discard(uid)
                 self._menu_unknown_log_by_uid.pop(uid, None)
                 self._menu_none_since_by_uid.pop(uid, None)
                 self._menu_none_timeout_since_by_uid.pop(uid, None)
+                self._process_generation_by_uid.pop(uid, None)
                 self._last_disconnect_sig_by_uid.pop(uid, None)
-                try:
-                    if hasattr(self, "_last_switch_ts"):
-                        self._last_switch_ts.pop(uid, None)
-                except Exception:
-                    pass
+                self._log_resolution_suspended_uids.discard(uid)
 
         # Do resolves + watcher setup without holding the engine lock
         for uid in user_ids_set:
-            self._resolve_current_log(uid, force=True)
+            self._resolve_current_log(uid, force=True, refresh_index=False)
             cur = self._cur.get(uid)
             if cur and cur.path:
-                self._watch_dir_for_path(cur.path)
+                self._log_index.mark_dirty(cur.path)
 
-        # Do the I/O-heavy warmstarts last, also outside the lock
-        for uid in user_ids_set:
-            self._warmstart_user_tail(uid)
+        # A tracked account should be visible even before a log is resolved or
+        # the first GUI status tick supplies its final server label.
+        with self._lock:
+            for scope in self._scopes.values():
+                for uid in stale_uids:
+                    uid_s = str(uid)
+                    scope.users.discard(uid_s)
+                    scope.in_menu_by_uid.pop(uid_s, None)
+                    scope.last_menu_ts_by_uid.pop(uid_s, None)
+            self._sync_user_scope_memberships(user_ids_set)
 
-    @staticmethod
-    def _normalize_log_path(path: Optional[str]) -> str:
-        if not path:
-            return ""
-        try:
-            return os.path.normcase(os.path.abspath(str(path)))
-        except Exception:
-            return str(path)
-
-    def _remember_ignored_log(self, uid: str, path: Optional[str]) -> None:
-        np = self._normalize_log_path(path)
-        if not np:
+    def _retire_generation(self, uid: str, generation_id: str) -> None:
+        generation = str(generation_id or "")
+        if not generation:
             return
         uid_s = str(uid)
-        ignored = self._ignored_logs_by_uid.setdefault(uid_s, set())
-        ignored.add(np)
+        retired = self._retired_generations_by_uid.setdefault(uid_s, set())
+        retired.add(generation)
+        if len(retired) > 8:
+            self._retired_generations_by_uid[uid_s] = set(sorted(retired)[-8:])
 
-    def _drop_user_log_tracking(self, uid: str, *, ignore_current: bool = True) -> None:
+    def _drop_user_log_tracking(self, uid: str) -> None:
         uid_s = str(uid)
         cur = self._cur.pop(uid_s, None)
 
-        if ignore_current:
-            try:
-                if cur and cur.path:
-                    self._remember_ignored_log(uid_s, cur.path)
-            except Exception:
-                pass
-
-        prev_np = self._normpath_by_uid.pop(uid_s, None)
-        if ignore_current and prev_np:
-            self._remember_ignored_log(uid_s, prev_np)
-
         try:
-            if hasattr(self, "_last_switch_ts"):
-                self._last_switch_ts.pop(uid_s, None)
+            if cur and cur.generation_id:
+                self._log_index.unpin(cur.generation_id)
+                self._retire_generation(uid_s, cur.generation_id)
         except Exception:
             pass
 
-    def _resolve_current_log(self, uid: str, *, force: bool = False) -> None:
-        uname = (self._get_username(uid) or "").lower()
+    def _resolve_current_log(
+        self,
+        uid: str,
+        *,
+        force: bool = False,
+        refresh_index: bool = True,
+    ) -> None:
+        uid = str(uid)
+        if uid in self._log_resolution_suspended_uids:
+            return
+        uname = (self._get_username(uid) or "").strip().lower()
         if not uname:
             return
-
-        # STRICT: rely on log_utils mapping (which we refresh on watcher hits)
+        not_before = None
         try:
-            path = find_log_for_username(uname, allow_fallback=False)
+            process_started = self._process_created_at_for_disconnect(uid)
+            if process_started is not None:
+                not_before = float(process_started) - 15.0
+        except Exception:
+            not_before = None
+        try:
+            lookup = self._log_index.lookup(
+                uname,
+                not_before=not_before,
+                refresh_index=refresh_index,
+            )
         except Exception:
             return
-        if not path:
-            return
-
-        cur = self._cur.get(uid) or Cursor()
-        prev_np = self._normpath_by_uid.get(uid)
-        if not prev_np and cur.path:
-            try:
-                prev_np = os.path.normcase(os.path.abspath(cur.path))
-            except Exception:
-                prev_np = os.path.normcase(str(cur.path))
-        # NEW: canonicalize both sides and skip if unchanged
-        new_np = os.path.normcase(os.path.abspath(path))
-        ignored_logs = self._ignored_logs_by_uid.get(str(uid), set())
-        if new_np in ignored_logs:
-            return
-        cur_np = self._normpath_by_uid.get(uid)
-        if cur_np and new_np == cur_np:
-            if cur.path:
-                self._watch_dir_for_path(cur.path)
-            return
-
-
-        # Optional per-uid minimum interval between switches (prevents rapid flaps)
-        last_sw = getattr(self, "_last_switch_ts", {}).get(uid, 0.0)
-        now_t = time.time()
-        min_switch_interval = 1.0
-        if not force and (now_t - last_sw < min_switch_interval) and cur.path:
-            if path == cur.path:
+        match = lookup.match
+        if match is None:
+            cur = self._cur.get(uid)
+            if cur is not None and cur.generation_id and not self._log_index.has_generation(cur.generation_id):
+                self._log_index.unpin(cur.generation_id)
+                self._retire_generation(uid, cur.generation_id)
+                self._cur.pop(uid, None)
+                self._mark_menu_unknown(uid)
                 return
-
-        # Anti-flap guard: only switch if candidate is STRICTLY newer
-        if cur.path and os.path.isfile(cur.path) and not force:
-            if path == cur.path:
-                # ensure watcher is set
-                self._watch_dir_for_path(cur.path)
-                return
-            try:
-                old_mtime = os.path.getmtime(cur.path)
-            except Exception:
-                old_mtime = 0.0
-            try:
-                new_mtime = os.path.getmtime(path)
-            except Exception:
-                new_mtime = 0.0
-            if new_mtime <= old_mtime:
-                return
-
-        # Switch
-        cur.path = path
-        if prev_np and new_np != prev_np:
-            # Prevent stitching a partial line from the previous file into the new one.
-            cur.carry = ""
-        try:
-            # seek to EOF so we only read NEW data from the new file
-            cur.pos = os.path.getsize(path) if os.path.isfile(path) else 0
-        except Exception:
-            cur.pos = 0
-
-        self._cur[uid] = cur
-        # remember last switch time
-        if not hasattr(self, "_last_switch_ts"):
-            self._last_switch_ts = {}
-        self._last_switch_ts[uid] = now_t
-
-        # ensure watcher on the new directory
-        self._watch_dir_for_path(cur.path)
-        
-        self._normpath_by_uid[uid] = new_np
-
-        self._log(f"[MultiScope] switched log for {uname} - {os.path.basename(path)}")
-        # Warmstart on log switches so we still seed in_menu/merchant state from the new file.
-        if prev_np and new_np != prev_np:
-            try:
-                self._executor.submit(self._warmstart_user_tail, uid)
-            except Exception:
-                try:
-                    self._warmstart_user_tail(uid)
-                except Exception:
-                    pass
-
-    def _maybe_refresh_paths(self, status_by_uid: Dict[str, dict]) -> None:
-        """
-        Option B++ fallback: 1s cadence + jitter.
-        - Rebuild username-log cache (cheap) so strict lookups see the latest file set
-        - Refresh ALL 'active' users every tick
-        - Round-robin idle users to sweep quickly without spikes
-        - If status_by_uid is empty, operate on self._cur keys
-        """
-        now = time.time()
-        if now < getattr(self, "_next_log_refresh", 0.0):
+            if (
+                not_before is not None
+                and cur is not None
+                and float(cur.session_started_at or 0.0) < float(not_before)
+            ):
+                if cur.generation_id:
+                    self._log_index.unpin(cur.generation_id)
+                    self._retire_generation(uid, cur.generation_id)
+                self._cur.pop(uid, None)
+                self._mark_menu_unknown(uid)
             return
-
-        import random
-        self._next_log_refresh = now + 1.0 + random.uniform(0.0, 0.25)
-
-        # Rebuild the strict cache once per fallback tick
-        try:
-            refresh_username_log_map()
-        except Exception:
-            pass
-
-        uids_all = list(status_by_uid.keys()) if status_by_uid else list(self._cur.keys())
-        if not uids_all:
+        if match.generation_id in self._retired_generations_by_uid.get(uid, set()):
             return
-
-        active_uids = [uid for uid in uids_all
-                       if status_by_uid and ((status_by_uid.get(uid, {}).get("status") == "Active")
-                                             or bool(status_by_uid.get(uid, {}).get("pids")))]
-        idle_uids = [uid for uid in uids_all if uid not in active_uids]
-
-        # refresh all actives immediately
-        for uid in active_uids:
-            self._resolve_current_log(uid)
-
-        # round-robin idles
-        if idle_uids:
-            sweep_seconds = 3.0
-            per_call = max(1, int(len(idle_uids) / sweep_seconds))
-            cursor = getattr(self, "_refresh_cursor", 0)
-            end = cursor + per_call
-            for idx in range(cursor, end):
-                uid = idle_uids[idx % len(idle_uids)]
-                self._resolve_current_log(uid)
-            self._refresh_cursor = (end % len(idle_uids))
+        cur = self._cur.get(uid)
+        if cur and cur.generation_id == match.generation_id:
+            self._log_index.pin(match)
+            cur.path = match.path
+            cur.session_started_at = match.session_started_at
+            cur.observed_size = int(match.size)
+            return
+        cold_attach = uid not in self._ever_attached_uids
+        if cur and cur.generation_id:
+            self._log_index.unpin(cur.generation_id)
+            self._retire_generation(uid, cur.generation_id)
+            self._mark_menu_unknown(uid)
+        next_cursor = Cursor(
+            path=match.path,
+            pos=int(match.size if cold_attach else 0),
+            carry=b"",
+            generation_id=match.generation_id,
+            session_started_at=float(match.session_started_at),
+            observed_size=int(match.size),
+        )
+        self._cur[uid] = next_cursor
+        self._log_index.pin(match)
+        self._ever_attached_uids.add(uid)
+        self._log_index.mark_dirty(match.path)
+        self._log(f"[MultiScope] switched log for {uname} - {os.path.basename(match.path)}")
+        if cold_attach:
+            self._warmstart_user_tail(uid)
 
     def _warmstart_user_tail(self, uid: str) -> None:
         cur = self._cur.get(uid)
@@ -1619,24 +1475,27 @@ class MultiScopeEngine:
             return
         try:
             size_now = os.path.getsize(cur.path)
-            with open(cur.path, "r", encoding="utf-8", errors="ignore") as f:
-                window = 8 * 1024 * 1024  # read up to last 8 MiB for seeds
-                base_offset = 0
-                if size_now > window:
-                    base_offset = int(size_now - window)
-                    f.seek(base_offset)
-                chunk = f.read()
+            with open(cur.path, "rb") as f:
+                window = 8 * 1024 * 1024
+                block_size = 256 * 1024
+                base_offset = max(0, int(size_now - window))
+                blocks: list[bytes] = []
+                read_at = int(size_now)
+                while read_at > base_offset:
+                    take = min(block_size, read_at - base_offset)
+                    read_at -= take
+                    f.seek(read_at)
+                    blocks.append(f.read(take))
+                raw = b"".join(reversed(blocks))
+            if base_offset and b"\n" in raw:
+                skipped = raw.find(b"\n") + 1
+                base_offset += skipped
+                raw = raw[skipped:]
+            chunk = raw.decode("utf-8", errors="replace")
         except Exception:
             return
-
-        # Disconnect lookback: only when the manager considers this uid active/recent.
-        # This avoids firing disconnect events for idle users when MultiScope starts.
+        # Cold attachment is a state seed only: never replay historical disconnects.
         disconnect_hit = False
-        try:
-            if self._should_disconnect_lookback(uid):
-                disconnect_hit = self._scan_disconnect_in_text(uid, chunk, path=cur.path, base_offset=base_offset)
-        except Exception:
-            disconnect_hit = False
 
         # merchant seed (no notify) +' seed *scope* timestamps to avoid retro spam across users
         if not self._disable_log_based_merchant_detection:
@@ -1657,14 +1516,25 @@ class MultiScopeEngine:
         # mark this user as warmstarted so its first live read doesn't post old lines
         self._first_merchant_scan_done.add(uid)
 
-        # seed last biome for scope (no notify) + do NOT set scope.last_biome,
-        # so the first live RPC will emit a START normally.
+        # Seed the current biome/menu without notifying; an unchanged live RPC must
+        # not turn startup history into a fresh alert.
         rpc_entries = _extract_rpc_entries_from_text(chunk)
         if rpc_entries:
-            last = _extract_biome_from_rpc(rpc_entries[-1][0])
-            if last:
-                key = self._server_key_for(uid)
-                self._scope(key).users.add(uid)
+            latest_biome = None
+            latest_biome_ts = None
+            for rpc, ts_epoch in reversed(rpc_entries):
+                latest_biome = _extract_biome_from_rpc(rpc)
+                if latest_biome:
+                    latest_biome_ts = ts_epoch
+                    break
+            key = self._server_key_for(uid)
+            scope = self._scope(key)
+            scope.users.add(uid)
+            if latest_biome:
+                scope.last_biome = str(latest_biome).upper()
+                if latest_biome_ts is not None:
+                    scope.last_biome_ts = float(latest_biome_ts)
+                    self._last_biome_post_by_scope[key] = float(latest_biome_ts)
             latest_state = None
             latest_menu_ts: Optional[float] = None
             for rpc, ts_epoch in rpc_entries:
@@ -1676,8 +1546,6 @@ class MultiScopeEngine:
                 elif st is not None and latest_menu_ts is None:
                     latest_state = st
             if (not disconnect_hit) and latest_state is not None and latest_menu_ts is not None:
-                key = self._server_key_for(uid)
-                scope = self._scope(key)
                 scope.in_menu = latest_state
                 scope.last_menu_ts = float(latest_menu_ts)
                 scope.in_menu_by_uid[str(uid)] = latest_state
@@ -1691,6 +1559,8 @@ class MultiScopeEngine:
                     self._log(f"[SCAN-TRACE] {uid}: warmstart no timestamped in_menu found rpc={len(rpc_entries)}")
                 except Exception:
                     pass
+        cur.pos = int(size_now)
+        cur.carry = b""
 
     def _emit_event(self, kind: str, uid: str, payload: str = "") -> None:
         with self._event_lock:
@@ -1702,14 +1572,35 @@ class MultiScopeEngine:
             self._events.clear()
         return ev
 
+    @staticmethod
+    def _recompute_scope_menu(scope: ServerScope) -> None:
+        known = []
+        for scope_uid in scope.users:
+            uid_s = str(scope_uid)
+            value = (scope.in_menu_by_uid or {}).get(uid_s, None)
+            if value is None:
+                continue
+            try:
+                event_ts = float((scope.last_menu_ts_by_uid or {}).get(uid_s, 0.0) or 0.0)
+            except Exception:
+                event_ts = 0.0
+            known.append((event_ts, uid_s, bool(value)))
+        if known:
+            event_ts, _uid, value = max(known)
+            scope.in_menu = value
+            scope.last_menu_ts = event_ts
+        else:
+            scope.in_menu = None
+            scope.last_menu_ts = 0.0
+
     def _mark_menu_unknown(self, uid: str) -> None:
         try:
             key = self._server_key_for(uid)
             scope = self._scope(key)
-            scope.in_menu = None
             scope.in_menu_by_uid[str(uid)] = None
             scope.last_menu_ts_by_uid[str(uid)] = 0.0
             scope.users.add(uid)
+            self._recompute_scope_menu(scope)
         except Exception:
             pass
 
@@ -1754,13 +1645,15 @@ class MultiScopeEngine:
                 current_status["process_created_at"] = created_at
                 snapshot[uid_s] = current_status
                 self._status_snapshot = snapshot
+                self._process_generation_by_uid[uid_s] = created_at
             except Exception:
                 pass
 
-        try:
-            self._ignored_logs_by_uid.pop(uid_s, None)
-        except Exception:
-            pass
+        # This method is called only after the manager has found a strict log
+        # for a live launch, so it is authoritative evidence that discovery
+        # may resume even if the last status tick still said inactive.
+        self._log_resolution_suspended_uids.discard(uid_s)
+
         try:
             self._menu_none_since_by_uid.pop(uid_s, None)
         except Exception:
@@ -1782,40 +1675,36 @@ class MultiScopeEngine:
         except Exception:
             pass
 
-        target_np = ""
+        target_generation = ""
         try:
             uname = str(self._get_username(uid_s) or "").strip().lower()
         except Exception:
             uname = ""
         if uname:
             try:
-                target_np = self._normalize_log_path(
-                    find_log_for_username(uname, allow_fallback=False)
+                lookup = self._log_index.lookup(
+                    uname,
+                    not_before=(created_at - 15.0) if created_at > 0 else None,
                 )
+                target_generation = lookup.match.generation_id if lookup.match else ""
             except Exception:
-                target_np = ""
+                target_generation = ""
 
         cur = None
         try:
             cur = self._cur.get(uid_s)
         except Exception:
             cur = None
-        try:
-            cur_np = self._normpath_by_uid.get(uid_s) or self._normalize_log_path(cur.path if cur else None)
-        except Exception:
-            cur_np = ""
-
         already_attached = bool(
-            target_np
-            and cur_np
-            and target_np == cur_np
+            target_generation
             and cur
+            and cur.generation_id == target_generation
             and cur.path
             and os.path.isfile(cur.path)
         )
         if already_attached:
             try:
-                self._watch_dir_for_path(cur.path)
+                self._log_index.mark_dirty(cur.path)
             except Exception:
                 pass
             return True
@@ -1832,12 +1721,23 @@ class MultiScopeEngine:
         except Exception:
             return False
 
-        try:
-            self._warmstart_user_tail(uid_s)
-        except Exception:
-            pass
-
         return True
+
+    def _claim_event_range(
+        self,
+        generation_id: str,
+        start: int,
+        end: int,
+        event_kind: str,
+    ) -> bool:
+        key = (str(generation_id or ""), max(0, int(start)), max(0, int(end)), str(event_kind))
+        with self._event_claim_lock:
+            if key in self._seen_event_ranges:
+                return False
+            self._seen_event_ranges[key] = None
+            while len(self._seen_event_ranges) > self._seen_event_range_limit:
+                self._seen_event_ranges.pop(next(iter(self._seen_event_ranges)))
+            return True
 
     def _scan_disconnect_in_text(
         self,
@@ -1846,6 +1746,10 @@ class MultiScopeEngine:
         *,
         path: Optional[str] = None,
         base_offset: int = 0,
+        absolute_end: Optional[int] = None,
+        absolute_start: Optional[int] = None,
+        generation_id: str = "",
+        timestamp_hint: Optional[float] = None,
     ) -> bool:
         """Scan `text` for disconnect signals; emits at most once per log position."""
         if not text:
@@ -1908,10 +1812,13 @@ class MultiScopeEngine:
             except Exception:
                 norm_path = str(path)
 
-        try:
-            abs_end = max(0, int(base_offset)) + int(last_end)
-        except Exception:
-            abs_end = int(last_end)
+        if absolute_end is not None:
+            abs_end = max(0, int(absolute_end))
+        else:
+            try:
+                abs_end = max(0, int(base_offset)) + int(last_end)
+            except Exception:
+                abs_end = int(last_end)
 
         prev = self._last_disconnect_sig_by_uid.get(str(uid))
         if prev and prev[0] == norm_path and abs_end <= int(prev[1]):
@@ -1920,7 +1827,9 @@ class MultiScopeEngine:
         # A warmstart can include a disconnect left in the log by the previous
         # Roblox process. Only let a timestamped line affect the process that
         # was alive when (or before) that line was written.
-        disconnect_ts = _extract_log_ts_epoch_before(text, last_start)
+        disconnect_ts = timestamp_hint
+        if disconnect_ts is None:
+            disconnect_ts = _extract_log_ts_epoch_before(text, last_start)
         process_created_at = self._process_created_at_for_disconnect(uid)
         if (
             disconnect_ts is not None
@@ -1932,8 +1841,11 @@ class MultiScopeEngine:
 
         self._last_disconnect_sig_by_uid[str(uid)] = (norm_path, abs_end)
         self._mark_menu_unknown(uid)
-        self._drop_user_log_tracking(uid, ignore_current=True)
-        self._emit_event("disconnect", uid, last_payload)
+        self._log_resolution_suspended_uids.add(str(uid))
+        self._drop_user_log_tracking(uid)
+        range_start = max(0, int(absolute_start if absolute_start is not None else base_offset))
+        if self._claim_event_range(generation_id or norm_path, range_start, abs_end, "disconnect"):
+            self._emit_event("disconnect", uid, last_payload)
         return True
 
     def _scan_disconnect_in_chunk(self, uid: str, chunk: str) -> bool:
@@ -1958,7 +1870,7 @@ class MultiScopeEngine:
     def _server_key_for(self, uid: str) -> str:
         label = (self._get_server_label(uid) or "").strip()
         if not label:
-            return "Unknown"
+            return f"Unknown #{uid}"
         upper = label.upper()
         if upper.startswith("DISCONNECTED") or upper.startswith("OFFLINE"):
             return "Disconnected"
@@ -1970,12 +1882,131 @@ class MultiScopeEngine:
         if not server_key:
             return "Unknown"
         upper = server_key.upper()
-        if upper.startswith("PUBLIC:") and " #" in server_key:
+        if (upper.startswith("PUBLIC:") or upper.startswith("UNKNOWN #")) and " #" in server_key:
             return server_key.split(" #", 1)[0]
         return server_key
 
     def _scope(self, key: str) -> ServerScope:
         return self._scopes.setdefault(key, ServerScope(key))
+
+    @staticmethod
+    def _is_unresolved_scope_key(key: str) -> bool:
+        upper = str(key or "").strip().upper()
+        return upper == "UNKNOWN" or upper.startswith("UNKNOWN #")
+
+    def _merge_resolved_scope_state(
+        self,
+        source_key: str,
+        source: ServerScope,
+        target_key: str,
+        target: ServerScope,
+    ) -> None:
+        """Move warm-start state only from a UID-isolated unresolved scope."""
+        if (
+            not self._is_unresolved_scope_key(source_key)
+            or self._is_unresolved_scope_key(target_key)
+            or str(target_key).strip().lower() == "disconnected"
+        ):
+            return
+
+        if source.last_biome and float(source.last_biome_ts or 0.0) >= float(target.last_biome_ts or 0.0):
+            target.last_biome = source.last_biome
+            target.last_biome_ts = float(source.last_biome_ts or 0.0)
+        if source.last_merchant and float(source.last_merchant_ts or 0.0) >= float(target.last_merchant_ts or 0.0):
+            target.last_merchant = source.last_merchant
+            target.last_merchant_ts = float(source.last_merchant_ts or 0.0)
+
+        source_biome_post = self._last_biome_post_by_scope.pop(source_key, None)
+        if source_biome_post is not None:
+            self._last_biome_post_by_scope[target_key] = max(
+                float(self._last_biome_post_by_scope.get(target_key, 0.0) or 0.0),
+                float(source_biome_post or 0.0),
+            )
+
+        source_merchants = self._last_merchant_ts_by_scope.pop(source_key, {}) or {}
+        if source_merchants:
+            target_merchants = self._last_merchant_ts_by_scope.setdefault(target_key, {})
+            for merchant, event_ts in source_merchants.items():
+                target_merchants[str(merchant)] = max(
+                    float(target_merchants.get(str(merchant), 0.0) or 0.0),
+                    float(event_ts or 0.0),
+                )
+
+        target.events += int(source.events or 0)
+        source.events = 0
+
+    def _sync_user_scope_memberships(self, user_ids: Iterable[str]) -> None:
+        """Move per-user state when process context changes its server scope."""
+        desired: Dict[str, str] = {}
+        for raw_uid in user_ids:
+            uid = str(raw_uid)
+            try:
+                desired[uid] = self._server_key_for(uid)
+            except Exception:
+                desired[uid] = f"Unknown #{uid}"
+
+        affected_scopes: Set[str] = set()
+        migrated_sources: Set[str] = set()
+        ambiguous_legacy_unknown = {
+            key
+            for key, scope in self._scopes.items()
+            if str(key).strip().upper() == "UNKNOWN" and len(scope.users) > 1
+        }
+        for old_key, old_scope in list(self._scopes.items()):
+            for uid in list(old_scope.users):
+                new_key = desired.get(str(uid))
+                if not new_key or new_key == old_key:
+                    continue
+
+                target = self._scope(new_key)
+                uid_s = str(uid)
+                if old_key not in migrated_sources and old_key not in ambiguous_legacy_unknown:
+                    self._merge_resolved_scope_state(old_key, old_scope, new_key, target)
+                    migrated_sources.add(old_key)
+
+                if uid_s in (old_scope.in_menu_by_uid or {}):
+                    value = old_scope.in_menu_by_uid.pop(uid_s, None)
+                    try:
+                        menu_ts = float(old_scope.last_menu_ts_by_uid.pop(uid_s, 0.0) or 0.0)
+                    except Exception:
+                        menu_ts = 0.0
+
+                    try:
+                        target_ts = float((target.last_menu_ts_by_uid or {}).get(uid_s, 0.0) or 0.0)
+                    except Exception:
+                        target_ts = 0.0
+                    if uid_s not in target.in_menu_by_uid or menu_ts >= target_ts:
+                        target.in_menu_by_uid[uid_s] = value
+                        target.last_menu_ts_by_uid[uid_s] = menu_ts
+                else:
+                    target.in_menu_by_uid.setdefault(uid_s, None)
+                    target.last_menu_ts_by_uid.setdefault(uid_s, 0.0)
+
+                old_scope.users.discard(uid)
+                target.users.add(uid_s)
+                affected_scopes.update({old_key, new_key})
+
+        # An aggregate menu value must not remain owned by a user that moved away.
+        for uid, key in desired.items():
+            scope = self._scope(key)
+            scope.users.add(uid)
+            scope.in_menu_by_uid.setdefault(uid, None)
+            scope.last_menu_ts_by_uid.setdefault(uid, 0.0)
+            affected_scopes.add(key)
+
+        for key in affected_scopes:
+            scope = self._scopes.get(key)
+            if scope is not None:
+                self._recompute_scope_menu(scope)
+
+        # Resolved transient scopes have no independent server identity and
+        # should not linger in snapshots or the MultiScope table.
+        for key in list(affected_scopes):
+            scope = self._scopes.get(key)
+            if scope is not None and not scope.users and self._is_unresolved_scope_key(key):
+                self._last_biome_post_by_scope.pop(key, None)
+                self._last_merchant_ts_by_scope.pop(key, None)
+                self._scopes.pop(key, None)
 
     def _resolve_owner(self, uid: str, server_label: str) -> str:
         """
@@ -2271,6 +2302,7 @@ class MultiScopeEngine:
         except Exception:
             scope.last_merchant_ts = time.time()
         scope.users.add(uid)
+        self._emit_event("merchant", str(uid), str(who))
 
         if not self._merchant_hook:
             return
@@ -2353,327 +2385,392 @@ class MultiScopeEngine:
                 self._last_merchant_ts_by_scope.setdefault(scope_key, {})[who] = float(now_ts)
             except Exception:
                 pass
+            self._emit_event("merchant", uid, who)
 
-    # ---- Cadence model -------------------------------------------------
+    def _dispatch_log_line(
+        self,
+        uid: str,
+        line: str,
+        *,
+        path: str,
+        generation_id: str,
+        byte_start: int,
+        byte_end: int,
+        disconnect_already: bool = False,
+    ) -> bool:
+        lower = line.lower()
+        needs_scope_order = bool(
+            "[BloxstrapRPC]" in line
+            or "disconnect" in lower
+            or "connection lost" in lower
+            or any(token in lower for token in _merchant_prefilters_for_mode(self._merchant_detection_mode))
+        )
+        if needs_scope_order:
+            with self._tail_scope_lock_for(uid):
+                return self._dispatch_log_line_serial(
+                    uid,
+                    line,
+                    path=path,
+                    generation_id=generation_id,
+                    byte_start=byte_start,
+                    byte_end=byte_end,
+                    disconnect_already=disconnect_already,
+                )
+        return self._dispatch_log_line_serial(
+            uid,
+            line,
+            path=path,
+            generation_id=generation_id,
+            byte_start=byte_start,
+            byte_end=byte_end,
+            disconnect_already=disconnect_already,
+        )
 
-    _MERCHANT_MIN_GAP = 18 * 60  # 18 minutes
+    def _dispatch_log_line_serial(
+        self,
+        uid: str,
+        line: str,
+        *,
+        path: str,
+        generation_id: str,
+        byte_start: int,
+        byte_end: int,
+        disconnect_already: bool = False,
+    ) -> bool:
+        """Parse one logical line and dispatch each supported record once."""
+        ts_epoch: Optional[float] = None
+        ts_match = _LOG_TS_RE.search(line)
+        if ts_match:
+            ts_epoch = _parse_log_ts_epoch(ts_match.group(0))
 
-    def _choose_uid_for_scope(self, key: str) -> Optional[str]:
-        scope = self._scope(key)
-        members = sorted(scope.users)
-        if not members:
-            return None
-        # Round-robin across users in the scope so we don't starve anyone
-        idx = scope.poll_rot % len(members)
-        scope.poll_rot = (scope.poll_rot + 1) % len(members)
-        return members[idx]
+        disconnect_hit = bool(disconnect_already)
+        if not disconnect_hit:
+            disconnect_hit = self._scan_disconnect_in_text(
+                uid,
+                line,
+                path=path,
+                base_offset=byte_start,
+                absolute_start=byte_start,
+                absolute_end=byte_end,
+                generation_id=generation_id,
+                timestamp_hint=ts_epoch,
+            )
 
-    def _compute_scope_interval(self, scope: ServerScope) -> float:
-        """
-        Returns seconds until the next poll for this scope, based on:
-        - Biome (NORMAL = hot, active biome = cooler; scale by remaining time if known)
-        - Merchant window (tighten after >= 18 minutes since last merchant)
-        """
-        import time
-        now = time.time()
+        lower = line.lower()
+        if (
+            not self._disable_log_based_merchant_detection
+            and ts_epoch is not None
+            and any(token in lower for token in _merchant_prefilters_for_mode(self._merchant_detection_mode))
+        ):
+            matches = _iter_merchant_matches(line.rstrip("\r\n"), self._merchant_detection_mode)
+            scope_key = self._server_key_for(uid)
+            self._scopes.setdefault(scope_key, ServerScope(scope_key)).users.add(uid)
+            for match in matches:
+                who = str(match.get("merchant_name") or "").title()
+                if not who:
+                    continue
+                event_dt = datetime.fromtimestamp(float(ts_epoch), tz=timezone.utc)
+                if uid not in self._first_merchant_scan_done:
+                    self._last_merchant_ts_by_scope.setdefault(scope_key, {})[who] = float(ts_epoch)
+                    continue
+                claimed = self._claim_event_range(
+                    generation_id,
+                    byte_start,
+                    byte_end,
+                    f"merchant:{who.lower()}",
+                )
+                if claimed and not self._scope_dedupe_merchant_ts(scope_key, who, float(ts_epoch), window=10.0):
+                    self._emit_merchant(uid, who, event_dt, str(match.get("full_line") or ""))
+            self._first_merchant_scan_done.add(uid)
 
-        # Default bounds (clamped)
-        MIN_IVL = 0.25   # never less than 250ms
-        MAX_IVL = 6.00   # never more than 6s
+        if "[BloxstrapRPC]" in line:
+            rpc_entries = _extract_rpc_entries_from_text(
+                line,
+                timestamp_hint=ts_epoch,
+                extract_timestamp=False,
+            )
+            server_key = self._server_key_for(uid)
+            scope = self._scopes.setdefault(server_key, ServerScope(server_key))
+            scope.users.add(uid)
+            for rpc, event_ts in rpc_entries:
+                if event_ts is None:
+                    continue
+                event_ts = float(event_ts)
+                menu_state = _extract_in_menu_from_rpc(rpc)
+                if menu_state is not None and not disconnect_hit:
+                    claimed = self._claim_event_range(
+                        generation_id,
+                        byte_start,
+                        byte_end,
+                        "rpc:menu",
+                    )
+                    # Range claims suppress duplicate scope-level work, but
+                    # every attached user still needs its own menu state.
+                    if claimed and event_ts >= float(getattr(scope, "last_menu_ts", 0.0) or 0.0):
+                        scope.in_menu = menu_state
+                        scope.last_menu_ts = event_ts
+                    scope.in_menu_by_uid[str(uid)] = menu_state
+                    scope.last_menu_ts_by_uid[str(uid)] = event_ts
+                    self._clear_menu_unknown(uid)
 
-        # Disconnected/Offline scopes: deprioritize hard
-        if scope.key == "Disconnected":
-            return 5.0
+                biome_name = _extract_biome_from_rpc(rpc)
+                if not biome_name:
+                    continue
+                biome = str(biome_name).upper()
+                if not self._claim_event_range(
+                    generation_id,
+                    byte_start,
+                    byte_end,
+                    f"rpc:biome:{biome}",
+                ):
+                    continue
+                previous = scope.last_biome
+                if not previous and uid in self._handoff_prev_biome_for_spare:
+                    previous = self._handoff_prev_biome_for_spare.pop(uid, None)
+                if previous and biome == previous:
+                    continue
+                last_post = float(self._last_biome_post_by_scope.get(server_key, 0.0) or 0.0)
+                allow_first = last_post == 0.0 and not previous
+                if not allow_first and (event_ts - last_post) < self._biome_min_interval:
+                    continue
+                if previous:
+                    self._emit_biome_event(uid, server_key, previous, event_type="end", ts_epoch=event_ts)
+                scope.last_biome = biome
+                scope.last_biome_ts = event_ts
+                self._last_biome_post_by_scope[server_key] = event_ts
+                if biome != "NORMAL":
+                    self._emit_biome_event(uid, server_key, biome, event_type="start", ts_epoch=event_ts)
+                    if biome in HARD_EVERYONE_BIOMES:
+                        self._maybe_start_temp_block(uid, f"Biome:{biome}")
+                else:
+                    self._log(
+                        f"[MultiScope] BIOME START suppressed | biome=NORMAL | "
+                        f"user={self._get_username(uid)} | server={server_key}"
+                    )
 
-        biome = (scope.last_biome or "NORMAL").upper()
-        color, _thumb = biome_meta(biome)  # keep warm (already imported)
-        dur = biome_duration(biome) or 600  # default 10 min if unknown
-        age = (now - scope.last_biome_ts) if scope.last_biome_ts else 0.0
-        remaining = max(0.0, float(dur) - age)
-
-        # Biome-driven base interval
-        if biome == "NORMAL":
-            base = 0.40    # poll very frequently when NORMAL to catch new spawns fast
-        else:
-            # Scale 1.2s..5.0s depending on how much time remains in the active biome
-            # (when far from ending, poll less often; tighten again as it nears the end)
-            rem_ratio = 0.0 if dur <= 0 else max(0.0, min(1.0, remaining / float(dur)))
-            base = 1.20 + 3.80 * rem_ratio  # 1.2 - 5.0
-
-        # Merchant window: if we're past the minimum spawn gap, tighten polling
-        m_age = (now - scope.last_merchant_ts) if scope.last_merchant_ts else 1e9
-        if m_age >= self._MERCHANT_MIN_GAP:
-            base *= 0.50   # tighten (more often)
-        else:
-            base *= 1.50   # relax (less often) while we're still within the 18-min quiet
-
-        # Clamp
-        if base < MIN_IVL: base = MIN_IVL
-        if base > MAX_IVL: base = MAX_IVL
-        return float(base)
+        cur = self._cur.get(uid)
+        if cur is not None and ts_epoch is not None:
+            cur.last_event_ts = max(float(cur.last_event_ts or 0.0), float(ts_epoch))
+        with self._tail_scope_lock_for(uid):
+            self._scope(self._server_key_for(uid)).users.add(uid)
+        return disconnect_hit
 
     # -- Tail one user ---------------------------------------------------------
 
-    def _tail_one(self, uid: str) -> None:
+    def _tail_scope_lock_for(self, uid: str) -> threading.RLock:
+        try:
+            scope_key = str(self._server_key_for(str(uid)) or f"Unknown #{uid}")
+        except Exception:
+            scope_key = f"Unknown #{uid}"
+        with self._tail_scope_locks_lock:
+            return self._tail_scope_locks.setdefault(scope_key, threading.RLock())
+
+    def _reader_stat_add(self, key: str, amount: int = 1) -> None:
+        with self._reader_stats_lock:
+            self._reader_stats[key] = int(self._reader_stats.get(key, 0) or 0) + int(amount)
+
+    def _tail_one(self, uid: str, *, max_bytes: Optional[int] = None) -> int:
+        return self._tail_one_serial(uid, max_bytes=max_bytes)
+
+    def _tail_one_serial(self, uid: str, *, max_bytes: Optional[int] = None) -> int:
         cur = self._cur.get(uid)
         if not cur or not cur.path or not os.path.isfile(cur.path):
             self._resolve_current_log(uid, force=True)
             cur = self._cur.get(uid)
             if not cur or not cur.path or not os.path.isfile(cur.path):
-                return
+                return 0
 
         disconnect_hit = False
         try:
             start_pos = int(cur.pos or 0)
-            read_start = _t.perf_counter()
-            chunks = []
-            bytes_read = 0
-
-            while True:
-                size_now = os.path.getsize(cur.path)
-                if size_now <= cur.pos:
-                    break
-
-                to_read = min(self._per_read_cap, size_now - cur.pos)
-                with open(cur.path, "r", encoding="utf-8", errors="ignore") as f:
-                    f.seek(cur.pos)
-                    chunks.append(f.read(to_read))
-                cur.pos += to_read
-                bytes_read += to_read
-                # burst limits: ~30ms or up to ~1 MiB total this dequeue
-                if (_t.perf_counter() - read_start) >= 0.030:
-                    break
-                if bytes_read >= (self._per_read_cap * 4):
-                    break
-
-            if not chunks:
-                return
-
-            chunk = "".join(chunks)
-
+            size_now = os.path.getsize(cur.path)
+            cur.observed_size = int(size_now)
+            if size_now < start_pos:
+                self._reader_stat_add("truncations")
+                self._log_index.mark_dirty(cur.path)
+                self._log_index.refresh(force=True)
+                self._resolve_current_log(uid, force=True)
+                return 0
+            if size_now <= start_pos:
+                return 0
+            limit = self._per_read_cap if max_bytes is None else max(1, int(max_bytes))
+            to_read = min(self._per_read_cap, limit, size_now - start_pos)
+            with open(cur.path, "rb") as f:
+                f.seek(start_pos)
+                raw = f.read(to_read)
+            if not raw:
+                return 0
+            cur.pos = start_pos + len(raw)
         except Exception:
-            return
+            self._reader_stat_add("read_failures")
+            return 0
 
-        # Stitch with any carried partial line from last time, and only parse full lines
-        text = (cur.carry or "") + (chunk or "")
+        previous_carry = bytes(cur.carry or b"")
+        combined = previous_carry + raw
+        combined_base = max(0, start_pos - len(previous_carry))
+        if cur.dropping_oversized:
+            first_nl = combined.find(b"\n")
+            if first_nl < 0:
+                cur.carry = b""
+                self._reader_stat_add("bytes_read", len(raw))
+                return len(raw)
+            combined = combined[first_nl + 1:]
+            combined_base += first_nl + 1
+            previous_carry = b""
+            cur.dropping_oversized = False
 
-        # Disconnect look-back: include the carried partial line so we don't miss split lines.
-        try:
-            base_offset = max(0, start_pos - len(cur.carry or ""))
-        except Exception:
-            base_offset = 0
-        disconnect_hit = self._scan_disconnect_in_text(uid, text, path=cur.path, base_offset=base_offset)
-        nl = text.rfind("\n")
-        if nl == -1:
-            # still no complete line; carry everything
-            cur.carry = text[-4096:]  # keep small tail
-            return
-        parse_text = text[:nl + 1]
-        cur.carry = text[nl + 1:]
+        nl = combined.rfind(b"\n")
+        complete = combined[:nl + 1] if nl >= 0 else b""
+        tail = combined[nl + 1:] if nl >= 0 else combined
+        cur.carry = tail
+        if len(tail) > self._max_line_bytes:
+            cur.carry = b""
+            cur.dropping_oversized = True
+            self._reader_stat_add("oversized_lines")
 
-        # -- Cheap token prefilters before heavy regex -------------------------
-        parse_text_lower = parse_text.lower()
-        has_merchant = (
-            (not self._disable_log_based_merchant_detection)
-            and any(token in parse_text_lower for token in _merchant_prefilters_for_mode(self._merchant_detection_mode))
+        line_parts: list[str] = []
+        line_offset = int(combined_base)
+        disconnect_hit = False
+        for line_bytes in complete.splitlines(keepends=True):
+            line_end = line_offset + len(line_bytes)
+            if len(line_bytes) > self._max_line_bytes:
+                self._reader_stat_add("oversized_lines")
+                line_offset = line_end
+                continue
+            try:
+                line_text = line_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                line_text = line_bytes.decode("utf-8", errors="replace")
+                self._reader_stat_add("decode_errors")
+            line_parts.append(line_text)
+            disconnect_hit = self._dispatch_log_line(
+                uid,
+                line_text,
+                path=cur.path,
+                generation_id=cur.generation_id,
+                byte_start=line_offset,
+                byte_end=line_end,
+                disconnect_already=disconnect_hit,
+            )
+            line_offset = line_end
+
+        # A final record need not end with a newline. Dispatch it once when one
+        # of the supported parsers can prove that the record is complete.
+        if cur.carry and len(cur.carry) <= self._max_line_bytes:
+            try:
+                tail_text = cur.carry.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                tail_text = ""
+            tail_is_complete = bool(
+                R_DISC_REASON.search(tail_text)
+                or R_DISC_NOTIFY.search(tail_text)
+                or R_DISC_SENDING.search(tail_text)
+                or R_CONN_LOST.search(tail_text)
+                or _iter_merchant_matches(tail_text, self._merchant_detection_mode)
+                or _extract_rpc_entries_from_text(tail_text)
+            )
+            if tail_is_complete:
+                tail_start = int(cur.pos) - len(cur.carry)
+                tail_end = int(cur.pos)
+                line_parts.append(tail_text)
+                disconnect_hit = self._dispatch_log_line(
+                    uid,
+                    tail_text,
+                    path=cur.path,
+                    generation_id=cur.generation_id,
+                    byte_start=tail_start,
+                    byte_end=tail_end,
+                    disconnect_already=disconnect_hit,
+                )
+                cur.carry = b""
+
+        self._reader_stat_add("bytes_read", len(raw))
+        self._reader_stat_add("lines_read", len(line_parts))
+        return len(raw)
+
+
+
+    def poll_logs(self) -> dict:
+        """Advance discovery and tail eligible cursors with bounded concurrency."""
+        self._log_index.poll()
+        generation_sizes = self._log_index.generation_sizes()
+        for cur in tuple(self._cur.values()):
+            known_size = generation_sizes.get(cur.generation_id)
+            if known_size is not None:
+                cur.observed_size = int(known_size)
+
+        now_mono = time.monotonic()
+        if now_mono >= self._next_path_resolve_mono:
+            self._next_path_resolve_mono = now_mono + 0.25
+            for uid in sorted(self._tracked_uids):
+                self._resolve_current_log(uid, refresh_index=False)
+
+        uids = sorted(
+            uid
+            for uid in self._tracked_uids
+            if uid in self._cur
+            and int(self._cur[uid].observed_size) != int(self._cur[uid].pos)
         )
-        has_rpc      = ("[BloxstrapRPC]" in parse_text)
+        if not uids:
+            with self._reader_stats_lock:
+                self._reader_stats["tail_cycles"] += 1
+                self._reader_stats["last_cycle_tailed_users"] = 0
+                self._reader_stats["backlog_users"] = 0
+            return self.reader_diagnostics()
+        start = self._tail_rotation % len(uids)
+        ordered = uids[start:] + uids[:start]
 
-        # Merchants (scope-level dedupe by timestamp window)
-        if has_merchant:
-            matches = _iter_merchant_matches(parse_text, self._merchant_detection_mode)
-            if matches:
-                latest: Dict[str, dict] = {}
-                for m in matches:
-                    try:
-                        ts = datetime.fromisoformat(str(m.get("timestamp") or "").replace("Z", "+00:00"))
-                    except Exception:
-                        continue
-                    name = str(m.get("merchant_name") or "").title()
-                    if not name:
-                        continue
-                    latest[name] = {"ts": ts, "line": str(m.get("full_line") or "")}
+        remaining = self._global_read_cap
+        jobs: list[tuple[str, int]] = []
+        for uid in ordered:
+            if remaining <= 0:
+                break
+            cur = self._cur.get(uid)
+            if cur is None:
+                continue
+            delta = max(1, abs(int(cur.observed_size) - int(cur.pos)))
+            reserved = min(self._per_read_cap, remaining, delta)
+            jobs.append((uid, reserved))
+            remaining -= reserved
 
-                scope_key = self._server_key_for(uid)
-                self._scopes.setdefault(scope_key, ServerScope(scope_key)).users.add(uid)
-
-                if uid not in self._first_merchant_scan_done:
-                    self._last_merchant_ts_by_scope.setdefault(scope_key, {})
-                    for k, v in latest.items():
-                        self._last_merchant_ts_by_scope[scope_key][k] = v["ts"].timestamp()
-                    self._first_merchant_scan_done.add(uid)
-                else:
-                    for k, v in latest.items():
-                        ts_epoch = v["ts"].timestamp()
-                        if not self._scope_dedupe_merchant_ts(scope_key, k, ts_epoch, window=10.0):
-                            self._emit_merchant(uid, k, v["ts"], v["line"])
-
-        # Biomes (anchor to log line's ISO timestamp like merchants)
-        if has_rpc:
-            matches = list(BIOME_RPC_RE.finditer(parse_text))
-            # Always keep explicit Optional types so Pylance knows the shape.
-            latest_ts: Optional[float] = None
-            latest_biome: Optional[str] = None
-            latest_menu_ts: Optional[float] = None
-            latest_menu_flag: Optional[bool] = None
-            fallback_count: int = 0
-            fallback_sample: Optional[dict] = None
-
-            server_key = self._server_key_for(uid)
-            scope = self._scopes.setdefault(server_key, ServerScope(server_key))
-
-            if matches:
-                for m in matches:
-                    ts_text = m.group("timestamp")
-                    try:
-                        dt = datetime.fromisoformat(ts_text.replace("Z", "+00:00"))
-                    except Exception:
-                        continue
-
-                    try:
-                        rpc = json.loads(m.group("json"))
-                    except Exception:
-                        continue
-
-                    menu_state = _extract_in_menu_from_rpc(rpc)
-                    if menu_state is not None:
-                        ts_epoch = float(dt.timestamp())
-                        if (latest_menu_ts is None) or (ts_epoch >= latest_menu_ts):
-                            latest_menu_ts = ts_epoch
-                            latest_menu_flag = menu_state
-
-                    try:
-                        data = rpc.get("data") or {}
-                        li = data.get("largeImage") or {}
-                        biome_name = (li.get("hoverText") or "").strip()
-                    except Exception:
-                        continue
-
-                    if not biome_name:
-                        continue
-
-                    latest_ts = float(dt.timestamp())
-                    latest_biome = str(biome_name).upper()
-
-            # Fallback: parse any RPC blobs even if the regex missed them, keeping
-            # the timestamp from the containing log line when available.
-            if latest_menu_ts is None or latest_ts is None or not latest_biome:
+        if jobs:
+            self._tail_rotation = (start + len(jobs)) % len(uids)
+            futures = [
+                self._tail_executor.submit(self._tail_one, uid, max_bytes=max_bytes)
+                for uid, max_bytes in jobs
+            ]
+            # Complete the batch before the process handles state-changing
+            # commands. This keeps process ownership deterministic while the
+            # expensive per-user file reads/parsers run concurrently.
+            for future in futures:
                 try:
-                    fallback_entries = _extract_rpc_entries_from_text(parse_text)
+                    future.result()
                 except Exception:
-                    fallback_entries = []
-                if fallback_entries:
-                    try:
-                        fallback_count = int(len(fallback_entries))
-                        if isinstance(fallback_entries[-1][0], dict):
-                            fallback_sample = fallback_entries[-1][0]
-                    except Exception:
-                        fallback_count = 0
-                        fallback_sample = None
-                    need_menu_fallback = latest_menu_ts is None
-                    need_biome_fallback = latest_ts is None or not latest_biome
-                    for rpc, ts_epoch in fallback_entries:
-                        if ts_epoch is None:
-                            continue
-                        ts_f = float(ts_epoch)
-                        if need_menu_fallback:
-                            ms = _extract_in_menu_from_rpc(rpc)
-                            if ms is not None:
-                                if latest_menu_ts is None or ts_f >= float(latest_menu_ts):
-                                    latest_menu_ts = ts_f
-                                    latest_menu_flag = ms
-                        if need_biome_fallback:
-                            b = _extract_biome_from_rpc(rpc)
-                            if b:
-                                if latest_ts is None or ts_f >= float(latest_ts):
-                                    latest_ts = ts_f
-                                    latest_biome = str(b).upper()
+                    self._reader_stat_add("read_failures")
 
-            if not disconnect_hit:
-                if latest_menu_ts is not None:
-                    if latest_menu_ts >= getattr(scope, "last_menu_ts", 0.0):
-                        prev_menu = getattr(scope, "in_menu", None)
-                        scope.in_menu = latest_menu_flag
-                        scope.last_menu_ts = latest_menu_ts
-                        if prev_menu != scope.in_menu:
-                            try:
-                                self._log(f"[SCAN-TRACE] {uid}: in_menu={scope.in_menu} server={server_key}")
-                            except Exception:
-                                pass
-                    scope.in_menu_by_uid[str(uid)] = latest_menu_flag
-                    scope.last_menu_ts_by_uid[str(uid)] = float(latest_menu_ts or 0.0)
-                    scope.users.add(uid)
-                    self._clear_menu_unknown(uid)
-                else:
-                    scope.users.add(uid)
-                    # Debug: RPC lines present but no menu state extracted.
-                    try:
-                        diag = ""
-                        if isinstance(fallback_sample, dict):
-                            data = fallback_sample.get("data")
-                            if isinstance(data, dict):
-                                sk = list(data.keys())[:8]
-                                st = data.get("state")
-                                dtl = data.get("details")
-                                diag = f" data_keys={sk} state={st!r} details={dtl!r}"
-                        self._throttled_log(
-                            key=f"menu-miss:{uid}",
-                            msg=f"[SCAN-TRACE] {uid}: no in_menu parsed from RPC matches={len(matches)} fallback={fallback_count} server={server_key}{diag}",
-                            every=30.0,
-                        )
-                    except Exception:
-                        pass
-            else:
-                scope.users.add(uid)
+        backlog_users = sum(
+            1
+            for uid in self._tracked_uids
+            if uid in self._cur
+            and int(self._cur[uid].observed_size) != int(self._cur[uid].pos)
+        )
+        with self._reader_stats_lock:
+            self._reader_stats["tail_cycles"] += 1
+            self._reader_stats["last_cycle_tailed_users"] = len(jobs)
+            self._reader_stats["backlog_users"] = int(backlog_users)
+        return self.reader_diagnostics()
 
-            if (latest_ts is not None) and latest_biome:
-                event_ts: float = latest_ts
-                biome: str = latest_biome
+    def reader_diagnostics(self) -> dict:
+        with self._reader_stats_lock:
+            out = dict(self._reader_stats)
+        out["index"] = self._log_index.diagnostics_snapshot()
+        out["tracked_users"] = len(self._tracked_uids)
+        out["attached_users"] = len(self._cur)
+        out["tail_workers"] = int(self._tail_workers)
+        return out
 
-                scope.users.add(uid)
-
-                # carry donor's last biome into spare (handoff) just once
-                prev = scope.last_biome
-                if not prev and uid in self._handoff_prev_biome_for_spare:
-                    prev = self._handoff_prev_biome_for_spare.pop(uid, None)
-
-                # NEW: if the biome didn't change, do nothing.
-                # Don't emit End/Start and don't reset the start timestamp.
-                if prev and biome == prev:
-                    pass
-                else:
-                    # Keep the existing min-interval gating and first-post allowance.
-                    last_post: float = float(self._last_biome_post_by_scope.get(server_key, 0.0) or 0.0)
-                    allow_first: bool = (last_post == 0.0 and not prev)  # first biome for this scope
-
-                    if allow_first or (event_ts - last_post) >= self._biome_min_interval:
-                        if prev:
-                            self._emit_biome_event(uid, server_key, prev, event_type="end", ts_epoch=event_ts)
-
-                        # Only set the start timestamp when the biome actually CHANGES.
-                        scope.last_biome = biome
-                        scope.last_biome_ts = event_ts
-                        self._last_biome_post_by_scope[server_key] = event_ts
-
-                        if biome != "NORMAL":
-                            self._emit_biome_event(uid, server_key, biome, event_type="start", ts_epoch=event_ts)
-                            if biome in HARD_EVERYONE_BIOMES:
-                                self._maybe_start_temp_block(uid, f"Biome:{biome}")
-                        else:
-                            self._log(f"[MultiScope] BIOME START suppressed | biome=NORMAL | user={self._get_username(uid)} | server={server_key}")
-        # keep scope membership fresh
-        key = self._server_key_for(uid)
-        self._scope(key).users.add(uid)
-        # If backlog remains, pull this scope forward slightly
-        try:
-            if os.path.getsize(cur.path) > cur.pos:
-                key = self._server_key_for(uid)
-                scope = self._scope(key)
-                scope.next_tail_at = min(getattr(scope, "next_tail_at", 0.0), _t.time() + 0.05)
-        except Exception:
-            pass
-
-
+    def diagnostics_snapshot(self) -> dict:
+        return self.reader_diagnostics()
 
     # -- Public loop hooks -----------------------------------------------------
 
@@ -2688,16 +2785,15 @@ class MultiScopeEngine:
                 self._status_snapshot = status_by_uid or {}
                 self._status_snapshot_ts = 0.0
 
-            # ensure scopes contain their current members
-            for uid in list(self._cur.keys()):
-                key = self._server_key_for(uid)
-                if key:
-                    self._scope(key).users.add(uid)
+            # Context can arrive after autonomous warm-start. Move the user's
+            # seeded state out of its UID-isolated unresolved scope (or a
+            # previous server) before the
+            # old scope is pruned.
+            scope_uids = set(str(uid) for uid in self._cur.keys())
+            scope_uids.update(str(uid) for uid in (status_by_uid or {}).keys())
+            self._sync_user_scope_memberships(scope_uids)
 
-            # fallback refresher (1s jitter; includes cache refresh)
-            self._maybe_refresh_paths(status_by_uid)
-
-            # ---- SCHEDULER: poll by scope, not by user -----------------------
+            # Log I/O is autonomous in poll_logs(); ticks only update state/context.
             import time
             now_t = time.time()
 
@@ -2705,17 +2801,20 @@ class MultiScopeEngine:
             # Skip users already in the disconnected pool.
             try:
                 for uid, st in (status_by_uid or {}).items():
+                    uid = str(uid)
                     try:
                         key = self._server_key_for(uid)
                     except Exception:
-                        key = "Unknown"
+                        key = f"Unknown #{uid}"
 
                     if key == "Disconnected":
+                        self._log_resolution_suspended_uids.add(uid)
                         self._mark_menu_unknown(uid)
-                        self._drop_user_log_tracking(uid, ignore_current=True)
+                        self._drop_user_log_tracking(uid)
                         self._menu_none_since_by_uid.pop(uid, None)
                         self._menu_none_timeout_since_by_uid.pop(uid, None)
                         self._menu_none_disconnect_fired_by_uid.discard(uid)
+                        self._process_generation_by_uid.pop(uid, None)
                         continue
 
                     pids = []
@@ -2727,21 +2826,80 @@ class MultiScopeEngine:
 
                     # Only apply while the user is actually running.
                     if not pids:
+                        # A later PID must establish fresh menu state even when
+                        # the server label has not reached Disconnected yet.
+                        self._log_resolution_suspended_uids.add(uid)
+                        self._mark_menu_unknown(uid)
                         self._menu_none_since_by_uid.pop(uid, None)
                         self._menu_none_timeout_since_by_uid.pop(uid, None)
                         self._menu_none_disconnect_fired_by_uid.discard(uid)
+                        self._process_generation_by_uid.pop(uid, None)
                         continue
+
+                    # A live PID is the normal lifecycle signal that permits
+                    # autonomous discovery again. Strict-log recovery also
+                    # clears this latch when it arrives before the next tick.
+                    self._log_resolution_suspended_uids.discard(uid)
 
                     scope = self._scope(key)
                     scope.users.add(uid)
 
-                    if scope.in_menu is None:
+                    try:
+                        process_created_at = float(st.get("process_created_at", 0.0) or 0.0)
+                    except Exception:
+                        process_created_at = 0.0
+                    previous_process = self._process_generation_by_uid.get(uid)
+                    if process_created_at > 0.0:
+                        if (
+                            previous_process is not None
+                            and abs(float(previous_process) - process_created_at) > 0.001
+                        ):
+                            # A menu record is evidence about one process/log
+                            # generation, never about the account forever.
+                            self._mark_menu_unknown(uid)
+                            self._menu_none_since_by_uid.pop(uid, None)
+                            self._menu_none_timeout_since_by_uid.pop(uid, None)
+                            self._menu_none_disconnect_fired_by_uid.discard(uid)
+                        self._process_generation_by_uid[uid] = process_created_at
+
+                    scope = self._scope(key)
+                    menu_state = (scope.in_menu_by_uid or {}).get(uid, None)
+                    try:
+                        menu_ts = float((scope.last_menu_ts_by_uid or {}).get(uid, 0.0) or 0.0)
+                    except Exception:
+                        menu_ts = 0.0
+
+                    # Snapshot/cold-start state is accepted only when the
+                    # attached generation and its record can belong to this
+                    # process.  This also protects the first tick, where there
+                    # is no prior process token to compare against.
+                    state_is_current = menu_state is not None
+                    cur = self._cur.get(uid)
+                    if state_is_current and not (cur and cur.path):
+                        state_is_current = False
+                    if state_is_current and process_created_at > 0.0:
+                        generation_cutoff = process_created_at - 15.0
+                        if (
+                            menu_ts < generation_cutoff
+                            or float(getattr(cur, "session_started_at", 0.0) or 0.0) < generation_cutoff
+                        ):
+                            state_is_current = False
+                    if not state_is_current and menu_state is not None:
+                        self._mark_menu_unknown(uid)
+                        scope = self._scope(key)
+
+                    if not state_is_current:
                         # Only start the in_menu-none timeout after we have a strict
                         # per-user log attached (username marker found in logs).
                         has_user_log = False
                         try:
                             cur = self._cur.get(uid)
                             has_user_log = bool(cur and cur.path and os.path.isfile(cur.path))
+                            if has_user_log and process_created_at > 0.0:
+                                has_user_log = (
+                                    float(cur.session_started_at or 0.0)
+                                    >= process_created_at - 15.0
+                                )
                         except Exception:
                             has_user_log = False
 
@@ -2777,12 +2935,18 @@ class MultiScopeEngine:
                                             self._menu_none_timeout_since_by_uid[uid] = timeout_since
 
                                         if (
-                                            (now_t - float(timeout_since)) >= 60.0
+                                            (now_t - float(timeout_since))
+                                            >= self._in_menu_none_timeout_seconds
                                             and uid not in self._menu_none_disconnect_fired_by_uid
                                         ):
                                             self._mark_menu_unknown(uid)
-                                            self._drop_user_log_tracking(uid, ignore_current=True)
-                                            self._emit_event("disconnect", uid, "in_menu_none_timeout=60")
+                                            self._drop_user_log_tracking(uid)
+                                            timeout_value = int(self._in_menu_none_timeout_seconds)
+                                            self._emit_event(
+                                                "disconnect",
+                                                uid,
+                                                f"in_menu_none_timeout={timeout_value}",
+                                            )
                                             self._menu_none_disconnect_fired_by_uid.add(uid)
                     else:
                         self._menu_none_since_by_uid.pop(uid, None)
@@ -2790,29 +2954,6 @@ class MultiScopeEngine:
                         self._menu_none_disconnect_fired_by_uid.discard(uid)
             except Exception:
                 pass
-
-            # Compute a stable list of active scopes for this pass
-            active_keys = sorted(self._scopes.keys())
-
-            for key in active_keys:
-                scope = self._scope(key)
-
-                # Skip until due
-                due = getattr(scope, "next_tail_at", 0.0)
-                if now_t < due:
-                    continue
-
-                # Choose which user to read for this scope (round-robin)
-                uid = self._choose_uid_for_scope(key)
-                if not uid:
-                    continue
-
-                # Tail once (now concurrent, bounded by the pool)
-                self._submit_tail(uid)
-
-                # Schedule next poll for this scope
-                interval = self._compute_scope_interval(scope)
-                scope.next_tail_at = time.time() + interval
 
             # prune quiet, empty scopes (unchanged)
             now_t = time.time()
@@ -2832,7 +2973,7 @@ class MultiScopeEngine:
         Export a JSON-serializable snapshot of MultiScope runtime state.
         Used by GUI Pause/Resume so in-menu + last biome/merchant state isn't reset.
         """
-        out: dict = {"version": 1, "ts": time.time()}
+        out: dict = {"version": 2, "ts": time.time()}
         with self._lock:
             try:
                 known_uids = set(self._cur.keys())
@@ -2876,8 +3017,6 @@ class MultiScopeEngine:
                             if str(u) in (getattr(s, "last_menu_ts_by_uid", {}) or {})
                         },
                         "events": int(getattr(s, "events", 0) or 0),
-                        "next_tail_at": float(getattr(s, "next_tail_at", 0.0) or 0.0),
-                        "poll_rot": int(getattr(s, "poll_rot", 0) or 0),
                     }
                 except Exception:
                     continue
@@ -2891,11 +3030,28 @@ class MultiScopeEngine:
                 if known_uids and u not in known_uids:
                     continue
                 try:
-                    cursors[u] = {
+                    stat_now = os.stat(cur.path) if getattr(cur, "path", None) else None
+                    cursor_state = {
                         "path": (str(cur.path) if getattr(cur, "path", None) else None),
                         "pos": int(getattr(cur, "pos", 0) or 0),
-                        "carry": str(getattr(cur, "carry", "") or ""),
+                        "carry_b64": base64.b64encode(bytes(getattr(cur, "carry", b"") or b"")).decode("ascii"),
+                        "generation_id": str(getattr(cur, "generation_id", "") or ""),
+                        "session_started_at": float(getattr(cur, "session_started_at", 0.0) or 0.0),
+                        "last_event_ts": float(getattr(cur, "last_event_ts", 0.0) or 0.0),
+                        "dropping_oversized": bool(getattr(cur, "dropping_oversized", False)),
+                        "size_at_snapshot": int(stat_now.st_size) if stat_now is not None else 0,
+                        "mtime_ns_at_snapshot": int(
+                            getattr(stat_now, "st_mtime_ns", int(stat_now.st_mtime * 1_000_000_000))
+                        ) if stat_now is not None else 0,
                     }
+                    try:
+                        anchor_size, anchor_sha256 = _cursor_anchor(cur.path, cursor_state["pos"])
+                        if anchor_size and anchor_sha256:
+                            cursor_state["anchor_size"] = anchor_size
+                            cursor_state["anchor_sha256"] = anchor_sha256
+                    except Exception:
+                        pass
+                    cursors[u] = cursor_state
                 except Exception:
                     continue
 
@@ -2943,13 +3099,11 @@ class MultiScopeEngine:
                 }
             except Exception:
                 out["last_disconnect_sig_by_uid"] = {}
-            try:
-                out["ignored_logs_by_uid"] = {
-                    str(uid): sorted(list(paths or []))
-                    for uid, paths in (self._ignored_logs_by_uid or {}).items()
-                }
-            except Exception:
-                out["ignored_logs_by_uid"] = {}
+            out["retired_generations_by_uid"] = {
+                str(uid): sorted(str(g) for g in generations)
+                for uid, generations in self._retired_generations_by_uid.items()
+            }
+            out["ever_attached_uids"] = sorted(self._ever_attached_uids)
 
         return out
 
@@ -2964,7 +3118,7 @@ class MultiScopeEngine:
             ver = int(state.get("version", 0) or 0)
         except Exception:
             ver = 0
-        if ver != 1:
+        if ver not in {1, 2}:
             return False
 
         applied = False
@@ -3046,21 +3200,12 @@ class MultiScopeEngine:
                         scope.events = int(raw.get("events", scope.events) or 0)
                     except Exception:
                         pass
-                    try:
-                        scope.next_tail_at = float(raw.get("next_tail_at", scope.next_tail_at) or 0.0)
-                    except Exception:
-                        pass
-                    try:
-                        scope.poll_rot = int(raw.get("poll_rot", scope.poll_rot) or 0)
-                    except Exception:
-                        pass
-
                     self._scopes[k] = scope
                     applied = True
 
-            # -- Cursors (pos/carry only when path matches current) ----------
+            # -- Cursors: v1 text offsets are unsafe and intentionally ignored. --
             cursors_in = state.get("cursors") or {}
-            if isinstance(cursors_in, dict) and cursors_in:
+            if ver == 2 and isinstance(cursors_in, dict) and cursors_in:
                 import os
                 for uid, raw in cursors_in.items():
                     u = str(uid)
@@ -3071,25 +3216,127 @@ class MultiScopeEngine:
                     cur = self._cur.get(u)
                     if not cur:
                         continue
+                    saved_generation = str(raw.get("generation_id") or "")
+                    current_generation = str(getattr(cur, "generation_id", "") or "")
                     try:
                         snap_path = raw.get("path")
                         cur_path = getattr(cur, "path", None)
                         if snap_path and cur_path:
                             sp = os.path.normcase(os.path.abspath(str(snap_path)))
                             cp = os.path.normcase(os.path.abspath(str(cur_path)))
-                            if sp != cp:
-                                continue
+                            same_path = sp == cp
                         elif snap_path or cur_path:
-                            continue
+                            same_path = False
+                        else:
+                            same_path = True
                     except Exception:
                         continue
 
                     try:
-                        cur.pos = int(raw.get("pos", getattr(cur, "pos", 0)) or 0)
+                        stat_now = os.stat(cur.path) if cur.path else None
+                        size_now = int(stat_now.st_size) if stat_now is not None else 0
+                        if stat_now is None:
+                            continue
+                        saved_pos = max(0, int(raw.get("pos", getattr(cur, "pos", 0)) or 0))
+                        saved_size = int(raw.get("size_at_snapshot", raw.get("pos", 0)) or 0)
                     except Exception:
-                        pass
+                        continue
+
+                    saved_identity = _generation_identity_without_revision(saved_generation)
+                    current_identity = _generation_identity_without_revision(current_generation)
+                    exact_generation = bool(
+                        saved_generation
+                        and current_generation
+                        and saved_generation == current_generation
+                    )
+                    stable_identity = bool(
+                        saved_identity
+                        and current_identity
+                        and saved_identity == current_identity
+                    )
+
+                    # Generation revisions are local to an index instance, so a
+                    # restarted child can label the same physical log ":0" even
+                    # when the paused snapshot called it ":1". Validate the
+                    # bytes immediately before the cursor before deciding that a
+                    # mismatch means rotation; otherwise resume can replay every
+                    # historical merchant record from byte zero.
+                    anchor_size = 0
+                    anchor_sha256 = ""
+                    anchor_matches = False
                     try:
-                        cur.carry = str(raw.get("carry", "") or "")
+                        anchor_size = max(0, int(raw.get("anchor_size", 0) or 0))
+                        anchor_sha256 = str(raw.get("anchor_sha256") or "").strip().lower()
+                        if (
+                            same_path
+                            and anchor_size > 0
+                            and anchor_size <= _CURSOR_ANCHOR_BYTES
+                            and saved_pos >= anchor_size
+                            and size_now >= saved_pos
+                            and anchor_sha256
+                        ):
+                            actual_size, actual_sha256 = _cursor_anchor(
+                                cur.path,
+                                saved_pos,
+                                length=anchor_size,
+                            )
+                            anchor_matches = (
+                                actual_size == anchor_size
+                                and actual_sha256.lower() == anchor_sha256
+                            )
+                    except Exception:
+                        anchor_matches = False
+
+                    has_anchor = bool(anchor_size and anchor_sha256)
+                    if has_anchor:
+                        content_continues = bool(
+                            same_path and size_now >= saved_pos and anchor_matches
+                        )
+                    else:
+                        # Older version-2 snapshots have no anchor. Preserve
+                        # their safe same-generation/revision-only resume path.
+                        content_continues = bool(
+                            same_path
+                            and size_now >= saved_pos
+                            and (exact_generation or stable_identity)
+                        )
+
+                    truncated = bool(
+                        same_path and (size_now < saved_pos or size_now < saved_size)
+                    )
+                    identity_changed = bool(
+                        saved_identity
+                        and current_identity
+                        and saved_identity != current_identity
+                    )
+
+                    if content_continues:
+                        cur.pos = saved_pos
+                    elif truncated or not same_path or identity_changed:
+                        # A genuinely new generation is intentionally replayed
+                        # from its beginning so events written while paused (and
+                        # before username discovery) are not lost.
+                        cur.pos = 0
+                        cur.carry = b""
+                        cur.dropping_oversized = False
+                    else:
+                        # Ambiguous same-path metadata/content drift must fail
+                        # quiet. Replaying an old file is worse than omitting an
+                        # unverifiable paused interval, especially for merchants.
+                        cur.pos = size_now
+                        cur.carry = b""
+                        cur.dropping_oversized = False
+                    cur.observed_size = size_now
+
+                    try:
+                        if content_continues:
+                            carry = base64.b64decode(str(raw.get("carry_b64") or ""), validate=True)
+                            cur.carry = carry if len(carry) <= self._max_line_bytes else b""
+                    except Exception:
+                        cur.carry = b""
+                    try:
+                        cur.last_event_ts = float(raw.get("last_event_ts", 0.0) or 0.0)
+                        cur.dropping_oversized = bool(raw.get("dropping_oversized", False))
                     except Exception:
                         pass
                     applied = True
@@ -3159,28 +3406,21 @@ class MultiScopeEngine:
                     applied = True
             except Exception:
                 pass
-            try:
-                ilb = state.get("ignored_logs_by_uid") or {}
-                if isinstance(ilb, dict):
-                    out: Dict[str, Set[str]] = {}
-                    for uid, paths in ilb.items():
-                        u = str(uid)
-                        vals: Set[str] = set()
-                        if isinstance(paths, (list, tuple, set)):
-                            for p in paths:
-                                np = self._normalize_log_path(str(p))
-                                if np:
-                                    vals.add(np)
-                        elif isinstance(paths, str):
-                            np = self._normalize_log_path(paths)
-                            if np:
-                                vals.add(np)
-                        if vals:
-                            out[u] = vals
-                    self._ignored_logs_by_uid = out
+            if ver == 2:
+                try:
+                    retired = state.get("retired_generations_by_uid") or {}
+                    if isinstance(retired, dict):
+                        self._retired_generations_by_uid = {
+                            str(uid): set(sorted(str(g) for g in (generations or []) if str(g))[-8:])
+                            for uid, generations in retired.items()
+                            if isinstance(generations, (list, tuple, set))
+                        }
+                    ever = state.get("ever_attached_uids") or []
+                    if isinstance(ever, (list, tuple, set)):
+                        self._ever_attached_uids.update(str(uid) for uid in ever)
                     applied = True
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
         return applied
 
@@ -3287,30 +3527,31 @@ class MultiScopeEngine:
     
     def _scope_dedupe_merchant_ts(self, scope_key: str, merchant: str, ts_epoch: float, window: float = 2.0) -> bool:
         """
-        Return True if this merchant was posted for this scope within `window` seconds of ts_epoch.
-        Otherwise record the ts and return False.
+        Return True for an already-covered or out-of-order merchant event.
+        Otherwise advance the scope watermark and return False.
         """
-        d = self._last_merchant_ts_by_scope.setdefault(scope_key, {})
-        last = d.get(merchant)
-        if last is not None and abs(ts_epoch - last) <= window:
-            return True
-        d[merchant] = ts_epoch
-        return False
+        with self._event_claim_lock:
+            d = self._last_merchant_ts_by_scope.setdefault(scope_key, {})
+            last = d.get(merchant)
+            # Never move this watermark backward. A restored cursor or a second
+            # account on the same server can expose an older log range after a newer
+            # merchant was already observed; accepting it would replay the entire
+            # historical merchant sequence.
+            if last is not None and ts_epoch <= (float(last) + max(0.0, float(window))):
+                return True
+            d[merchant] = ts_epoch
+            return False
     
     # in multiscope.py (inside class MultiScopeEngine)
     def shutdown(self):
-        obs = getattr(self, "_observer", None)
-        self._observer = None
         try:
-            if obs:
-                obs.stop()
-                obs.join(timeout=3)
+            self._log_index.shutdown()
         except Exception:
             pass
-        exe = getattr(self, "_executor", None)
+        tail = getattr(self, "_tail_executor", None)
         try:
-            if exe:
-                exe.shutdown(wait=False)
+            if tail:
+                tail.shutdown(wait=True, cancel_futures=True)
         except Exception:
             pass
         snd = getattr(self, "_send_executor", None)
@@ -3319,8 +3560,6 @@ class MultiScopeEngine:
                 snd.shutdown(wait=False)
         except Exception:
             pass
-        # optional: clear bookkeeping
-        self._watched_dirs.clear()
         # temp-block sessions currently auto-expire; no explicit cancel hook yet
         try:
             with self._stats_lock:

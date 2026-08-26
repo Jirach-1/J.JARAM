@@ -1077,18 +1077,18 @@ class FoundStatsMixin:
                         core_ry = max(4.5, rh0 * 0.16)
 
                         painter.setPen(QColor(0, 0, 0, 0))
-                        painter.setBrush(QColor(8, 12, 34, 140))
+                        painter.setBrush(QColor(34, 8, 4, 140))
                         painter.drawEllipse(QPointF(core_cx, core_cy), core_rx, core_ry)
                         painter.setBrush(Qt.BrushStyle.NoBrush)
 
                         for ring_idx in range(2):
-                            ring = QColor(95 + (ring_idx * 35), 150 + (ring_idx * 25), 255, 75 - (ring_idx * 20))
+                            ring = QColor(255, 95 + (ring_idx * 35), 45 + (ring_idx * 20), 75 - (ring_idx * 20))
                             painter.setPen(ring)
                             ring_rx = core_rx * (1.65 + ring_idx * 0.55) + math.sin(t * (0.90 + ring_idx * 0.35) + phase0) * 1.2
                             ring_ry = core_ry * (1.30 + ring_idx * 0.35) + math.cos(t * (0.75 + ring_idx * 0.25) + phase0) * 0.8
                             painter.drawEllipse(QPointF(core_cx, core_cy), ring_rx, ring_ry)
 
-                        mote = QColor(170, 215, 255, 90)
+                        mote = QColor(255, 170, 95, 90)
                         painter.setPen(mote)
                         for k in range(20):
                             ang = (t * (0.55 + 0.85 * _r01(P_SGSP, k))) + ((math.pi * 2.0) * _r01(P_SGPH, k))
@@ -1288,7 +1288,7 @@ class FoundStatsMixin:
                 if is_hell or is_blood:
                     shadow = QColor(30, 0, 0, 180)
                 if is_singularity:
-                    shadow = QColor(4, 8, 28, 185)
+                    shadow = QColor(32, 6, 2, 185)
                 if is_cyber:
                     shadow = QColor(0, 20, 20, 170)
 
@@ -1530,7 +1530,7 @@ class FoundStatsMixin:
                         val = _clamp01(val * 1.15)
                     if is_singularity:
                         well = 0.5 + 0.5 * math.sin(t * 1.35 + phase0 + i * 0.20)
-                        hue = (0.58 + (0.10 * well) + (pos * 0.04)) % 1.0
+                        hue = (0.01 + (0.07 * well) + (pos * 0.02)) % 1.0
                         sat = _clamp01(max(sat * 0.95, 0.72))
                         val = _clamp01(max(val * 0.92, 0.55 + 0.38 * well))
                     if is_glitch:
@@ -1622,7 +1622,7 @@ class FoundStatsMixin:
                         p0.setX(px + (w * 0.50)); p0.setY(py - 4.0)
                         painter.drawPoint(p0)
                     if is_singularity and hi > 0.20:
-                        spark_col.setRgb(215, 235, 255, min(190, 75 + int(115.0 * hi)))
+                        spark_col.setRgb(255, 215, 170, min(190, 75 + int(115.0 * hi)))
                         painter.setPen(spark_col)
                         cx = px + (w * 0.48)
                         cy = py - 4.0

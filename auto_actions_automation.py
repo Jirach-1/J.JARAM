@@ -12,6 +12,7 @@ import copy
 import ctypes
 import datetime as _dt
 import difflib
+import io
 import json
 import re
 import threading
@@ -873,12 +874,23 @@ except Exception:  # pragma: no cover - Auto-Actions must run without alerts.
         def send_pre_sequence_alert(self, request: Any) -> bool:
             return False
 
-        def send_step_webhook(self, *, webhook_url: str, message: str) -> bool:
+        def send_step_webhook(
+            self,
+            *,
+            webhook_url: str,
+            message: str,
+            embed_title: str = "",
+            embed_description: str = "",
+            screenshot: Optional[bytes] = None,
+        ) -> bool:
             return False
 
 
 class _MenuGateBlocked(Exception):
     pass
+
+
+_ANTIAFK_EXECUTION_GUARD_FLOOR_S = 30.0
 
 
 def _normalize_user_filter_mode(raw: Any) -> str:
@@ -922,6 +934,11 @@ class ActionStep:
     paste_user_values: Tuple[Tuple[str, str], ...] = ()
     webhook_url: str = ""
     webhook_message: str = ""
+    webhook_include_screenshot: bool = False
+    webhook_screenshot_roi: Optional[RelRect] = None
+    webhook_embed_enabled: bool = False
+    webhook_embed_title: str = ""
+    webhook_embed_description: str = ""
     key: str = ""
     keys: Tuple[str, ...] = ()
     key_hold_s: float = 0.0
@@ -934,17 +951,22 @@ class ActionStep:
     tolerance: int = 0
     select_all: bool = True
     scroll_direction: str = "down"
+    target_row_id: str = ""
+    target_row_name: str = ""
     condition: ActionCondition = field(default_factory=ActionCondition)
 
 
 @dataclass(frozen=True)
 class ActionRule:
+    row_id: str
     name: str
     actions: Tuple[ActionStep, ...]
     cooldown_s: float
+    startup_delay_s: float
     allowed_biomes: Tuple[str, ...]
     trigger_type: str
     trigger_filter_ids: Tuple[str, ...]
+    trigger_merchants: Tuple[str, ...]
     repeat_mode: str
     repeat_count: int
     enabled: bool = True
@@ -979,6 +1001,23 @@ def _normalize_filter_ids(raw: Any) -> Tuple[str, ...]:
         except Exception:
             return ()
     return tuple(_unique_strings(raw))
+
+
+_AUTO_ACTION_MERCHANTS = ("Jester", "Mari", "Rin")
+
+
+def _normalize_merchants(raw: Any) -> Tuple[str, ...]:
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        return ()
+    by_name = {name.lower(): name for name in _AUTO_ACTION_MERCHANTS}
+    out: List[str] = []
+    for value in raw:
+        merchant = by_name.get(str(value or "").strip().lower())
+        if merchant and merchant not in out:
+            out.append(merchant)
+    return tuple(out)
 
 
 def _normalize_user_text_map(raw: Any) -> Tuple[Tuple[str, str], ...]:
@@ -1132,6 +1171,14 @@ def _normalize_action_step(raw: Any, *, fallback_name: str = "") -> Optional[Act
     elif kind in ("discord_webhook", "send_webhook", "webhook_send"):
         kind = "webhook"
     elif kind in (
+        "action_sequence",
+        "play_action",
+        "play_action_row",
+        "trigger_action",
+        "trigger_action_row",
+    ):
+        kind = "action_row"
+    elif kind in (
         "kill",
         "kill_user",
         "kill_user_processes",
@@ -1151,6 +1198,7 @@ def _normalize_action_step(raw: Any, *, fallback_name: str = "") -> Optional[Act
         "drag",
         "wait",
         "webhook",
+        "action_row",
         "kill_user",
         "if",
         "else",
@@ -1275,6 +1323,19 @@ def _normalize_action_step(raw: Any, *, fallback_name: str = "") -> Optional[Act
             or (raw.get("text") if kind == "webhook" else "")
             or ""
         ),
+        webhook_include_screenshot=bool(
+            raw.get("webhook_include_screenshot", raw.get("include_screenshot", False))
+        ),
+        webhook_screenshot_roi=_normalize_rel_rect(
+            raw.get("webhook_screenshot_roi") or raw.get("screenshot_roi")
+        ),
+        webhook_embed_enabled=bool(
+            raw.get("webhook_embed_enabled", raw.get("embed_enabled", False))
+        ),
+        webhook_embed_title=str(raw.get("webhook_embed_title") or raw.get("embed_title") or ""),
+        webhook_embed_description=str(
+            raw.get("webhook_embed_description") or raw.get("embed_description") or ""
+        ),
         key=key_values[0] if key_values else "",
         keys=tuple(key_values),
         key_hold_s=key_hold_s,
@@ -1287,6 +1348,18 @@ def _normalize_action_step(raw: Any, *, fallback_name: str = "") -> Optional[Act
         tolerance=tolerance,
         select_all=select_all,
         scroll_direction=scroll_direction,
+        target_row_id=str(
+            raw.get("target_row_id")
+            or raw.get("target_action_row_id")
+            or raw.get("target_action_id")
+            or ""
+        ).strip(),
+        target_row_name=str(
+            raw.get("target_row_name")
+            or raw.get("target_action_row_name")
+            or raw.get("target_action_name")
+            or ""
+        ).strip(),
         condition=condition,
     )
 
@@ -1299,18 +1372,34 @@ def _normalize_behavior(raw: Any, legacy: Optional[Dict[str, Any]] = None) -> Di
     filter_ids = _normalize_filter_ids(
         trigger.get("filter_ids", base.get("filter_ids", legacy.get("filter_ids", []))) or []
     )
+    merchants = _normalize_merchants(
+        trigger.get(
+            "merchants",
+            trigger.get(
+                "merchant_names",
+                base.get("merchants", legacy.get("merchants", legacy.get("merchant_names", []))),
+            ),
+        )
+        or []
+    )
     raw_trigger_type = str(trigger.get("type") or base.get("trigger_type") or "").strip().lower()
     if raw_trigger_type in ("normal", "none"):
         trigger_type = "normal"
     elif raw_trigger_type == "ocr_filter":
         trigger_type = "ocr_filter" if filter_ids else "normal"
+    elif raw_trigger_type == "merchant":
+        trigger_type = "merchant" if merchants else "normal"
+    elif raw_trigger_type in ("action_row", "action_sequence", "action_step"):
+        trigger_type = "action_row"
     else:
-        trigger_type = "ocr_filter" if filter_ids else "normal"
+        trigger_type = "ocr_filter" if filter_ids else ("merchant" if merchants else "normal")
     if trigger_type != "ocr_filter":
         filter_ids = ()
+    if trigger_type != "merchant":
+        merchants = ()
 
     repeat_mode = str(base.get("repeat_mode") or legacy.get("repeat_mode") or "repeat").strip().lower()
-    if repeat_mode not in ("repeat", "count", "once_per_pid"):
+    if repeat_mode not in ("repeat", "count", "count_per_trigger", "once_per_pid"):
         repeat_mode = "repeat"
 
     try:
@@ -1332,6 +1421,22 @@ def _normalize_behavior(raw: Any, legacy: Optional[Dict[str, Any]] = None) -> Di
     except Exception:
         cooldown = 0.0
 
+    try:
+        startup_delay = max(
+            0.0,
+            float(
+                base.get(
+                    "startup_delay",
+                    base.get(
+                        "startup_delay_s",
+                        legacy.get("startup_delay", legacy.get("startup_delay_s", 10.0)),
+                    ),
+                )
+            ),
+        )
+    except Exception:
+        startup_delay = 10.0
+
     biomes = tuple(
         _unique_strings(
             base.get("biomes", legacy.get("biomes", legacy.get("allowed_biomes", []))) or [],
@@ -1341,11 +1446,13 @@ def _normalize_behavior(raw: Any, legacy: Optional[Dict[str, Any]] = None) -> Di
 
     return {
         "cooldown": cooldown,
+        "startup_delay": startup_delay,
         "biomes": biomes,
         "repeat_mode": repeat_mode,
         "repeat_count": repeat_count,
         "trigger_type": trigger_type,
         "filter_ids": filter_ids,
+        "merchants": merchants,
     }
 
 
@@ -1678,6 +1785,7 @@ class AutoActionEngine:
     The host is expected to:
       - Call `update_config()` whenever UI settings change.
       - Provide `record_ocr_filter_trigger()` events from the OCR worker.
+      - Provide `record_merchant_trigger()` events from merchant detection.
       - Provide pid/biome/menu/window lookup callbacks for each user.
     """
 
@@ -1689,6 +1797,7 @@ class AutoActionEngine:
         biome_provider: Callable[[str], str],
         in_menu_provider: Optional[Callable[[str], Optional[bool]]] = None,
         username_provider: Optional[Callable[[str], str]] = None,
+        user_ids_provider: Optional[Callable[[], Iterable[str]]] = None,
         log_filename_provider: Optional[Callable[[str], str]] = None,
         server_label_provider: Optional[Callable[[str], str]] = None,
         ps_link_provider: Optional[Callable[[str], str]] = None,
@@ -1708,6 +1817,7 @@ class AutoActionEngine:
         self._biome_provider = biome_provider
         self._in_menu_provider = in_menu_provider
         self._username_provider = username_provider
+        self._user_ids_provider = user_ids_provider
         self._log_filename_provider = log_filename_provider
         self._server_label_provider = server_label_provider
         self._ps_link_provider = ps_link_provider
@@ -1737,14 +1847,18 @@ class AutoActionEngine:
         self._pending_trigger_seq: Dict[str, Dict[int, int]] = {}
         self._last_trigger_seq: Dict[str, Dict[int, int]] = {}
         self._completed_pids: Dict[str, Dict[int, set[int]]] = {}
+        self._completed_startup_rows: Dict[str, set[int]] = {}
         self._rule_signature: Dict[str, Dict[int, int]] = {}
         self._not_in_menu_since: Dict[Tuple[str, int], float] = {}
         self._trigger_events: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._merchant_events: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._trigger_seq: int = 0
         self._last_antiafk_alert_log_ts: float = 0.0
         self._last_alert_queue_limit_log_ts: float = 0.0
         self._last_alert_send_at: float = 0.0
         self._active_action: Optional[Tuple[str, int]] = None
+        self._active_action_row_id: str = ""
+        self._active_action_chain: Tuple[str, ...] = ()
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -1768,19 +1882,26 @@ class AutoActionEngine:
         with self._cfg_lock:
             self._cfg = copy.deepcopy(cfg or {})
 
+    def reset_manager_startup_counts(self) -> None:
+        """Allow startup-limited rows to run again for a new manager session."""
+        with self._state_lock:
+            self._completed_startup_rows.clear()
+
     def monitor_snapshot(self) -> Dict[str, Any]:
         """Return a thread-safe, presentation-neutral snapshot for runtime monitors."""
         cfg = self._cfg_snapshot()
         now = time.time()
-        users = [str(uid).strip() for uid in (cfg.get("users") or []) if str(uid).strip()]
+        users = self._users_from_cfg(cfg)
 
         with self._state_lock:
             next_ready = copy.deepcopy(self._next_ready)
             pending_use = copy.deepcopy(self._pending_use_at)
             pending_send = copy.deepcopy(self._pending_alert_send_at)
             consumed = copy.deepcopy(self._last_trigger_seq)
-            completed = copy.deepcopy(self._completed_pids)
+            completed_pids = copy.deepcopy(self._completed_pids)
+            completed_startup_rows = copy.deepcopy(self._completed_startup_rows)
             trigger_events = copy.deepcopy(self._trigger_events)
+            merchant_events = copy.deepcopy(self._merchant_events)
             not_in_menu_since = dict(self._not_in_menu_since)
             active_action = self._active_action
 
@@ -1806,8 +1927,15 @@ class AutoActionEngine:
                 send_at_raw = (pending_send.get(uid) or {}).get(idx_i)
                 send_at = float(send_at_raw or 0.0) if send_at_raw is not None else None
                 is_completed = bool(
-                    pid > 0
-                    and pid in ((completed.get(uid) or {}).get(idx_i, set()) or set())
+                    (
+                        rule.repeat_mode == "count"
+                        and idx_i in (completed_startup_rows.get(uid) or set())
+                    )
+                    or (
+                        rule.repeat_mode == "once_per_pid"
+                        and pid > 0
+                        and pid in ((completed_pids.get(uid) or {}).get(idx_i, set()) or set())
+                    )
                 )
 
                 latest_trigger: Optional[Dict[str, Any]] = None
@@ -1815,6 +1943,15 @@ class AutoActionEngine:
                     user_events = trigger_events.get(uid) or {}
                     for filter_id in rule.trigger_filter_ids:
                         event = user_events.get(str(filter_id))
+                        if event and (
+                            latest_trigger is None
+                            or int(event.get("seq", 0) or 0) > int(latest_trigger.get("seq", 0) or 0)
+                        ):
+                            latest_trigger = event
+                elif rule.trigger_type == "merchant":
+                    user_events = merchant_events.get(uid) or {}
+                    for merchant in rule.trigger_merchants:
+                        event = user_events.get(str(merchant))
                         if event and (
                             latest_trigger is None
                             or int(event.get("seq", 0) or 0) > int(latest_trigger.get("seq", 0) or 0)
@@ -1844,13 +1981,16 @@ class AutoActionEngine:
                 elif in_menu is None:
                     status = "blocked"
                     status_detail = "Menu state unknown"
-                elif (now - float(not_in_menu_since.get(self._menu_gate_key(uid, pid), now))) < 10.0:
+                elif (
+                    now - float(not_in_menu_since.get(self._menu_gate_key(uid, pid), now))
+                ) < float(rule.startup_delay_s):
                     status = "waiting"
                     remaining_s = max(
                         0.0,
-                        10.0 - (now - float(not_in_menu_since.get(self._menu_gate_key(uid, pid), now))),
+                        float(rule.startup_delay_s)
+                        - (now - float(not_in_menu_since.get(self._menu_gate_key(uid, pid), now))),
                     )
-                    status_detail = "Menu exit grace"
+                    status_detail = "Startup delay"
                 elif use_at > 0.0:
                     if send_at is not None:
                         status = "alert"
@@ -1867,9 +2007,9 @@ class AutoActionEngine:
                 elif not self._eligible_in_biome(biome, rule):
                     status = "blocked"
                     status_detail = "Biome blocked"
-                elif rule.repeat_mode == "once_per_pid" and is_completed:
+                elif rule.repeat_mode in ("count", "once_per_pid") and is_completed:
                     status = "complete"
-                    status_detail = "Complete for PID"
+                    status_detail = "Startup play count complete" if rule.repeat_mode == "count" else "Complete for PID"
                 elif rule.trigger_type == "ocr_filter" and rule.trigger_filter_ids:
                     if latest_trigger_seq > consumed_seq:
                         status = "triggered"
@@ -1877,18 +2017,30 @@ class AutoActionEngine:
                     else:
                         status = "waiting"
                         status_detail = "Waiting for OCR"
+                elif rule.trigger_type == "merchant" and rule.trigger_merchants:
+                    if latest_trigger_seq > consumed_seq:
+                        status = "triggered"
+                        status_detail = "Merchant triggered"
+                    else:
+                        status = "waiting"
+                        status_detail = "Waiting for merchant"
+                elif rule.trigger_type == "action_row":
+                    status = "waiting"
+                    status_detail = "Waiting for action row call"
 
                 rows.append(
                     {
                         "uid": uid,
                         "username": self._username(uid),
                         "action_index": idx_i,
+                        "action_row_id": str(rule.row_id),
                         "action_name": str(rule.name),
                         "action_enabled": bool(rule.enabled),
                         "status": status,
                         "status_detail": status_detail,
                         "remaining_s": float(remaining_s),
                         "cooldown_s": float(rule.cooldown_s),
+                        "startup_delay_s": float(rule.startup_delay_s),
                         "ready_at": ready_at,
                         "pending_use_at": use_at,
                         "pending_send_at": send_at,
@@ -1897,6 +2049,7 @@ class AutoActionEngine:
                         "in_menu": in_menu,
                         "trigger_type": str(rule.trigger_type),
                         "trigger_filter_ids": list(rule.trigger_filter_ids),
+                        "trigger_merchants": list(rule.trigger_merchants),
                         "last_trigger_at": float((latest_trigger or {}).get("ts", 0.0) or 0.0),
                         "repeat_mode": str(rule.repeat_mode),
                         "repeat_count": int(rule.repeat_count),
@@ -1928,9 +2081,206 @@ class AutoActionEngine:
                 "name": str(filter_name or filter_id_s),
             }
 
+    def record_merchant_trigger(self, uid: str, pid: int, merchant: str) -> None:
+        uid_s = str(uid or "").strip()
+        merchants = _normalize_merchants([merchant])
+        if not uid_s or not merchants:
+            return
+        merchant_s = merchants[0]
+        with self._state_lock:
+            self._trigger_seq += 1
+            self._merchant_events.setdefault(uid_s, {})[merchant_s] = {
+                "seq": int(self._trigger_seq),
+                "ts": float(time.time()),
+                "pid": int(pid or 0),
+                "name": merchant_s,
+            }
+
+    def _play_action_row_now(
+        self,
+        hwnd: int,
+        uid: str,
+        pid: int,
+        target_row_id: str,
+        *,
+        click_delay: float,
+        target_row_name: str = "",
+        source_row_id: str = "",
+        source_row_name: str = "",
+        chain: Sequence[str] = (),
+    ) -> bool:
+        """Synchronously play a referenced action row, then return to its caller."""
+        uid_s = str(uid or "").strip()
+        target_id = str(target_row_id or "").strip()
+        target_label = str(target_row_name or target_id or "unknown row").strip()
+
+        def _skip(reason: str) -> bool:
+            try:
+                self._log(f"[Auto-Actions] {uid_s or 'unknown user'}: action row '{target_label}' skipped ({reason}).")
+            except Exception:
+                pass
+            return False
+
+        if not uid_s or not target_id:
+            return _skip("missing target")
+
+        cfg = self._cfg_snapshot()
+        if not bool(cfg.get("enabled", False)):
+            return _skip("engine disabled")
+        if uid_s not in self._users_from_cfg(cfg):
+            return _skip("user is not enabled for Auto Actions")
+
+        raw_items = cfg.get("items") or []
+        raw_target: Optional[Dict[str, Any]] = None
+        target_index = -1
+        if isinstance(raw_items, list):
+            for idx, raw in enumerate(raw_items):
+                if not isinstance(raw, dict):
+                    continue
+                row_id = str(raw.get("id") or raw.get("row_id") or f"row_{idx + 1}").strip() or f"row_{idx + 1}"
+                if row_id == target_id:
+                    raw_target = raw
+                    target_index = int(idx)
+                    break
+        if raw_target is None:
+            return _skip("target row no longer exists")
+        if not bool(raw_target.get("enabled", True)):
+            return _skip("target row is disabled")
+
+        target_rule: Optional[ActionRule] = None
+        for idx, rule in self._rules_from_cfg(cfg, uid=uid_s):
+            if int(idx) == target_index and str(rule.row_id) == target_id:
+                target_rule = rule
+                break
+        if target_rule is None:
+            return _skip("user is not enabled for the target row")
+        if target_rule.trigger_type != "action_row":
+            return _skip("target row does not use the Play Action Row trigger")
+        if not self._menu_gate_allows(uid_s, int(pid or 0), float(target_rule.startup_delay_s)):
+            return _skip("startup delay or menu gate is active")
+
+        try:
+            biome = str(self._biome_provider(uid_s) or "").strip()
+        except Exception:
+            biome = ""
+        if not self._eligible_in_biome(biome, target_rule):
+            return _skip("current biome is not allowed")
+
+        source_id = str(source_row_id or "").strip()
+        event_chain = tuple(str(value or "").strip() for value in (chain or ()) if str(value or "").strip())
+        if not event_chain and source_id:
+            event_chain = (source_id,)
+        if target_id in event_chain:
+            return _skip("action-row trigger cycle detected")
+        event_chain = event_chain + (target_id,)
+
+        with self._state_lock:
+            if time.time() < float((self._next_ready.get(uid_s) or {}).get(int(target_index), 0.0) or 0.0):
+                return _skip("target row is on cooldown")
+            if (
+                target_rule.repeat_mode == "count"
+                and int(target_index) in (self._completed_startup_rows.get(uid_s) or set())
+            ):
+                return _skip("playback is already complete for this manager startup")
+            if (
+                target_rule.repeat_mode == "once_per_pid"
+                and int(pid or 0)
+                in ((self._completed_pids.get(uid_s) or {}).get(int(target_index), set()) or set())
+            ):
+                return _skip("playback is already complete for this PID")
+            previous_active = self._active_action
+            previous_row_id = str(self._active_action_row_id or "")
+            previous_chain = tuple(self._active_action_chain or ())
+            self._active_action = (uid_s, int(target_index))
+            self._active_action_row_id = target_id
+            self._active_action_chain = event_chain
+
+        try:
+            if self._rule_pre_alert_enabled(target_rule):
+                reason = self._alert_antiafk_delay_reason(target_rule)
+                if reason:
+                    return _skip(reason)
+                lead_s = max(0.0, float(target_rule.alert_lead_s or 0.0))
+                use_at = time.time() + lead_s
+                if self._schedule_alert(uid_s, target_rule, use_at=use_at) and lead_s > 0.0:
+                    self._stop.wait(timeout=lead_s)
+                    if self._stop.is_set():
+                        return _skip("engine is stopping")
+
+            if bool(cfg.get("menu_debug", False)):
+                try:
+                    biome_for_log = str(self._biome_provider(uid_s) or "").strip()
+                except Exception:
+                    biome_for_log = ""
+                self._log_menu_activation_debug(
+                    uid=uid_s,
+                    pid=int(pid or 0),
+                    hwnd=int(hwnd or 0),
+                    biome=biome_for_log,
+                    row_index=int(target_index),
+                    rule=target_rule,
+                    min_not_in_menu_s=float(target_rule.startup_delay_s),
+                    phase="nested-activate",
+                )
+
+            self._run_rule_on_window(
+                int(hwnd),
+                target_rule,
+                uid=uid_s,
+                pid=int(pid or 0),
+                click_delay=float(click_delay),
+                times=self._execution_count(target_rule),
+                block_user_mouse_move=bool(cfg.get("disable_mouse_move", False)),
+            )
+            self._mark_used(uid_s, int(pid or 0), [(int(target_index), target_rule)])
+            try:
+                self._log(
+                    f"[Auto-Actions] {uid_s}: played nested action row '{target_rule.name}'"
+                    + (f" from '{source_row_name}'" if str(source_row_name or "").strip() else "")
+                    + "."
+                )
+            except Exception:
+                pass
+            return True
+        finally:
+            with self._state_lock:
+                self._active_action = previous_active
+                self._active_action_row_id = previous_row_id
+                self._active_action_chain = previous_chain
+
     def _cfg_snapshot(self) -> Dict[str, Any]:
         with self._cfg_lock:
             return copy.deepcopy(self._cfg or {})
+
+    def _users_from_cfg(self, cfg: Dict[str, Any]) -> List[str]:
+        selected: List[str] = []
+        selected_set: set[str] = set()
+        for raw_uid in (cfg.get("users") or []):
+            uid = str(raw_uid).strip()
+            if uid and uid not in selected_set:
+                selected.append(uid)
+                selected_set.add(uid)
+
+        if _normalize_user_filter_mode(cfg.get("user_filter_mode", "whitelist")) != "blacklist":
+            return selected
+
+        provider = self._user_ids_provider
+        if provider is None:
+            return []
+        try:
+            available = provider() or []
+        except Exception:
+            return []
+
+        resolved: List[str] = []
+        seen: set[str] = set()
+        for raw_uid in available:
+            uid = str(raw_uid).strip()
+            if not uid or uid in selected_set or uid in seen:
+                continue
+            seen.add(uid)
+            resolved.append(uid)
+        return resolved
 
     def _username(self, uid: str) -> str:
         fn = self._username_provider
@@ -2019,12 +2369,16 @@ class AutoActionEngine:
                 (
                     int(idx),
                     ActionRule(
+                        row_id=str(raw.get("id") or raw.get("row_id") or f"row_{idx + 1}").strip()
+                        or f"row_{idx + 1}",
                         name=name,
                         actions=tuple(actions),
                         cooldown_s=float(behavior.get("cooldown", 0.0) or 0.0),
+                        startup_delay_s=float(behavior.get("startup_delay", 10.0)),
                         allowed_biomes=tuple(behavior.get("biomes") or ()),
                         trigger_type=str(behavior.get("trigger_type") or "ocr_filter"),
                         trigger_filter_ids=tuple(behavior.get("filter_ids") or ()),
+                        trigger_merchants=tuple(behavior.get("merchants") or ()),
                         repeat_mode=str(behavior.get("repeat_mode") or "repeat"),
                         repeat_count=max(1, int(behavior.get("repeat_count", 1) or 1)),
                         enabled=bool(raw.get("enabled", True)),
@@ -2187,12 +2541,17 @@ class AutoActionEngine:
         )
 
     def _latest_trigger_event(self, uid: str, rule: ActionRule) -> Optional[Dict[str, Any]]:
-        if rule.trigger_type != "ocr_filter" or not rule.trigger_filter_ids:
+        if rule.trigger_type == "ocr_filter" and rule.trigger_filter_ids:
+            keys = rule.trigger_filter_ids
+            events = self._trigger_events.get(str(uid), {})
+        elif rule.trigger_type == "merchant" and rule.trigger_merchants:
+            keys = rule.trigger_merchants
+            events = self._merchant_events.get(str(uid), {})
+        else:
             return None
-        events = self._trigger_events.get(str(uid), {})
         latest: Optional[Dict[str, Any]] = None
-        for filter_id in rule.trigger_filter_ids:
-            event = events.get(str(filter_id))
+        for key in keys:
+            event = events.get(str(key))
             if not event:
                 continue
             if latest is None or int(event.get("seq", 0) or 0) > int(latest.get("seq", 0) or 0):
@@ -2230,6 +2589,31 @@ class AutoActionEngine:
             ).strip()
         except Exception:
             return ""
+
+    def _antiafk_is_overdue_within(self, within_s: float) -> bool:
+        provider = self._antiafk_overdue_within_provider
+        if provider is None:
+            return False
+        try:
+            return bool(provider(max(0.0, float(within_s or 0.0))))
+        except Exception:
+            return False
+
+    def _antiafk_execution_guard_s(
+        self,
+        due: Sequence[Tuple[int, ActionRule]],
+        *,
+        click_delay: float,
+    ) -> float:
+        estimated_s = 0.0
+        for _idx, rule in due:
+            try:
+                once_s = self._estimate_steps_duration(rule.actions, click_delay=click_delay)
+                estimated_s += once_s * self._execution_count(rule)
+                estimated_s += max(0.05, float(click_delay or 0.0))
+            except Exception:
+                estimated_s += _ANTIAFK_EXECUTION_GUARD_FLOOR_S
+        return max(_ANTIAFK_EXECUTION_GUARD_FLOOR_S, estimated_s + 2.0)
 
     def _log_alert_delay(self, reason: str) -> None:
         reason_s = str(reason or "").strip()
@@ -2278,7 +2662,8 @@ class AutoActionEngine:
         now = time.time()
         with self._state_lock:
             next_ready = self._next_ready.setdefault(str(uid), {})
-            completed = self._completed_pids.setdefault(str(uid), {})
+            completed_pids = self._completed_pids.setdefault(str(uid), {})
+            completed_startup_rows = self._completed_startup_rows.setdefault(str(uid), set())
             pending = self._pending_use_at.setdefault(str(uid), {})
             pending_send = self._pending_alert_send_at.setdefault(str(uid), {})
             pending_seq = self._pending_trigger_seq.setdefault(str(uid), {})
@@ -2287,8 +2672,10 @@ class AutoActionEngine:
                 pending.pop(int(idx), None)
                 pending_send.pop(int(idx), None)
                 pending_seq.pop(int(idx), None)
-                if str(rule.repeat_mode) == "once_per_pid":
-                    completed.setdefault(int(idx), set()).add(int(pid or 0))
+                if str(rule.repeat_mode) == "count":
+                    completed_startup_rows.add(int(idx))
+                elif str(rule.repeat_mode) == "once_per_pid":
+                    completed_pids.setdefault(int(idx), set()).add(int(pid or 0))
 
     def _condition_matches(self, hwnd: int, condition: ActionCondition, *, click_delay: float) -> bool:
         if not bool(condition.enabled):
@@ -2387,11 +2774,7 @@ class AutoActionEngine:
                         return str(value_text if value_text is not None else "")
         return str(step.text or "")
 
-    def _webhook_message_for_step(self, step: ActionStep, uid: str, rule_name: str) -> str:
-        template = str(step.webhook_message or "").strip()
-        if not template:
-            template = "Auto-Actions webhook step reached for {username}."
-
+    def _webhook_replacements_for_step(self, step: ActionStep, uid: str, rule_name: str) -> Dict[str, str]:
         uid_s = str(uid or "").strip()
         username = self._username(uid_s) if uid_s else ""
         server_label = self._server_label(uid_s) if uid_s else ""
@@ -2402,7 +2785,7 @@ class AutoActionEngine:
         except Exception:
             biome = ""
         now = _dt.datetime.now().astimezone()
-        replacements = {
+        return {
             "user_id": uid_s,
             "uid": uid_s,
             "username": username or uid_s or "Unknown",
@@ -2418,13 +2801,51 @@ class AutoActionEngine:
             "time": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
             "timestamp": now.isoformat(timespec="seconds"),
         }
-        message = template
+
+    @staticmethod
+    def _render_webhook_template(template: str, replacements: Dict[str, str], *, limit: int) -> str:
+        message = str(template or "")
         for key, value in replacements.items():
             message = message.replace("{" + key + "}", str(value or ""))
-        message = message[:2000].strip()
+        return message[: max(0, int(limit))].strip()
+
+    def _webhook_message_for_step(self, step: ActionStep, uid: str, rule_name: str) -> str:
+        template = str(step.webhook_message or "").strip()
+        if not template:
+            template = "Auto-Actions webhook step reached for {username}."
+        replacements = self._webhook_replacements_for_step(step, uid, rule_name)
+        message = self._render_webhook_template(template, replacements, limit=2000)
         return message or "Auto-Actions webhook step reached."
 
-    def _send_webhook_step(self, step: ActionStep, uid: str, rule_name: str) -> None:
+    def _webhook_embed_for_step(self, step: ActionStep, uid: str, rule_name: str) -> Tuple[str, str]:
+        if not bool(step.webhook_embed_enabled):
+            return "", ""
+        replacements = self._webhook_replacements_for_step(step, uid, rule_name)
+        return (
+            self._render_webhook_template(step.webhook_embed_title, replacements, limit=256),
+            self._render_webhook_template(step.webhook_embed_description, replacements, limit=4096),
+        )
+
+    def _webhook_screenshot_for_step(self, step: ActionStep, hwnd: int) -> Optional[bytes]:
+        if not bool(step.webhook_include_screenshot) or step.webhook_screenshot_roi is None:
+            return None
+        if _capture_window_image is None or not hwnd:
+            return None
+        roi = step.webhook_screenshot_roi
+        try:
+            image = _capture_window_image(
+                int(hwnd),
+                (float(roi.x), float(roi.y), float(roi.w), float(roi.h)),
+            )
+            if image is None:
+                return None
+            output = io.BytesIO()
+            image.save(output, format="PNG")
+            return output.getvalue()
+        except Exception:
+            return None
+
+    def _send_webhook_step(self, step: ActionStep, uid: str, rule_name: str, hwnd: int = 0) -> None:
         url = str(step.webhook_url or "").strip()
         if not url:
             try:
@@ -2434,8 +2855,26 @@ class AutoActionEngine:
             return
 
         message = self._webhook_message_for_step(step, uid, rule_name)
+        embed_title, embed_description = self._webhook_embed_for_step(step, uid, rule_name)
+        screenshot = self._webhook_screenshot_for_step(step, hwnd)
+        if bool(step.webhook_include_screenshot) and screenshot is None:
+            try:
+                self._log(
+                    f"[Auto-Actions] {uid}: webhook step '{step.name}' could not capture its screenshot area; "
+                    "sending without it."
+                )
+            except Exception:
+                pass
         try:
-            sent = bool(self._alert_service.send_step_webhook(webhook_url=url, message=message))
+            sent = bool(
+                self._alert_service.send_step_webhook(
+                    webhook_url=url,
+                    message=message,
+                    embed_title=embed_title,
+                    embed_description=embed_description,
+                    screenshot=screenshot,
+                )
+            )
         except Exception:
             sent = False
         if sent:
@@ -2490,6 +2929,7 @@ class AutoActionEngine:
         *,
         click_delay: float,
         uid: str = "",
+        pid: Optional[int] = None,
         rule_name: str = "",
     ) -> bool:
         if not self._condition_matches(hwnd, step.condition, click_delay=click_delay):
@@ -2499,13 +2939,35 @@ class AutoActionEngine:
         if step.kind == "break":
             return True
 
+        if step.kind == "action_row":
+            with self._state_lock:
+                source_row_id = str(self._active_action_row_id or "")
+                source_chain = tuple(self._active_action_chain or ())
+            try:
+                active_pid = int(pid) if pid is not None else int((self._pid_provider(uid) if uid else 0) or 0)
+            except Exception:
+                active_pid = 0
+            self._play_action_row_now(
+                int(hwnd),
+                uid,
+                active_pid,
+                step.target_row_id,
+                click_delay=float(click_delay),
+                target_row_name=step.target_row_name,
+                source_row_id=source_row_id,
+                source_row_name=rule_name,
+                chain=source_chain,
+            )
+            time.sleep(max(0.03, float(click_delay)))
+            return False
+
         if step.kind == "kill_user":
             self._kill_user_step(step, uid)
             time.sleep(max(0.03, float(click_delay)))
             return True
 
         if step.kind == "webhook":
-            self._send_webhook_step(step, uid, rule_name)
+            self._send_webhook_step(step, uid, rule_name, hwnd)
             time.sleep(max(0.03, float(click_delay)))
             return False
 
@@ -2672,7 +3134,14 @@ class AutoActionEngine:
                 pc += 1
                 continue
 
-            if self._run_action_step(hwnd, step, click_delay=click_delay, uid=uid, rule_name=rule_name):
+            if self._run_action_step(
+                hwnd,
+                step,
+                click_delay=click_delay,
+                uid=uid,
+                pid=pid,
+                rule_name=rule_name,
+            ):
                 return True
             pc += 1
         return False
@@ -2715,7 +3184,7 @@ class AutoActionEngine:
                     break
 
     def _execution_count(self, rule: ActionRule) -> int:
-        if rule.repeat_mode == "count":
+        if rule.repeat_mode in ("count", "count_per_trigger"):
             return max(1, int(rule.repeat_count or 1))
         return 1
 
@@ -2727,6 +3196,7 @@ class AutoActionEngine:
             self._pending_trigger_seq.pop(uid, None)
             self._last_trigger_seq.pop(uid, None)
             self._completed_pids.pop(uid, None)
+            self._completed_startup_rows.pop(uid, None)
             self._rule_signature.pop(uid, None)
             return
 
@@ -2744,6 +3214,9 @@ class AutoActionEngine:
             for idx in list(mapping.keys()):
                 if int(idx) not in valid_indices:
                     mapping.pop(int(idx), None)
+        completed_startup_rows = self._completed_startup_rows.get(uid)
+        if isinstance(completed_startup_rows, set):
+            completed_startup_rows.intersection_update(valid_indices)
 
     @staticmethod
     def _estimate_steps_duration(actions: Sequence[ActionStep], *, click_delay: float) -> float:
@@ -2779,7 +3252,7 @@ class AutoActionEngine:
                 total += max(0.0, float(step.drag_duration_s or 0.0)) + max(0.03, delay)
             elif kind == "key":
                 total += max(0.0, float(step.key_hold_s or 0.0)) + max(0.03, delay)
-            elif kind in ("paste", "webhook", "scroll", "kill_user"):
+            elif kind in ("paste", "webhook", "action_row", "scroll", "kill_user"):
                 total += max(0.03, delay)
             else:
                 total += max(0.01, delay)
@@ -3159,7 +3632,8 @@ class AutoActionEngine:
             pending_send = self._pending_alert_send_at.setdefault(str(uid), {})
             pending_seq = self._pending_trigger_seq.setdefault(str(uid), {})
             consumed = self._last_trigger_seq.setdefault(str(uid), {})
-            completed = self._completed_pids.setdefault(str(uid), {})
+            completed_pids = self._completed_pids.setdefault(str(uid), {})
+            completed_startup_rows = self._completed_startup_rows.setdefault(str(uid), set())
             signatures = self._rule_signature.setdefault(str(uid), {})
 
             for idx, rule in rules:
@@ -3172,7 +3646,8 @@ class AutoActionEngine:
                     pending_send.pop(idx_i, None)
                     pending_seq.pop(idx_i, None)
                     consumed.pop(idx_i, None)
-                    completed.pop(idx_i, None)
+                    completed_pids.pop(idx_i, None)
+                    completed_startup_rows.discard(idx_i)
 
                 if not rule.enabled or not rule.actions:
                     pending.pop(idx_i, None)
@@ -3227,7 +3702,9 @@ class AutoActionEngine:
                         continue
                     if not self._eligible_in_biome(biome, rule):
                         continue
-                    if rule.repeat_mode == "once_per_pid" and int(pid or 0) in completed.get(idx_i, set()):
+                    if rule.repeat_mode == "count" and idx_i in completed_startup_rows:
+                        continue
+                    if rule.repeat_mode == "once_per_pid" and int(pid or 0) in completed_pids.get(idx_i, set()):
                         continue
                     reason = self._alert_antiafk_overdue_reason()
                     if reason:
@@ -3243,12 +3720,19 @@ class AutoActionEngine:
                 if self._has_sent_alert_countdown_locked():
                     continue
 
-                if rule.trigger_type != "ocr_filter" or not rule.trigger_filter_ids:
+                is_event_trigger = bool(
+                    (rule.trigger_type == "ocr_filter" and rule.trigger_filter_ids)
+                    or (rule.trigger_type == "merchant" and rule.trigger_merchants)
+                    or rule.trigger_type == "action_row"
+                )
+                if not is_event_trigger:
                     if now < float(next_ready.get(idx_i, 0.0)):
                         continue
                     if not self._eligible_in_biome(biome, rule):
                         continue
-                    if rule.repeat_mode == "once_per_pid" and int(pid or 0) in completed.get(idx_i, set()):
+                    if rule.repeat_mode == "count" and idx_i in completed_startup_rows:
+                        continue
+                    if rule.repeat_mode == "once_per_pid" and int(pid or 0) in completed_pids.get(idx_i, set()):
                         continue
 
                     if alert_enabled:
@@ -3288,7 +3772,9 @@ class AutoActionEngine:
                     continue
                 if not self._eligible_in_biome(biome, rule):
                     continue
-                if rule.repeat_mode == "once_per_pid" and int(pid or 0) in completed.get(idx_i, set()):
+                if rule.repeat_mode == "count" and idx_i in completed_startup_rows:
+                    continue
+                if rule.repeat_mode == "once_per_pid" and int(pid or 0) in completed_pids.get(idx_i, set()):
                     continue
 
                 if alert_enabled:
@@ -3339,12 +3825,10 @@ class AutoActionEngine:
                 self._stop.wait(timeout=interval)
                 continue
 
-            users = [str(uid).strip() for uid in (cfg.get("users") or []) if str(uid).strip()]
+            users = self._users_from_cfg(cfg)
             click_delay = float(cfg.get("click_delay", 0.2) or 0.2)
             block_user_mouse_move = bool(cfg.get("disable_mouse_move", False))
             menu_debug = bool(cfg.get("menu_debug", False))
-            min_not_in_menu_s = 10.0
-
             if not users:
                 with self._state_lock:
                     self._pending_use_at.clear()
@@ -3411,7 +3895,7 @@ class AutoActionEngine:
                     except Exception:
                         biome = ""
 
-                    if not self._menu_gate_allows(uid, int(pid), min_not_in_menu_s):
+                    if not self._menu_gate_allows(uid, int(pid), 0.0):
                         self._cancel_overdue_pending_alerts(uid, now=now_ts, reason="menu gate")
                         continue
 
@@ -3423,9 +3907,29 @@ class AutoActionEngine:
                             self._pending_trigger_seq.pop(str(uid), None)
                         continue
 
+                    gated_rules: List[Tuple[int, ActionRule]] = []
+                    for idx, rule in rules:
+                        if self._menu_gate_allows(uid, int(pid), float(rule.startup_delay_s)):
+                            gated_rules.append((idx, rule))
+                    rules = gated_rules
+                    if not rules:
+                        continue
+
                     due = self._evaluate_rules_for_user(uid, int(pid), biome, rules, click_delay=click_delay)
                     if not due:
                         continue
+
+                    antiafk_guard_s = self._antiafk_execution_guard_s(due, click_delay=click_delay)
+                    if self._antiafk_is_overdue_within(antiafk_guard_s):
+                        if self._antiafk_is_overdue_within(0.0):
+                            antiafk_reason = "Anti-AFK is overdue"
+                        else:
+                            antiafk_reason = f"Anti-AFK is due within {antiafk_guard_s:.0f}s"
+                        self._log(
+                            f"[Auto-Actions] {antiafk_reason}; stopping this batch before {uid}."
+                        )
+                        pause_denied = True
+                        break
 
                     if pause_denied:
                         break
@@ -3451,7 +3955,12 @@ class AutoActionEngine:
                         self._stop.wait(timeout=max(0.0, float(lead_s)))
                         if self._stop.is_set():
                             break
-                    if not self._menu_gate_allows(uid, int(pid), min_not_in_menu_s):
+                    gated_due: List[Tuple[int, ActionRule]] = []
+                    for idx, rule in due:
+                        if self._menu_gate_allows(uid, int(pid), float(rule.startup_delay_s)):
+                            gated_due.append((idx, rule))
+                    due = gated_due
+                    if not due:
                         continue
 
                     try:
@@ -3460,6 +3969,10 @@ class AutoActionEngine:
                             for idx, rule in due:
                                 with self._state_lock:
                                     self._active_action = (str(uid), int(idx))
+                                    self._active_action_row_id = str(rule.row_id or "")
+                                    self._active_action_chain = (
+                                        (str(rule.row_id),) if str(rule.row_id or "").strip() else ()
+                                    )
                                 try:
                                     if menu_debug:
                                         self._log_menu_activation_debug(
@@ -3469,7 +3982,7 @@ class AutoActionEngine:
                                             biome=str(biome or ""),
                                             row_index=int(idx),
                                             rule=rule,
-                                            min_not_in_menu_s=min_not_in_menu_s,
+                                            min_not_in_menu_s=float(rule.startup_delay_s),
                                             phase="activate",
                                         )
                                     self._run_rule_on_window(
@@ -3485,6 +3998,8 @@ class AutoActionEngine:
                                 finally:
                                     with self._state_lock:
                                         self._active_action = None
+                                        self._active_action_row_id = ""
+                                        self._active_action_chain = ()
                         if used:
                             self._mark_used(uid, int(pid), used)
                             did_any = True
@@ -3531,7 +4046,14 @@ class AutoActionEngine:
 
         self._log("[Auto-Actions] Engine stopped.")
 
-    def test_once(self, uid: str, row_indices: Optional[Sequence[int]] = None) -> bool:
+    def test_once(
+        self,
+        uid: str,
+        row_indices: Optional[Sequence[int]] = None,
+        *,
+        target_pid: Optional[int] = None,
+        target_hwnd: Optional[int] = None,
+    ) -> bool:
         if autoit is None:
             self._log("[Auto-Actions] Test: AutoIt is required for input.")
             return False
@@ -3546,7 +4068,7 @@ class AutoActionEngine:
             return False
 
         try:
-            pid = self._pid_provider(str(uid))
+            pid = int(target_pid) if target_pid is not None else self._pid_provider(str(uid))
         except Exception:
             pid = None
         if not pid:
@@ -3554,7 +4076,7 @@ class AutoActionEngine:
             return False
 
         try:
-            hwnd = self._hwnd_provider(int(pid))
+            hwnd = int(target_hwnd) if target_hwnd is not None else self._hwnd_provider(int(pid))
         except Exception:
             hwnd = None
         if not hwnd:
@@ -3590,26 +4112,38 @@ class AutoActionEngine:
             self._log(f"[Auto-Actions] Test: running {len(rules)} selected action row(s) once for {uid}...")
             with self._action_lock:
                 for _idx, rule in rules:
-                    if menu_debug:
-                        self._log_menu_activation_debug(
+                    with self._state_lock:
+                        self._active_action = (str(uid), int(_idx))
+                        self._active_action_row_id = str(rule.row_id or "")
+                        self._active_action_chain = (
+                            (str(rule.row_id),) if str(rule.row_id or "").strip() else ()
+                        )
+                    try:
+                        if menu_debug:
+                            self._log_menu_activation_debug(
+                                uid=str(uid),
+                                pid=int(pid),
+                                hwnd=int(hwnd),
+                                biome="",
+                                row_index=int(_idx),
+                                rule=rule,
+                                min_not_in_menu_s=float(rule.startup_delay_s),
+                                phase="test-activate",
+                            )
+                        self._run_rule_on_window(
+                            int(hwnd),
+                            rule,
                             uid=str(uid),
                             pid=int(pid),
-                            hwnd=int(hwnd),
-                            biome="",
-                            row_index=int(_idx),
-                            rule=rule,
-                            min_not_in_menu_s=10.0,
-                            phase="test-activate",
+                            click_delay=click_delay,
+                            times=1,
+                            block_user_mouse_move=block_user_mouse_move,
                         )
-                    self._run_rule_on_window(
-                        int(hwnd),
-                        rule,
-                        uid=str(uid),
-                        pid=int(pid),
-                        click_delay=click_delay,
-                        times=1,
-                        block_user_mouse_move=block_user_mouse_move,
-                    )
+                    finally:
+                        with self._state_lock:
+                            self._active_action = None
+                            self._active_action_row_id = ""
+                            self._active_action_chain = ()
             self._log("[Auto-Actions] Test: complete.")
             return True
         except _MenuGateBlocked as e:

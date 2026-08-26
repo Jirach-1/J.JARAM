@@ -82,7 +82,7 @@ def _format_step_duration(seconds: float) -> str:
         return f"{value * 1000.0:.1f}ms"
     return f"{value:.3f}s"
 
-# RapidOCR (ONNXRuntime) import with fallback search paths (helps when the frozen EXE missed the package)
+# RapidOCR import with fallback search paths (helps when the frozen EXE missed the package)
 RapidOCR = None  # type: ignore
 ort = None  # type: ignore
 _RAPIDOCR_IMPORT_ERROR = None
@@ -90,8 +90,6 @@ _ORT_IMPORT_ERROR = None
 _OCR_DEVICE_SUMMARY: Optional[str] = None
 _OCR_ENGINE_REF: Any = None
 _OCR_DEVICE_ID: Optional[int] = None
-_RAPIDOCR_ORIG_GET_EP_LIST = None
-_RAPIDOCR_PATCHED_DEVICE_ID: Optional[int] = None
 _RAPIDOCR_NATIVE_LOCK = threading.RLock()
 
 
@@ -400,12 +398,12 @@ def _add_site_packages_paths() -> None:
 
 
 def _try_import_rapidocr():
-    """Try to import rapidocr_onnxruntime from standard site-packages locations only."""
+    """Try to import rapidocr from standard site-packages locations only."""
     import importlib
 
     _add_site_packages_paths()
     try:
-        module = importlib.import_module("rapidocr_onnxruntime")  # type: ignore
+        module = importlib.import_module("rapidocr")  # type: ignore
     except Exception:
         return None
     return getattr(module, "RapidOCR", None)
@@ -423,7 +421,7 @@ def _try_import_onnxruntime():
 
 
 try:
-    from rapidocr_onnxruntime import RapidOCR  # type: ignore
+    from rapidocr import RapidOCR  # type: ignore
 except Exception as _rapid_err:  # pragma: no cover - environment dependent
     RapidOCR = _try_import_rapidocr()  # type: ignore
     _RAPIDOCR_IMPORT_ERROR = _rapid_err if RapidOCR is None else None
@@ -448,40 +446,28 @@ def _get_ort_providers() -> List[str]:
         return []
 
 
-def _apply_rapidocr_device_id(device_id: Optional[int]) -> None:
-    global _RAPIDOCR_ORIG_GET_EP_LIST, _RAPIDOCR_PATCHED_DEVICE_ID
+def _ensure_rapidocr_dml_options_are_plain_dict() -> None:
+    """Keep RapidOCR 3.x DirectML options compatible with ONNX Runtime."""
     try:
-        from rapidocr_onnxruntime.utils import infer_engine as _infer_engine  # type: ignore
+        from rapidocr.inference_engine.onnxruntime.provider_config import (  # type: ignore
+            ProviderConfig,
+        )
     except Exception:
         return
 
-    if _RAPIDOCR_ORIG_GET_EP_LIST is None:
-        _RAPIDOCR_ORIG_GET_EP_LIST = _infer_engine.OrtInferSession._get_ep_list
-
-    if device_id is None:
-        _infer_engine.OrtInferSession._get_ep_list = _RAPIDOCR_ORIG_GET_EP_LIST
-        _RAPIDOCR_PATCHED_DEVICE_ID = None
+    current = ProviderConfig.dml_ep_cfg
+    if getattr(current, "_jaram_plain_dict", False):
         return
 
-    if _RAPIDOCR_PATCHED_DEVICE_ID == device_id:
-        return
+    def _dml_ep_cfg(self):  # type: ignore[no-untyped-def]
+        # RapidOCR 3.9 returns an OmegaConf DictConfig when dml_ep_cfg is
+        # explicitly configured. ONNX Runtime requires a real dict and
+        # otherwise silently retries the sessions on CPU.
+        options = current(self)
+        return dict(options or {})
 
-    orig_get_ep_list = _RAPIDOCR_ORIG_GET_EP_LIST
-
-    def _get_ep_list(self):  # type: ignore[no-untyped-def]
-        ep_list = orig_get_ep_list(self)
-        updated = []
-        for provider, opts in ep_list:
-            if provider in ("DmlExecutionProvider", "CUDAExecutionProvider"):
-                new_opts = dict(opts or {})
-                new_opts["device_id"] = int(device_id)
-                updated.append((provider, new_opts))
-            else:
-                updated.append((provider, opts))
-        return updated
-
-    _infer_engine.OrtInferSession._get_ep_list = _get_ep_list
-    _RAPIDOCR_PATCHED_DEVICE_ID = device_id
+    _dml_ep_cfg._jaram_plain_dict = True  # type: ignore[attr-defined]
+    ProviderConfig.dml_ep_cfg = _dml_ep_cfg
 
 
 def _init_rapidocr_engine(
@@ -491,7 +477,7 @@ def _init_rapidocr_engine(
 ):
     global _OCR_DEVICE_SUMMARY, _OCR_ENGINE_REF, _OCR_DEVICE_ID
     if RapidOCR is None:
-        raise RuntimeError("rapidocr_onnxruntime is not available.")
+        raise RuntimeError("rapidocr is not available.")
     if ort is None:
         raise RuntimeError("onnxruntime is not available.")
 
@@ -500,61 +486,46 @@ def _init_rapidocr_engine(
     with _RAPIDOCR_NATIVE_LOCK:
         if force_cpu:
             require_dml = False
-        _OCR_DEVICE_ID = device_id
-        if force_cpu:
-            _apply_rapidocr_device_id(None)
-        else:
-            _apply_rapidocr_device_id(device_id)
+        _OCR_DEVICE_ID = None if force_cpu else device_id
         providers = _get_ort_providers()
-        use_dml = "DmlExecutionProvider" in providers
-        if require_dml and not use_dml:
+        dml_available = "DmlExecutionProvider" in providers
+        if require_dml and not dml_available:
             _OCR_DEVICE_SUMMARY = "Unavailable (DirectML provider not available)"
             raise RuntimeError("DirectML provider is not available (install onnxruntime-directml).")
+
+        use_dml = dml_available and not force_cpu
+        rapidocr_params: Dict[str, Any] = {
+            "Global.use_cls": False,
+            "EngineConfig.onnxruntime.use_dml": use_dml,
+            "EngineConfig.onnxruntime.use_cuda": False,
+        }
+        if use_dml and device_id is not None:
+            rapidocr_params["EngineConfig.onnxruntime.dml_ep_cfg"] = {
+                # ONNX Runtime provider option values are strings, including
+                # numeric options such as the DirectML adapter index.
+                "device_id": str(int(device_id))
+            }
+
+        if use_dml:
+            _ensure_rapidocr_dml_options_are_plain_dict()
+        engine = RapidOCR(params=rapidocr_params)
         if force_cpu:
-            try:
-                engine = RapidOCR(
-                    det_use_dml=False,
-                    cls_use_dml=False,
-                    rec_use_dml=False,
-                    det_use_cuda=False,
-                    cls_use_cuda=False,
-                    rec_use_cuda=False,
-                )
-            except TypeError:
-                engine = RapidOCR()
             _OCR_DEVICE_SUMMARY = "CPU"
         else:
-            if use_dml:
-                try:
-                    engine = RapidOCR(det_use_dml=True, cls_use_dml=True, rec_use_dml=True)
-                except TypeError:
-                    engine = RapidOCR()
-            else:
-                engine = RapidOCR()
             _OCR_DEVICE_SUMMARY = _summarize_device_from_engine(engine, providers, device_id)
         _OCR_ENGINE_REF = engine
         return engine
 
 
 def _rapidocr_text_only(engine, img_np: np.ndarray) -> str:
-    """
-    Run RapidOCR and return text only (one line per detection).
-    rapidocr_onnxruntime returns (ocr_result, elapse).
-    """
+    """Run RapidOCR and return text only (one line per detection)."""
     with _RAPIDOCR_NATIVE_LOCK:
-        ocr_result, _elapse = engine(img_np)
-    if not ocr_result:
-        return ""
+        ocr_result = engine(img_np)
 
-    lines: List[str] = []
-    for item in ocr_result:
-        try:
-            rec_text = item[1]
-        except Exception:
-            continue
-        if rec_text:
-            lines.append(str(rec_text))
-    return "\n".join(lines)
+    texts = getattr(ocr_result, "txts", None)
+    if not texts:
+        return ""
+    return "\n".join(str(text) for text in texts if text)
 
 
 _POOL_ENGINE = None
@@ -1583,7 +1554,7 @@ def read_window_ocr_text_once(
     """
     cfg = ocr_settings or {}
     if RapidOCR is None:
-        raise RuntimeError(f"rapidocr_onnxruntime is not available: {_RAPIDOCR_IMPORT_ERROR}")
+        raise RuntimeError(f"rapidocr is not available: {_RAPIDOCR_IMPORT_ERROR}")
     if ort is None:
         raise RuntimeError(f"onnxruntime is not available: {_ORT_IMPORT_ERROR}")
 
@@ -1785,7 +1756,7 @@ class OCRWorker(QThread):
         if RapidOCR is None or ort is None:
             missing: List[str] = []
             if RapidOCR is None:
-                missing.append(f"rapidocr_onnxruntime ({_RAPIDOCR_IMPORT_ERROR})")
+                missing.append(f"rapidocr ({_RAPIDOCR_IMPORT_ERROR})")
             if ort is None:
                 missing.append(f"onnxruntime ({_ORT_IMPORT_ERROR})")
             self._log(f"[OCR] RapidOCR/ONNX Runtime not available: {', '.join(missing)}")

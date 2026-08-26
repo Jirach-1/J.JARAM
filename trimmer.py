@@ -1,7 +1,20 @@
 import time
 import threading
 import queue
+import sys
 from multiprocessing import get_context
+from pathlib import Path
+
+
+# In-place native builds are written to JARAM/native.  CPython only considers
+# extension modules whose ABI tag matches the running interpreter (for example,
+# cp314 on Python 3.14), so let the regular import machinery select the correct
+# file from that directory.
+_native_dir = Path(__file__).resolve().parent / "native"
+if _native_dir.is_dir():
+    native_s = str(_native_dir)
+    if native_s not in sys.path:
+        sys.path.insert(0, native_s)
 
 try:
     from ram_limiter_native import trim_targets as _native_trim_targets  # type: ignore
@@ -208,7 +221,7 @@ class TrimmerTab(QWidget):
             self.enabled_chk.setEnabled(False)
             self._append_log(
                 "[ERROR] Native RAM trimmer module `ram_limiter_native` is not available. "
-                "Build it from `native/` and place the `.pyd` next to `trimmer.py`."
+                "Build it in-place from the `native/` directory."
             )
             self._update_status()
             return

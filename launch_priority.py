@@ -1,6 +1,7 @@
 DEFAULT_LAUNCH_PRIORITY = 0
 MIN_LAUNCH_PRIORITY = -3
 MAX_LAUNCH_PRIORITY = 3
+LAUNCH_LAST_ONCE_STATE_KEY = "launch_last_once"
 
 
 def coerce_launch_priority(value: object) -> int:
@@ -29,6 +30,40 @@ def launch_priority_value(user_info: object) -> int:
 
 def launch_priority_sort_key(uid: object, user_info: object, fallback_index: int = 0) -> tuple:
     return (-launch_priority_value(user_info), int(fallback_index))
+
+
+def launch_last_once_value(user_state: object) -> bool:
+    return bool(
+        isinstance(user_state, dict)
+        and user_state.get(LAUNCH_LAST_ONCE_STATE_KEY, False)
+    )
+
+
+def mark_launch_last_once(user_state: object) -> bool:
+    if not isinstance(user_state, dict):
+        return False
+    user_state[LAUNCH_LAST_ONCE_STATE_KEY] = True
+    return True
+
+
+def consume_launch_last_once(user_state: object) -> bool:
+    if not isinstance(user_state, dict):
+        return False
+    was_pending = launch_last_once_value(user_state)
+    user_state.pop(LAUNCH_LAST_ONCE_STATE_KEY, None)
+    return was_pending
+
+
+def launch_queue_sort_key(
+    uid: object,
+    user_info: object,
+    user_state: object,
+    fallback_index: int = 0,
+) -> tuple:
+    """Sort one-shot-demoted accounts last, ignoring their saved priority."""
+    launch_last = launch_last_once_value(user_state)
+    priority_key = 0 if launch_last else -launch_priority_value(user_info)
+    return (int(launch_last), priority_key, int(fallback_index))
 
 
 def sort_user_items_by_launch_priority(items) -> list:

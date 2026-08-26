@@ -6,9 +6,19 @@ import win32gui
 import win32process
 import requests
 import json
-from log_utils import find_log_for_username, refresh_username_log_map
+from log_utils import LogLookupResult, PreconnectTracker, find_log_match
 from pathlib import Path
-from launch_priority import launch_priority_sort_key, sort_user_items_by_launch_priority
+from launch_priority import (
+    consume_launch_last_once,
+    launch_queue_sort_key,
+    mark_launch_last_once,
+    sort_user_items_by_launch_priority,
+)
+from cap_watchdog import (
+    DEFAULT_CAP_WATCHDOG_SETTINGS,
+    increment_cap_counter,
+    normalize_cap_watchdog_settings,
+)
 
 try:
     from roblox_cookie_utils import (
@@ -167,6 +177,7 @@ except ImportError:
                     "kill_timeout": 1740,
                     "poll_interval": 10,
                 },
+                "cap_watchdog": dict(DEFAULT_CAP_WATCHDOG_SETTINGS),
             }
             self._ensure_directories()
 
@@ -1782,17 +1793,31 @@ def execute_main_loop():
     user_state = {
         uid: {"last_launch": 0,
               "log_miss_streak": 0,
+              "log_generation_baseline": "",
               "user_info" : info}
         for uid, info in sort_user_items_by_launch_priority(manager.settings.items())
     }
+
+    for uid, st in user_state.items():
+        uname = str((st.get("user_info") or {}).get("username", "") or "").strip().lower()
+        if uname:
+            baseline = find_log_match(uname).match
+            st["log_generation_baseline"] = baseline.generation_id if baseline else ""
 
     # fire everything once on boot
     launcher.initialize_all_sessions(manager.settings)
     for uid in user_state:
         user_state[uid]["last_launch"] = time.time()
+    last_global_launch_at = time.time()
 
     # ───── main loop ─────
     tickers = {'window': 0, 'cleanup': 0}
+    cap_watchdog_cfg = normalize_cap_watchdog_settings(
+        (manager.config_manager.load_settings() or {}).get("cap_watchdog")
+    )
+    preconnect_tracker = PreconnectTracker(
+        grace_seconds=cap_watchdog_cfg["missing_username_timeout_seconds"]
+    )
     while True:
         now = time.time()
 
@@ -1811,46 +1836,58 @@ def execute_main_loop():
             tickers['window'] = now
             
         # --- NEW: pre-connect watchdog (headless) -----------------------------
-        try:
-            refresh_username_log_map()  # make sure strict map is fresh
-        except Exception:
-            pass
-
         now = time.time()
-        PRECONNECT_GRACE = 120  # seconds
 
         for uid, pids in list(manager.process_tracker.user_processes.items()):
             uid_s = str(uid)
             live_pids = [pid for pid in pids if process_mgr.verify_process_active(pid)]
             if not live_pids:
+                preconnect_tracker.reset(uid_s)
                 continue
 
             info = manager.settings.get(uid_s, {}) or {}
             uname = str(info.get("username", "")).lower()
             if not uname:
+                preconnect_tracker.reset(uid_s)
                 continue  # nothing to check
 
-            log_path = find_log_for_username(uname, allow_fallback=False)
-            if log_path:
+            process_ct = max(manager.process_tracker.creation_timestamps.get(pid, now) for pid in live_pids)
+            lookup = find_log_match(uname, not_before=float(process_ct) - 15.0)
+            baseline_generation = str(
+                (user_state.get(uid_s, {}) or {}).get("log_generation_baseline", "") or ""
+            )
+            if lookup.match and baseline_generation == lookup.match.generation_id:
+                lookup = LogLookupResult("conclusively_missing", health=lookup.health)
+            decision = preconnect_tracker.observe(
+                uid_s,
+                launch_token=float(process_ct),
+                live=True,
+                lookup=lookup,
+            )
+            if decision == "confirmed":
                 try:
                     user_state[uid_s]["log_miss_streak"] = 0
+                    user_state[uid_s]["log_generation_baseline"] = ""
                 except Exception:
                     pass
-            if not log_path:
-                oldest_ct = min(manager.process_tracker.creation_timestamps.get(pid, now) for pid in live_pids)
-                waited = now - oldest_ct
-                if waited >= PRECONNECT_GRACE:
+            elif decision == "timed_out":
+                    st0 = user_state.get(uid_s, {})
+                    mark_launch_last_once(st0)
+                    user_state[uid_s] = st0
                     # failed to ever attach to a log with the username — recycle it
                     if not bool(info.get("cap", False)):
                         try:
-                            st0 = user_state.get(uid_s, {})
-                            streak = int(st0.get("log_miss_streak", 0) or 0) + 1
-                            st0["log_miss_streak"] = streak
+                            streak, _counted, reached_limit = increment_cap_counter(
+                                st0,
+                                enabled=cap_watchdog_cfg["missing_username_increments_cap"],
+                                limit=cap_watchdog_cfg["cap_counter_limit"],
+                            )
                             user_state[uid_s] = st0
                         except Exception:
                             streak = 0
+                            reached_limit = False
 
-                        if streak >= 3:
+                        if reached_limit:
                             try:
                                 manager.config_manager.mark_cap_flag(uid_s, True)
                             except Exception:
@@ -1864,6 +1901,7 @@ def execute_main_loop():
                     for pid in live_pids:
                         process_mgr.terminate_process(pid, manager.process_tracker)
                     manager.process_tracker.user_server[uid_s] = "DISCONNECTED"
+                    preconnect_tracker.reset(uid_s)
         # --- END new watchdog --------------------------------------------------
 
         # --- build eligible candidates for this tick ---------------------------------
@@ -1889,7 +1927,7 @@ def execute_main_loop():
             if live_pids:
                 continue
 
-            # 2) honor the global launch_delay
+            # 2) honor this account's launch_delay
             if (now - st["last_launch"]) < manager.timeouts['launch_delay']:
                 continue
 
@@ -1945,27 +1983,39 @@ def execute_main_loop():
             # if we got here, this uid is a valid candidate for launching this tick
             eligible.append((uid, st, cookie, info, server_label))
 
-        # --- deterministic: try higher launch priority first ---
-        MAX_TRIES = 3
-        tries = 0
+        # --- deterministic: one-shot demotions last, then launch priority ---
         eligible = [
             row
             for _idx, row in sorted(
                 enumerate(eligible),
-                key=lambda pair: launch_priority_sort_key(
+                key=lambda pair: launch_queue_sort_key(
                     pair[1][0],
                     pair[1][3] if isinstance(pair[1][3], dict) else {},
+                    pair[1][1] if isinstance(pair[1][1], dict) else {},
                     pair[0],
                 ),
             )
         ]
 
+        global_launch_delay = max(
+            0.0,
+            float(manager.timeouts.get('launch_delay', 0) or 0),
+        )
+        if (now - last_global_launch_at) < global_launch_delay:
+            eligible = []
+
         for uid, st, cookie, info, server_label in eligible:
-            if tries >= MAX_TRIES:
-                break
-            tries += 1
+            uname = str(info.get("username", "") or "").strip().lower() if isinstance(info, dict) else ""
+            baseline = find_log_match(uname).match if uname else None
+            st["log_generation_baseline"] = baseline.generation_id if baseline else ""
+            attempt_started = time.time()
+            last_global_launch_at = attempt_started
+            consume_launch_last_once(st)
             ok = launcher.start_game_session(uid, cookie, info)
-            st["last_launch"] = now           # bump ONLY on an actual attempt
+            st["last_launch"] = attempt_started  # every attempt consumes the slot
+            preconnect_tracker.reset(uid)
+            if not ok:
+                break
             if ok:
                 break                         # launched one → stop this tick
 

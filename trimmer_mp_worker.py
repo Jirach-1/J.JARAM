@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import queue
+import sys
 import time
 import traceback
+from pathlib import Path
 from typing import Any, Optional
 
 
@@ -57,13 +59,21 @@ def run_trimmer_worker(config_queue: Any, log_queue: Any, stop_event: Any) -> No
         except Exception:
             return
 
+    # Windows starts this worker with a fresh interpreter.  Add the in-place
+    # build directory here as well instead of relying on the parent's sys.path.
+    native_dir = Path(__file__).resolve().parent / "native"
+    if native_dir.is_dir():
+        native_s = str(native_dir)
+        if native_s not in sys.path:
+            sys.path.insert(0, native_s)
+
     try:
         from ram_limiter_native import trim_targets as native_trim_targets  # type: ignore
     except Exception:
         _safe_put(
             log_queue,
             "[ERROR] Native RAM trimmer module `ram_limiter_native` is not available. "
-            "Build it from `native/` and place the `.pyd` next to `trimmer.py`.",
+            "Build it in-place from the `native/` directory.",
         )
         _safe_put(log_queue, None)
         return

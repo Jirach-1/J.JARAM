@@ -58,16 +58,22 @@
 ## Quick Start
 
 ### Run From Source (Windows)
-1. Install **Python 3.12** (native `.pyd` extensions in this repo are built for CPython 3.12).
+1. Install **Python 3.14 (64-bit)**.
 2. Install dependencies: `pip install -r requirements.txt`
-3. (Optional, OCR on GPU) Replace ONNXRuntime with DirectML:
-   - `pip uninstall -y onnxruntime`
-   - `pip install onnxruntime-directml`
+3. Build the native modules with the same interpreter (Visual Studio Build Tools required):
+   - `cd native`
+   - `python -m pip install -U "pybind11>=3.0" "setuptools>=77"`
+   - `python setup.py build_ext --inplace`
+   - `cd ..`
 4. Run: `python gui.py`
+
+The `.pyd` ABI tag must match Python. Python 3.14 loads the `cp314` builds; it
+will intentionally ignore older `cp312` files. See `native/NATIVE_BUILD.md` for
+build and verification details.
 
 ### System Requirements
 - **Operating System**: Windows 10/11
-- **Python**: 3.12 (if running from source)
+- **Python**: 3.14, 64-bit (if running from source)
 - **Roblox**: Installed and working on the system
 - **Optional**:
   - Chrome for browser cookie login + utilities

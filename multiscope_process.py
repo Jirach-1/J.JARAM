@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 import queue
 import threading
 import time
@@ -7,6 +9,12 @@ import traceback
 from typing import Any, Callable, Dict, List, Optional
 
 import multiprocessing as mp
+
+
+_READER_DEBUG = str(os.environ.get("JARAM_LOG_READER_DEBUG", "")).strip().lower() in {
+    "1", "true", "yes", "on",
+}
+_READER_LOGGER = logging.getLogger("jaram.log_reader.process")
 
 
 def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
@@ -17,6 +25,8 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
     owner_by_uid: Dict[str, str] = {}
 
     engine = None
+    last_reader_health = ""
+    last_snapshot_signature = None
     pending_update_users: Optional[List[str]] = None
     pending_configure_webhooks: Optional[dict] = None
     pending_record_ocr_merchants: List[tuple[str, str]] = []
@@ -69,9 +79,70 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
         except Exception:
             return ""
 
-    while True:
+    def _snapshot_signature(rows: List[dict]) -> tuple:
+        signature = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            menu_by_uid = row.get("in_menu_by_uid") or {}
+            menu_ts_by_uid = row.get("last_menu_ts_by_uid") or {}
+            signature.append(
+                (
+                    str(row.get("server_key") or row.get("server") or ""),
+                    tuple(str(uid) for uid in (row.get("users") or [])),
+                    row.get("in_menu"),
+                    float(row.get("last_menu_ts", 0.0) or 0.0),
+                    tuple(sorted((str(uid), value) for uid, value in menu_by_uid.items())),
+                    tuple(sorted((str(uid), float(value or 0.0)) for uid, value in menu_ts_by_uid.items())),
+                    str(row.get("last_biome") or row.get("biome") or ""),
+                    str(row.get("last_merchant") or row.get("merchant") or ""),
+                    int(row.get("events", 0) or 0),
+                )
+            )
+        return tuple(signature)
+
+    def _publish_snapshot(*, force: bool = False) -> List[dict]:
+        nonlocal last_snapshot_signature
+        if engine is None:
+            return []
+        rows = engine.snapshot()
+        signature = _snapshot_signature(rows)
+        if force or signature != last_snapshot_signature:
+            last_snapshot_signature = signature
+            _send({"type": "snapshot", "rows": rows})
+        return rows
+
+    def _poll_engine() -> bool:
+        nonlocal last_reader_health
+        if engine is None:
+            return False
         try:
-            cmd = cmd_q.get()
+            diagnostics = engine.poll_logs()
+            events = engine.drain_events()
+            if events:
+                _send({"type": "events", "events": events})
+            health = str(((diagnostics or {}).get("index") or {}).get("health") or "")
+            if health and health != last_reader_health:
+                last_reader_health = health
+                _send({"type": "reader_health", "health": health, "diagnostics": diagnostics})
+                if _READER_DEBUG:
+                    _READER_LOGGER.debug("reader health=%s diagnostics=%r", health, diagnostics)
+            _publish_snapshot()
+            return bool(int((diagnostics or {}).get("backlog_users", 0) or 0))
+        except Exception as exc:
+            if _READER_DEBUG:
+                _READER_LOGGER.debug("autonomous log poll failed", exc_info=exc)
+            return False
+
+    while True:
+        backlog_pending = _poll_engine()
+        try:
+            # Drain existing byte backlogs without adding 100 ms between bounded
+            # batches. Retain a 10 ms floor so a persistently unreadable file
+            # cannot turn the child process into a hot loop.
+            cmd = cmd_q.get(timeout=0.01 if backlog_pending else 0.1)
+        except queue.Empty:
+            continue
         except Exception:
             continue
 
@@ -127,6 +198,10 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                             skip_webhook_unknown_context=bool(
                                 pending_configure_webhooks.get("skip_webhook_unknown_context", False)
                             ),
+                            in_menu_none_timeout_seconds=float(
+                                pending_configure_webhooks.get("in_menu_none_timeout_seconds", 120.0)
+                                or 120.0
+                            ),
                         )
                 except Exception:
                     pass
@@ -134,6 +209,7 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                 try:
                     if pending_update_users:
                         engine.update_users([str(u) for u in pending_update_users])
+                        _publish_snapshot(force=True)
                 except Exception:
                     pass
                 try:
@@ -194,6 +270,7 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                     if uid not in user_ids_set:
                         owner_by_uid.pop(uid, None)
                 engine.update_users(user_ids)
+                _publish_snapshot(force=True)
 
             elif ctype == "configure_webhooks":
                 if engine is None:
@@ -216,7 +293,27 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                     biome_min_interval=float(cmd.get("biome_min_interval", 2.0) or 2.0),
                     biome_modes=cmd.get("biome_modes"),
                     skip_webhook_unknown_context=bool(cmd.get("skip_webhook_unknown_context", False)),
+                    in_menu_none_timeout_seconds=float(
+                        cmd.get("in_menu_none_timeout_seconds", 120.0) or 120.0
+                    ),
                 )
+
+            elif ctype == "recover_user_log_tracking":
+                if engine is None:
+                    continue
+                recovered = engine.recover_user_log_tracking(
+                    str(cmd.get("uid") or ""),
+                    process_created_at=cmd.get("process_created_at"),
+                )
+                if recovered:
+                    _publish_snapshot(force=True)
+
+            elif ctype == "import_state":
+                if engine is None:
+                    continue
+                state = cmd.get("state") or {}
+                if isinstance(state, dict) and engine.import_state(state):
+                    _publish_snapshot(force=True)
 
             elif ctype == "begin_handoff":
                 if engine is None:
@@ -257,7 +354,11 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                             cookies_by_uid[u] = str(st.get("cookie") or cookies_by_uid.get(u, ""))
 
                 engine.tick(status_by_uid)
-                _send({"type": "tick", "rows": engine.snapshot(), "events": engine.drain_events()})
+                rows = engine.snapshot()
+                last_snapshot_signature = _snapshot_signature(rows)
+                # A tick reply is also the command acknowledgement used by the
+                # proxy to release its in-flight guard, so it must always send.
+                _send({"type": "tick", "rows": rows, "events": engine.drain_events()})
 
             elif ctype == "rpc":
                 rid = cmd.get("id")
@@ -319,6 +420,8 @@ class MultiScopeProcessProxy:
         self._ready = False
         self._last_snapshot: List[dict] = []
         self._events: List[tuple[str, str, str]] = []
+        self._reader_health: str = "degraded"
+        self._reader_diagnostics: dict = {}
         self._rpc_replies: Dict[int, dict] = {}
         self._next_rpc_id = 1
         self._tick_pending = False
@@ -377,6 +480,26 @@ class MultiScopeProcessProxy:
                                 self._events.append((str(kind), str(uid), str(payload)))
                             except Exception:
                                 continue
+            elif mtype == "snapshot":
+                rows = msg.get("rows") or []
+                if isinstance(rows, list):
+                    with self._state_lock:
+                        self._last_snapshot = rows
+            elif mtype == "events":
+                evs = msg.get("events") or []
+                if isinstance(evs, list):
+                    with self._state_lock:
+                        for ev in evs:
+                            try:
+                                kind, uid, payload = ev
+                                self._events.append((str(kind), str(uid), str(payload)))
+                            except Exception:
+                                continue
+            elif mtype == "reader_health":
+                with self._state_lock:
+                    self._reader_health = str(msg.get("health") or "degraded")
+                    diag = msg.get("diagnostics")
+                    self._reader_diagnostics = dict(diag) if isinstance(diag, dict) else {}
             elif mtype == "rpc":
                 rid = msg.get("id")
                 try:
@@ -445,6 +568,7 @@ class MultiScopeProcessProxy:
         biome_min_interval: float = 2.0,
         biome_modes: Optional[Dict[str, str]] = None,
         skip_webhook_unknown_context: bool = False,
+        in_menu_none_timeout_seconds: float = 120.0,
     ) -> None:
         self._drain_out_queue()
         self._send_cmd(
@@ -464,6 +588,7 @@ class MultiScopeProcessProxy:
                 "biome_min_interval": float(biome_min_interval or 0.0),
                 "biome_modes": biome_modes,
                 "skip_webhook_unknown_context": bool(skip_webhook_unknown_context),
+                "in_menu_none_timeout_seconds": float(in_menu_none_timeout_seconds),
             }
         )
 
@@ -514,6 +639,19 @@ class MultiScopeProcessProxy:
             ev = list(self._events)
             self._events.clear()
         return ev
+
+    def reader_health(self) -> str:
+        self._drain_out_queue()
+        with self._state_lock:
+            return str(self._reader_health or "degraded")
+
+    def reader_diagnostics(self) -> dict:
+        self._drain_out_queue()
+        with self._state_lock:
+            return dict(self._reader_diagnostics or {})
+
+    def diagnostics_snapshot(self) -> dict:
+        return self.reader_diagnostics()
 
     def _rpc(self, method: str, *args: Any, timeout_s: float = 0.25, **kwargs: Any) -> Any:
         self._drain_out_queue()
@@ -570,6 +708,30 @@ class MultiScopeProcessProxy:
         except Exception:
             return False
 
+    def recover_user_log_tracking_async(
+        self,
+        uid: str,
+        process_created_at: Optional[float] = None,
+    ) -> bool:
+        """Queue recovery without stalling the manager heartbeat on an RPC."""
+        uid_s = str(uid or "").strip()
+        if not uid_s:
+            return False
+        self._drain_out_queue()
+        try:
+            if not self._proc.is_alive():
+                return False
+        except Exception:
+            return False
+        self._send_cmd(
+            {
+                "type": "recover_user_log_tracking",
+                "uid": uid_s,
+                "process_created_at": process_created_at,
+            }
+        )
+        return True
+
     def export_state(self) -> dict:
         # Pause/Resume needs this to succeed even if the worker is busy processing a tick;
         # allow a longer timeout so state isn't silently lost and values don't reset on resume.
@@ -590,6 +752,19 @@ class MultiScopeProcessProxy:
             return bool(out)
         except Exception:
             return False
+
+    def import_state_async(self, state: dict) -> bool:
+        """Queue a resume import so manager readiness does not wait on log I/O."""
+        if not isinstance(state, dict) or not state:
+            return False
+        self._drain_out_queue()
+        try:
+            if not self._proc.is_alive():
+                return False
+        except Exception:
+            return False
+        self._send_cmd({"type": "import_state", "state": state})
+        return True
 
     def shutdown(self) -> None:
         self._drain_out_queue()

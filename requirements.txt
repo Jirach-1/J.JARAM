@@ -2,14 +2,11 @@ PySide6
 psutil
 requests
 pywin32
-undetected-chromedriver
 selenium
 numpy
 Pillow
 pyautoit
 watchdog
-rapidocr-onnxruntime
+rapidocr
 discord.py
-# Run these separately afterwards
-# pip uninstall onnxruntime
-# pip install onnxruntime-directML
+onnxruntime-directML

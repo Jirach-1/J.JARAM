@@ -1,101 +1,101 @@
 {
     "WINDY": {
         "color": "0x9ae5ff",
-        "thumbnail_url": "https://i.postimg.cc/6qPH4wy6/image.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Windy%20Biome.png",
         "Timer": "120"
     },
     "RAINY": {
         "color": "0x027cbd",
-        "thumbnail_url": "https://static.wikia.nocookie.net/sol-rng/images/e/ec/Rainy.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Rainy%20Biome.png",
         "Timer": "120"
     },
     "SNOWY": {
         "color": "0xDceff9",
-        "thumbnail_url": "https://static.wikia.nocookie.net/sol-rng/images/d/d7/Snowy_img.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Snowy%20Biome.png",
         "Timer": "120"
     },
     "SAND STORM": {
         "color": "0x8F7057",
-        "thumbnail_url": "https://i.postimg.cc/3JyL25Kz/image.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Sand%20Storm%20Biome.png",
         "Timer": "660"
     },
     "HELL": {
         "color": "0xff4719",
-        "thumbnail_url": "https://i.postimg.cc/hGC5xNyY/image.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Hell%20Biome.png",
         "Timer": "660"
     },
     "STARFALL": {
         "color": "0x011ab7",
-        "thumbnail_url": "https://i.postimg.cc/1t0dY4J8/image.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Starfall%20Biome.png",
         "Timer": "600"
     },
     "Heaven": {
-        "color": "0XFFDE5E",
-        "thumbnail_url": "https://media.discordapp.net/stickers/1447481739240018010.webp?size=240&quality=lossless",
+        "color": "0Xe7c698",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Heaven%20Biome.png",
         "Timer": "240"
     },
     "CORRUPTION": {
         "color": "0x6d32a8",
-        "thumbnail_url": "https://i.postimg.cc/ncZQ84Dh/image.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Corruption%20Biome.png",
         "Timer": "660"
     },
     "NULL": {
         "color": "0x838383",
-        "thumbnail_url": "https://static.wikia.nocookie.net/sol-rng/images/f/fc/NULLLL.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Null%20Biome.png",
         "Timer": "99"
-    },
-    "Cyberspace": {
-        "color": "0x011ab7",
-        "thumbnail_url": "https://at-cdn-s01.audiotool.com/2013/06/13/documents/zW2OHriFzthb06Ty5h9tUxEGgEw/0/cover256x256-f161eb9cd16c4786bbb3c78292e7131f.jpg",
-        "Timer": "150"
     },
     "GLITCHED": {
         "color": "0xbfff00",
-        "thumbnail_url": "https://i.postimg.cc/W3Lhtn5g/image.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Glitched%20Biome.png",
         "Timer": "164"
     },
     "DREAMSPACE": {
         "color": "0xea9dda",
-        "thumbnail_url": "https://i.postimg.cc/rFjCcW3w/image.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Dreamspace%20Biome.png",
         "Timer": "192"
     },
+    "Cyberspace": {
+        "color": "0x0064CE",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Cyberspace%20Biome.png",
+        "Timer": "150"
+    },
     "Singularity": {
-        "color": "0x011ab7",
-        "thumbnail_url": "https://images.stockcake.com/public/1/5/a/15a57388-244b-4e36-ade9-871b031bb041_medium/cosmic-anime-vortex-stockcake.jpg",
+        "color": "0xE07B48",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Singularity%20Biome.png",
         "Timer": "1200"
     },
     "NORMAL": {
         "color": "0x00ff00",
-        "thumbnail_url": "https://static.wikia.nocookie.net/sol-rng/images/c/c9/Daytime_img.png/revision/latest/scale-to-width-down/1000?cb=20241116044859"
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Normal%20Biome.png"
     },
      "BLAZING SUN": {
-        "color": "0XFF8900",
-        "thumbnail_url": "https://static.wikia.nocookie.net/supermarioglitchy4/images/b/b5/Angry_Sun_SMB3.png/revision/latest?cb=20230512215153",
+        "color": "0XFFB633",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Blazing%20Sun%20Biome.png",
         "Timer": "150"
     },
     "Graveyard": {
         "color": "0X696761",
-        "thumbnail_url": "https://images.vexels.com/media/users/3/136069/isolated/lists/399370e90f142aff65c2c3963134b11d-graveyard-tombstones.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Graveyard%20Biome.png",
         "Timer": "150"
     },
     "Pumpkin Moon": {
-        "color": "0Xba7600",
-        "thumbnail_url": "https://cdn.shopify.com/s/files/1/0125/8261/7145/files/Pumpkin_Plushie-SV2-P-1_1000x.png.webp?v=1759503127",
+        "color": "0XDD6E00",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Pumpkin%20Moon%20Biome.png",
         "Timer": "150"
     },
     "Blood Rain": {
         "color": "0X701f03",
-        "thumbnail_url": "https://cdn-icons-png.flaticon.com/512/967/967119.png",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Blood%20Rain%20Biome.png",
         "Timer": "150"
     },
     "Aurora": {
         "color": "0X3299a8",
-        "thumbnail_url": "https://images.stockcake.com/public/b/d/3/bd3769ca-18e5-4d66-9722-6f9dc8aa64de_medium/aurora-over-mountains-stockcake.jpg",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Aurora%20Biome.png",
         "Timer": "600"
     },
     "Eggland": {
         "color": "0Xf5f5dc",
-        "thumbnail_url": "https://cdn-icons-png.freepik.com/256/14400/14400227.png?semt=ais_white_label",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Eggland%20Biome.png",
         "Timer": "600"
     }
 
