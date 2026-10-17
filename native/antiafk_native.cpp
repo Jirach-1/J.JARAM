@@ -409,6 +409,38 @@ void key_event_up(int vk_code) {
   ::keybd_event(static_cast<BYTE>(vk_code), static_cast<BYTE>(scan), KEYEVENTF_KEYUP, 0);
 }
 
+bool tap_alt_for_foreground_permission() {
+  // Windows releases its SetForegroundWindow lock when the user presses Alt.
+  // Do this once as a recovery step after an ordinary focus attempt fails.  A
+  // single SendInput batch keeps the modifier transition ordered and avoids
+  // leaving Alt held while Anti-AFK moves on to another window.
+  if ((::GetAsyncKeyState(VK_MENU) & 0x8000) != 0) {
+    return false;
+  }
+
+  INPUT inputs[2]{};
+  inputs[0].type = INPUT_KEYBOARD;
+  inputs[0].ki.wVk = VK_MENU;
+  inputs[1].type = INPUT_KEYBOARD;
+  inputs[1].ki.wVk = VK_MENU;
+  inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+  const UINT sent = ::SendInput(2, inputs, sizeof(INPUT));
+  if (sent == 2) {
+    return true;
+  }
+
+  // SendInput normally inserts the entire batch.  If it ever inserts only the
+  // key-down event, make a best-effort release so a failed recovery cannot
+  // leave the user's Alt key logically stuck.
+  INPUT release{};
+  release.type = INPUT_KEYBOARD;
+  release.ki.wVk = VK_MENU;
+  release.ki.dwFlags = KEYEVENTF_KEYUP;
+  (void)::SendInput(1, &release, sizeof(INPUT));
+  return false;
+}
+
 void sleep_abortable(int delay_ms,
                      const std::atomic<bool>* stop_requested,
                      const std::atomic<bool>* shutdown_requested,
@@ -519,6 +551,7 @@ bool ensure_foreground(HWND hwnd,
                        const std::atomic<bool>* pause_requested = nullptr,
                        int* out_attempts_used = nullptr) {
   int attempts_used = 0;
+  bool foreground_permission_recovery_attempted = false;
   for (int i = 0; i < attempts; ++i) {
     attempts_used = i + 1;
     if (should_abort(stop_requested, shutdown_requested, pause_requested)) {
@@ -541,6 +574,26 @@ bool ensure_foreground(HWND hwnd,
         return true;
       }
       return true;
+    }
+
+    // A Windows shell surface (notably SearchApp/SearchHost) can retain the
+    // foreground lock indefinitely.  Without a recovery input every Roblox
+    // window in every later sweep fails behind that same foreground window.
+    // Try the documented Alt unlock once per focus operation, then immediately
+    // retry the target before falling back to the normal bounded retry loop.
+    if (!foreground_permission_recovery_attempted &&
+        !should_abort(stop_requested, shutdown_requested, pause_requested)) {
+      foreground_permission_recovery_attempted = true;
+      if (tap_alt_for_foreground_permission()) {
+        sleep_abortable(sleep_ms, stop_requested, shutdown_requested, pause_requested);
+        if (!should_abort(stop_requested, shutdown_requested, pause_requested) &&
+            focus_window_best_effort(hwnd, window_tid)) {
+          if (out_attempts_used) {
+            *out_attempts_used = attempts_used;
+          }
+          return true;
+        }
+      }
     }
     sleep_abortable(sleep_ms, stop_requested, shutdown_requested, pause_requested);
   }

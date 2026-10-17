@@ -17,6 +17,12 @@ BASE_DIR = Path(__file__).resolve().parent
 
 ext_modules = [
     Pybind11Extension(
+        "wgc_capture_native",
+        [str(BASE_DIR / "wgc_capture_native.cpp")],
+        cxx_std=20,
+        libraries=["d3d11", "dxgi", "dwmapi", "windowsapp", "user32"],
+    ),
+    Pybind11Extension(
         "bes_limiter_native",
         [str(BASE_DIR / "bes_limiter_native.cpp")],
         cxx_std=17,
