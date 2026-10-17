@@ -188,6 +188,16 @@ def main():
         from merchant_fix import run_helper_from_argv
 
         raise SystemExit(run_helper_from_argv(sys.argv[1:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--asset-request-filter-helper":
+        try:
+            from dev_only.asset_request_filter import run_proxy_helper_from_argv
+        except ImportError:
+            # The Request Filter is optional. A build without its one dev_only
+            # module must still start normally; only its private helper command
+            # is unavailable.
+            raise SystemExit(2)
+
+        raise SystemExit(run_proxy_helper_from_argv(sys.argv[1:]))
 
     # Silence noisy Windows DPI-awareness warning:
     # "qt.qpa.window: SetProcessDpiAwarenessContext() failed: Access is denied."

@@ -6,6 +6,8 @@ import queue
 import threading
 import time
 import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 import multiprocessing as mp
@@ -29,19 +31,43 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
     last_snapshot_signature = None
     pending_update_users: Optional[List[str]] = None
     pending_configure_webhooks: Optional[dict] = None
+    pending_development_config: dict = {}
+    service_waiters: dict = {}
+    service_lock = threading.Lock()
     pending_record_ocr_merchants: List[tuple[str, str]] = []
 
-    def _send(msg: dict) -> None:
+    def _send(msg: dict) -> bool:
         try:
             out_q.put(msg)
+            return True
         except Exception:
-            pass
+            return False
+
+    def _service_notify(payload):
+        return _send({"type": "service_request", "id": uuid.uuid4().hex,
+                      "payload": payload, "notify_only": True})
 
     def _log(msg: object) -> None:
         try:
             _send({"type": "log", "message": str(msg)})
         except Exception:
             pass
+
+    def _member_lookup(guild_id, user_id):
+        request_id = uuid.uuid4().hex
+        event = threading.Event()
+        result = {}
+        with service_lock:
+            service_waiters[request_id] = (event, result)
+        try:
+            _send({"type": "service_request", "id": request_id,
+                   "payload": {"method": "discord_member", "guild_id": guild_id, "user_id": user_id}})
+            if not event.wait(10):
+                return {"ok": False, "message": "Discord service unavailable."}
+            return result
+        finally:
+            with service_lock:
+                service_waiters.pop(request_id, None)
 
     try:
         from multiscope import MultiScopeEngine
@@ -171,7 +197,10 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                     get_cookie_for_user=_get_cookie,
                     stats_path=str(stats_path) if stats_path else None,
                     log_fn=_log,
+                    member_lookup=_member_lookup,
+                    service_notify=_service_notify,
                 )
+                engine.configure_development(pending_development_config)
                 _send({"type": "ready"})
 
                 # Apply any commands that arrived before init completed.
@@ -276,6 +305,19 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                         owner_by_uid.pop(uid, None)
                 engine.update_users(user_ids, refresh_user_ids=refresh_user_ids)
                 _publish_snapshot(force=True)
+
+            elif ctype == "service_reply":
+                with service_lock:
+                    waiter = service_waiters.get(cmd.get("id"))
+                    if waiter:
+                        event, result = waiter
+                        result.update(cmd.get("result") or {"ok": False})
+                        event.set()
+
+            elif ctype == "configure_development":
+                pending_development_config = dict(cmd.get("config") or {})
+                if engine is not None:
+                    engine.configure_development(pending_development_config)
 
             elif ctype == "configure_webhooks":
                 if engine is None:
@@ -414,8 +456,11 @@ class MultiScopeProcessProxy:
         cookies_by_uid: Dict[str, str],
         stats_path: str,
         log_fn: Optional[Callable[[str], None]] = None,
+        service_handler: Optional[Callable[[dict], dict]] = None,
     ):
         self._log = log_fn or (lambda _msg: None)
+        self._service_handler = service_handler
+        self._service_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ms-service")
         self._ctx = mp.get_context("spawn")
         self._cmd_q: mp.Queue = self._ctx.Queue()
         self._out_q: mp.Queue = self._ctx.Queue()
@@ -463,7 +508,9 @@ class MultiScopeProcessProxy:
                 continue
 
             mtype = msg.get("type")
-            if mtype == "ready":
+            if mtype == "service_request":
+                self._service_executor.submit(self._answer_service_request, msg)
+            elif mtype == "ready":
                 with self._state_lock:
                     self._ready = True
             elif mtype == "log":
@@ -528,6 +575,17 @@ class MultiScopeProcessProxy:
                     self._log(line)
                 except Exception:
                     pass
+
+    def _answer_service_request(self, msg: dict) -> None:
+        try:
+            result = self._service_handler(msg.get("payload") or {}) if self._service_handler else {"ok": False}
+        except Exception:
+            result = {"ok": False, "message": "Service request failed."}
+        if not msg.get("notify_only"):
+            self._send_cmd({"type": "service_reply", "id": msg.get("id"), "result": result})
+
+    def configure_development(self, config: dict) -> None:
+        self._send_cmd({"type": "configure_development", "config": config})
 
     def _ensure_ready(self) -> bool:
         self._drain_out_queue()
@@ -779,7 +837,11 @@ class MultiScopeProcessProxy:
             pass
 
         try:
-            self._proc.join(timeout=2.0)
+            deadline = time.monotonic() + 30.0
+            while self._proc.is_alive() and time.monotonic() < deadline:
+                self._drain_out_queue()
+                self._proc.join(timeout=0.05)
+            self._drain_out_queue()
         except Exception:
             pass
         try:
@@ -787,3 +849,4 @@ class MultiScopeProcessProxy:
                 self._proc.terminate()
         except Exception:
             pass
+        self._service_executor.shutdown(wait=True)

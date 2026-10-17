@@ -34,6 +34,7 @@ from ctypes import windll, wintypes
 from dataclasses import dataclass
 
 from multiscope import APP_FOOTER
+from wgc_capture import capture_window_wgc, configure_wgc_captures, release_wgc_captures
 
 # -----------------------------
 # Frame similarity helpers
@@ -1562,10 +1563,23 @@ def capture_window_fallback(hwnd: int) -> Optional[Image.Image]:
         return None
 
 
-def capture_window_image(hwnd: int, roi: Optional[Tuple[float, float, float, float]] = None) -> Optional[Image.Image]:
-    img = capture_window_printwindow(hwnd)
-    if img is None:
-        img = capture_window_fallback(hwnd)
+def normalize_capture_mode(value: Any) -> str:
+    return "wgc" if str(value or "").strip().lower() == "wgc" else "printwindow"
+
+
+def capture_window_image(
+    hwnd: int,
+    roi: Optional[Tuple[float, float, float, float]] = None,
+    *,
+    capture_mode: str = "printwindow",
+) -> Optional[Image.Image]:
+    if normalize_capture_mode(capture_mode) == "wgc":
+        # Never reintroduce PrintWindow (or occluded desktop pixels) on WGC failure.
+        img = capture_window_wgc(hwnd)
+    else:
+        img = capture_window_printwindow(hwnd)
+        if img is None:
+            img = capture_window_fallback(hwnd)
     if img is None:
         return None
     if roi is not None:
@@ -1756,7 +1770,7 @@ def read_window_ocr_text_once(
     if roi_tuple is None and isinstance(cfg.get("roi"), dict):
         roi_tuple = _roi_from_cfg(cfg.get("roi") or {})
 
-    raw_img = capture_window_image(int(hwnd), roi_tuple)
+    raw_img = capture_window_image(int(hwnd), roi_tuple, capture_mode=cfg.get("capture_mode", "printwindow"))
     if raw_img is None:
         raise RuntimeError("window capture failed")
 
@@ -1841,11 +1855,13 @@ class OCRWorker(QThread):
         ocr_settings: Optional[Dict[str, Any]],
         ms_settings: Optional[Dict[str, Any]],
         context_provider: Optional[Callable[[int], Dict[str, Any]]] = None,
+        verification_log_batch_provider: Optional[Callable[[], Any]] = None,
     ):
         super().__init__()
         self._ocr_cfg = ocr_settings or {}
         self._ms_cfg = ms_settings or {}
         self._context_provider = context_provider
+        self._verification_log_batch_provider = verification_log_batch_provider
 
         self._cooldowns: Dict[int, Dict[str, float]] = {}
         self._capture_rr_index = 0
@@ -1856,7 +1872,9 @@ class OCRWorker(QThread):
         self._frame_hash_size = _FRAME_HASH_SIZE
         self._frame_diff_tolerance = 0.0
         self._last_frame_hash_by_key: Dict[str, int] = {}
+        self._capture_errors: Dict[int, Tuple[str, float]] = {}
         self._verification_next_check_by_pid: Dict[int, float] = {}
+        self._verification_positive_log_sessions: set[Tuple[int, int]] = set()
         self._verification_check_interval = 2.0
         self._window_snapshot_lock = threading.Lock()
         self._window_snapshot_ready = threading.Event()
@@ -1876,6 +1894,20 @@ class OCRWorker(QThread):
 
     def update_settings(self, ocr_settings: Dict[str, Any], ms_settings: Optional[Dict[str, Any]] = None) -> None:
         self._apply_cfg(ocr_settings or {}, ms_settings or self._ms_cfg)
+
+    def _capture_window(self, hwnd: int) -> Optional[Image.Image]:
+        try:
+            image = capture_window_image(hwnd, capture_mode=self._capture_mode)
+            self._capture_errors.pop(hwnd, None)
+            return image
+        except Exception as exc:
+            message = str(exc)
+            now = time.monotonic()
+            previous, logged_at = self._capture_errors.get(hwnd, ("", 0.0))
+            if message != previous or now - logged_at >= 30.0:
+                self._log(f"[OCR Capture] HWND {hwnd}: {message}")
+                self._capture_errors[hwnd] = (message, now)
+            return None
 
     # -------------------- window enumeration cache --------------------
     def _start_window_enumerator(self) -> None:
@@ -1994,6 +2026,7 @@ class OCRWorker(QThread):
             self.status_signal.emit("running")
             self._log("OCR worker started.")
             self._log(f"[OCR] Processing mode: {self._processing_mode}.")
+            self._log(f"[OCR] Capture mode: {self._capture_mode}.")
             self._start_window_enumerator()
 
             while not self._stop_event.is_set():
@@ -2032,6 +2065,11 @@ class OCRWorker(QThread):
                         )
                         self._stop_event.wait(timeout=sleep_for)
                         continue
+
+                    if self._capture_mode == "wgc":
+                        configure_wgc_captures(
+                            len(windows), self._max_captures_per_second, self._batch_delay_seconds
+                        )
 
                     step_started = time.perf_counter()
                     work_list = self._select_windows(windows)
@@ -2100,7 +2138,7 @@ class OCRWorker(QThread):
                                 continue
 
                             step_started = time.perf_counter()
-                            full_img = capture_window_image(win.hwnd)
+                            full_img = self._capture_window(win.hwnd)
                             capture_elapsed += time.perf_counter() - step_started
                             remaining_slots -= 1
                             if full_img is None:
@@ -2360,6 +2398,7 @@ class OCRWorker(QThread):
         finally:
             self._stop_event.set()
             self._stop_window_enumerator()
+            release_wgc_captures()
             self._shutdown_ocr_pool()
             self._shutdown_send_pool()
 
@@ -2688,6 +2727,28 @@ class OCRWorker(QThread):
     def _pid_has_eligible_verification_filters(self, pid: int) -> bool:
         return bool(self._verification_filter_specs(pid))
 
+    @staticmethod
+    def _verification_session_key(win: Any) -> Optional[Tuple[int, int]]:
+        """Identify one live Roblox window session without retaining stale PIDs."""
+        try:
+            pid = int(getattr(win, "pid", 0) or 0)
+            hwnd = int(getattr(win, "hwnd", 0) or 0)
+        except Exception:
+            return None
+        if pid <= 0 or hwnd <= 0:
+            return None
+        return (pid, hwnd)
+
+    def _has_configured_verification_filters(self) -> bool:
+        for spec in self._filters or []:
+            if not bool(spec.get("enabled", True)):
+                continue
+            if str(spec.get("behavior", "") or "").strip().lower() != "verification_cap":
+                continue
+            if self._effective_filter_roi(spec) is not None:
+                return True
+        return False
+
     def _build_capture_groups(self, pid: int) -> List[Dict[str, Any]]:
         groups: Dict[str, Dict[str, Any]] = {}
         ctx = self._pid_context(pid)
@@ -2797,6 +2858,12 @@ class OCRWorker(QThread):
         prev_device_id = getattr(self, "_device_id", None)
         prev_force_cpu = getattr(self, "_force_cpu", None)
         prev_verification_interval = getattr(self, "_verification_check_interval", None)
+        prev_capture_mode = getattr(self, "_capture_mode", "printwindow")
+        self._capture_mode = normalize_capture_mode(self._ocr_cfg.get("capture_mode"))
+        if prev_capture_mode != self._capture_mode:
+            release_wgc_captures()
+            self._capture_errors.clear()
+            self._log(f"[OCR] Capture mode: {self._capture_mode}.")
 
         self._filters = _filters_from_cfg(self._ocr_cfg)
         self._roi = _roi_from_cfg(self._ocr_cfg.get("roi") or {})
@@ -2848,6 +2915,7 @@ class OCRWorker(QThread):
             or prev_roi != self._roi
             or prev_shared_areas != self._shared_areas
             or prev_use_preprocess != self._use_preprocess
+            or prev_capture_mode != self._capture_mode
         ):
             try:
                 self._last_frame_hash_by_key.clear()
@@ -2953,7 +3021,13 @@ class OCRWorker(QThread):
         if self._ocr_pool is None:
             return
 
+        # Ordinary OCR windows also pass through this method. Avoid resolving
+        # every PID when no usable verification filter is configured.
+        if not self._has_configured_verification_filters():
+            return
+
         now = time.time()
+        pending: List[Tuple[Any, int, Optional[Tuple[int, int]]]] = []
         for win in windows:
             if self._stop_event.is_set():
                 return
@@ -2966,27 +3040,65 @@ class OCRWorker(QThread):
             if now < next_allowed:
                 continue
 
+            session_key = self._verification_session_key(win)
+            if session_key is not None:
+                stale_keys = {
+                    cached_key
+                    for cached_key in self._verification_positive_log_sessions
+                    if cached_key[0] == pid and cached_key != session_key
+                }
+                self._verification_positive_log_sessions.difference_update(stale_keys)
+            if session_key is not None and session_key in self._verification_positive_log_sessions:
+                self._verification_next_check_by_pid[pid] = time.time() + self._verification_check_interval
+                continue
+
+            pending.append((win, pid, session_key))
+
+        if not pending:
+            return
+
+        # Advance the shared Roblox log index once for this entire batch. The
+        # context provider can then perform read-only username lookups.
+        batch_provider = self._verification_log_batch_provider
+        if batch_provider is not None:
+            try:
+                batch_provider()
+            except Exception as e:
+                self._log(f"[Verification] Failed to refresh Roblox log index: {e}")
+                retry_at = time.time() + self._verification_check_interval
+                for _win, pid, _session_key in pending:
+                    self._verification_next_check_by_pid[pid] = retry_at
+                return
+
+        for win, pid, session_key in pending:
+            if self._stop_event.is_set():
+                return
+
             ctx = self._pid_context(pid)
             uid = str((ctx or {}).get("user_id") or "").strip()
+            has_user_log = self._is_truthy((ctx or {}).get("has_user_log"))
+            if has_user_log and session_key is not None:
+                self._verification_positive_log_sessions.add(session_key)
             if not uid:
-                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+                self._verification_next_check_by_pid[pid] = time.time() + self._verification_check_interval
                 continue
 
             if self._is_truthy((ctx or {}).get("is_cap")):
-                self._verification_next_check_by_pid[pid] = now + 30.0
+                self._verification_next_check_by_pid[pid] = time.time() + 30.0
                 continue
 
-            if self._is_truthy((ctx or {}).get("has_user_log")):
-                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+            if has_user_log:
+                self._verification_next_check_by_pid[pid] = time.time() + self._verification_check_interval
                 continue
 
             verification_specs = self._verification_filter_specs(pid, ctx)
             if not verification_specs:
+                self._verification_next_check_by_pid[pid] = time.time() + self._verification_check_interval
                 continue
 
-            full_img = capture_window_image(win.hwnd)
+            full_img = self._capture_window(win.hwnd)
             if full_img is None:
-                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+                self._verification_next_check_by_pid[pid] = time.time() + self._verification_check_interval
                 continue
 
             matched = False
@@ -3022,12 +3134,12 @@ class OCRWorker(QThread):
                     continue
 
                 if self._handle_filter_match(spec, pid, img):
-                    self._verification_next_check_by_pid[pid] = now + 30.0
+                    self._verification_next_check_by_pid[pid] = time.time() + 30.0
                     matched = True
                     break
 
             if not matched:
-                self._verification_next_check_by_pid[pid] = now + self._verification_check_interval
+                self._verification_next_check_by_pid[pid] = time.time() + self._verification_check_interval
 
     # ---------------------------- misc ----------------------------
     def _log(self, msg: str) -> None:

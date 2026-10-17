@@ -41,6 +41,13 @@ DEFAULT_POST_MARKER_DELAY_SECONDS = 0.0
 DEFAULT_MENU_EXIT_DELAY_SECONDS = 0.0
 MAX_POST_MARKER_DELAY_SECONDS = 60.0
 SMART_DATABASE_LOCK_SECONDS = 10.0
+SMART_ACTIVITY_LOG_INTERVAL_SECONDS = 30.0
+SMART_ACTIVITY_LOG_PID_SAMPLE_SIZE = 12
+# The fallback PID-to-log matcher is only used when psutil cannot report the
+# log opened by the Roblox process.  A shutdown can update an old log after a
+# replacement process has started, so modification time alone is not enough
+# to prove that a log belongs to the replacement.
+SMART_LOG_CREATION_EARLY_TOLERANCE_SECONDS = 2.0
 SMART_USER_SCOPE_ALL = "all"
 SMART_USER_SCOPE_SELECTED = "selected"
 SMART_USER_SCOPE_WHITELIST = "whitelist"
@@ -55,6 +62,12 @@ STORAGE_DATABASE_NAMES = (
 )
 MANAGER_RESUME_STATE_KEY = "merchant_fix_smart_state"
 _HANDOFF_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_STORAGE_HOLDING_NAME_PATTERN = re.compile(
+    r"^rbx-storage\.jaram-held-[0-9a-f]{32}$"
+)
+_STORAGE_PLACEHOLDER_NAME_PATTERN = re.compile(
+    r"^rbx-storage\.jaram-placeholder-[0-9a-f]{32}$"
+)
 
 _LOG_LOCK = threading.Lock()
 _LOG_PATH_OVERRIDE: Optional[Path] = None
@@ -341,10 +354,31 @@ def _socket_filter(pid: int, addresses: set[str]) -> str:
     return f"event == CONNECT and processId == {int(pid)} and ({terms})"
 
 
-def _matching_connections(pid: int, addresses: set[str]) -> list[dict[str, Any]]:
-    matches: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for connection in psutil.net_connections(kind="inet"):
-        if connection.pid != int(pid) or not connection.raddr:
+def _matching_connections_by_pid(
+    pids: set[int],
+    addresses: set[str],
+    *,
+    connections: Optional[list[Any]] = None,
+) -> dict[int, list[dict[str, Any]]]:
+    """Return matching live flows after one machine-wide connection snapshot."""
+    target_pids: set[int] = set()
+    for raw_pid in pids:
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            continue
+        if pid > 0:
+            target_pids.add(pid)
+    matches: dict[int, dict[tuple[Any, ...], dict[str, Any]]] = {
+        pid: {} for pid in target_pids
+    }
+    snapshot = psutil.net_connections(kind="inet") if connections is None else connections
+    for connection in snapshot:
+        try:
+            pid = int(connection.pid or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid not in target_pids or not connection.raddr:
             continue
         try:
             remote_ip = str(ipaddress.ip_address(connection.raddr.ip))
@@ -367,8 +401,14 @@ def _matching_connections(pid: int, addresses: set[str]) -> list[dict[str, Any]]
             "remote_port": int(connection.raddr.port),
         }
         key = tuple(item.values())
-        matches[key] = item
-    return list(matches.values())
+        matches[pid][key] = item
+    return {pid: list(items.values()) for pid, items in matches.items()}
+
+
+def _matching_connections(pid: int, addresses: set[str]) -> list[dict[str, Any]]:
+    """Compatibility wrapper for callers that only need one PID."""
+    pid_i = int(pid)
+    return _matching_connections_by_pid({pid_i}, addresses).get(pid_i, [])
 
 
 def _flow_filter(item: dict[str, Any]) -> str:
@@ -398,20 +438,108 @@ def _flow_filter(item: dict[str, Any]) -> str:
     return f"({outgoing} or {incoming})"
 
 
+class _SmartActivityLogger:
+    """Combine routine Smart blocker events without hiding errors or state changes."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: dict[str, dict[str, Any]] = {}
+        self._logged_once = False
+        self._last_flush_at = 0.0
+
+    def _take_locked(self) -> list[tuple[str, int, tuple[int, ...], bool]]:
+        snapshot = [
+            (
+                label,
+                int(event["count"]),
+                tuple(sorted(event["pids"])),
+                bool(event["pids_truncated"]),
+            )
+            for label, event in self._events.items()
+        ]
+        self._events.clear()
+        return snapshot
+
+    @staticmethod
+    def _format(snapshot: list[tuple[str, int, tuple[int, ...], bool]]) -> str:
+        parts = []
+        for label, count, pids, pids_truncated in snapshot:
+            detail = f"{count} {label}"
+            if pids:
+                samples = ", ".join(str(pid) for pid in pids)
+                if pids_truncated:
+                    samples += ", ..."
+                detail += f" (PID sample: {samples})"
+            parts.append(detail)
+        return "Smart activity: " + "; ".join(parts) + "."
+
+    def record(self, label: str, *, amount: int = 1, pid: object = None) -> None:
+        try:
+            normalized_amount = max(1, int(amount))
+        except (TypeError, ValueError):
+            normalized_amount = 1
+        snapshot: list[tuple[str, int, tuple[int, ...], bool]] = []
+        with self._lock:
+            event = self._events.setdefault(
+                str(label),
+                {"count": 0, "pids": set(), "pids_truncated": False},
+            )
+            event["count"] += normalized_amount
+            try:
+                normalized_pid = int(pid)
+            except (TypeError, ValueError):
+                normalized_pid = 0
+            if normalized_pid > 0 and normalized_pid not in event["pids"]:
+                if len(event["pids"]) < SMART_ACTIVITY_LOG_PID_SAMPLE_SIZE:
+                    event["pids"].add(normalized_pid)
+                else:
+                    event["pids_truncated"] = True
+
+            now = time.monotonic()
+            if not self._logged_once:
+                self._logged_once = True
+                self._last_flush_at = now
+                snapshot = self._take_locked()
+            elif now - self._last_flush_at >= SMART_ACTIVITY_LOG_INTERVAL_SECONDS:
+                self._last_flush_at = now
+                snapshot = self._take_locked()
+        if snapshot:
+            _write_log(self._format(snapshot))
+
+    def flush(self) -> None:
+        with self._lock:
+            snapshot = self._take_locked()
+            if snapshot:
+                self._last_flush_at = time.monotonic()
+        if snapshot:
+            _write_log(self._format(snapshot))
+
+
 class _PidDomainBlocker:
     """WinDivert SOCKET block plus NETWORK drops for already-open flows."""
 
-    def __init__(self, pid: int, creation_time: float, addresses: set[str]) -> None:
+    def __init__(
+        self,
+        pid: int,
+        creation_time: float,
+        addresses: set[str],
+        *,
+        activity_logger: Optional[_SmartActivityLogger] = None,
+    ) -> None:
         self.pid = int(pid)
         self.creation_time = float(creation_time)
         self.addresses = set(addresses)
         self.socket_handle = None
         self.network_handles: list[Any] = []
         self.stop_event = threading.Event()
+        self._receive_thread: Optional[threading.Thread] = None
+        self._lifecycle_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self._blocked_connections = 0
         self._first_hit_logged = False
+        self._activity_logger = activity_logger
         self._stopped = False
+        self._flow_keys: set[tuple[Any, ...]] = set()
 
     @property
     def blocked_connection_count(self) -> int:
@@ -431,36 +559,106 @@ class _PidDomainBlocker:
             self._first_hit_logged = True
 
     def _record_blocked_connection(self, remote_port: int) -> None:
+        first_hit = False
         with self._stats_lock:
             if self._stopped:
                 return
             self._blocked_connections += 1
             if not self._first_hit_logged:
                 self._first_hit_logged = True
-                _write_log(
-                    f"Smart block for PID {self.pid} intercepted its first {DOMAIN} "
-                    f"connection (remote port {int(remote_port)}); further hits will be "
-                    "counted silently."
-                )
+                first_hit = True
+        if self._activity_logger is not None:
+            self._activity_logger.record(
+                f"{DOMAIN} connection attempts blocked",
+                pid=self.pid,
+            )
+        elif first_hit:
+            _write_log(
+                f"Smart block for PID {self.pid} intercepted its first {DOMAIN} "
+                f"connection (remote port {int(remote_port)}); further hits will be "
+                "counted silently."
+            )
 
-    def start(self) -> None:
+    @staticmethod
+    def _flow_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            str(item.get("protocol") or ""),
+            str(item.get("local_ip") or ""),
+            int(item.get("local_port") or 0),
+            str(item.get("remote_ip") or ""),
+            int(item.get("remote_port") or 0),
+        )
+
+    @classmethod
+    def _unique_flows(cls, flows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        unique: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for item in flows:
+            try:
+                unique[cls._flow_key(item)] = item
+            except Exception:
+                continue
+        return list(unique.values())
+
+    def _open_network_handles(
+        self,
+        flows: list[dict[str, Any]],
+    ) -> tuple[list[Any], set[tuple[Any, ...]]]:
+        from pydivert import windivert_dll
+        from pydivert.consts import Flag, Layer
+
+        new_handles: list[Any] = []
+        opened_keys: set[tuple[Any, ...]] = set()
+        pending = [
+            item
+            for item in self._unique_flows(flows)
+            if self._flow_key(item) not in self._flow_keys
+        ]
+        try:
+            for offset in range(0, len(pending), 8):
+                chunk = pending[offset : offset + 8]
+                text = " or ".join(_flow_filter(item) for item in chunk)
+                handle = windivert_dll.WinDivertOpen(
+                    text.encode("ascii"), int(Layer.NETWORK), 900, int(Flag.DROP)
+                )
+                new_handles.append(handle)
+                opened_keys.update(self._flow_key(item) for item in chunk)
+        except Exception:
+            for handle in new_handles:
+                try:
+                    windivert_dll.WinDivertClose(handle)
+                except Exception:
+                    pass
+            raise
+        return new_handles, opened_keys
+
+    def add_network_flows(self, flows: list[dict[str, Any]]) -> int:
+        """Add DROP handles for flows that appeared during a blocker refresh."""
+        with self._lifecycle_lock:
+            if self._stopped:
+                return 0
+            handles, keys = self._open_network_handles(flows)
+            self.network_handles.extend(handles)
+            self._flow_keys.update(keys)
+            return len(keys)
+
+    def start(self, *, existing_flows: Optional[list[dict[str, Any]]] = None) -> None:
         from pydivert import windivert_dll
         from pydivert.consts import Flag, Layer
 
         socket_filter = _socket_filter(self.pid, self.addresses)
-        flows = _matching_connections(self.pid, self.addresses)
+        flows = (
+            _matching_connections(self.pid, self.addresses)
+            if existing_flows is None
+            else self._unique_flows(existing_flows)
+        )
         socket_handle = None
         network_handles: list[Any] = []
+        flow_keys: set[tuple[Any, ...]] = set()
         try:
             socket_handle = windivert_dll.WinDivertOpen(
                 socket_filter.encode("ascii"), int(Layer.SOCKET), 1000, int(Flag.RECV_ONLY)
             )
-            for offset in range(0, len(flows), 8):
-                text = " or ".join(_flow_filter(item) for item in flows[offset : offset + 8])
-                handle = windivert_dll.WinDivertOpen(
-                    text.encode("ascii"), int(Layer.NETWORK), 900, int(Flag.DROP)
-                )
-                network_handles.append(handle)
+            network_handles, flow_keys = self._open_network_handles(flows)
         except Exception:
             if socket_handle is not None:
                 try:
@@ -474,14 +672,43 @@ class _PidDomainBlocker:
                     pass
             raise
 
-        self.socket_handle = socket_handle
-        self.network_handles = network_handles
-        self.stop_event.clear()
-        threading.Thread(target=self._receive_loop, name=f"MerchantFix-PID-{self.pid}", daemon=True).start()
-        _write_log(
-            f"Smart domain block active for PID {self.pid}; {len(self.addresses)} resolved "
-            f"address(es), {len(flows)} existing flow(s)."
+        receive_thread = threading.Thread(
+            target=self._receive_loop,
+            name=f"MerchantFix-PID-{self.pid}",
+            daemon=True,
         )
+        with self._lifecycle_lock:
+            self.socket_handle = socket_handle
+            self.network_handles = network_handles
+            self._flow_keys = flow_keys
+            self._receive_thread = receive_thread
+            self.stop_event.clear()
+        try:
+            receive_thread.start()
+        except Exception:
+            with self._lifecycle_lock:
+                self.socket_handle = None
+                self.network_handles = []
+                self._flow_keys.clear()
+                self._receive_thread = None
+            try:
+                windivert_dll.WinDivertClose(socket_handle)
+            except Exception:
+                pass
+            for network_handle in network_handles:
+                try:
+                    windivert_dll.WinDivertClose(network_handle)
+                except Exception:
+                    pass
+            raise
+        if self._activity_logger is not None:
+            self._activity_logger.record("PID domain blocks activated", pid=self.pid)
+        else:
+            _write_log(
+                f"Smart domain block active for PID {self.pid}; "
+                f"{len(self.addresses)} resolved address(es), "
+                f"{len(flows)} existing flow(s)."
+            )
 
     def _receive_loop(self) -> None:
         from pydivert import windivert_dll
@@ -502,47 +729,116 @@ class _PidDomainBlocker:
                 pass
 
     def stop(self, *, report_hits: bool = True) -> None:
-        from pydivert import windivert_dll
+        with self._lifecycle_lock:
+            with self._stats_lock:
+                if self._stopped:
+                    return
+                self._stopped = True
+            self.stop_event.set()
+            handle = self.socket_handle
+            receive_thread = self._receive_thread
+            network_handles = list(self.network_handles)
+            self.socket_handle = None
+            self.network_handles = []
+            self._flow_keys.clear()
 
-        with self._stats_lock:
-            if self._stopped:
-                return
-            self._stopped = True
-        self.stop_event.set()
-        handle = self.socket_handle
-        self.socket_handle = None
-        if handle is not None:
+        # An unstarted blocker owns no native resources, so stopping it should
+        # not require pydivert to be importable (useful for partial startup and
+        # for reporting-only cleanup paths).
+        windivert_dll = None
+        if handle is not None or network_handles:
+            from pydivert import windivert_dll
+
+        if handle is not None and hasattr(windivert_dll, "WinDivertShutdown"):
+            try:
+                # WINDIVERT_SHUTDOWN_RECV = 0x1. This releases a synchronous
+                # WinDivertRecv before its handle is closed.
+                windivert_dll.WinDivertShutdown(handle, 0x1)
+            except Exception:
+                pass
+
+        if (
+            receive_thread is not None
+            and receive_thread is not threading.current_thread()
+        ):
+            receive_thread.join(timeout=2.0)
+
+        receiver_alive = bool(receive_thread is not None and receive_thread.is_alive())
+        if receiver_alive:
+            _write_log(
+                f"Smart blocker receiver for PID {self.pid} did not stop within 2 seconds; "
+                "moving handle cleanup off the helper control loop.",
+                level="WARNING",
+            )
+
+            def _reap_receiver() -> None:
+                try:
+                    receive_thread.join(timeout=5.0)
+                except Exception:
+                    pass
+                if handle is not None:
+                    try:
+                        windivert_dll.WinDivertClose(handle)
+                    except Exception:
+                        pass
+
+            threading.Thread(
+                target=_reap_receiver,
+                name=f"MerchantFix-Reaper-{self.pid}",
+                daemon=True,
+            ).start()
+        elif handle is not None:
             try:
                 windivert_dll.WinDivertClose(handle)
             except Exception:
                 pass
-        for network_handle in self.network_handles:
+            self._receive_thread = None
+
+        for network_handle in network_handles:
             try:
                 windivert_dll.WinDivertClose(network_handle)
             except Exception:
                 pass
-        self.network_handles = []
         if report_hits:
             blocked = self.blocked_connection_count
-            _write_log(
-                f"Smart domain block stopped for PID {self.pid} after blocking "
-                f"{blocked} connection attempt{'s' if blocked != 1 else ''}."
-            )
+            if self._activity_logger is not None:
+                self._activity_logger.record("PID domain blocks stopped", pid=self.pid)
+            else:
+                _write_log(
+                    f"Smart domain block stopped for PID {self.pid} after blocking "
+                    f"{blocked} connection attempt{'s' if blocked != 1 else ''}."
+                )
 
 
 class _StorageAclGuard:
-    def __init__(self, recovery_path: Path) -> None:
+    def __init__(
+        self,
+        recovery_path: Path,
+        *,
+        activity_logger: Optional[_SmartActivityLogger] = None,
+    ) -> None:
         self.path: Optional[Path] = None
         self.original_sddl: Optional[str] = None
+        # Keep the storage tree and its sibling SQLite files separate. A file
+        # beneath rbx-storage can legitimately have the same name as one of
+        # the sibling databases, so a single recovery mapping is ambiguous.
         self.original_tree_sddl: dict[str, str] = {}
+        self.original_database_sddl: dict[str, str] = {}
         self.created_placeholders: dict[str, tuple[int, int, int]] = {}
+        self.blocked_user_sid: Optional[str] = None
+        self.holding_name: Optional[str] = None
+        self.placeholder_name: Optional[str] = None
+        self.original_storage_identity: Optional[tuple[int, int, int]] = None
+        self.storage_placeholder_identity: Optional[tuple[int, int, int]] = None
+        self.storage_placeholder_sddl: Optional[str] = None
         self.launch_deadlines: dict[str, Optional[float]] = {}
         self.release_at: Optional[float] = None
         self.recovery_path = Path(recovery_path)
+        self._activity_logger = activity_logger
 
     @property
     def active(self) -> bool:
-        return self.path is not None and self.original_sddl is not None
+        return self.path is not None and bool(self.original_database_sddl)
 
     @staticmethod
     def _normalize_launch_id(raw_launch_id: object) -> str:
@@ -563,10 +859,10 @@ class _StorageAclGuard:
             if deadline is not None
         )
 
-    def _save_recovery_record(
+    def _save_database_recovery_record(
         self,
         path: Path,
-        tree_sddl: dict[str, str],
+        database_sddl: dict[str, str],
         created_placeholders: dict[str, tuple[int, int, int]],
     ) -> None:
         self.recovery_path.parent.mkdir(parents=True, exist_ok=True)
@@ -577,16 +873,12 @@ class _StorageAclGuard:
             temporary.write_text(
                 json.dumps(
                     {
-                        "version": 5,
+                        "version": 8,
                         "mode": "database_files_only",
                         "path": str(path),
-                        "entries": tree_sddl,
+                        "entries": database_sddl,
                         "created_placeholders": {
-                            name: {
-                                "device": identity[0],
-                                "inode": identity[1],
-                                "birth_ns": identity[2],
-                            }
+                            name: self._identity_to_record(identity)
                             for name, identity in sorted(created_placeholders.items())
                         },
                         "owner_pid": os.getpid(),
@@ -668,21 +960,152 @@ class _StorageAclGuard:
             )
         )
 
+    @staticmethod
+    def _deny_permissions(
+        path: Path,
+        sid: Any,
+        permissions: int,
+        *,
+        inherit: bool,
+        base_sddl: Optional[str] = None,
+    ) -> None:
+        """Apply a canonical deny ACE, optionally from a captured clean DACL."""
+        import win32security
+
+        if base_sddl is None:
+            security = win32security.GetFileSecurity(
+                str(path), win32security.DACL_SECURITY_INFORMATION
+            )
+        else:
+            security = (
+                win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+                    str(base_sddl), win32security.SDDL_REVISION_1
+                )
+            )
+        dacl = security.GetSecurityDescriptorDacl()
+        entries = [
+            {
+                "Trustee": {
+                    "MultipleTrustee": None,
+                    "MultipleTrusteeOperation": 0,
+                    "TrusteeForm": win32security.TRUSTEE_IS_SID,
+                    "TrusteeType": win32security.TRUSTEE_IS_USER,
+                    "Identifier": sid,
+                },
+                "Inheritance": (
+                    win32security.SUB_CONTAINERS_AND_OBJECTS_INHERIT
+                    if inherit
+                    else win32security.NO_INHERITANCE
+                ),
+                "AccessMode": win32security.DENY_ACCESS,
+                "AccessPermissions": int(permissions),
+            }
+        ]
+        if dacl is None:
+            # A null DACL grants everyone full access. Preserve that behavior
+            # for rights outside this targeted read/write deny.
+            dacl = win32security.ACL()
+            entries.append(
+                {
+                    "Trustee": {
+                        "MultipleTrustee": None,
+                        "MultipleTrusteeOperation": 0,
+                        "TrusteeForm": win32security.TRUSTEE_IS_SID,
+                        "TrusteeType": win32security.TRUSTEE_IS_WELL_KNOWN_GROUP,
+                        "Identifier": win32security.CreateWellKnownSid(
+                            win32security.WinWorldSid, None
+                        ),
+                    },
+                    "Inheritance": (
+                        win32security.SUB_CONTAINERS_AND_OBJECTS_INHERIT
+                        if inherit
+                        else win32security.NO_INHERITANCE
+                    ),
+                    "AccessMode": win32security.GRANT_ACCESS,
+                    "AccessPermissions": ntsecuritycon.FILE_ALL_ACCESS,
+                }
+            )
+        dacl.SetEntriesInAcl(entries)
+        if base_sddl is not None:
+            # The active read deny prevents SetNamedSecurityInfo from reopening
+            # the object for READ_CONTROL. SetFileSecurity can replace the DACL
+            # directly from our captured clean descriptor without that read.
+            security.SetSecurityDescriptorDacl(1, dacl, 0)
+            win32security.SetFileSecurity(
+                str(path), win32security.DACL_SECURITY_INFORMATION, security
+            )
+            return
+        # SetNamedSecurityInfo, unlike SetFileSecurity, propagates a new
+        # inheritable ACE to existing descendants of a directory.
+        win32security.SetNamedSecurityInfo(
+            str(path),
+            win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            dacl,
+            None,
+        )
+
+    @classmethod
+    def _deny_read_write(cls, path: Path, sid: Any, *, inherit: bool) -> None:
+        """Add a canonical R/W deny ACE without starting icacls.exe."""
+        import ntsecuritycon
+
+        cls._deny_permissions(
+            path,
+            sid,
+            ntsecuritycon.FILE_GENERIC_READ | ntsecuritycon.FILE_GENERIC_WRITE,
+            inherit=inherit,
+        )
+
+    @classmethod
+    def _prepare_placeholder_for_rename(
+        cls, path: Path, sid: Any, original_sddl: str
+    ) -> None:
+        """Keep new entries blocked while allowing the placeholder rename."""
+        import ntsecuritycon
+
+        cls._deny_permissions(
+            path,
+            sid,
+            ntsecuritycon.FILE_ADD_FILE | ntsecuritycon.FILE_ADD_SUBDIRECTORY,
+            inherit=False,
+            base_sddl=original_sddl,
+        )
+
     @classmethod
     def _restore_acl_tree(cls, root: Path, entries: dict[str, str]) -> int:
+        validated: list[tuple[str, str]] = []
+        for relative, sddl in entries.items():
+            relative_text = str(relative)
+            relative_path = Path(relative_text)
+            if (
+                relative_text != "."
+                and (relative_path.is_absolute() or ".." in relative_path.parts)
+            ):
+                raise ValueError(f"Unsafe ACL recovery path: {relative}")
+            if not str(sddl):
+                raise ValueError(f"ACL recovery path has no descriptor: {relative}")
+            validated.append((relative_text, str(sddl)))
         restored = 0
         ordered = sorted(
-            entries.items(),
+            validated,
             key=lambda item: (0 if item[0] == "." else len(Path(item[0]).parts), item[0]),
         )
         for relative, sddl in ordered:
             relative_path = Path(str(relative))
-            if relative_path.is_absolute() or ".." in relative_path.parts:
-                raise ValueError(f"Unsafe ACL recovery path: {relative}")
             candidate = root if str(relative) == "." else root / relative_path
             if not candidate.exists() and not candidate.is_symlink():
                 continue
-            cls._restore_sddl(candidate, str(sddl))
+            try:
+                cls._restore_sddl(candidate, str(sddl))
+            except Exception as exc:
+                # A system process can evict a cache entry during stale
+                # recovery. A vanished path no longer has an ACL to repair.
+                if cls._is_missing_path_error(exc):
+                    continue
+                raise
             restored += 1
         return restored
 
@@ -704,10 +1127,18 @@ class _StorageAclGuard:
             expected_creation = float(record.get("owner_creation_time") or 0.0)
             if owner_pid <= 0 or expected_creation <= 0.0:
                 return False
+        except (TypeError, ValueError):
+            return False
+        try:
             actual_creation = float(psutil.Process(owner_pid).create_time())
             return abs(actual_creation - expected_creation) < 0.01
-        except Exception:
+        except psutil.NoSuchProcess:
             return False
+        except Exception:
+            # Failing closed here is safer than restoring ACLs that may still
+            # be owned by a live elevated helper. A later retry can establish
+            # conclusively that the owner exited.
+            return True
 
     @staticmethod
     def _file_identity(path: Path) -> tuple[int, int, int]:
@@ -724,6 +1155,7 @@ class _StorageAclGuard:
                 flags = int(win32con.FILE_ATTRIBUTE_NORMAL) | int(
                     getattr(win32con, "FILE_FLAG_OPEN_REPARSE_POINT", 0)
                 )
+                flags |= int(getattr(win32con, "FILE_FLAG_BACKUP_SEMANTICS", 0))
                 handle = win32file.CreateFile(
                     str(path),
                     0,
@@ -752,6 +1184,224 @@ class _StorageAclGuard:
         if identity[0] == 0 and identity[1] == 0:
             raise RuntimeError(f"Windows did not provide a stable file identity for {path}.")
         return identity
+
+    @staticmethod
+    def _identity_to_record(identity: tuple[int, int, int]) -> dict[str, int]:
+        return {
+            "device": int(identity[0]),
+            "inode": int(identity[1]),
+            "birth_ns": int(identity[2]),
+        }
+
+    @staticmethod
+    def _identity_from_record(
+        value: object, *, description: str
+    ) -> tuple[int, int, int]:
+        if not isinstance(value, dict):
+            raise ValueError(f"The {description} identity is missing.")
+        try:
+            identity = (
+                int(value.get("device")),
+                int(value.get("inode")),
+                int(value.get("birth_ns")),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"The {description} identity is invalid.") from exc
+        if identity[0] == 0 and identity[1] == 0:
+            raise ValueError(f"The {description} identity is invalid.")
+        return identity
+
+    @staticmethod
+    def _validate_swap_name(name: object, pattern: re.Pattern[str]) -> str:
+        normalized = str(name or "")
+        if pattern.fullmatch(normalized) is None or Path(normalized).name != normalized:
+            raise ValueError("The storage swap recovery name is invalid.")
+        return normalized
+
+    @classmethod
+    def _remove_storage_placeholder(
+        cls,
+        path: Path,
+        expected_identity: tuple[int, int, int],
+        original_sddl: str,
+        *,
+        remove_populated: bool = False,
+        preserve_replaced: bool = False,
+    ) -> int:
+        if not path.exists() and not path.is_symlink():
+            return 0
+        if path.is_symlink() or not path.is_dir():
+            raise RuntimeError(f"Expected {path} to remain a placeholder directory.")
+
+        # A transitioned placeholder permits identity reads but still blocks
+        # new entries. Check before changing its DACL whenever possible so a
+        # replacement is never modified or removed.
+        try:
+            current_identity = cls._file_identity(path)
+        except Exception:
+            cls._restore_sddl(path, original_sddl)
+            current_identity = cls._file_identity(path)
+        if current_identity != expected_identity:
+            if preserve_replaced:
+                _write_log(
+                    "Preserved a replacement found at the Smart storage placeholder "
+                    f"path after restoring the original rbx-storage directory: {path}",
+                    level="WARNING",
+                )
+                return 0
+            raise RuntimeError(f"Refusing to remove a replaced storage placeholder: {path}")
+        cls._restore_sddl(path, original_sddl)
+        try:
+            with os.scandir(path) as scanner:
+                if next(scanner, None) is not None:
+                    if remove_populated:
+                        _write_log(
+                            "Removing a populated Smart storage placeholder after "
+                            f"restoring the original rbx-storage directory: {path}",
+                            level="WARNING",
+                        )
+                        shutil.rmtree(path)
+                        return 1
+                    raise RuntimeError(
+                        f"Refusing to remove a non-empty storage placeholder: {path}"
+                    )
+        except FileNotFoundError:
+            return 0
+        path.rmdir()
+        return 1
+
+    @classmethod
+    def _restore_storage_swap(
+        cls,
+        storage: Path,
+        holding_name: object,
+        placeholder_name: object,
+        original_identity: tuple[int, int, int],
+        placeholder_identity: tuple[int, int, int],
+        placeholder_sddl: str,
+        user_sid: str,
+    ) -> tuple[int, int]:
+        import win32security
+
+        holding_name = cls._validate_swap_name(
+            holding_name, _STORAGE_HOLDING_NAME_PATTERN
+        )
+        placeholder_name = cls._validate_swap_name(
+            placeholder_name, _STORAGE_PLACEHOLDER_NAME_PATTERN
+        )
+        holding = storage.parent / holding_name
+        staged_placeholder = storage.parent / placeholder_name
+        holding_exists = holding.exists() or holding.is_symlink()
+        storage_exists = storage.exists() or storage.is_symlink()
+        staged_exists = staged_placeholder.exists() or staged_placeholder.is_symlink()
+        removed = 0
+
+        if holding_exists:
+            if holding.is_symlink() or not holding.is_dir():
+                raise RuntimeError(f"Expected {holding} to remain the held storage directory.")
+            if cls._file_identity(holding) != original_identity:
+                raise RuntimeError(f"The held storage directory was replaced: {holding}")
+            if storage_exists and staged_exists:
+                if storage.is_symlink() or not storage.is_dir():
+                    raise RuntimeError(
+                        f"Expected {storage} to remain a storage directory."
+                    )
+                if staged_placeholder.is_symlink() or not staged_placeholder.is_dir():
+                    raise RuntimeError(
+                        f"Expected {staged_placeholder} to remain a storage directory."
+                    )
+                try:
+                    visible_identity = cls._file_identity(storage)
+                except Exception:
+                    visible_identity = None
+                try:
+                    staged_identity = cls._file_identity(staged_placeholder)
+                except Exception:
+                    staged_identity = None
+                if staged_identity == placeholder_identity:
+                    # A previous recovery moved the recorded placeholder aside,
+                    # then Roblox recreated the canonical storage directory before
+                    # the held original could be restored. Remove only the exact
+                    # recorded placeholder. The replacement at the canonical path
+                    # is moved aside and preserved by the normal flow below.
+                    removed += cls._remove_storage_placeholder(
+                        staged_placeholder,
+                        placeholder_identity,
+                        placeholder_sddl,
+                        remove_populated=True,
+                    )
+                    staged_exists = False
+                elif visible_identity == placeholder_identity:
+                    # The canonical path is still the exact recorded placeholder;
+                    # the occupied staging path is a replacement and must survive.
+                    removed += cls._remove_storage_placeholder(
+                        storage,
+                        placeholder_identity,
+                        placeholder_sddl,
+                        remove_populated=True,
+                    )
+                    storage_exists = False
+                else:
+                    raise RuntimeError(
+                        "Both storage recovery locations contain unrecognized "
+                        "directories; refusing recovery."
+                    )
+            if storage_exists:
+                if storage.is_symlink() or not storage.is_dir():
+                    raise RuntimeError(
+                        f"Expected {storage} to remain a placeholder directory."
+                    )
+                try:
+                    visible_identity = cls._file_identity(storage)
+                except Exception:
+                    visible_identity = None
+                if visible_identity is None or visible_identity == placeholder_identity:
+                    sid = win32security.ConvertStringSidToSid(str(user_sid or ""))
+                    # Replace the R/W deny with a narrow create-entry deny. It
+                    # remains impossible for Roblox to add files, while Windows
+                    # can rename the directory out of the canonical path.
+                    cls._prepare_placeholder_for_rename(
+                        storage, sid, placeholder_sddl
+                    )
+                storage.rename(staged_placeholder)
+            holding.rename(storage)
+            if staged_placeholder.exists() or staged_placeholder.is_symlink():
+                removed += cls._remove_storage_placeholder(
+                    staged_placeholder,
+                    placeholder_identity,
+                    placeholder_sddl,
+                    remove_populated=True,
+                    preserve_replaced=True,
+                )
+            return 1, removed
+
+        if not storage_exists:
+            raise RuntimeError("The original and held storage directories are both missing.")
+        if storage.is_symlink() or not storage.is_dir():
+            raise RuntimeError(f"Expected {storage} to remain a storage directory.")
+        try:
+            storage_identity = cls._file_identity(storage)
+        except Exception:
+            # A denied placeholder cannot be identity-checked normally. Make
+            # it inspectable without deleting it; the identity check below
+            # still prevents a replacement from being removed.
+            cls._restore_sddl(storage, placeholder_sddl)
+            storage_identity = cls._file_identity(storage)
+        if storage_identity != original_identity:
+            if storage_identity == placeholder_identity:
+                raise RuntimeError(
+                    "The storage placeholder remains, but the held original is missing."
+                )
+            raise RuntimeError(f"The storage directory was unexpectedly replaced: {storage}")
+        if staged_exists:
+            removed += cls._remove_storage_placeholder(
+                staged_placeholder,
+                placeholder_identity,
+                placeholder_sddl,
+                remove_populated=True,
+                preserve_replaced=True,
+            )
+        return 0, removed
 
     @classmethod
     def _prepare_database_targets(
@@ -821,6 +1471,33 @@ class _StorageAclGuard:
                 continue
         return removed
 
+    @staticmethod
+    def _created_placeholders_from_record(
+        record: dict[str, Any],
+    ) -> dict[str, Optional[tuple[int, int, int]]]:
+        raw_created = record.get("created_placeholders")
+        created: dict[str, Optional[tuple[int, int, int]]] = {}
+        if isinstance(raw_created, dict):
+            for raw_name, raw_identity in raw_created.items():
+                name = str(raw_name)
+                if isinstance(raw_identity, dict):
+                    try:
+                        identity = (
+                            int(raw_identity.get("device")),
+                            int(raw_identity.get("inode")),
+                            int(raw_identity.get("birth_ns")),
+                        )
+                    except (TypeError, ValueError):
+                        identity = None
+                else:
+                    identity = None
+                created[name] = identity
+        elif isinstance(raw_created, list):
+            # Version 4 had names but no stable identities. Restore their ACLs,
+            # but keep the files rather than risk deleting replacements.
+            created = {str(name): None for name in raw_created}
+        return created
+
     @classmethod
     def _restore_database_targets(
         cls,
@@ -856,6 +1533,99 @@ class _StorageAclGuard:
             restored += 1
         removed = cls._remove_empty_placeholders(storage, created_placeholders)
         return restored, removed
+
+    @classmethod
+    def _restore_swap_targets(
+        cls,
+        storage: Path,
+        database_entries: dict[str, str],
+        created_placeholders: dict[str, Optional[tuple[int, int, int]]],
+        holding_name: object,
+        placeholder_name: object,
+        original_identity: tuple[int, int, int],
+        placeholder_identity: tuple[int, int, int],
+        placeholder_sddl: str,
+        user_sid: str,
+    ) -> tuple[int, int, int]:
+        unexpected = set(database_entries).difference(STORAGE_DATABASE_NAMES)
+        unexpected.update(created_placeholders.keys() - set(STORAGE_DATABASE_NAMES))
+        if unexpected:
+            raise ValueError(
+                f"Unsafe database ACL recovery target(s): {', '.join(sorted(unexpected))}"
+            )
+        missing = set(STORAGE_DATABASE_NAMES).difference(database_entries)
+        if missing:
+            raise ValueError(
+                f"Database ACL recovery is missing target(s): {', '.join(sorted(missing))}"
+            )
+        if not str(placeholder_sddl):
+            raise ValueError("The storage placeholder ACL is missing.")
+        if not str(user_sid):
+            raise ValueError("The storage swap recovery record has no user SID.")
+
+        storage_restored, storage_removed = cls._restore_storage_swap(
+            storage,
+            holding_name,
+            placeholder_name,
+            original_identity,
+            placeholder_identity,
+            str(placeholder_sddl),
+            str(user_sid),
+        )
+        database_restored, database_removed = cls._restore_database_targets(
+            storage, database_entries, created_placeholders
+        )
+        return (
+            storage_restored + database_restored,
+            storage_removed,
+            database_removed,
+        )
+
+    @classmethod
+    def _restore_combined_targets(
+        cls,
+        storage: Path,
+        storage_entries: dict[str, str],
+        database_entries: dict[str, str],
+        created_placeholders: dict[str, Optional[tuple[int, int, int]]],
+        user_sid: str,
+    ) -> tuple[int, int, int]:
+        root_sddl = str(storage_entries.get(".") or "")
+        if not root_sddl:
+            raise ValueError(
+                "The storage ACL recovery record is missing the root descriptor."
+            )
+        unexpected = set(database_entries).difference(STORAGE_DATABASE_NAMES)
+        unexpected.update(created_placeholders.keys() - set(STORAGE_DATABASE_NAMES))
+        if unexpected:
+            raise ValueError(
+                f"Unsafe database ACL recovery target(s): {', '.join(sorted(unexpected))}"
+            )
+        missing = set(STORAGE_DATABASE_NAMES).difference(database_entries)
+        if missing:
+            raise ValueError(
+                f"Database ACL recovery is missing target(s): {', '.join(sorted(missing))}"
+            )
+        import win32security
+
+        sid = win32security.ConvertStringSidToSid(str(user_sid or ""))
+        sid_text = str(win32security.ConvertSidToStringSid(sid))
+
+        # Restore the parent first. Removing its inheritable deny makes every
+        # child reachable again; then each captured descendant gets its exact
+        # pre-block ACL back. This ordering is what prevents inherited deny
+        # entries from being stranded on child files.
+        restored = cls._restore_acl_tree(storage, storage_entries)
+
+        # Files created by a service or another security principal while the
+        # block was active are not in the snapshot. Normally Windows removes
+        # their inherited deny when the parent is restored, but explicitly
+        # strip only Merchant Fix's inherited R/W deny as a recovery safeguard.
+        repaired = cls.repair_orphaned_denies(storage, sid_text)
+        database_restored, removed = cls._restore_database_targets(
+            storage, database_entries, created_placeholders
+        )
+        return restored + database_restored, repaired, removed
 
     @staticmethod
     def _strip_legacy_deny_sddl(sddl: str, sid_text: str) -> tuple[str, int]:
@@ -988,13 +1758,87 @@ class _StorageAclGuard:
             path = _validate_helper_storage_dir(Path(str(record.get("path") or "")))
             if self._recovery_owner_is_live(record):
                 _write_log(
-                    "Left the Smart database ACL recovery record with its live helper "
+                    "Left the Smart storage ACL recovery record with its live helper "
                     f"owner (PID {int(record.get('owner_pid') or 0)})."
                 )
                 return
             raw_entries = record.get("entries")
             mode = str(record.get("mode") or "")
-            if mode == "database_files_only":
+            if mode == "storage_directory_swap_and_database_files":
+                raw_database_entries = record.get("database_entries")
+                if not isinstance(raw_database_entries, dict) or not raw_database_entries:
+                    raise ValueError(
+                        "The database ACL recovery record has no security descriptors."
+                    )
+                database_entries = {
+                    str(name): str(entry_sddl)
+                    for name, entry_sddl in raw_database_entries.items()
+                    if str(entry_sddl)
+                }
+                created = self._created_placeholders_from_record(record)
+                original_identity = self._identity_from_record(
+                    record.get("original_storage_identity"),
+                    description="original storage",
+                )
+                placeholder_identity = self._identity_from_record(
+                    record.get("storage_placeholder_identity"),
+                    description="storage placeholder",
+                )
+                restored, storage_removed, database_removed = self._restore_swap_targets(
+                    path,
+                    database_entries,
+                    created,
+                    record.get("holding_name"),
+                    record.get("placeholder_name"),
+                    original_identity,
+                    placeholder_identity,
+                    str(record.get("storage_placeholder_sddl") or ""),
+                    str(record.get("user_sid") or ""),
+                )
+                detail = (
+                    f"Recovered {restored} stale Smart storage/database ACL(s), "
+                    f"removed {storage_removed} empty storage placeholder(s), and "
+                    f"removed {database_removed} empty database placeholder(s) for "
+                    f"{path.parent}."
+                )
+            elif mode == "storage_tree_and_database_files":
+                raw_storage_entries = record.get("storage_entries")
+                raw_database_entries = record.get("database_entries")
+                if not isinstance(raw_storage_entries, dict) or not raw_storage_entries:
+                    raise ValueError(
+                        "The storage ACL recovery record has no security descriptors."
+                    )
+                if not isinstance(raw_database_entries, dict) or not raw_database_entries:
+                    raise ValueError(
+                        "The database ACL recovery record has no security descriptors."
+                    )
+                storage_entries = {
+                    str(relative): str(entry_sddl)
+                    for relative, entry_sddl in raw_storage_entries.items()
+                    if str(entry_sddl)
+                }
+                database_entries = {
+                    str(name): str(entry_sddl)
+                    for name, entry_sddl in raw_database_entries.items()
+                    if str(entry_sddl)
+                }
+                created = self._created_placeholders_from_record(record)
+                user_sid = str(record.get("user_sid") or "")
+                if not user_sid:
+                    raise ValueError("The storage ACL recovery record has no user SID.")
+                restored, repaired, removed = self._restore_combined_targets(
+                    path,
+                    storage_entries,
+                    database_entries,
+                    created,
+                    user_sid,
+                )
+                detail = (
+                    f"Recovered {restored} stale Smart storage/database ACL(s), "
+                    f"repaired {repaired} inherited deny ACL(s), and removed "
+                    f"{removed} empty placeholder(s) for {path.parent}."
+                )
+            elif mode == "database_files_only":
                 if not isinstance(raw_entries, dict) or not raw_entries:
                     raise ValueError(
                         "The database ACL recovery record has no security descriptors."
@@ -1004,28 +1848,7 @@ class _StorageAclGuard:
                     for name, entry_sddl in raw_entries.items()
                     if str(entry_sddl)
                 }
-                raw_created = record.get("created_placeholders")
-                created: dict[str, Optional[tuple[int, int, int]]] = {}
-                if isinstance(raw_created, dict):
-                    for raw_name, raw_identity in raw_created.items():
-                        name = str(raw_name)
-                        if isinstance(raw_identity, dict):
-                            try:
-                                identity = (
-                                    int(raw_identity.get("device")),
-                                    int(raw_identity.get("inode")),
-                                    int(raw_identity.get("birth_ns")),
-                                )
-                            except (TypeError, ValueError):
-                                identity = None
-                        else:
-                            identity = None
-                        created[name] = identity
-                elif isinstance(raw_created, list):
-                    # Version 4 had names but no stable identities. Restore
-                    # their ACLs, but keep the files rather than risk deleting
-                    # a replacement created after an interrupted helper.
-                    created = {str(name): None for name in raw_created}
+                created = self._created_placeholders_from_record(record)
                 restored, removed = self._restore_database_targets(
                     path, entries, created
                 )
@@ -1066,6 +1889,8 @@ class _StorageAclGuard:
         launch_key = self._normalize_launch_id(launch_id)
         path = _validate_helper_storage_dir(Path(raw_path))
         path.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink() or not path.is_dir():
+            raise RuntimeError(f"Roblox storage path is not a regular directory: {path}")
 
         if not self.active and self.recovery_path.is_file():
             record = json.loads(self.recovery_path.read_text(encoding="utf-8"))
@@ -1074,7 +1899,7 @@ class _StorageAclGuard:
             if self._recovery_owner_is_live(record):
                 raise RuntimeError(
                     "Another live Merchant Fix helper currently owns the Smart "
-                    "database block; retry this launch after its pre-launch block ends."
+                    "database-file guard; retry this launch after its pre-launch guard ends."
                 )
             self.recover_stale_acl()
 
@@ -1084,10 +1909,15 @@ class _StorageAclGuard:
             else:
                 self.launch_deadlines[launch_key] = None
                 self._recalculate_release_at()
-                _write_log(
-                    "Extended the existing rbx-storage database ACL block for "
-                    f"launch {launch_key}."
-                )
+                if self._activity_logger is not None:
+                    self._activity_logger.record(
+                        "database-file launch guards extended"
+                    )
+                else:
+                    _write_log(
+                        "Extended the existing rbx-storage database-file block for "
+                        f"launch {launch_key}."
+                    )
                 return
 
         import win32security
@@ -1096,48 +1926,43 @@ class _StorageAclGuard:
         # a standard user approves UAC with another administrator account.
         sid = win32security.ConvertStringSidToSid(str(user_sid or ""))
         sid_text = str(win32security.ConvertSidToStringSid(sid))
-        # The three SQLite files must exist before a file-specific ACL can be
-        # attached. Empty placeholders are tracked and removed after release.
-        original_tree_sddl, created_placeholders = self._prepare_database_targets(path)
-        original_sddl = next(iter(original_tree_sddl.values()))
+        original_database_sddl, created_placeholders = self._prepare_database_targets(
+            path
+        )
         try:
-            self._save_recovery_record(
-                path, original_tree_sddl, created_placeholders
+            self._save_database_recovery_record(
+                path,
+                original_database_sddl,
+                created_placeholders,
             )
         except Exception:
             self._remove_empty_placeholders(path, created_placeholders)
             raise
         self.path = path
-        self.original_sddl = original_sddl
-        self.original_tree_sddl = original_tree_sddl
+        self.original_sddl = None
+        self.original_tree_sddl = {}
+        self.original_database_sddl = original_database_sddl
         self.created_placeholders = created_placeholders
+        self.blocked_user_sid = sid_text
+        self.holding_name = None
+        self.placeholder_name = None
+        self.original_storage_identity = None
+        self.storage_placeholder_identity = None
+        self.storage_placeholder_sddl = None
         self.launch_deadlines = {launch_key: None}
         self.release_at = None
-        creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
         try:
             for target in self._database_targets(path).values():
-                result = subprocess.run(
-                    [
-                        "icacls.exe",
-                        str(target),
-                        "/deny",
-                        f"*{sid_text}:(R,W)",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    creationflags=creation_flags,
-                )
-                if result.returncode != 0:
-                    detail = (result.stderr or result.stdout or "icacls failed").strip()
-                    raise RuntimeError(f"Could not block {target.name}: {detail}")
+                self._deny_read_write(target, sid, inherit=False)
         except Exception:
-            # icacls can fail after partially changing an ACL, so always put
-            # back every captured descriptor before reporting the launch failure.
+            # An ACL update can fail after earlier targets changed, so restore
+            # every captured database descriptor before returning the error.
             self.restore()
             raise
         _write_log(
             "Denied local user read/write access to rbx-storage.db, "
-            "rbx-storage.db-wal, and rbx-storage.db-shm before Roblox launch."
+            "rbx-storage.db-wal, and rbx-storage.db-shm before Roblox launch; "
+            "the rbx-storage directory was left unchanged."
         )
 
     def release_after(self, delay: float, launch_id: object = "legacy") -> None:
@@ -1146,24 +1971,28 @@ class _StorageAclGuard:
         launch_key = self._normalize_launch_id(launch_id)
         if launch_key not in self.launch_deadlines:
             _write_log(
-                f"Ignored an unknown Smart database release for launch {launch_key}.",
+                f"Ignored an unknown Smart database-file release for launch {launch_key}.",
                 level="WARNING",
             )
             return
         normalized_delay = max(0.0, float(delay))
         self.launch_deadlines[launch_key] = time.monotonic() + normalized_delay
         self._recalculate_release_at()
-        if self.release_at is None:
+        if self._activity_logger is not None:
+            self._activity_logger.record(
+                "database-file launch releases scheduled"
+            )
+        elif self.release_at is None:
             waiting = sum(
                 deadline is None for deadline in self.launch_deadlines.values()
             )
             _write_log(
-                f"Scheduled database release for launch {launch_key}; waiting for "
+                f"Scheduled database-file release for launch {launch_key}; waiting for "
                 f"{waiting} other prepared launch(es)."
             )
         else:
             _write_log(
-                "Scheduled rbx-storage database ACL restoration after all launches "
+                "Scheduled rbx-storage database-file restoration after all launches "
                 f"complete (no sooner than {normalized_delay:.2f}s)."
             )
 
@@ -1179,7 +2008,7 @@ class _StorageAclGuard:
             return
         self._recalculate_release_at()
         _write_log(
-            f"Cancelled Smart database preparation for launch {launch_key}; "
+            f"Cancelled Smart database-file preparation for launch {launch_key}; "
             f"{len(self.launch_deadlines)} launch(es) remain protected."
         )
 
@@ -1199,7 +2028,7 @@ class _StorageAclGuard:
         self._recalculate_release_at()
         if abandoned:
             _write_log(
-                f"Abandoned {len(abandoned)} pending Smart database launch(es) "
+                f"Abandoned {len(abandoned)} pending Smart database-file launch(es) "
                 "while preserving already-started launch protection."
             )
 
@@ -1212,35 +2041,86 @@ class _StorageAclGuard:
                 # allow a later apply to overwrite the recovery information.
                 self.release_at = time.monotonic() + 1.0
                 _write_log(
-                    "Will retry rbx-storage database ACL restoration in 1 second.",
+                    "Will retry rbx-storage database-file restoration in 1 second.",
                     level="WARNING",
                 )
 
     def restore(self) -> None:
         path = self.path
         sddl = self.original_sddl
-        tree_sddl = self.original_tree_sddl
+        database_sddl = self.original_database_sddl
         created_placeholders = self.created_placeholders
-        if path is None or not sddl:
+        holding_name = self.holding_name
+        placeholder_name = self.placeholder_name
+        original_storage_identity = self.original_storage_identity
+        storage_placeholder_identity = self.storage_placeholder_identity
+        storage_placeholder_sddl = self.storage_placeholder_sddl
+        user_sid = self.blocked_user_sid
+        if path is None or not database_sddl:
             return
         try:
-            restored, removed = self._restore_database_targets(
-                path, tree_sddl, created_placeholders
+            combined_guard = any(
+                value is not None
+                for value in (
+                    sddl,
+                    holding_name,
+                    placeholder_name,
+                    original_storage_identity,
+                    storage_placeholder_identity,
+                    storage_placeholder_sddl,
+                )
             )
+            if combined_guard:
+                if original_storage_identity is None or storage_placeholder_identity is None:
+                    raise RuntimeError("The active storage swap has no stable identities.")
+                if not user_sid:
+                    raise RuntimeError("The active storage swap has no user SID.")
+                restored, storage_removed, database_removed = self._restore_swap_targets(
+                    path,
+                    database_sddl,
+                    created_placeholders,
+                    holding_name,
+                    placeholder_name,
+                    original_storage_identity,
+                    storage_placeholder_identity,
+                    str(storage_placeholder_sddl or ""),
+                    user_sid,
+                )
+            else:
+                restored, database_removed = self._restore_database_targets(
+                    path, database_sddl, created_placeholders
+                )
+                storage_removed = 0
             self._clear_recovery_record()
-            _write_log(
-                f"Restored {restored} rbx-storage database ACL(s) and removed "
-                f"{removed} empty placeholder(s) for {path.parent}."
-            )
+            if combined_guard:
+                _write_log(
+                    f"Restored {restored} legacy rbx-storage directory/database target(s), "
+                    f"removed {storage_removed} empty storage placeholder(s), and "
+                    f"removed {database_removed} empty database placeholder(s) for "
+                    f"{path.parent}."
+                )
+            else:
+                _write_log(
+                    f"Restored {restored} rbx-storage database ACL(s) and removed "
+                    f"{database_removed} empty database placeholder(s) for {path.parent}."
+                )
             self.path = None
             self.original_sddl = None
             self.original_tree_sddl = {}
+            self.original_database_sddl = {}
             self.created_placeholders = {}
+            self.blocked_user_sid = None
+            self.holding_name = None
+            self.placeholder_name = None
+            self.original_storage_identity = None
+            self.storage_placeholder_identity = None
+            self.storage_placeholder_sddl = None
             self.launch_deadlines = {}
             self.release_at = None
         except Exception as exc:
             _write_log(
-                f"Could not restore the rbx-storage database ACLs for {path.parent}: {exc}",
+                f"Could not restore the rbx-storage database ACLs for "
+                f"{path.parent}: {exc}",
                 level="ERROR",
             )
             raise
@@ -1250,7 +2130,11 @@ class _ElevatedHelper:
     def __init__(self, connection: Connection, parent_pid: int, recovery_path: Path) -> None:
         self.connection: Optional[Connection] = connection
         self.parent_pid = int(parent_pid)
-        self.acl = _StorageAclGuard(recovery_path)
+        self._smart_activity = _SmartActivityLogger()
+        self.acl = _StorageAclGuard(
+            recovery_path,
+            activity_logger=self._smart_activity,
+        )
         self.handoff_path = Path(recovery_path).with_name("merchant_fix_helper_handoff.json")
         self.blockers: dict[int, _PidDomainBlocker] = {}
         self.running = True
@@ -1258,15 +2142,20 @@ class _ElevatedHelper:
         self.addresses: set[str] = set()
         self._pending_refresh_addresses: Optional[set[str]] = None
         self._pending_refresh_pids: deque[int] = deque()
+        self._pending_refresh_flows_by_pid: dict[int, list[dict[str, Any]]] = {}
         self._detached_handoff_id: Optional[str] = None
         self._prepared_handoff_id: Optional[str] = None
         self._handoff_acl_wait_logged = False
+        self._handoff_adopted = False
 
     def _parent_alive(self) -> bool:
         try:
             return psutil.pid_exists(self.parent_pid)
         except Exception:
-            return False
+            # The authenticated pipe will still close when the parent exits.
+            # Do not tear down every live PID block on a transient process-query
+            # failure while that stronger liveness signal remains available.
+            return True
 
     @staticmethod
     def _validate_handoff_id(raw_handoff_id: object) -> str:
@@ -1310,6 +2199,8 @@ class _ElevatedHelper:
                 pass
 
     def _handoff_was_adopted(self) -> bool:
+        if self._handoff_adopted:
+            return True
         handoff_id = self._detached_handoff_id
         if handoff_id is None:
             return False
@@ -1319,11 +2210,24 @@ class _ElevatedHelper:
             status = str(record.get("status") or "").strip().lower()
         except Exception:
             return False
+        # If READY overwrote this helper's WAITING record, the replacement has
+        # already opened every expected PID block. Promote that state to
+        # ADOPTED so both sides converge regardless of write ordering.
+        if record_id == handoff_id and status == "ready":
+            try:
+                self._write_handoff_record(handoff_id, "adopted")
+            except Exception:
+                return False
+            self._handoff_adopted = True
+            return True
         # A different waiting helper can only publish its record after opening
         # replacement blocks, so it is also a completed takeover for this one.
-        return (record_id == handoff_id and status == "adopted") or (
+        adopted = (record_id == handoff_id and status == "adopted") or (
             record_id != handoff_id and status == "waiting"
         )
+        if adopted:
+            self._handoff_adopted = True
+        return adopted
 
     def _clear_own_handoff_record(self) -> None:
         handoff_id = self._detached_handoff_id or self._prepared_handoff_id
@@ -1333,7 +2237,17 @@ class _ElevatedHelper:
             record = json.loads(self.handoff_path.read_text(encoding="utf-8"))
             record_id = str(record.get("handoff_id") or "").strip().lower()
             record_helper_pid = int(record.get("helper_pid") or 0)
-            if record_id == handoff_id and record_helper_pid == os.getpid():
+            record_status = str(record.get("status") or "").strip().lower()
+            preserve_adoption = (
+                self._handoff_adopted
+                and self._prepared_handoff_id is None
+                and record_status == "adopted"
+            )
+            if (
+                record_id == handoff_id
+                and record_helper_pid == os.getpid()
+                and not preserve_adoption
+            ):
                 self.handoff_path.unlink(missing_ok=True)
         except Exception:
             pass
@@ -1396,7 +2310,7 @@ class _ElevatedHelper:
         _write_log("Replacement helper completed the paused-manager Smart block handoff.")
         return True
 
-    def _smart_ready(self, raw_path: str = "", user_sid: str = "") -> dict[str, Any]:
+    def _smart_ready(self) -> dict[str, Any]:
         from pydivert import windivert_dll
         from pydivert.consts import Flag, Layer
 
@@ -1407,14 +2321,9 @@ class _ElevatedHelper:
         )
         windivert_dll.WinDivertClose(probe)
 
-        repaired = 0
-        if raw_path and user_sid:
-            storage = _validate_helper_storage_dir(Path(raw_path))
-            repaired = self.acl.repair_orphaned_denies(storage, user_sid)
-
         self.addresses = _resolve_domain()
         self.last_resolve_at = time.monotonic()
-        return {"addresses": sorted(self.addresses), "repaired_acls": repaired}
+        return {"addresses": sorted(self.addresses)}
 
     def _block_pid(self, pid: int, creation_time: float) -> dict[str, Any]:
         pid = int(pid)
@@ -1435,7 +2344,16 @@ class _ElevatedHelper:
             addresses = _resolve_domain()
         self.addresses = set(addresses)
         self.last_resolve_at = time.monotonic()
-        blocker = _PidDomainBlocker(pid, actual_creation, addresses)
+        activity_logger = getattr(self, "_smart_activity", None)
+        if activity_logger is None:
+            blocker = _PidDomainBlocker(pid, actual_creation, addresses)
+        else:
+            blocker = _PidDomainBlocker(
+                pid,
+                actual_creation,
+                addresses,
+                activity_logger=activity_logger,
+            )
         blocker.start()
         self.blockers[pid] = blocker
         return {"pid": pid, "addresses": sorted(addresses)}
@@ -1458,8 +2376,17 @@ class _ElevatedHelper:
             if not pending:
                 self.addresses = set(addresses)
                 return
+            try:
+                flows_by_pid = _matching_connections_by_pid(set(pending), addresses)
+            except Exception as exc:
+                flows_by_pid = {pid: [] for pid in pending}
+                _write_log(
+                    f"Could not snapshot existing {DOMAIN} flows for Smart refresh: {exc}",
+                    level="WARNING",
+                )
             self._pending_refresh_addresses = set(addresses)
             self._pending_refresh_pids = pending
+            self._pending_refresh_flows_by_pid = flows_by_pid
             _write_log(
                 f"{DOMAIN} address set changed; refreshing {len(pending)} Smart PID "
                 "block(s) incrementally."
@@ -1478,9 +2405,24 @@ class _ElevatedHelper:
                     previous_hits = int(old.blocked_connection_count)
                 except (TypeError, ValueError):
                     previous_hits = 0
-                replacement = _PidDomainBlocker(pid, old.creation_time, addresses)
+                activity_logger = getattr(self, "_smart_activity", None)
+                if activity_logger is None:
+                    replacement = _PidDomainBlocker(
+                        pid, old.creation_time, addresses
+                    )
+                else:
+                    replacement = _PidDomainBlocker(
+                        pid,
+                        old.creation_time,
+                        addresses,
+                        activity_logger=activity_logger,
+                    )
                 replacement.inherit_blocked_connections(previous_hits)
-                replacement.start()
+                replacement.start(
+                    existing_flows=(
+                        getattr(self, "_pending_refresh_flows_by_pid", {}) or {}
+                    ).pop(pid, [])
+                )
                 self.blockers[pid] = replacement
                 old.stop(report_hits=False)
                 try:
@@ -1495,13 +2437,33 @@ class _ElevatedHelper:
             break
 
         if not self._pending_refresh_pids:
+            # One final machine-wide snapshot covers flows opened while the
+            # SOCKET filters were being replaced. This keeps the expensive
+            # scan count constant (two per refresh), rather than one per PID.
+            refreshed = {
+                pid: blocker
+                for pid, blocker in self.blockers.items()
+                if blocker.addresses == addresses
+            }
+            if refreshed:
+                try:
+                    final_flows = _matching_connections_by_pid(set(refreshed), addresses)
+                    for pid, blocker in refreshed.items():
+                        blocker.add_network_flows(final_flows.get(pid, []))
+                except Exception as exc:
+                    _write_log(
+                        f"Could not reconcile existing {DOMAIN} flows after Smart refresh: {exc}",
+                        level="WARNING",
+                    )
             self.addresses = set(addresses)
             self._pending_refresh_addresses = None
+            self._pending_refresh_flows_by_pid = {}
             _write_log(f"Completed incremental {DOMAIN} Smart PID block refresh.")
 
     def _cancel_domain_refresh(self) -> None:
         self._pending_refresh_addresses = None
         self._pending_refresh_pids.clear()
+        self._pending_refresh_flows_by_pid = {}
 
     def _remove_dead_blockers(self) -> None:
         for pid, blocker in list(self.blockers.items()):
@@ -1511,8 +2473,13 @@ class _ElevatedHelper:
                     str(process.name() or "").lower() == ROBLOX_PROCESS_NAME
                     and abs(float(process.create_time()) - blocker.creation_time) < 0.01
                 )
-            except Exception:
+            except psutil.NoSuchProcess:
                 alive = False
+            except Exception:
+                # AccessDenied and other transient inspection failures are not
+                # proof that the process exited. Keep protection and retry on
+                # the helper's next tick.
+                continue
             if not alive:
                 self.blockers.pop(pid, None)
                 blocker.stop()
@@ -1530,27 +2497,22 @@ class _ElevatedHelper:
                 "creation_time": creation_time,
             }
         if operation == "smart_ready":
-            return self._smart_ready(
-                str(request.get("path") or ""), str(request.get("user_sid") or "")
-            )
-        if operation == "storage_prepare":
+            return self._smart_ready()
+        if operation == "database_prepare":
             self.acl.apply(
                 str(request.get("path") or ""),
                 str(request.get("user_sid") or ""),
                 request.get("launch_id") or "legacy",
             )
             return True
-        if operation == "storage_release_after":
+        if operation == "database_release_after":
             self.acl.release_after(
                 float(request.get("delay") or 0.0),
                 request.get("launch_id") or "legacy",
             )
             return True
-        if operation == "storage_cancel":
+        if operation == "database_cancel":
             self.acl.cancel_launch(request.get("launch_id") or "legacy")
-            return True
-        if operation == "storage_release":
-            self.acl.restore()
             return True
         if operation == "block_pid":
             return self._block_pid(int(request["pid"]), float(request["creation_time"]))
@@ -1560,6 +2522,7 @@ class _ElevatedHelper:
                 blocker.stop()
             self.blockers.clear()
             self.acl.restore()
+            self._smart_activity.flush()
             return True
         if operation == "classic_enable":
             _set_classic_hosts_block(True)
@@ -1678,6 +2641,7 @@ class _ElevatedHelper:
                 except Exception:
                     pass
             self.blockers.clear()
+            self._smart_activity.flush()
             connection = self.connection
             if connection is not None:
                 try:
@@ -1697,6 +2661,11 @@ class MerchantFixController:
         self._start_lock = threading.Lock()
         self._rpc_lock = threading.Lock()
         self._state_lock = threading.RLock()
+        # Serializes helper mutations whose ordering must agree with the local
+        # Smart enabled state. In particular, a watcher must not apply a PID
+        # block after deactivate_smart() has already completed unblock_all.
+        self._smart_operation_lock = threading.RLock()
+        self._smart_activity = _SmartActivityLogger()
         self._smart_enabled = False
         self._smart_block_trigger = DEFAULT_SMART_BLOCK_TRIGGER
         self._post_marker_delay_seconds = DEFAULT_POST_MARKER_DELAY_SECONDS
@@ -1962,8 +2931,11 @@ class MerchantFixController:
     def _adopt_waiting_handoff_once(
         self, handoff_id: str, generation: int
     ) -> bool:
-        record = self._load_waiting_handoff_record()
+        record = self._handoff_record()
         if self._validated_handoff_id(record.get("handoff_id")) != handoff_id:
+            return False
+        status = str(record.get("status") or "").strip().lower()
+        if status not in {"waiting", "adopted"}:
             return False
         with self._state_lock:
             if (
@@ -2312,25 +3284,28 @@ class MerchantFixController:
 
     def set_smart_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
-        with self._state_lock:
-            self._smart_enabled = enabled
-            self._watch_generation += 1
-            if not enabled:
-                late_handoff_stop = self._late_handoff_stop
-                if late_handoff_stop is not None:
-                    late_handoff_stop.set()
-                self._late_handoff_stop = None
-                for stop_event in self._watchers.values():
-                    stop_event.set()
-                self._watchers.clear()
-                self._claimed_logs.clear()
-                self._blocked_pids.clear()
-                self._prepared_launch_ids.clear()
-                self._resume_handoff_id = None
-                self._resume_handoff_detached = False
-                self._resume_source_manager_pid = None
-                self._resume_source_manager_creation_time = 0.0
-                self._handoff_adopted_by_replacement = False
+        with self._smart_operation_lock:
+            with self._state_lock:
+                self._smart_enabled = enabled
+                self._watch_generation += 1
+                if not enabled:
+                    late_handoff_stop = self._late_handoff_stop
+                    if late_handoff_stop is not None:
+                        late_handoff_stop.set()
+                    self._late_handoff_stop = None
+                    for stop_event in self._watchers.values():
+                        stop_event.set()
+                    self._watchers.clear()
+                    self._claimed_logs.clear()
+                    self._blocked_pids.clear()
+                    self._prepared_launch_ids.clear()
+                    self._resume_handoff_id = None
+                    self._resume_handoff_detached = False
+                    self._resume_source_manager_pid = None
+                    self._resume_source_manager_creation_time = 0.0
+                    self._handoff_adopted_by_replacement = False
+        if not enabled:
+            self._smart_activity.flush()
         _write_log(f"Smart mode setting changed to {'enabled' if enabled else 'disabled'}.")
 
     def _accept_helper(self, listener: Listener) -> None:
@@ -2477,8 +3452,13 @@ class MerchantFixController:
                     str(process.name() or "").lower() == ROBLOX_PROCESS_NAME
                     and abs(float(process.create_time()) - creation_time) < 0.01
                 )
-            except Exception:
+            except psutil.NoSuchProcess:
                 valid = False
+            except Exception:
+                # A transient permission/query failure is inconclusive. Keep
+                # the block tracked so it can be displayed and rehydrated.
+                live.append((pid, creation_time))
+                continue
             if valid:
                 live.append((pid, creation_time))
             else:
@@ -2546,105 +3526,112 @@ class MerchantFixController:
         _write_log(f"Reapplied {restored} of {len(live)} Smart PID block(s).")
 
     def activate_smart(self) -> None:
-        if is_classic_block_active():
-            raise RuntimeError("Disable the global Classic block before enabling Smart mode.")
-        with self._state_lock:
-            if (
-                self._smart_user_scope == SMART_USER_SCOPE_WHITELIST
-                and not self._smart_user_ids
-            ):
-                raise RuntimeError("Select at least one user before enabling Smart mode.")
-        result = self._request_with_reconnect(
-            "smart_ready",
-            path=str(get_roblox_storage_dir()),
-            user_sid=get_current_user_sid(),
-            timeout=30.0,
-        )
-        addresses = result.get("addresses", []) if isinstance(result, dict) else []
-        repaired = int(result.get("repaired_acls", 0)) if isinstance(result, dict) else 0
-        _write_log(
-            f"Smart mode privilege check passed; resolved {len(addresses)} domain address(es)"
-            f" and repaired {repaired} orphaned ACL(s)."
-        )
-        self.set_smart_enabled(True)
+        with self._smart_operation_lock:
+            if is_classic_block_active():
+                raise RuntimeError("Disable the global Classic block before enabling Smart mode.")
+            with self._state_lock:
+                if (
+                    self._smart_user_scope == SMART_USER_SCOPE_WHITELIST
+                    and not self._smart_user_ids
+                ):
+                    raise RuntimeError("Select at least one user before enabling Smart mode.")
+            result = self._request_with_reconnect(
+                "smart_ready",
+                timeout=30.0,
+            )
+            addresses = result.get("addresses", []) if isinstance(result, dict) else []
+            _write_log(
+                f"Smart mode privilege check passed; resolved {len(addresses)} domain address(es)."
+            )
+            self.set_smart_enabled(True)
 
     def recover_stale_acl_if_needed(self) -> None:
         if get_acl_recovery_path().is_file():
             self.ensure_helper()
 
     def deactivate_smart(self) -> None:
-        self._release_detached_handoff()
-        self.set_smart_enabled(False)
-        if self._connection is not None:
-            self._request_with_reconnect("unblock_all", timeout=20.0)
+        with self._smart_operation_lock:
+            self._release_detached_handoff()
+            self.set_smart_enabled(False)
+            if self._connection is not None:
+                self._request_with_reconnect("unblock_all", timeout=20.0)
 
     def before_roblox_launch(self, user_id: object) -> bool:
-        with self._state_lock:
-            if not self._smart_enabled:
+        with self._smart_operation_lock:
+            with self._state_lock:
+                if not self._smart_enabled:
+                    return False
+                applies = self._smart_applies_to_user_unlocked(user_id)
+            if not applies:
+                self._smart_activity.record(
+                    "managed launches skipped by Smart user selection"
+                )
                 return False
-            applies = self._smart_applies_to_user_unlocked(user_id)
-        if not applies:
-            _write_log(f"Smart mode skipped unselected managed user {user_id}.")
-            return False
-        self._request_with_reconnect(
-            "storage_prepare",
-            path=str(get_roblox_storage_dir()),
-            user_sid=get_current_user_sid(),
-            launch_id=str(user_id),
-            timeout=20.0,
-        )
-        with self._state_lock:
-            self._prepared_launch_ids.add(str(user_id))
-        _write_log(f"Smart pre-launch storage block applied for managed user {user_id}.")
+            self._request_with_reconnect(
+                "database_prepare",
+                path=str(get_roblox_storage_dir()),
+                user_sid=get_current_user_sid(),
+                launch_id=str(user_id),
+                timeout=20.0,
+            )
+            with self._state_lock:
+                self._prepared_launch_ids.add(str(user_id))
+        self._smart_activity.record("managed launches admitted by Smart mode")
         return True
 
     def cancel_prelaunch(self, user_id: object, reason: str) -> None:
         with self._state_lock:
+            admitted = str(user_id) in self._prepared_launch_ids
             self._prepared_launch_ids.discard(str(user_id))
-        if self._connection is None:
-            return
-        try:
-            self._request_with_reconnect(
-                "storage_cancel", launch_id=str(user_id), timeout=20.0
-            )
-            _write_log(f"Released pre-launch storage block for user {user_id}: {reason}.")
-        except Exception as exc:
-            _write_log(f"Could not release pre-launch storage block: {exc}", level="ERROR")
+        if admitted:
+            try:
+                self._request_with_reconnect(
+                    "database_cancel", launch_id=str(user_id), timeout=20.0
+                )
+                _write_log(
+                    f"Cancelled Smart database-file guard for user {user_id}: {reason}."
+                )
+            except Exception as exc:
+                _write_log(
+                    f"Could not cancel Smart database-file guard: {exc}",
+                    level="ERROR",
+                )
 
     def on_roblox_process_created(
         self, pid: int, user_id: object, process_created_at: Optional[float] = None
     ) -> None:
         launch_id = str(user_id)
-        with self._state_lock:
-            prepared = launch_id in self._prepared_launch_ids
-            self._prepared_launch_ids.discard(launch_id)
-            if not self._smart_enabled or not prepared:
-                return
-        process = psutil.Process(int(pid))
-        creation_time = float(process_created_at or process.create_time())
-        remaining = max(
-            0.0,
-            (creation_time + SMART_DATABASE_LOCK_SECONDS) - time.time(),
-        )
-        self._request_with_reconnect(
-            "storage_release_after",
-            delay=remaining,
-            launch_id=launch_id,
-            timeout=10.0,
-        )
-        with self._state_lock:
-            generation = self._watch_generation
-            old = self._watchers.pop(int(pid), None)
-            if old is not None:
-                old.set()
-            stop_event = threading.Event()
-            self._watchers[int(pid)] = stop_event
-        threading.Thread(
-            target=self._watch_for_user_key,
-            args=(int(pid), str(user_id), creation_time, generation, stop_event),
-            name=f"MerchantFix-Log-{int(pid)}",
-            daemon=True,
-        ).start()
+        with self._smart_operation_lock:
+            with self._state_lock:
+                prepared = launch_id in self._prepared_launch_ids
+                self._prepared_launch_ids.discard(launch_id)
+                if not self._smart_enabled or not prepared:
+                    return
+            process = psutil.Process(int(pid))
+            creation_time = float(process_created_at or process.create_time())
+            remaining = max(
+                0.0,
+                (creation_time + SMART_DATABASE_LOCK_SECONDS) - time.time(),
+            )
+            self._request_with_reconnect(
+                "database_release_after",
+                delay=remaining,
+                launch_id=launch_id,
+                timeout=10.0,
+            )
+            with self._state_lock:
+                generation = self._watch_generation
+                old = self._watchers.pop(int(pid), None)
+                if old is not None:
+                    old.set()
+                stop_event = threading.Event()
+                self._watchers[int(pid)] = stop_event
+            threading.Thread(
+                target=self._watch_for_user_key,
+                args=(int(pid), str(user_id), creation_time, generation, stop_event),
+                name=f"MerchantFix-Log-{int(pid)}",
+                daemon=True,
+            ).start()
 
     def _candidate_log_for_pid(self, pid: int, creation_time: float) -> Optional[Path]:
         try:
@@ -2671,6 +3658,14 @@ class MerchantFixController:
                     continue
                 if stat.st_mtime < creation_time - 3.0:
                     continue
+                # On Windows st_ctime is the file creation time.  Do not bind a
+                # new PID to a prior session's log merely because that old log
+                # received a final write while the account was relaunching.
+                if (
+                    stat.st_ctime
+                    < creation_time - SMART_LOG_CREATION_EARLY_TOLERANCE_SECONDS
+                ):
+                    continue
                 with self._state_lock:
                     owner = self._claimed_logs.get(path)
                 if owner not in (None, pid):
@@ -2692,18 +3687,20 @@ class MerchantFixController:
         offset = 0
         carry = ""
         trigger = self.smart_block_trigger
-        trigger_label = (
-            "main-menu exit"
-            if trigger == SMART_BLOCK_TRIGGER_MENU_EXIT
-            else "BossRaidUI Line 114 marker"
-        )
         saw_main_menu = False
-        _write_log(
-            f"Watching Roblox log for PID {pid}, managed user {user_id}, "
-            f"for the {trigger_label}."
-        )
+        pending_menu_delay: Optional[float] = None
+        self._smart_activity.record("Roblox log watchers started", pid=pid)
         try:
-            while not stop_event.wait(0.2):
+            while True:
+                poll_seconds = 0.2
+                if pending_menu_delay is not None:
+                    poll_seconds = min(poll_seconds, max(0.0, pending_menu_delay))
+                if poll_seconds > 0.0 and stop_event.wait(poll_seconds):
+                    return
+                if pending_menu_delay is not None:
+                    pending_menu_delay = max(
+                        0.0, pending_menu_delay - poll_seconds
+                    )
                 with self._state_lock:
                     if (
                         not self._smart_enabled
@@ -2717,8 +3714,12 @@ class MerchantFixController:
                         or abs(float(process.create_time()) - creation_time) >= 0.01
                     ):
                         return
-                except Exception:
+                except psutil.NoSuchProcess:
                     return
+                except Exception:
+                    # A transient process query failure must not permanently
+                    # abandon protection for an otherwise live managed PID.
+                    continue
 
                 if log_path is None or not log_path.exists():
                     log_path = self._candidate_log_for_pid(pid, creation_time)
@@ -2728,85 +3729,137 @@ class MerchantFixController:
                         self._claimed_logs[log_path] = pid
                     offset = 0
                     carry = ""
-                    _write_log(f"Associated PID {pid} with Roblox log {log_path.name}.")
+                    self._smart_activity.record(
+                        "Roblox logs associated with managed PIDs",
+                        pid=pid,
+                    )
 
                 try:
                     size = log_path.stat().st_size
                     if size < offset:
                         offset = 0
                         carry = ""
-                    if size == offset:
-                        continue
-                    with log_path.open("rb") as handle:
-                        handle.seek(offset)
-                        raw = handle.read()
-                        offset = handle.tell()
-                    decoded = raw.decode("utf-8", errors="replace")
-                    text = carry + decoded
-                    if trigger == SMART_BLOCK_TRIGGER_MENU_EXIT:
-                        # Only parse complete log lines. This preserves a split
-                        # RPC JSON entry without replaying completed states on
-                        # every later write.
-                        line_end = max(text.rfind("\n"), text.rfind("\r"))
-                        if line_end < 0:
+                    text = ""
+                    if size != offset:
+                        with log_path.open("rb") as handle:
+                            handle.seek(offset)
+                            raw = handle.read()
+                            offset = handle.tell()
+                        decoded = raw.decode("utf-8", errors="replace")
+                        text = carry + decoded
+                        if trigger == SMART_BLOCK_TRIGGER_MENU_EXIT:
+                            # Only parse complete log lines. This preserves a split
+                            # RPC JSON entry without replaying completed states on
+                            # every later write. A syntactically complete trailing
+                            # RPC entry is safe to consume even without a newline;
+                            # Roblox can leave its final flushed record that way.
+                            line_end = max(text.rfind("\n"), text.rfind("\r"))
+                            if line_end < 0:
+                                carry = text[-8192:]
+                                if _smart_menu_states_from_log_text(carry):
+                                    text = carry
+                                    carry = ""
+                                else:
+                                    text = ""
+                            else:
+                                carry = text[line_end + 1 :][-8192:]
+                                text = text[: line_end + 1]
+                                if carry and _smart_menu_states_from_log_text(carry):
+                                    text += carry
+                                    carry = ""
+                        else:
                             carry = text[-8192:]
-                            continue
-                        carry = text[line_end + 1 :][-8192:]
-                        text = text[: line_end + 1]
-                    else:
-                        carry = text[-8192:]
                 except (OSError, PermissionError):
                     continue
 
                 if trigger == SMART_BLOCK_TRIGGER_MENU_EXIT:
-                    trigger_detected = False
+                    apply_reason = ""
                     for in_menu in _smart_menu_states_from_log_text(text):
                         if in_menu:
                             saw_main_menu = True
+                            if pending_menu_delay is not None:
+                                _write_log(
+                                    f"PID {pid} returned to the Roblox main menu; "
+                                    "cancelled the pending per-PID block delay."
+                                )
+                            pending_menu_delay = None
                         elif saw_main_menu:
-                            trigger_detected = True
-                            break
-                    if not trigger_detected:
+                            if pending_menu_delay is not None:
+                                continue
+                            delay = self.smart_block_delay_seconds(trigger)
+                            if delay > 0.0:
+                                pending_menu_delay = delay
+                                self._smart_activity.record(
+                                    "main-menu exit triggers awaiting block delay",
+                                    pid=pid,
+                                )
+                            else:
+                                apply_reason = "immediate"
+                                break
+                    if (
+                        not apply_reason
+                        and pending_menu_delay is not None
+                        and pending_menu_delay <= 0.0
+                    ):
+                        apply_reason = "elapsed"
+                    if not apply_reason:
                         continue
-                    detected_label = "the Roblox main-menu exit"
+                    if apply_reason == "elapsed":
+                        self._smart_activity.record(
+                            "PID block requests issued after delay",
+                            pid=pid,
+                        )
+                    else:
+                        self._smart_activity.record(
+                            "PID block requests issued immediately",
+                            pid=pid,
+                        )
                 else:
                     if SMART_LOG_PATTERN.search(text) is None:
                         continue
-                    detected_label = "the BossRaidUI Line 114 marker"
-                delay = self.smart_block_delay_seconds(trigger)
-                if delay > 0.0:
-                    _write_log(
-                        f"Detected {detected_label} for PID {pid}; "
-                        f"waiting {delay:.2f}s before applying the per-PID block."
-                    )
-                    if stop_event.wait(delay):
-                        return
-                    with self._state_lock:
-                        if not self._smart_enabled or generation != self._watch_generation:
+                    delay = self.smart_block_delay_seconds(trigger)
+                    if delay > 0.0:
+                        self._smart_activity.record(
+                            "BossRaidUI triggers awaiting block delay",
+                            pid=pid,
+                        )
+                        if stop_event.wait(delay):
                             return
-                    try:
-                        process = psutil.Process(pid)
+                        with self._state_lock:
+                            if not self._smart_enabled or generation != self._watch_generation:
+                                return
+                        try:
+                            process = psutil.Process(pid)
+                            if (
+                                str(process.name() or "").lower() != ROBLOX_PROCESS_NAME
+                                or abs(float(process.create_time()) - creation_time) >= 0.01
+                            ):
+                                return
+                        except Exception:
+                            return
+                        self._smart_activity.record(
+                            "PID block requests issued after delay",
+                            pid=pid,
+                        )
+                    else:
+                        self._smart_activity.record(
+                            "PID block requests issued immediately",
+                            pid=pid,
+                        )
+                with self._smart_operation_lock:
+                    with self._state_lock:
                         if (
-                            str(process.name() or "").lower() != ROBLOX_PROCESS_NAME
-                            or abs(float(process.create_time()) - creation_time) >= 0.01
+                            not self._smart_enabled
+                            or generation != self._watch_generation
+                            or stop_event.is_set() is True
                         ):
                             return
-                    except Exception:
-                        return
-                    _write_log(
-                        f"Smart asset-block delay elapsed for PID {pid}; applying per-PID block."
+                    self._request_with_reconnect(
+                        "block_pid", pid=pid, creation_time=creation_time, timeout=30.0
                     )
-                else:
-                    _write_log(
-                        f"Detected {detected_label} for PID {pid}; "
-                        "applying per-PID block immediately."
-                    )
-                self._request_with_reconnect(
-                    "block_pid", pid=pid, creation_time=creation_time, timeout=30.0
-                )
-                with self._state_lock:
-                    if self._smart_enabled and generation == self._watch_generation:
-                        self._blocked_pids[pid] = creation_time
+                    with self._state_lock:
+                        if self._smart_enabled and generation == self._watch_generation:
+                            self._blocked_pids[pid] = creation_time
                 return
         except Exception as exc:
             _write_log(f"Smart log watcher failed for PID {pid}: {exc}", level="ERROR")

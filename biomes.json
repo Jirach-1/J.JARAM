@@ -34,6 +34,11 @@
         "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Heaven%20Biome.png",
         "Timer": "240"
     },
+    "Lost Forest": {
+        "color": "0X036327",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Lost%20Forest%20Biome.png",
+        "Timer": "300"
+    },
     "CORRUPTION": {
         "color": "0x6d32a8",
         "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Corruption%20Biome.png",
@@ -57,12 +62,17 @@
     "Cyberspace": {
         "color": "0x0064CE",
         "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Cyberspace%20Biome.png",
-        "Timer": "150"
+        "Timer": "720"
     },
     "Singularity": {
         "color": "0xE07B48",
         "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Singularity%20Biome.png",
         "Timer": "1200"
+    },
+    "Radiant Forest": {
+        "color": "0x7f2ae8",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Radiant%20Forest%20Biome.png",
+        "Timer": "1320"
     },
     "NORMAL": {
         "color": "0x00ff00",
@@ -86,22 +96,21 @@
     "Blood Rain": {
         "color": "0X701f03",
         "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Blood%20Rain%20Biome.png",
-        "Timer": "150"
+        "Timer": "600"
     },
     "Aurora": {
         "color": "0X3299a8",
         "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Aurora%20Biome.png",
-        "Timer": "600"
+        "Timer": "300"
     },
     "Incinerator": {
         "color": "0XFFB633",
         "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Incinerator%20Biome.png  ",
-        "Timer": "600"
+        "Timer": "200"
     },
     "Eggland": {
         "color": "0Xf5f5dc",
-        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Eggland%20Biome.png",
-        "Timer": "600"
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Eggland%20Biome.png"
     }
 
 }

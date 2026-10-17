@@ -28,6 +28,7 @@ from log_utils import (
 
 _ACCESS_ENV_NAME = "".join(chr(c) for c in (74, 65, 82, 65, 77, 95, 85, 78, 76, 79, 67, 75))
 _ACCESS_MARKER_NAME = "".join(chr(c) for c in (74, 65, 82, 65, 77, 46, 98, 105, 117))
+_DEV_ONLY_PACKAGE = "dev_only"
 
 # Optional biomes metadata (color, thumbnail). Fallbacks if missing.
 try:
@@ -38,9 +39,8 @@ except Exception:
         return int(0x3BA55D), ""     # default color, empty thumbnail
     def biome_names() -> list[str]:
         return ["NORMAL"]
-APP_FOOTER = "J.JARAM JX 2x86"
+APP_FOOTER = "J.JARAM JX 2x88"
 HARD_EVERYONE_BIOMES = {"GLITCHED", "DREAMSPACE", "CYBERSPACE"}
-_LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
@@ -299,364 +299,6 @@ BIOME_RPC_RE = re.compile(
 
 
 # ------------------------------------------------------------------------------
-# Blocker
-# ------------------------------------------------------------------------------
-
-class _TempBlockSession(threading.Thread):
-    """
-    3-minute temp blocker for one 'finder' account.
-    - Uses Roblox user-blocking API (no browser)
-    - Tails their log for 'Player added: <name> <id>'
-    - Blocks only names present in Blank 
-    - Grows lookups/blocklist via Bloxlink reverse search
-    - Unblocks any IDs we blocked when the window ends
-    """
-    GUILD_ID = "1371698242886307921"   # your server (can be moved to credentials if you prefer)
-    WINDOW_SEC = 180
-
-    def __init__(self, log_fn, uid: str, username: str, cookie: str):
-        super().__init__(daemon=True)
-        self._log = log_fn
-        self.uid = str(uid)
-        self.username = str(username or "").strip()
-        self.cookie = cookie
-        self._stop = False
-        self._blocked_ids = set()
-        self._seen_ids = set()
-        self._pending: list[tuple[str, str]] = []  # (username, roblox_id) carried across ticks
-        self._log_carry = b""
-
-    # ---------- Jaram files ----------
-    @staticmethod
-    def _jaram_dir() -> Path:
-        base = os.environ.get("APPDATA") or ""
-        p = Path(base) / "Jaram" if base else Path.cwd() / "Jaram"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    @classmethod
-    def _lookup_path(cls) -> Path:
-        return cls._jaram_dir() / "lookup.json"
-
-    @classmethod
-    def _cred_path(cls) -> Path:
-        return cls._jaram_dir() / "credentials.json"
-
-    @classmethod
-    def _load_lookup(cls) -> dict:
-        p = cls._lookup_path()
-        if p.exists():
-            try:
-                return json.loads(p.read_text(encoding="utf-8")) or {}
-            except Exception:
-                pass
-        return {"lookups": {}, "blocklist": []}
-
-    @classmethod
-    def _save_lookup(cls, obj: dict) -> None:
-        p = cls._lookup_path()
-        # Use a unique tmp name per thread to avoid collisions, still guarded by a lock
-        tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-        with _LOOKUP_SAVE_LOCK:
-            tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
-            # Atomic replace on Windows 10+ and modern Python
-            tmp.replace(p)
-
-
-    @classmethod
-    def _bloxlink_key(cls) -> str:
-        p = cls._cred_path()
-        try:
-            data = json.loads(p.read_text(encoding="utf-8")) or {}
-            return str(data.get("bloxlink_api_key") or "")
-        except Exception:
-            return ""
-
-    # ---------- Decisions ----------
-    @staticmethod
-    def _in_blocklist(name: str, lk: dict) -> bool:
-        bl = [str(x).lower() for x in (lk.get("blocklist") or [])]
-        return name.lower() in bl
-
-    @staticmethod
-    def _in_lookups(name: str, lk: dict) -> bool:
-        nm = name.lower()
-        for arr in (lk.get("lookups") or {}).values():
-            for item in arr or []:
-                if str(item).lower() == nm:
-                    return True
-        return False
-
-    @classmethod
-    def _add_to_lookups(cls, lk: dict, discord_id: str, username: str) -> None:
-        lookups = lk.setdefault("lookups", {})
-        arr = lookups.setdefault(str(discord_id), [])
-        if username not in arr and username.lower() not in [a.lower() for a in arr]:
-            arr.append(username)
-
-    @classmethod
-    def _append_blocklist(cls, lk: dict, username: str) -> None:
-        bl = lk.setdefault("blocklist", [])
-        if username not in bl and username.lower() not in [b.lower() for b in bl]:
-            bl.append(username)
-
-    # ---------- Bloxlink reverse ----------
-    def _bloxlink_reverse(self, roblox_id: str) -> str | None:
-        """
-        Map Roblox userId -> Discord ID via Bloxlink using *plain* Authorization header.
-        Supports response shapes:
-          - {"user":{"id":"..."}}
-          - {"discordID":"..."} or {"discordId":"..."}
-          - {"discordIDs":["..."]}    a plural form (pick first)
-        Returns Discord ID string or None. Logs status so you can verify it ran.
-        """
-        key = self._bloxlink_key()
-        if not key:
-            self._log("[TempBlock] Bloxlink key missing; reverse lookup skipped")
-            return None
-
-        guild_id = self.GUILD_ID
-        url = f"https://api.blox.link/v4/public/guilds/{guild_id}/roblox-to-discord/{roblox_id}"
-        headers = {"Authorization": key}
-
-        # 3 tries total, short timeouts, quick backoff on transient failures
-        timeouts = (5, 5, 5)  # seconds per attempt
-        backoffs = (0.5, 1) # between attempts
-        for i, to in enumerate(timeouts):
-            try:
-                r = requests.get(url, headers=headers, timeout=to)
-                status = r.status_code
-                try:
-                    data = r.json()
-                except Exception:
-                    data = None
-
-                self._log(f"[TempBlock] Bloxlink - {status} for {roblox_id} (guild {guild_id})")
-
-                if isinstance(data, dict) and data.get("error"):
-                    self._log(f"[TempBlock] Bloxlink error: {data.get('error')}")
-
-                if status == 200 and isinstance(data, dict):
-                    # 1) {"user":{"id":"..."}}
-                    if isinstance(data.get("user"), dict) and data["user"].get("id"):
-                        return str(data["user"]["id"])
-                    # 2) {"discordID":"..."} / {"discordId":"..."}
-                    if data.get("discordID"):
-                        return str(data["discordID"])
-                    if data.get("discordId"):
-                        return str(data["discordId"])
-                    # 3) {"discordIDs":["..."]}
-                    if isinstance(data.get("discordIDs"), list) and data["discordIDs"]:
-                        return str(data["discordIDs"][0])
-                    # 200 but unknown shape - treat as no mapping
-                    return None
-
-                # 204/404/400/etc - no mapping; don't retry
-                if status not in (500, 502, 503, 504):   # only retry server errors
-                    return None
-
-            except (_rq_exc.Timeout, _rq_exc.ConnectionError) as e:
-                self._log(f"[TempBlock] Bloxlink timeout/network error (try {i+1}/3): {e}")
-            except Exception as e:
-                self._log(f"[TempBlock] Bloxlink exception (try {i+1}/3): {e}")
-
-            # retry if we have remaining attempts
-            if i < len(backoffs):
-                time.sleep(backoffs[i])
-
-        # fell through without success
-        self._log("[TempBlock] Bloxlink: giving up after retries")
-        return None
-
-    # ---------- Roblox user-blocking API ----------
-    def _make_session(self):
-        from utilities_tab import _make_blocking_api_session  # lazy-import to avoid init cycles
-        return _make_blocking_api_session(self.cookie)
-
-    def _block_id(self, session, user_id: str) -> str:
-        from utilities_tab import _api_block_user
-        return _api_block_user(session, self.cookie, user_id)
-
-    def _unblock_id(self, session, user_id: str) -> str:
-        from utilities_tab import _api_unblock_user
-        return _api_unblock_user(session, self.cookie, user_id)
-
-    # ---------- Tail the finder's log ----------
-    def _tail_new_players(self, f) -> list[tuple[str, str]]:
-        """Read any new lines and return [(username, id), ...] that match."""
-        found = []
-        raw = f.read(256 * 1024)
-        if not raw:
-            return found
-        combined = self._log_carry + raw
-        parts = combined.split(b"\n")
-        self._log_carry = parts.pop() if parts else combined
-        if len(self._log_carry) > 1024 * 1024:
-            self._log_carry = b""
-        for line_raw in parts:
-            line = line_raw.rstrip(b"\r").decode("utf-8", errors="replace")
-            if "Player added:" not in line:
-                continue
-            m = re.search(r"Player added:\s+([A-Za-z0-9_]+)\s+(\d+)", line)
-            if m:
-                uname = m.group(1)
-                rid = m.group(2)
-                found.append((uname, rid))
-        if self._log_carry:
-            tail = self._log_carry.decode("utf-8", errors="replace")
-            match = re.search(r"Player added:\s+([A-Za-z0-9_]+)\s+(\d+)", tail)
-            if match:
-                found.append((match.group(1), match.group(2)))
-                self._log_carry = b""
-        return found
-
-    # ---------- Main ----------
-    def run(self):
-        if not self.cookie or not self.username:
-            self._log(f"[TempBlock] {self.uid}: missing cookie/username")
-            return
-
-        # Create API session up front (CSRF + browserid)
-        try:
-            session = self._make_session()
-        except Exception as e:
-            self._log(f"[TempBlock] {self.uid}: failed to start API session ({e})")
-            return
-
-        # Prepare log tail
-        log_path = find_log_for_username(self.username.lower(), allow_fallback=False)
-        if not log_path or not os.path.isfile(log_path):
-            self._log(f"[TempBlock] {self.uid}: no log for '{self.username}'")
-            try: session.close()
-            except Exception: pass
-            return
-
-        try:
-            f = open(log_path, "rb")
-        except Exception as e:
-            self._log(f"[TempBlock] {self.uid}: cannot open log ({e})")
-            try: session.close()
-            except Exception: pass
-            return
-
-        # Seek to end so we only see new players after the spawn
-        try:
-            f.seek(0, os.SEEK_END)
-        except Exception:
-            pass
-
-        # Load lookup once; we'll persist changes as they occur
-        lookup = self._load_lookup()
-
-        deadline = time.time() + self.WINDOW_SEC
-        self._log(f"[TempBlock] {self.uid}: window OPEN ({self.WINDOW_SEC}s)")
-
-        try:
-            while time.time() < deadline and not self._stop:
-                # --- SURGE-AWARE PER-TICK LOGIC ---
-                tick_deadline = time.time() + 0.10  # ~100ms budget per tick
-
-                # merge any leftover work from the previous tick with fresh arrivals
-                new_players = self._tail_new_players(f)
-                batch = (self._pending + new_players)
-                self._pending = []
-
-                surge = len(batch) >= 20  # tune threshold as you like
-                if surge:
-                    self._log(f"[TempBlock] {self.uid}: SURGE mode ({len(batch)} new) - skipping Bloxlink")
-
-                for uname, rid in batch:
-                    # budget guard FIRST: if we're out of time, queue this work for next tick
-                    if time.time() > tick_deadline:
-                        self._pending.append((uname, rid))
-                        continue
-
-                    if rid in self._seen_ids:
-                        continue
-
-                    # only mark "seen" once we *know* we'll process this entry now
-                    # (prevents losing users when we run out of budget)
-                    # --- Known bad - block immediately ---
-                    if self._in_blocklist(uname, lookup):
-                        res = self._block_id(session, rid)
-                        if res in ("blocked", "already_blocked"):
-                            self._blocked_ids.add(rid)
-                            self._log(f"[TempBlock] blocked @{uname} ({rid}) on {self.uid} - {res} [blocklist]")
-                        else:
-                            self._log(f"[TempBlock] failed blocking @{uname} ({rid}) on {self.uid} - {res} [blocklist]")
-                        self._seen_ids.add(rid)
-                        continue
-
-                    # --- Already mapped - skip ---
-                    if self._in_lookups(uname, lookup):
-                        self._log(f"[TempBlock] @{uname} already mapped in lookups - skip")
-                        self._seen_ids.add(rid)
-                        continue
-
-                    if surge:
-                        # SURGE path: skip Bloxlink; block now
-                        self._append_blocklist(lookup, uname)
-                        self._save_lookup(lookup)
-                        self._log(f"[TempBlock] (SURGE) @{uname} - added to blocklist & blocking now")
-                        res = self._block_id(session, rid)
-                        if res in ("blocked", "already_blocked"):
-                            self._blocked_ids.add(rid)
-                            self._log(f"[TempBlock] (SURGE) blocked @{uname} ({rid}) on {self.uid} - {res}")
-                        else:
-                            self._log(f"[TempBlock] (SURGE) failed blocking @{uname} ({rid}) on {self.uid} - {res}")
-                        self._seen_ids.add(rid)
-                        continue
-
-                    # Normal path: Bloxlink quick try; else block+record
-                    self._log(f"[TempBlock] Bloxlink reverse lookup for @{uname} ({rid})")
-                    d_id = self._bloxlink_reverse(rid)
-
-                    if d_id:
-                        self._add_to_lookups(lookup, d_id, uname)
-                        self._save_lookup(lookup)
-                        self._log(f"[TempBlock] @{uname} - Discord {d_id} (added to lookups)")
-                        # no block
-                    else:
-                        self._append_blocklist(lookup, uname)
-                        self._save_lookup(lookup)
-                        self._log(f"[TempBlock] @{uname} - no Bloxlink match; added to blocklist and blocking now")
-                        res = self._block_id(session, rid)
-                        if res in ("blocked", "already_blocked"):
-                            self._blocked_ids.add(rid)
-                            self._log(f"[TempBlock] blocked @{uname} ({rid}) on {self.uid} - {res} [unknown-blocklist]")
-                        else:
-                            self._log(f"[TempBlock] failed blocking @{uname} ({rid}) on {self.uid} - {res} [unknown-blocklist]")
-
-                    # we actually processed this entry this tick - safe to mark seen
-                    self._seen_ids.add(rid)
-                    
-                time.sleep(0.25)
-
-        except Exception as e:
-            self._log(f"[TempBlock] {self.uid}: loop crashed - {e!r}")
-        finally:
-            # Always close the log file
-            try:
-                f.close()
-            except Exception:
-                pass
-
-        # Unblock everyone we blocked during this window
-        if self._blocked_ids:
-            self._log(f"[TempBlock] {self.uid}: window CLOSED - unblocking {len(self._blocked_ids)} id(s)")
-            for rid in list(self._blocked_ids):
-                res = self._unblock_id(session, rid)
-                if res in ("unblocked", "already_unblocked"):
-                    self._log(f"[TempBlock] unblocked {rid} - {res}")
-                else:
-                    self._log(f"[TempBlock] unblock failed {rid} - {res}")
-        else:
-            self._log(f"[TempBlock] {self.uid}: window CLOSED - nothing to unblock")
-
-        try: session.close()
-        except Exception: pass
-
-# ------------------------------------------------------------------------------
 # Data
 # ------------------------------------------------------------------------------
 
@@ -710,6 +352,8 @@ class MultiScopeEngine:
         get_cookie_for_user,            # NEW
         stats_path: Optional[str] = None,
         log_fn: Optional[Callable[[str], None]] = None,
+        member_lookup: Optional[Callable] = None,
+        service_notify: Optional[Callable] = None,
     ):
         self._get_username = get_username
         self._get_server_label = get_server_label
@@ -717,6 +361,7 @@ class MultiScopeEngine:
         self._get_owner = get_server_owner_for_user or (lambda uid: "")
         self._get_cookie_for_user = get_cookie_for_user   # NEW
         self._log = log_fn or (lambda _msg: None)
+        self._development_service_notify = service_notify
 
         self._cur: Dict[str, Cursor] = {}
         self._tracked_uids: Set[str] = set()
@@ -837,8 +482,14 @@ class MultiScopeEngine:
         # Track which biomes were forced to Everyone due to lock enforcement.
         self._lock_forced_biomes: Set[str] = set()
 
-        self._temp_block_sessions = {}  # uid -> expiry epoch (simple gate)
-        self._temp_block_disabled: bool = True
+        self._development_runtime = None
+        try:
+            from dev_only.runtime import DevelopmentRuntime
+            self._development_runtime = DevelopmentRuntime(
+                self, member_lookup or (lambda *args: {"ok": False})
+            )
+        except ImportError:
+            pass
 
     # -- Config ----------------------------------------------------------------
 
@@ -1504,6 +1155,9 @@ class MultiScopeEngine:
             chunk = raw.decode("utf-8", errors="replace")
         except Exception:
             return
+        if self._development_runtime:
+            for line in chunk.splitlines():
+                self._development_runtime.observe(uid, line, path=cur.path, generation_id=cur.generation_id)
         # Cold attachment is a state seed only: never replay historical disconnects.
         disconnect_hit = False
 
@@ -2041,25 +1695,15 @@ class MultiScopeEngine:
             return True
         return False
 
-    def _maybe_start_temp_block(self, uid: str, reason: str):
-        if self._temp_block_disabled:
-            return
+    def configure_development(self, config: dict) -> None:
+        runtime = self._development_runtime
+        if runtime:
+            runtime.configure(config)
 
-        now = time.time()
-        exp = self._temp_block_sessions.get(uid, 0)
-        if exp > now:
-            return  # already running recently
-
-        username = (self._get_username(uid) or "").strip()
-        cookie = (self._get_cookie_for_user(uid) or "").strip()
-        if not username or not cookie:
-            return
-
-        self._log(f"[TempBlock] starting for {uid} ({username}) due to {reason}")
-        t = _TempBlockSession(self._log, uid, username, cookie)
-        t.start()
-        # Gate re-entrancy slightly beyond the window (3min + 30s pad)
-        self._temp_block_sessions[uid] = now + (_TempBlockSession.WINDOW_SEC + 30)
+    def _development_trigger(self, uid: str, trigger: str, event_ts: float) -> None:
+        runtime = self._development_runtime
+        if runtime:
+            runtime.trigger(uid, trigger, event_ts)
 
     # -- Embeds ----------------------------------------------------------------
 
@@ -2119,16 +1763,23 @@ class MultiScopeEngine:
             if os.environ.get(_ACCESS_ENV_NAME, "").strip() == "1":
                 return True
 
-            candidates = [Path(_ACCESS_MARKER_NAME)]
+            candidates = [
+                Path(_ACCESS_MARKER_NAME),
+                Path(_DEV_ONLY_PACKAGE) / _ACCESS_MARKER_NAME,
+            ]
             try:
-                candidates.append(Path(__file__).resolve().with_name(_ACCESS_MARKER_NAME))
+                source_dir = Path(__file__).resolve().parent
+                candidates.append(source_dir / _ACCESS_MARKER_NAME)
+                candidates.append(source_dir / _DEV_ONLY_PACKAGE / _ACCESS_MARKER_NAME)
             except Exception:
                 pass
             try:
                 import sys as _sys
                 meipass = getattr(_sys, "_MEIPASS", None)
                 if meipass:
-                    candidates.append(Path(meipass) / _ACCESS_MARKER_NAME)
+                    bundle_dir = Path(meipass)
+                    candidates.append(bundle_dir / _ACCESS_MARKER_NAME)
+                    candidates.append(bundle_dir / _DEV_ONLY_PACKAGE / _ACCESS_MARKER_NAME)
             except Exception:
                 pass
 
@@ -2314,6 +1965,7 @@ class MultiScopeEngine:
             scope.last_merchant_ts = time.time()
         scope.users.add(uid)
         self._emit_event("merchant", str(uid), str(who))
+        self._development_trigger(str(uid), f"Merchant:{who}", event_time_utc.timestamp())
 
         if not self._merchant_hook:
             return
@@ -2353,9 +2005,6 @@ class MultiScopeEngine:
             self._send_executor.submit(_post_webhook, self._merchant_hook, payload)
         except Exception:
             pass
-        # START TEMP BLOCK WINDOW for Jester
-        if who == "Jester":
-            self._maybe_start_temp_block(uid, "Jester")
 
         scope.events += 1
 
@@ -2397,6 +2046,7 @@ class MultiScopeEngine:
             except Exception:
                 pass
             self._emit_event("merchant", uid, who)
+            self._development_trigger(uid, f"Merchant:{who}", now_ts)
 
     def _dispatch_log_line(
         self,
@@ -2449,6 +2099,9 @@ class MultiScopeEngine:
         disconnect_already: bool = False,
     ) -> bool:
         """Parse one logical line and dispatch each supported record once."""
+        runtime = self._development_runtime
+        if runtime:
+            runtime.observe(uid, line, path=path, generation_id=generation_id)
         ts_epoch: Optional[float] = None
         ts_match = _LOG_TS_RE.search(line)
         if ts_match:
@@ -2509,6 +2162,8 @@ class MultiScopeEngine:
                 event_ts = float(event_ts)
                 menu_state = _extract_in_menu_from_rpc(rpc)
                 if menu_state is not None and not disconnect_hit:
+                    previous_menu_state = scope.in_menu_by_uid.get(str(uid))
+                    previous_menu_ts = float(scope.last_menu_ts_by_uid.get(str(uid), 0.0) or 0.0)
                     claimed = self._claim_event_range(
                         generation_id,
                         byte_start,
@@ -2523,6 +2178,15 @@ class MultiScopeEngine:
                     scope.in_menu_by_uid[str(uid)] = menu_state
                     scope.last_menu_ts_by_uid[str(uid)] = event_ts
                     self._clear_menu_unknown(uid)
+                    if (
+                        menu_state is False
+                        and previous_menu_state is not False
+                        and event_ts >= previous_menu_ts
+                        and self._claim_event_range(
+                            generation_id, byte_start, byte_end, f"rpc:menu_exit:{uid}"
+                        )
+                    ):
+                        self._emit_event("menu_exit", uid, str(event_ts))
 
                 biome_name = _extract_biome_from_rpc(rpc)
                 if not biome_name:
@@ -2549,10 +2213,9 @@ class MultiScopeEngine:
                 scope.last_biome = biome
                 scope.last_biome_ts = event_ts
                 self._last_biome_post_by_scope[server_key] = event_ts
+                self._development_trigger(uid, f"Biome:{biome}", event_ts)
                 if biome != "NORMAL":
                     self._emit_biome_event(uid, server_key, biome, event_type="start", ts_epoch=event_ts)
-                    if biome in HARD_EVERYONE_BIOMES:
-                        self._maybe_start_temp_block(uid, f"Biome:{biome}")
                 else:
                     self._log(
                         f"[MultiScope] BIOME START suppressed | biome=NORMAL | "
@@ -2679,6 +2342,7 @@ class MultiScopeEngine:
                 or R_CONN_LOST.search(tail_text)
                 or _iter_merchant_matches(tail_text, self._merchant_detection_mode)
                 or _extract_rpc_entries_from_text(tail_text)
+                or (self._development_runtime and self._development_runtime.complete_record(tail_text))
             )
             if tail_is_complete:
                 tail_start = int(cur.pos) - len(cur.carry)
@@ -3571,7 +3235,8 @@ class MultiScopeEngine:
                 snd.shutdown(wait=False)
         except Exception:
             pass
-        # temp-block sessions currently auto-expire; no explicit cancel hook yet
+        if self._development_runtime:
+            self._development_runtime.shutdown()
         try:
             with self._stats_lock:
                 self._prune_found_events_locked(now_ts=time.time())

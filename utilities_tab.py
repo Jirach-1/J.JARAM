@@ -9,6 +9,8 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 import os, json, time, urllib.parse as _urlparse, random, threading, re
+import math
+from hashlib import sha256
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional, Set, Callable
 from collections import defaultdict
@@ -120,6 +122,33 @@ def _save_settings(settings: Dict[str, Any]) -> bool:
             return False
     _save_json(_settings_json_path(), settings)
     return True
+
+
+DEFAULT_UTILITY_TIMINGS = {
+    "api_call_delay_seconds": 2.0,
+    "account_switch_delay_seconds": 5.0,
+}
+UTILITY_DELAY_MAX_SECONDS = 300.0
+
+
+def normalize_utility_timings(config: Any) -> Dict[str, float]:
+    config = config if isinstance(config, dict) else {}
+    timings = {}
+    for key, default in DEFAULT_UTILITY_TIMINGS.items():
+        raw = config.get(key, default)
+        try:
+            value = float(raw) if not isinstance(raw, bool) else default
+        except (TypeError, ValueError, OverflowError):
+            value = default
+        if not math.isfinite(value):
+            value = default
+        timings[key] = round(max(0.0, min(UTILITY_DELAY_MAX_SECONDS, value)), 2)
+    return timings
+
+
+def _load_utility_timings() -> Dict[str, float]:
+    settings = _load_settings()
+    return normalize_utility_timings(settings.get("utilities") if isinstance(settings, dict) else None)
 
 
 class _DoubleClickPlainTextEdit(QPlainTextEdit):
@@ -407,8 +436,6 @@ _BLOCKING_API_BASE = "https://apis.roblox.com/user-blocking-api/v1/users"
 _CSRF_CACHE: Dict[str, Dict[str, Any]] = {}
 _BROWSER_ID_CACHE: Dict[str, str] = {}
 _API_CACHE_LOCK = threading.Lock()
-_BLOCKING_CALL_DELAY_SEC = 1.0
-_USER_SWAP_DELAY_SEC = 5.0
 
 
 def _transfer_cookie_caches(old_cookie: str, new_cookie: str) -> None:
@@ -603,7 +630,15 @@ def _roblox_error_code(resp: requests.Response) -> Optional[int]:
         pass
     return None
 
-def _roblox_post(session: requests.Session, cookie: str, url: str, timeout: float = 12.0) -> Tuple[Optional[requests.Response], str]:
+def _roblox_post(
+    session: requests.Session,
+    cookie: str,
+    url: str,
+    timeout: float = 12.0,
+    *,
+    response_log: Optional[Callable[[str], None]] = None,
+    label: str = "Roblox API",
+) -> Tuple[Optional[requests.Response], str]:
     cookie = str(cookie or "")
     last: Optional[requests.Response] = None
     for attempt in range(3):
@@ -612,7 +647,11 @@ def _roblox_post(session: requests.Session, cookie: str, url: str, timeout: floa
         try:
             r = session.post(url, timeout=timeout)
             last = r
-        except Exception:
+            if response_log:
+                response_log(_format_api_response_for_debug(label, r))
+        except Exception as e:
+            if response_log:
+                response_log(_format_api_response_for_debug(label, None, e))
             continue
 
         cookie = _maybe_take_updated_cookie(r, cookie, session=session)
@@ -627,7 +666,11 @@ def _roblox_post(session: requests.Session, cookie: str, url: str, timeout: floa
                 try:
                     r = session.post(url, timeout=timeout)
                     last = r
-                except Exception:
+                    if response_log:
+                        response_log(_format_api_response_for_debug(f"{label} (CSRF retry)", r))
+                except Exception as e:
+                    if response_log:
+                        response_log(_format_api_response_for_debug(f"{label} (CSRF retry)", None, e))
                     continue
                 cookie = _maybe_take_updated_cookie(r, cookie, session=session)
                 _apply_session_cookies(session, cookie)
@@ -646,9 +689,65 @@ def _roblox_post(session: requests.Session, cookie: str, url: str, timeout: floa
 
     return last, cookie
 
-def _api_block_user(session: requests.Session, cookie: str, target_user_id: str) -> Tuple[str, str]:
+def _api_get_authenticated_user(
+    session: requests.Session,
+    cookie: str,
+    *,
+    response_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[Optional[dict], str]:
+    """Resolve the cookie's owner, caching only verified identities per cookie."""
+    cookie = str(cookie or "")
+    if not cookie:
+        return None, cookie
+    fingerprint = sha256(cookie.encode("utf-8")).digest()
+    cached = getattr(session, "_jaram_authenticated_user", None)
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == fingerprint:
+        return dict(cached[1]), cookie
+    _apply_session_cookies(session, cookie)
+    try:
+        response = session.get("https://users.roblox.com/v1/users/authenticated", timeout=5)
+    except requests.RequestException as e:
+        if response_log:
+            response_log(_format_api_response_for_debug("Get authenticated user", None, e))
+        return None, cookie
+    if response_log:
+        response_log(_format_api_response_for_debug("Get authenticated user", response))
+    cookie = _maybe_take_updated_cookie(response, cookie, session=session)
+    _apply_session_cookies(session, cookie)
+    if response.status_code != 200:
+        return None, cookie
+    try:
+        data = response.json()
+    except (TypeError, ValueError):
+        return None, cookie
+    if not isinstance(data, dict):
+        return None, cookie
+    user_id = str(data.get("id") or "").strip()
+    if not re.fullmatch(r"[0-9]+", user_id) or int(user_id) <= 0:
+        return None, cookie
+    user = {"id": str(int(user_id)), "name": data.get("name") if isinstance(data.get("name"), str) else ""}
+    session._jaram_authenticated_user = (sha256(cookie.encode("utf-8")).digest(), user)
+    return dict(user), cookie
+
+
+def _api_block_user(
+    session: requests.Session,
+    cookie: str,
+    target_user_id: str,
+    *,
+    response_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, str]:
+    target_user_id = str(target_user_id).strip()
+    if not re.fullmatch(r"[0-9]+", target_user_id) or int(target_user_id) <= 0:
+        return "invalid_user_id", cookie
+    target_user_id = str(int(target_user_id))
+    user, cookie = _api_get_authenticated_user(session, cookie, response_log=response_log)
+    if user is None:
+        return "identity_unavailable (no block request sent)", cookie
+    if target_user_id == user["id"]:
+        return "self_block_skipped", cookie
     url = f"{_BLOCKING_API_BASE}/{target_user_id}/block-user"
-    r, cookie = _roblox_post(session, cookie, url)
+    r, cookie = _roblox_post(session, cookie, url, response_log=response_log, label=f"Block user {target_user_id}")
     if r is None:
         return "failed", cookie
 
@@ -671,9 +770,15 @@ def _api_block_user(session: requests.Session, cookie: str, target_user_id: str)
 
     return f"failed ({r.status_code})" + (f" {hint}" if hint else ""), cookie
 
-def _api_unblock_user(session: requests.Session, cookie: str, target_user_id: str) -> Tuple[str, str]:
+def _api_unblock_user(
+    session: requests.Session,
+    cookie: str,
+    target_user_id: str,
+    *,
+    response_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, str]:
     url = f"{_BLOCKING_API_BASE}/{target_user_id}/unblock-user"
-    r, cookie = _roblox_post(session, cookie, url)
+    r, cookie = _roblox_post(session, cookie, url, response_log=response_log, label=f"Unblock user {target_user_id}")
     if r is None:
         return "failed", cookie
 
@@ -1204,7 +1309,35 @@ class _UtilitiesRunDialog(QDialog):
         self.status.setText(s)
 
 # ---------------- Workers ----------------
-class _BlockWorker(QThread):
+class _UtilitiesWorker(QThread):
+    response_debug = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._cancel = False
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        self._cancel = True
+        self._cancel_event.set()
+
+    def _wait_delay(self, seconds: float) -> bool:
+        """Return True when cancelled, waking long configured delays immediately."""
+        return self._cancel_event.wait(seconds)
+
+    def _account_response_log(self, uid: str, data: Dict[str, Any]) -> Callable[[str], None]:
+        account_label = str(uid)
+        username = str(data.get("username") or "")
+        if username:
+            account_label += f" ({username})"
+
+        def log(s: str):
+            self.response_debug.emit(f"Account: {account_label}\n{s}")
+
+        return log
+
+
+class _BlockWorker(_UtilitiesWorker):
     progress = Signal(str)
     tick = Signal(int, int)
     done = Signal()
@@ -1218,12 +1351,11 @@ class _BlockWorker(QThread):
         else:
             self.allowed_uids = {str(x) for x in allowed_uids}
         self.force = bool(force)
-        self._cancel = False
 
-    def cancel(self): self._cancel = True
     def _emit(self, s: str): self.progress.emit(s)
 
     def run(self):
+        timings = _load_utility_timings()
         users = _load_users()
         blocklog = _load_blocklog_migrated(users)
         username_cache: Dict[str, str] = blocklog.get("username_cache", {})
@@ -1278,6 +1410,7 @@ class _BlockWorker(QThread):
             data = users.get(uid, {})
             cookie = str(data.get("cookie") or "")
             self._emit(f"[Block] {uid}: starting session")
+            response_log = self._account_response_log(uid, data)
 
             try:
                 old_cookie = cookie
@@ -1296,7 +1429,7 @@ class _BlockWorker(QThread):
             except Exception as e:
                 self._emit(f"[Block] {uid}: failed to start API session ({e})")
                 if (not self._cancel) and user_idx < (len(work_items) - 1):
-                    time.sleep(_USER_SWAP_DELAY_SEC)
+                    self._wait_delay(timings["account_switch_delay_seconds"])
                 continue
 
             blocklog.setdefault("by_user", {}).setdefault(uid, {}).setdefault("blocked", [])
@@ -1309,9 +1442,9 @@ class _BlockWorker(QThread):
                     if (not self.force) and t in blocked:
                         cur += 1; self.tick.emit(cur, total)
                         continue
-                    if did_call:
-                        time.sleep(_BLOCKING_CALL_DELAY_SEC)
-                    res, new_cookie = _api_block_user(session, cookie, t)
+                    if did_call and self._wait_delay(timings["api_call_delay_seconds"]):
+                        break
+                    res, new_cookie = _api_block_user(session, cookie, t, response_log=response_log)
                     did_call = True
                     if new_cookie and cookie and new_cookie != cookie:
                         cookie = new_cookie
@@ -1344,7 +1477,7 @@ class _BlockWorker(QThread):
             if self._cancel:
                 break
             if user_idx < (len(work_items) - 1):
-                time.sleep(_USER_SWAP_DELAY_SEC)
+                self._wait_delay(timings["account_switch_delay_seconds"])
 
         blocklog["username_cache"] = username_cache
         _save_json(_block_log_path(), blocklog)
@@ -1356,7 +1489,7 @@ class _BlockWorker(QThread):
         self._emit("[Block] " + ("Cancelled." if self._cancel else "Done."))
         self.done.emit()
 
-class _UnblockWorker(QThread):
+class _UnblockWorker(_UtilitiesWorker):
     progress = Signal(str)
     tick = Signal(int, int)
     scrub_from_persistent = Signal(list)
@@ -1371,12 +1504,11 @@ class _UnblockWorker(QThread):
         else:
             self.allowed_uids = {str(x) for x in allowed_uids}
         self.force = bool(force)
-        self._cancel = False
 
-    def cancel(self): self._cancel = True
     def _emit(self, s: str): self.progress.emit(s)
 
     def run(self):
+        timings = _load_utility_timings()
         users = _load_users()
         blocklog = _load_blocklog_migrated(users)
         username_cache: Dict[str, str] = blocklog.get("username_cache", {}) or {}
@@ -1432,6 +1564,7 @@ class _UnblockWorker(QThread):
             cookie = str(data.get("cookie") or "")
             blocked_ids = set(map(str, blocklog.get("by_user", {}).get(uid, {}).get("blocked", [])))
 
+            response_log = self._account_response_log(uid, data)
             try:
                 old_cookie = cookie
                 session, cookie = _make_blocking_api_session(cookie)
@@ -1450,7 +1583,7 @@ class _UnblockWorker(QThread):
                 self._emit(f"[Unblock] {uid}: failed to start API session ({e})")
                 cur += len(hits_for_uid); self.tick.emit(cur, total)
                 if (not self._cancel) and user_idx < (len(work_items) - 1):
-                    time.sleep(_USER_SWAP_DELAY_SEC)
+                    self._wait_delay(timings["account_switch_delay_seconds"])
                 continue
 
             try:
@@ -1462,9 +1595,9 @@ class _UnblockWorker(QThread):
                     raw_name = next((x for x in raws if not str(x).isdigit()), None)
                     label = f"@{str(raw_name).lower()}" if raw_name else t
 
-                    if did_call:
-                        time.sleep(_BLOCKING_CALL_DELAY_SEC)
-                    res, new_cookie = _api_unblock_user(session, cookie, t)
+                    if did_call and self._wait_delay(timings["api_call_delay_seconds"]):
+                        break
+                    res, new_cookie = _api_unblock_user(session, cookie, t, response_log=response_log)
                     did_call = True
                     if new_cookie and cookie and new_cookie != cookie:
                         cookie = new_cookie
@@ -1502,7 +1635,7 @@ class _UnblockWorker(QThread):
             if self._cancel:
                 break
             if user_idx < (len(work_items) - 1):
-                time.sleep(_USER_SWAP_DELAY_SEC)
+                self._wait_delay(timings["account_switch_delay_seconds"])
 
         # Scrub persistent users_to_block.txt and notify GUI to scrub the box
         scrub_names = list(removed_ids_global) + list(removed_names_global)
@@ -1526,9 +1659,8 @@ class _PSLOpts:
     expected_price: int
     only_missing: bool
 
-class _PSLWorker(QThread):
+class _PSLWorker(_UtilitiesWorker):
     progress = Signal(str)
-    response_debug = Signal(str)
     tick = Signal(int, int)
     done = Signal()
 
@@ -1539,14 +1671,11 @@ class _PSLWorker(QThread):
             self.allowed_uids = None
         else:
             self.allowed_uids = {str(x) for x in allowed_uids}
-        self._cancel = False
 
-    def cancel(self): self._cancel = True
     def _emit(self, s: str): self.progress.emit(s)
-    def _emit_response_debug(self, s: str):
-        self.response_debug.emit(s)
 
     def run(self):
+        timings = _load_utility_timings()
         users = _load_users()
         work = [(uid, d) for uid, d in users.items()
                 if str(d.get("cookie") or "")
@@ -1570,22 +1699,16 @@ class _PSLWorker(QThread):
 
             cookie = str(data.get("cookie") or "")
             username = str(data.get("username") or "")
-            account_label = str(uid)
-            if username:
-                account_label += f" ({username})"
-
-            def _emit_user_response_debug(s: str):
-                self._emit_response_debug(f"Account: {account_label}\n{s}")
-
-            response_log = _emit_user_response_debug
+            response_log = self._account_response_log(uid, data)
             session: Optional[requests.Session] = None
             did_api_call = False
 
             def _pace_api_call():
                 nonlocal did_api_call
-                if did_api_call:
-                    time.sleep(_BLOCKING_CALL_DELAY_SEC)
+                if did_api_call and self._wait_delay(timings["api_call_delay_seconds"]):
+                    return False
                 did_api_call = True
+                return not self._cancel
 
             self._emit(f"[PSL] {uid}: checking private servers")
 
@@ -1600,11 +1723,12 @@ class _PSLWorker(QThread):
                 self._emit(f"[PSL] {uid}: failed to start API session ({e})")
                 cur += 1; self.tick.emit(cur, total)
                 if (not self._cancel) and user_idx < (total - 1):
-                    time.sleep(_USER_SWAP_DELAY_SEC)
+                    self._wait_delay(timings["account_switch_delay_seconds"])
                 continue
 
             try:
-                _pace_api_call()
+                if not _pace_api_call():
+                    break
                 vip_server_id, cookie = _api_get_existing_vip_server_id(
                     session, cookie, self.opts.place_id, response_log=response_log
                 )
@@ -1612,12 +1736,14 @@ class _PSLWorker(QThread):
                     self._emit(f"[PSL] {uid}: using existing VIP server {vip_server_id}")
                 else:
                     self._emit(f"[PSL] {uid}: no private server found; creating one")
-                    _pace_api_call()
+                    if not _pace_api_call():
+                        break
                     universe_id, cookie = _api_get_universe_id(
                         session, cookie, self.opts.place_id, response_log=response_log
                     )
                     server_name = _render_psl_server_name(self.opts.name_template, username, str(uid))
-                    _pace_api_call()
+                    if not _pace_api_call():
+                        break
                     vip_server_id, cookie = _api_create_vip_server(
                         session,
                         cookie,
@@ -1628,18 +1754,21 @@ class _PSLWorker(QThread):
                     )
                     self._emit(f"[PSL] {uid}: created VIP server {vip_server_id}")
 
-                _pace_api_call()
+                if not _pace_api_call():
+                    break
                 link_code, cookie = _api_get_vip_server_link_code(
                     session, cookie, vip_server_id, response_log=response_log
                 )
                 if not link_code:
                     self._emit(f"[PSL] {uid}: joinCode was empty; requesting a new join code")
-                    _pace_api_call()
+                    if not _pace_api_call():
+                        break
                     link_code, cookie = _api_regenerate_vip_server_link_code(
                         session, cookie, vip_server_id, response_log=response_log
                     )
                     if not link_code:
-                        _pace_api_call()
+                        if not _pace_api_call():
+                            break
                         link_code, cookie = _api_get_vip_server_link_code(
                             session, cookie, vip_server_id, response_log=response_log
                         )
@@ -1674,7 +1803,7 @@ class _PSLWorker(QThread):
             if self._cancel:
                 break
             if user_idx < (total - 1):
-                time.sleep(_USER_SWAP_DELAY_SEC)
+                self._wait_delay(timings["account_switch_delay_seconds"])
 
         if any_update:
             if not _save_users(users):
@@ -1787,7 +1916,7 @@ def build_utilities_widget(self) -> QWidget:
     self.utilities_api_log_box.setReadOnly(True)
     self.utilities_api_log_box.setMinimumHeight(180)
     self.utilities_api_log_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-    self.utilities_api_log_box.setPlaceholderText("PSL API responses will appear here while response logging is enabled.")
+    self.utilities_api_log_box.setPlaceholderText("Blocking, unblocking, and PSL API responses will appear here.")
     self.utilities_api_log_label.hide()
     self.utilities_api_log_box.hide()
     v.addWidget(self.utilities_api_log_label)
@@ -2083,6 +2212,7 @@ def build_utilities_widget(self) -> QWidget:
         w.tick.connect(lambda cur, tot: (dlg.set_total(tot), dlg.set_value(cur)))
         w.done.connect(lambda: (self.append_log("[Utilities] Blocking complete."),
                                 dlg.accept(), _set_util_busy(False)))
+        w.response_debug.connect(_append_api_response_log)
         dlg.cancel_btn.clicked.connect(w.cancel)
 
         self._active_worker = w
@@ -2109,6 +2239,7 @@ def build_utilities_widget(self) -> QWidget:
         w.scrub_from_persistent.connect(_scrub)
         w.done.connect(lambda: (self.append_log("[Utilities] Unblocking complete."),
                                 dlg.accept(), _set_util_busy(False)))
+        w.response_debug.connect(_append_api_response_log)
         dlg.cancel_btn.clicked.connect(w.cancel)
 
         self._active_worker = w

@@ -8,6 +8,7 @@ DEFAULT_CAP_WATCHDOG_SETTINGS = {
     "missing_username_timeout_seconds": 360,
     "in_menu_none_increments_cap": True,
     "in_menu_none_timeout_seconds": 120,
+    "log_disconnect_increments_cap": False,
     "cap_counter_limit": 3,
 }
 
@@ -48,6 +49,12 @@ def normalize_cap_watchdog_settings(raw: object) -> dict:
             defaults["in_menu_none_timeout_seconds"],
             1,
             86_400,
+        ),
+        "log_disconnect_increments_cap": bool(
+            source.get(
+                "log_disconnect_increments_cap",
+                defaults["log_disconnect_increments_cap"],
+            )
         ),
         "cap_counter_limit": _bounded_int(
             source.get("cap_counter_limit"),

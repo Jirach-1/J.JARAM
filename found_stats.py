@@ -9,8 +9,8 @@ import faulthandler
 from pathlib import Path
 from typing import Dict, Optional
 
-from PySide6.QtCore import QPointF, QRect, Qt, QTimer
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPainterPath, QRadialGradient
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -477,6 +477,12 @@ class FoundStatsMixin:
         P_SGR = _stable_u32("sgr")
         P_SGPH = _stable_u32("sgph")
 
+        P_FX = _stable_u32("forest_x")
+        P_FY = _stable_u32("forest_y")
+        P_FSP = _stable_u32("forest_speed")
+        P_FPH = _stable_u32("forest_phase")
+        P_FSZ = _stable_u32("forest_size")
+
         P_M = _stable_u32("m")
         P_RS = _stable_u32("rs")
         P_RO = _stable_u32("ro")
@@ -549,6 +555,56 @@ class FoundStatsMixin:
 
                 # Constant “rainy splash” brush color
                 self._splash = QColor(190, 220, 255, 70)
+
+                # Reuse the same pointed leaf outline for both forest effects.
+                self._forest_leaf = QPainterPath()
+                self._forest_leaf.moveTo(-1.0, 0.0)
+                self._forest_leaf.quadTo(0.0, -0.85, 1.0, 0.0)
+                self._forest_leaf.quadTo(0.0, 0.85, -1.0, 0.0)
+                self._forest_leaf.closeSubpath()
+
+                self._forest_ray = QPainterPath()
+                self._forest_ray.moveTo(-0.12, 0.0)
+                self._forest_ray.lineTo(0.12, 0.0)
+                self._forest_ray.lineTo(0.85, 1.0)
+                self._forest_ray.lineTo(0.20, 1.0)
+                self._forest_ray.closeSubpath()
+
+                # Periodic, feathered textures avoid hard oval edges and tile seams.
+                self._forest_fog = {
+                    "RADIANT FOREST": self._make_forest_fog(174, 133, 230),
+                    "LOST FOREST": self._make_forest_fog(120, 167, 143),
+                }
+                self._forest_firefly = QImage(24, 24, QImage.Format.Format_ARGB32_Premultiplied)
+                self._forest_firefly.fill(Qt.GlobalColor.transparent)
+                halo = QRadialGradient(QPointF(12.0, 12.0), 12.0)
+                halo.setColorAt(0.0, QColor(249, 255, 221, 255))
+                halo.setColorAt(0.10, QColor(216, 255, 204, 235))
+                halo.setColorAt(0.24, QColor(164, 247, 213, 90))
+                halo.setColorAt(0.55, QColor(140, 230, 219, 24))
+                halo.setColorAt(1.0, QColor(140, 230, 219, 0))
+                fog_painter = QPainter(self._forest_firefly)
+                fog_painter.fillRect(self._forest_firefly.rect(), halo)
+                fog_painter.end()
+
+            @staticmethod
+            def _make_forest_fog(red: int, green: int, blue: int) -> QImage:
+                width, height = 256, 64
+                pixels = bytearray(width * height * 4)
+                for x in range(width):
+                    phase = math.tau * x / width
+                    ridge_a = 0.46 + 0.12 * math.sin(phase) + 0.06 * math.sin(phase * 3.0)
+                    ridge_b = 0.67 + 0.10 * math.sin(phase * 2.0 + 1.3)
+                    density = 0.65 + 0.20 * math.sin(phase * 2.0 + 0.7)
+                    for y in range(height):
+                        fy = y / (height - 1)
+                        wisps = math.exp(-((fy - ridge_a) / 0.18) ** 2)
+                        wisps += 0.55 * math.exp(-((fy - ridge_b) / 0.12) ** 2)
+                        edge_fade = math.sin(math.pi * fy) ** 2
+                        alpha = min(100, int(100.0 * wisps * density * edge_fade))
+                        offset = (y * width + x) * 4
+                        pixels[offset:offset + 4] = bytes((red, green, blue, alpha))
+                return QImage(pixels, width, height, width * 4, QImage.Format.Format_RGBA8888).copy()
 
             def paint(self, painter, option, index) -> None:
                 t0_perf = time.perf_counter() if FOUND_STATS_DEBUG else 0.0
@@ -657,6 +713,9 @@ class FoundStatsMixin:
                 is_aurora = biome_key == "AURORA"
                 is_eggland = biome_key == "EGGLAND"
                 is_singularity = biome_key == "SINGULARITY"
+                is_radiant_forest = biome_key == "RADIANT FOREST"
+                is_lost_forest = biome_key == "LOST FOREST"
+                is_forest = is_radiant_forest or is_lost_forest
 
                 is_void = is_null or is_corruption
                 is_celestial = is_starfall or is_aurora or is_heaven
@@ -755,6 +814,17 @@ class FoundStatsMixin:
                     hue_amp = 0.15
                     shimmer = 1.05
                     glow_alpha = 140
+                elif is_radiant_forest:
+                    speed *= 0.75
+                    hue_amp = 0.035
+                    shimmer = 1.35
+                    glow_alpha = 170
+                elif is_lost_forest:
+                    speed *= 0.48
+                    amp *= 0.65
+                    hue_amp = 0.025
+                    shimmer = 0.40
+                    glow_alpha = 75
                 elif is_cyber:
                     speed *= 1.10
                     amp *= 0.85
@@ -814,6 +884,89 @@ class FoundStatsMixin:
 
                 # --- Background "atmosphere" per biome (behind the text) --------
                 try:
+                    if is_forest:
+                        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                        painter.setPen(Qt.PenStyle.NoPen)
+
+                        if is_radiant_forest:
+                            # Shafts of enchanted light sweep slowly through the canopy.
+                            ray_light = QLinearGradient(0.0, 0.0, 0.0, 1.0)
+                            ray_light.setColorAt(0.0, QColor(203, 163, 255, 75))
+                            ray_light.setColorAt(0.45, QColor(172, 206, 255, 35))
+                            ray_light.setColorAt(1.0, QColor(151, 243, 225, 0))
+                            painter.setBrush(ray_light)
+                            for k in range(7):
+                                ray_x = rx0 + rw0 * (k + 0.3) / 7.0
+                                ray_x += math.sin(t * 0.38 + k + phase0) * 10.0
+                                painter.save()
+                                try:
+                                    painter.translate(ray_x, ry0)
+                                    painter.scale(15.0 + 12.0 * _r01(P_FSZ, k, 3), rh0)
+                                    painter.drawPath(self._forest_ray)
+                                finally:
+                                    painter.restore()
+
+                        # Counter-drifting translucent wisps form layers of rolling fog.
+                        fog = self._forest_fog[biome_key]
+                        tile_w = max(140.0, rw0 * 0.72)
+                        painter.save()
+                        try:
+                            for layer in range(3):
+                                direction = 1.0 if layer % 2 == 0 else -1.0
+                                offset = (t * (8.0 + 5.0 * layer) * direction + tile_w * layer * 0.31) % tile_w
+                                fog_y = ry0 + rh0 * (0.02 + 0.19 * layer)
+                                fog_y += math.sin(t * 0.32 + layer * 1.9 + phase0) * rh0 * 0.06
+                                painter.setOpacity(0.31 if is_radiant_forest else 0.36)
+                                for tile in range(int(math.ceil(rw0 / tile_w)) + 1):
+                                    painter.drawImage(QRectF(rx0 - offset + tile * tile_w, fog_y, tile_w, rh0), fog)
+                        finally:
+                            painter.restore()
+
+                        # Leaves rise in the radiant updraft and tumble down in Lost Forest.
+                        leaf = QColor()
+                        for k in range(18 if is_radiant_forest else 8):
+                            leaf_phase = phase0 + math.tau * _r01(P_FPH, k)
+                            travel = (t * (5.0 + 7.0 * _r01(P_FSP, k)) + (rh0 + 16.0) * _r01(P_FY, k)) % (rh0 + 16.0)
+                            leaf_y = rbottom + 8.0 - travel if is_radiant_forest else ry0 - 8.0 + travel
+                            leaf_x = rx0 + rw0 * _r01(P_FX, k) + math.sin(t * 0.85 + leaf_phase) * 9.0
+                            leaf_hue = (0.73 + 0.10 * _r01(P_FPH, k)) if is_radiant_forest else (0.27 + 0.12 * _r01(P_FPH, k))
+                            leaf.setHsvF(leaf_hue, 0.48 if is_radiant_forest else 0.65, 0.95 if is_radiant_forest else 0.68, 0.55)
+                            painter.setBrush(leaf)
+                            painter.save()
+                            try:
+                                painter.translate(leaf_x, leaf_y)
+                                painter.rotate(35.0 * math.sin(t * 1.10 + leaf_phase) + t * (22.0 if is_radiant_forest else 38.0))
+                                leaf_size = 2.8 + 1.8 * _r01(P_FSZ, k)
+                                painter.scale(leaf_size, leaf_size)
+                                painter.drawPath(self._forest_leaf)
+                            finally:
+                                painter.restore()
+
+                        if is_radiant_forest:
+                            # A denser cloud of luminous fireflies and occasional starbursts.
+                            painter.save()
+                            try:
+                                for k in range(36):
+                                    fly_phase = phase0 + math.tau * _r01(P_FPH, k, 2)
+                                    fly_x = rx0 + rw0 * _r01(P_FX, k, 2) + math.sin(t * 0.80 + fly_phase) * 9.0
+                                    fly_travel = t * (4.0 + 8.0 * _r01(P_FSP, k, 2))
+                                    fly_y = rbottom + 6.0 - ((fly_travel + (rh0 + 12.0) * _r01(P_FY, k, 2)) % (rh0 + 12.0))
+                                    pulse = 0.5 + 0.5 * math.sin(t * 2.4 + fly_phase)
+                                    radius = 3.0 + 2.0 * _r01(P_FSZ, k, 2) + pulse
+                                    painter.setOpacity(0.40 + 0.60 * pulse)
+                                    painter.drawImage(
+                                        QRectF(fly_x - radius, fly_y - radius, radius * 2.0, radius * 2.0),
+                                        self._forest_firefly,
+                                    )
+                                    if k % 4 == 0 and pulse > 0.70:
+                                        painter.setPen(QColor(238, 255, 220, int(180.0 * pulse)))
+                                        arm = 1.5 + pulse
+                                        painter.drawLine(QPointF(fly_x - arm, fly_y), QPointF(fly_x + arm, fly_y))
+                                        painter.drawLine(QPointF(fly_x, fly_y - arm), QPointF(fly_x, fly_y + arm))
+                            finally:
+                                painter.restore()
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+
                     if is_rainy or is_blood:
                         col = QColor(base)
                         if is_blood:
@@ -1368,6 +1521,8 @@ class FoundStatsMixin:
                     sweep_speed = 1.0
                 elif is_singularity:
                     sweep_speed = 1.8
+                elif is_radiant_forest:
+                    sweep_speed = 1.15
                 sweep_pos = ((t * sweep_speed) + float((seed >> 16) % 13)) % float(len(text) + 10) - 5.0
 
                 scan_y = ry0 + ((t * 70.0 + float(seed % 997)) % rh0)
@@ -1517,6 +1672,14 @@ class FoundStatsMixin:
                         dx += math.sin(spin) * (amp * (0.30 + 0.45 * pull))
                         dy += math.cos(spin * 1.18) * (amp * (0.55 + 0.30 * pull))
                         dx -= center_offset * 0.14 * (0.55 + 0.45 * math.sin(t * 1.20 + ph))
+                    elif is_radiant_forest:
+                        # A soft, coordinated lift like leaves in an enchanted breeze.
+                        dy += math.sin(t * 1.05 + i * 0.32 + phase0) * (amp * 0.65)
+                        dx += math.sin(t * 0.70 + ph) * (amp * 0.20)
+                    elif is_lost_forest:
+                        # Slow, uneven swaying through the mist.
+                        dy += math.sin(t * 0.60 + ph) * (amp * 0.40)
+                        dx += math.sin(t * 0.45 + i * 0.24 + phase0) * (amp * 0.35)
                     elif is_corruption:
                         # Corrupted crawl + occasional snap (no wave).
                         frame = int(t * 10.0)
@@ -1640,6 +1803,16 @@ class FoundStatsMixin:
                         hue = (0.01 + (0.07 * well) + (pos * 0.02)) % 1.0
                         sat = _clamp01(max(sat * 0.95, 0.72))
                         val = _clamp01(max(val * 0.92, 0.55 + 0.38 * well))
+                    if is_radiant_forest:
+                        bloom = 0.5 + 0.5 * math.sin(t * 1.05 + i * 0.28 + phase0)
+                        hue = (hue0 + 0.035 * math.sin(t * 0.70 + i * 0.18 + phase0)) % 1.0
+                        sat = 0.48 + 0.25 * bloom
+                        val = 0.82 + 0.18 * bloom
+                    elif is_lost_forest:
+                        breath = 0.5 + 0.5 * math.sin(t * 0.65 + i * 0.20 + phase0)
+                        hue = (hue0 + 0.025 * math.sin(t * 0.45 + i * 0.15 + phase0)) % 1.0
+                        sat = 0.60 + 0.16 * breath
+                        val = 0.62 + 0.18 * breath
                     if is_glitch:
                         # Hard swap between RGB primaries + white (no hue drifting).
                         rgb_frame = int(t * 8.0)
@@ -1656,7 +1829,7 @@ class FoundStatsMixin:
 
                     # Highlight/sweep (stars, aurora ribbon, cyber scanline, sun flare).
                     hi = 0.0
-                    if is_starfall or is_aurora or is_heaven or is_cyber or is_blazing or is_incinerator or is_eggland or is_singularity:
+                    if is_starfall or is_aurora or is_heaven or is_cyber or is_blazing or is_incinerator or is_eggland or is_singularity or is_radiant_forest:
                         radius = 3.0
                         if is_aurora:
                             radius = 4.6

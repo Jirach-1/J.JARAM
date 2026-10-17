@@ -1,3 +1,4 @@
+import asyncio
 import time
 import tempfile
 import re
@@ -272,6 +273,143 @@ class CookieExtractionThread(QThread):
         self._cleanup_browser()
 
 
+class ZenDriverCookieExtractionThread(QThread):
+    """Extract a Roblox login cookie through ZenDriver's CDP connection."""
+
+    cookie_extracted = Signal(str)
+    extraction_failed = Signal(str)
+    status_update = Signal(str)
+    browser_ready = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.browser = None
+        self.should_stop = False
+        self.extraction_timeout = 600
+        self.extraction_completed = False
+
+    def run(self):
+        try:
+            asyncio.run(self._run_async())
+        except ModuleNotFoundError as exc:
+            if not self.should_stop and not self.extraction_completed:
+                self.extraction_completed = True
+                if exc.name == "zendriver":
+                    self.extraction_failed.emit(
+                        "ZenDriver is not installed. Install the project requirements and try again."
+                    )
+                else:
+                    self.extraction_failed.emit(f"Failed to load ZenDriver dependency: {exc}")
+        except Exception as exc:
+            if not self.should_stop and not self.extraction_completed:
+                self.extraction_completed = True
+                self.extraction_failed.emit(f"Unexpected ZenDriver error: {exc}")
+
+    async def _run_async(self):
+        try:
+            self.status_update.emit("Initializing browser with ZenDriver...")
+            import zendriver
+
+            self.browser = await zendriver.start(
+                headless=False,
+                browser_args=[
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--window-size=1200,800",
+                ],
+            )
+            if self.should_stop:
+                return
+
+            self.status_update.emit("Navigating to Roblox login page...")
+            page = await self.browser.get("https://www.roblox.com/login")
+            if self.should_stop:
+                return
+
+            self.status_update.emit("Browser ready - Please complete login manually")
+            self.browser_ready.emit()
+
+            start_time = time.monotonic()
+            login_detected = False
+            while (
+                not self.should_stop
+                and not self.extraction_completed
+                and (time.monotonic() - start_time) < self.extraction_timeout
+            ):
+                try:
+                    if self.browser.stopped:
+                        self.extraction_completed = True
+                        self.extraction_failed.emit("Browser window was closed by user")
+                        return
+
+                    current_url = str(getattr(page, "url", "") or "")
+                    if not login_detected and _is_roblox_login_success_url(current_url):
+                        login_detected = True
+                        self.status_update.emit("Login detected! Extracting cookie...")
+
+                    cookie = await self._extract_roblosecurity_cookie()
+                    if cookie:
+                        self.extraction_completed = True
+                        self.cookie_extracted.emit(cookie)
+                        return
+                except Exception as exc:
+                    if self.browser is None or self.browser.stopped:
+                        self.extraction_completed = True
+                        self.extraction_failed.emit("Browser connection lost")
+                        return
+                    # A navigation can briefly replace the active CDP target. Keep
+                    # polling while ZenDriver refreshes its list of browser tabs.
+                    self.status_update.emit(f"Waiting for login to finish... ({type(exc).__name__})")
+
+                await asyncio.sleep(1)
+
+                open_tabs = [tab for tab in self.browser.tabs if not tab.closed]
+                if open_tabs:
+                    page = open_tabs[-1]
+
+            if not self.should_stop and not self.extraction_completed:
+                self.extraction_completed = True
+                self.extraction_failed.emit("Login timeout - please try again")
+        finally:
+            await self._cleanup_browser()
+
+    async def _extract_roblosecurity_cookie(self) -> Optional[str]:
+        if self.browser is None:
+            return None
+
+        cookies = await self.browser.cookies.get_all()
+        for cookie in cookies:
+            if str(getattr(cookie, "name", "") or "") != ROBLOSECURITY_COOKIE_NAME:
+                continue
+            cookie_value = str(getattr(cookie, "value", "") or "")
+            if is_probably_roblosecurity is not None:
+                try:
+                    if not is_probably_roblosecurity(cookie_value):
+                        continue
+                except Exception:
+                    continue
+            elif not cookie_value:
+                continue
+            return cookie_value
+        return None
+
+    async def _cleanup_browser(self):
+        browser = self.browser
+        self.browser = None
+        if browser is not None:
+            try:
+                await browser.stop()
+            except Exception:
+                pass
+
+    def stop_extraction(self):
+        # The worker's asyncio loop observes this flag within one second and
+        # performs ZenDriver cleanup on the same thread/event loop that owns it.
+        self.should_stop = True
+        if not self.extraction_completed:
+            self.extraction_completed = True
+
+
 class BrowserLaunchThread(QThread):
     launched = Signal(object)
     launch_failed = Signal(str)
@@ -415,16 +553,29 @@ class CookieExtractor(QObject):
         self._browser_threads = []
         self._browser_drivers = []
 
-    def extract_cookie_async(self, callback: Callable[[str], None], parent_widget=None):
+    def extract_cookie_async(
+        self,
+        callback: Callable[[str], None],
+        parent_widget=None,
+        method: str = "selenium",
+    ):
         if self.extraction_thread and self.extraction_thread.isRunning():
             QMessageBox.warning(parent_widget, "Extraction in Progress",
                               "Cookie extraction is already in progress. Please wait.")
             return
 
+        method = str(method or "selenium").strip().lower()
+        if method not in {"selenium", "zendriver"}:
+            raise ValueError(f"Unsupported browser login method: {method}")
+
         self.callback = callback
         self.callback_called = False
+        self.extraction_method = method
 
-        self.extraction_thread = CookieExtractionThread()
+        if method == "zendriver":
+            self.extraction_thread = ZenDriverCookieExtractionThread()
+        else:
+            self.extraction_thread = CookieExtractionThread()
         self.extraction_thread.cookie_extracted.connect(self._on_cookie_extracted)
         self.extraction_thread.extraction_failed.connect(self._on_extraction_failed)
         self.extraction_thread.status_update.connect(self._on_status_update)
@@ -437,8 +588,9 @@ class CookieExtractor(QObject):
 
     def _create_progress_dialog(self, parent_widget):
         self.progress_dialog = QProgressDialog(parent_widget)
-        self.progress_dialog.setWindowTitle("Cookie Extraction")
-        self.progress_dialog.setLabelText("Initializing browser...")
+        method_label = "ZenDriver" if getattr(self, "extraction_method", "selenium") == "zendriver" else "Selenium"
+        self.progress_dialog.setWindowTitle(f"Cookie Extraction - {method_label}")
+        self.progress_dialog.setLabelText(f"Initializing browser with {method_label}...")
         self.progress_dialog.setRange(0, 0)
         self.progress_dialog.setCancelButtonText("Cancel")
         self.progress_dialog.setModal(True)

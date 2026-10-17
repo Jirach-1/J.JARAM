@@ -23,12 +23,14 @@
 - Optional **Spares Mode** to keep standby accounts for fast handoffs
 - Window-limit enforcement, orphan cleanup, and an optional age-based kill watchdog (with Discord webhook ping)
 - Per-account launch priorities; higher-priority waiting accounts launch first
+- Missing usernames and log disconnections send an account to the back of its next launch queue
+- **Settings > CAP Watchdog Settings > Log Disconnections** can count disconnections toward the shared CAP limit (off by default); enabling it keeps the counter across username matches and retries until the account exits the main menu, which resets the counter
 - Dashboard controls to restart every session or terminate managed processes
 
 ### Account + Cookie Tools
 - `Accounts` tab plus the richer `File > Manage Users` editor (automatic `users.json` backups)
 - Multi-select launching, saved account descriptions, activity/last-launch tracking, and filtered bulk deletion
-- Cookie helpers, including **Login with Browser** (Selenium) to extract `.ROBLOSECURITY`
+- Cookie helpers, including **Login with Browser** (Selenium or ZenDriver) to extract `.ROBLOSECURITY`
 - Supports private servers (link-based) and public places (place ID)
 - Optional password-based AES-GCM encryption for stored cookies and the Discord bot token
 - Lock/unlock, change-password, decrypt, and emergency-reset controls under `File > Cookie Encryption...`
@@ -71,6 +73,8 @@
 - Remote PSL grabbing plus Roblox block/unblock utilities
 - Commands: `/help`, `/status`, `/enable`, `/disable`, `/action`, `/clearflags`, `/restartall`, `/psl`, `/block`, and `/unblock` (`/list` is available in supported builds)
 - Auto-start support, an in-app command reference/log, and command usage records in `logs/discord_command_usage.jsonl`
+- In builds with Discord user linking, **Linked User Role** manages one role in a configured server. Users linked to at least one saved JARAM account receive it; every unlinked member loses it. Set the server and role IDs, enable the feature, and click **Save Config**. Synchronization runs on startup, after saving/removing links, on member joins and role changes, and every minute; **Sync Roles Now** queues an extra pass.
+- Role management requires **Server Members Intent** under Bot > Privileged Gateway Intents in the Discord Developer Portal, plus **Manage Roles** permission and a bot role higher than the linked-user role. Use an unmanaged role other than `@everyone`. Failed reads of the saved links or server member list skip synchronization and retry later.
 
 ### Resource Controls
 - `Trimmer` tab: periodically trims Roblox working-set (optional threshold)
@@ -79,6 +83,7 @@
 ### Extras Menu Tools
 - **Found Stats...**: all-time and time-window biome/merchant totals
 - **Roblox Multi-Instance**: allow multiple Roblox Player processes
+- **Roblox Settings Editor...**: edit every typed value in `GlobalBasicSettings_13.xml`, switch named profiles, and control the file's Read-only attribute
 - **Merchant Fix**: Classic whole-PC or Smart per-managed-process asset blocking for merchant log detection
 - **RAM Export**: import accounts from Roblox Account Manager into `users.json`
 - **Utilities**: block/unblock tools + private server link (PSL) grabber
@@ -117,9 +122,14 @@ All configuration files are stored in `%APPDATA%\\JARAM\\` (use `File > Show Con
 - `found_stats.json` - all-time biome/merchant counters (Multiscope)
 - `block_log.json`, `users_to_block.txt` - Utilities state
 - `manager_pause_state.json` - manager/Multiscope state used during pause and resume
+- `roblox_profiles\` - named snapshots created by the Roblox Settings Editor
 - `logs\` - Merchant Fix activity and Discord command audit logs
 
 When Cookie Encryption is enabled, cookies in `users.json` and the configured Discord bot token are encrypted at rest. JARAM asks for the password at startup; automation that needs a cookie remains unavailable until the store is unlocked. The password cannot be recovered, so retain a secure copy outside JARAM.
+
+New encryption setups and password changes use PBKDF2-HMAC-SHA256 with 600,000 iterations. Existing stores keep their recorded iteration count until the password is changed. Backups made before encryption was enabled may still contain plaintext secrets; use **Encrypt sensitive data in existing backup files** in the Cookie Encryption dialog to protect them.
+
+Password changes stage the new encrypted users and settings together. If the app stops while applying them, the next launch completes the change before loading either file; unlock with the new password. A staging failure leaves the old files in place. If the pending record is damaged or cannot be replayed, startup stops with an error rather than loading a mismatched pair.
 
 ## Usage Notes
 
@@ -127,15 +137,25 @@ When Cookie Encryption is enabled, cookies in `users.json` and the configured Di
 - Use the `Accounts` tab or `File > Manage Users`.
 - Cookies:
   - Manual: copy `.ROBLOSECURITY` from browser DevTools.
-  - Built-in: click **Login with Browser** (requires Chrome + Selenium).
+  - Built-in: choose Selenium or ZenDriver from the button's corner menu, then click **Login with Browser** (requires Chrome).
 
 ### OCR Setup
 1. Open the `OCR` tab and enable OCR.
 2. Calibrate ROI (chat area), adjust color filters and cooldowns.
 3. If you see "DirectML provider is not available", install `onnxruntime-directml` or switch OCR device to CPU.
+4. **Capture mode** selects **PrintWindow (Default)** or **Windows Graphics Capture**.
+   WGC captures overlapping windows without calling PrintWindow and applies to OCR
+   scanning, verification, previews/calibration, and Auto Actions OCR checks. It
+   requires Windows 10 1903+ and the `wgc_capture_native` extension (built with the
+   other native modules). Keep Roblox restored, not minimized. Windows may show
+   a capture border. WGC errors are reported instead of falling back to PrintWindow.
 
 ### RAM (Roblox Account Manager) Import
 - Use `Extras > RAM Export` to fetch accounts from RAM via its HTTP API and merge/replace `users.json`.
+
+### Windows Clock Sync
+- Enable **Settings > Misc > Sync Windows clock on startup** and save settings. On the next J.JARAM launch, the app requests a one-time sync from the configured Windows Time service using `w32tm /resync`.
+- The result appears in the app log. Windows Time must be available, and Windows may require J.JARAM to run as Administrator for the request to succeed.
 
 ### Auto Actions Setup
 1. Open `Auto Actions`, enable the engine, and select the target users.
@@ -159,6 +179,11 @@ Treat the bot token like a password. Cookie Encryption also protects it in `sett
 - Open `Extras > Merchant Fix`.
 - **Classic** applies the asset-delivery block to the whole PC and requires Roblox to be closed during preparation.
 - **Smart** applies PID-scoped blocks only to selected accounts managed by JARAM and supports a configurable log trigger/delay.
+- **Request Filter (Dev)** filters individual asset IDs in managed launches using Roblox's exported TLS session keys while preserving its server certificate. After updating JARAM, restart JARAM and the filtered Roblox clients so new launches receive the relay settings.
+- Request Filter currently handles HTTP/1.x over TLS 1.3. Unsupported protocols or missing key export are forwarded without filtering and reported as **Degraded** in the block list and activity log. On Windows, a local pipe restricted to the current user and SYSTEM receives exported keys into bounded memory, without accumulating a key file. Required keys are retained until their connection closes.
+- The relay logs lifetime connection, bypass, closure, and warning-reason totals every 30 seconds. Degraded status retains the last warning and distinguishes lifetime failures from currently unfiltered connections. HTTP/2 prefaces and HTTP/1 framing failures have separate diagnostics; HTTP/2 filtering remains unsupported.
+- Normal Request Filter helpers automatically inspect HTTP/2 request categories while HTTP/1 asset filtering continues. The existing `asset_request_filter.log` includes `http2_inspection` totals every 30 seconds and at shutdown: observed connections/requests, batch requests, batch POSTs, other/unclassified requests, and incomplete observations/errors/limits. A separate warning marks the first HTTP/2 batch request detected in that helper run. URLs, query strings, headers, bodies, and TLS secrets are omitted. Inspection failures stop only observation. Restart the helper after updating to enable collection; a paused/resumed helper keeps its previous code. `available: false` or missing-dependency counts mean `hpack` must be installed/included in the build before coverage can be assessed.
+- `tests/manual_asset_filter_http2_inspection.py` runs an isolated, inspection-only Roblox launch (requires `hpack` and existing local Roblox clients closed). Use `--join-url` with an experience/private-server link to sample in-game traffic; the link/code is omitted from reports. Unlike normal Request Filter, this standalone diagnostic also disables HTTP/1 filtering. It uses the same passive HTTP/2 observer and records only aggregate counters.
 - Administrator access may be requested for the elevated helper. 
 - Use the same window to inspect active blocks and the activity log.
 

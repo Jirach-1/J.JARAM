@@ -46,6 +46,32 @@ def format_discord_ids(values: Any) -> str:
     return ", ".join(ids)
 
 
+def normalize_linked_role_config(raw: Any) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "guild_id": str(raw.get("guild_id") or "").strip(),
+        "role_id": str(raw.get("role_id") or "").strip(),
+    }
+
+
+def valid_discord_snowflake(value: Any) -> bool:
+    return (
+        isinstance(value, str) and 1 <= len(value) <= 20
+        and value.isascii() and value.isdigit() and 0 < int(value) < 2**64
+    )
+
+
+def linked_role_config_error(raw: Any) -> str:
+    config = normalize_linked_role_config(raw)
+    if config["enabled"]:
+        for key, label in (("guild_id", "server"), ("role_id", "role")):
+            value = config[key]
+            if not valid_discord_snowflake(value):
+                return f"Enter a valid numeric Discord {label} ID for linked-user roles."
+    return ""
+
+
 class DiscordBotService:
     def __init__(
         self,
@@ -61,6 +87,7 @@ class DiscordBotService:
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._bot = None
+        self._linked_role_sync = None
         self._config: Dict[str, Any] = {}
         self._startup_event = threading.Event()
 
@@ -82,6 +109,46 @@ class DiscordBotService:
         with self._lock:
             return dict(self._config or {})
 
+    def request_linked_role_sync(self) -> bool:
+        """Queue reconciliation without blocking the GUI on Discord requests."""
+        with self._lock:
+            loop, sync = self._loop, self._linked_role_sync
+        if loop is None or sync is None or not loop.is_running():
+            return False
+        try:
+            loop.call_soon_threadsafe(sync.request_sync)
+            return True
+        except RuntimeError:
+            return False
+
+    def lookup_member(self, guild_id: str, user_id: str, timeout: float = 8.0) -> dict:
+        """Fetch current membership and roles on the running bot's event loop."""
+        with self._lock:
+            loop, bot = self._loop, self._bot
+        if loop is None or bot is None or not loop.is_running() or not bot.is_ready():
+            return {"ok": False, "message": "Discord bot is not connected."}
+        if not str(guild_id).isdigit() or not str(user_id).isdigit():
+            return {"ok": False, "message": "Invalid Discord server or user ID."}
+
+        async def fetch():
+            guild = bot.get_guild(int(guild_id))
+            if guild is None:
+                return {"ok": False, "message": "Discord bot is not in the configured server."}
+            try:
+                member = await guild.fetch_member(int(user_id))
+            except discord.NotFound:
+                return {"ok": True, "present": False, "roles": []}
+            except discord.HTTPException:
+                return {"ok": False, "message": "Discord member check failed."}
+            return {"ok": True, "present": True, "roles": [str(role.id) for role in member.roles]}
+
+        future = asyncio.run_coroutine_threadsafe(fetch(), loop)
+        try:
+            return future.result(timeout=timeout)
+        except Exception:
+            future.cancel()
+            return {"ok": False, "message": "Discord member check timed out."}
+
     def start(self, config: Dict[str, Any]) -> Tuple[bool, str]:
         normalized = self._normalize_config(config)
         if not self.is_available():
@@ -94,6 +161,11 @@ class DiscordBotService:
             msg = "Discord bot token is empty."
             self._set_state("error", msg)
             return False, msg
+
+        role_error = linked_role_config_error(normalized.get("linked_role"))
+        if role_error:
+            self._set_state("error", role_error)
+            return False, role_error
 
         with self._lock:
             if self._thread and self._thread.is_alive():
@@ -158,6 +230,7 @@ class DiscordBotService:
             "admin_role_ids": normalize_discord_ids(config.get("admin_role_ids")),
             "allow_discord_admin_permission": bool(config.get("allow_discord_admin_permission", True)),
             "user_account_list_visible": bool(config.get("user_account_list_visible", False)),
+            "linked_role": normalize_linked_role_config(config.get("linked_role")),
         }
 
     def _log(self, message: str) -> None:
@@ -203,6 +276,12 @@ class DiscordBotService:
             self._log(f"[Discord Control] Bot exited with error: {exc}")
             self._set_state("error", f"Discord bot error: {exc}")
         finally:
+            sync = self._linked_role_sync
+            if sync is not None:
+                try:
+                    loop.run_until_complete(sync.close())
+                except Exception:
+                    pass
             try:
                 loop.run_until_complete(loop.shutdown_asyncgens())
             except Exception:
@@ -215,6 +294,7 @@ class DiscordBotService:
                 self._thread = None
                 self._loop = None
                 self._bot = None
+                self._linked_role_sync = None
 
     def _build_bot(self, config: Dict[str, Any]):
         if commands is None or discord is None:
@@ -226,6 +306,15 @@ class DiscordBotService:
         user_account_list_visible = bool(config.get("user_account_list_visible", False))
 
         intents = discord.Intents.default()
+        role_sync_cls = None
+        role_config = normalize_linked_role_config(config.get("linked_role"))
+        if role_config["enabled"]:
+            try:
+                from dev_only.discord_user_linking import DiscordLinkedRoleSync
+                role_sync_cls = DiscordLinkedRoleSync
+            except ImportError:
+                self._log("[Discord Roles] Linked-user role management is unavailable in this build.")
+        intents.members = role_sync_cls is not None
 
         bot = commands.Bot(
             command_prefix=commands.when_mentioned,
@@ -233,6 +322,8 @@ class DiscordBotService:
             help_command=None,
             case_insensitive=True,
         )
+        if role_sync_cls is not None:
+            self._linked_role_sync = role_sync_cls(self, bot, role_config)
         service = self
         tree_synced = False
 
