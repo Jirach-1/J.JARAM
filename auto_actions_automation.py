@@ -3924,8 +3924,8 @@ class AutoActionEngine:
         filters = user_filters if user_filters is not None else self._compile_item_user_filters(cfg)
 
         with self._state_lock:
-            # Usually this is empty. Do not parse/filter rules for hundreds of
-            # accounts when no pre-sequence alert is waiting.
+            # Usually this is empty. Avoid parsing/filtering rules for hundreds
+            # of accounts when no optional work is pending.
             pending_uids = [uid for uid in self._pending_alert_send_at if str(uid) in user_order]
             for uid in pending_uids:
                 uid_s = str(uid)

@@ -16,7 +16,7 @@ import threading
 import traceback
 import difflib
 from collections import deque
-from typing import Any, Dict, Set, List, Tuple, Optional, Sequence
+from typing import Any, Dict, Set, List, Tuple, Optional, Sequence, Iterable
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen
@@ -674,6 +674,37 @@ def _should_disable_log_based_merchant_detection(settings_cfg: object) -> bool:
     if not bool(misc_cfg.get(MISC_DISABLE_LOG_MERCHANTS_WHEN_OCR_ACTIVE_KEY, True)):
         return False
     return _ocr_merchant_filters_enabled_in_cfg(settings_cfg.get("ocr"))
+
+
+def _filter_multiscope_rows(rows: list, user_ids: Iterable[str]) -> list:
+    """Keep queued/resume snapshots consistent with the current account roster."""
+    allowed = set(user_ids)
+    filtered = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        users = [str(uid) for uid in (row.get("users") or []) if str(uid) in allowed]
+        if not users:
+            continue
+        if users == row.get("users"):
+            filtered.append(row)
+            continue
+        current = {**row, "users": users}
+        menu = {str(uid): value for uid, value in (row.get("in_menu_by_uid") or {}).items()
+                if str(uid) in users}
+        timestamps = {str(uid): value for uid, value in (row.get("last_menu_ts_by_uid") or {}).items()
+                      if str(uid) in users}
+        current["in_menu_by_uid"] = menu
+        current["last_menu_ts_by_uid"] = timestamps
+        known = [(float(timestamps.get(uid, 0.0) or 0.0), uid, bool(value))
+                 for uid, value in menu.items() if value is not None]
+        if known:
+            timestamp, _uid, value = max(known)
+            current.update(in_menu=value, last_menu_ts=timestamp)
+        else:
+            current.update(in_menu=None, last_menu_ts=0.0)
+        filtered.append(current)
+    return filtered
 
 _SECONDS_PER_DAY = 86400.0
 _ACTIVITY_FRESH_DAYS = 1.0
@@ -7025,6 +7056,14 @@ class WorkerThread(QThread):
         if not self.ms or not isinstance(getattr(self, "user_states", None), dict):
             return
         try:
+            settings = getattr(self.manager, "settings", {}) if self.manager else {}
+            if not isinstance(settings, dict):
+                settings = {}
+            eligible_uids = {
+                str(uid) for uid, info in settings.items()
+                if str(uid) in self.user_states and isinstance(info, dict)
+                and not any(info.get(flag, False) for flag in ("disabled", "bad", "cap"))
+            }
             if active_pids_by_uid is None:
                 cached = getattr(self, "_active_pids_by_uid", None)
                 if isinstance(cached, dict):
@@ -7042,20 +7081,17 @@ class WorkerThread(QThread):
             live_uids = {
                 str(uid)
                 for uid, pids in (active_pids_by_uid or {}).items()
-                if pids and str(uid) in self.user_states
+                if pids and str(uid) in eligible_uids
             }
             for uid in live_uids:
                 grace[uid] = now_mono + 6.0
             for uid, expires_at in list(grace.items()):
-                if uid not in self.user_states or (uid not in live_uids and float(expires_at) <= now_mono):
+                if uid not in eligible_uids or (uid not in live_uids and float(expires_at) <= now_mono):
                     grace.pop(uid, None)
             user_ids = sorted(grace)
             self._multiscope_synced_user_ids = tuple(user_ids)
             usernames_by_uid: dict[str, str] = {}
             cookies_by_uid: dict[str, str] = {}
-            settings = getattr(self.manager, "settings", {}) if self.manager else {}
-            if not isinstance(settings, dict):
-                settings = {}
             for uid in user_ids:
                 info = settings.get(uid, {})
                 if not isinstance(info, dict):
@@ -7067,17 +7103,18 @@ class WorkerThread(QThread):
             )
             if not force and getattr(self, "_last_multiscope_user_sync_signature", None) == sync_signature:
                 return
-            self._last_multiscope_user_sync_signature = sync_signature
-            self.ms.update_users(
-                user_ids,
-                usernames_by_uid=usernames_by_uid,
-                cookies_by_uid=cookies_by_uid,
-            )
-        except TypeError:
             try:
-                self.ms.update_users(user_ids)
-            except Exception:
-                pass
+                accepted = self.ms.update_users(
+                    user_ids,
+                    usernames_by_uid=usernames_by_uid,
+                    cookies_by_uid=cookies_by_uid,
+                )
+            except TypeError:
+                accepted = self.ms.update_users(user_ids)
+            # A failed enqueue must not suppress every later attempt to sync
+            # this same roster. Older in-process engines return None on success.
+            if accepted is not False:
+                self._last_multiscope_user_sync_signature = sync_signature
         except Exception:
             pass
 
@@ -8126,7 +8163,10 @@ class WorkerThread(QThread):
                             {uid: row.get("pids", ()) for uid, row in live_status.items()}
                         )
                         multiscope_status = {
-                            uid: status[uid]
+                            uid: {
+                                **status[uid],
+                                "username": str(self.manager.settings.get(uid, {}).get("username") or ""),
+                            }
                             for uid in self._multiscope_synced_user_ids
                             if uid in status
                         }
@@ -8170,6 +8210,7 @@ class WorkerThread(QThread):
                         elif rows and self._bootstrap_multiscope_rows:
                             self._bootstrap_multiscope_rows = None
                             self._bootstrap_multiscope_deadline = 0.0
+                        rows = _filter_multiscope_rows(rows, self._multiscope_synced_user_ids)
                         ms_rows_for_limiter = rows if isinstance(rows, list) else None
                         self.multiscope_signal.emit(rows)    # GUI will render it
                 except Exception as _e:
@@ -12729,6 +12770,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._merchant_fix_classic_disable_button: Optional[QPushButton] = None
         self._merchant_fix_smart_enable_button: Optional[QPushButton] = None
         self._merchant_fix_smart_disable_button: Optional[QPushButton] = None
+        self._merchant_fix_clear_storage_button: Optional[QPushButton] = None
         self._merchant_fix_log_box: Optional[QTextEdit] = None
         self._merchant_fix_log_path_label: Optional[QLabel] = None
         self._merchant_fix_refresh_timer: Optional[QTimer] = None
@@ -12849,8 +12891,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 set_handoff_callback(self.asset_filter_handoff_signal.emit)
             self._asset_request_filter_module = asset_filter_module
         except Exception as exc:
-            # This mode is deliberately removable with its single dev_only file.
-            # Core startup and the two existing Merchant Fix modes stay untouched.
+            # Optional modules can be removed independently.
+            # Keep core startup and existing modes available.
             self._asset_request_filter_module = None
             self._asset_request_filter_controller = None
             self._asset_request_filter_load_error = str(exc)
@@ -13809,7 +13851,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         for number, heading, detail in (
             ("01", "Prepare", "Close Roblox and clear its storage."),
             ("02", "Choose", "For Roll Fix, load to the Play button."),
-            ("03", "Block", "Apply the block to all processes."),
+            ("03", "Block", "Apply the block to whole PC."),
         ):
             step = QVBoxLayout()
             step.setSpacing(4)
@@ -14125,6 +14167,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         layout.addWidget(details_tabs, 1)
 
         close_row = QHBoxLayout()
+        clear_storage_button = QPushButton("Clear rbx-storage")
+        clear_storage_button.setObjectName("merchantFixClearStorage")
+        clear_storage_button.setProperty("merchantFixTone", "secondary")
+        clear_storage_button.setToolTip(
+            "Close Roblox and clear rbx-storage and its database files. "
+            "Stop the manager first."
+        )
+        clear_storage_button.clicked.connect(self._clear_merchant_fix_storage)
+        close_row.addWidget(clear_storage_button)
+        self._merchant_fix_clear_storage_button = clear_storage_button
         close_row.addStretch()
         close_button = QPushButton("Close")
         close_button.setProperty("merchantFixTone", "secondary")
@@ -14648,6 +14700,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         pending = bool(getattr(self, "_merchant_fix_pending", False))
         roll_ready = bool(getattr(self, "_merchant_fix_roll_ready", False))
 
+        clear_storage_button = getattr(self, "_merchant_fix_clear_storage_button", None)
+        if clear_storage_button is not None:
+            clear_storage_button.setEnabled(
+                not pending and not self._merchant_fix_manager_active()
+            )
         if self._merchant_fix_classic_start_button is not None:
             self._merchant_fix_classic_start_button.setText("Prepare Classic Fix")
             self._merchant_fix_classic_start_button.setEnabled(
@@ -14895,6 +14952,35 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             threading.Thread(target=_work, daemon=True).start()
 
+    def _prepare_merchant_fix_storage(self) -> str:
+        self.merchant_fix_controller.recover_stale_acl_if_needed()
+        closed = close_roblox_processes()
+        removed = clear_roblox_storage()
+        return f"Closed {closed} Roblox process(es) and removed {removed} rbx-storage item(s)."
+
+    def _clear_merchant_fix_storage(self) -> None:
+        if self._merchant_fix_pending:
+            return
+        if self._merchant_fix_manager_active():
+            QMessageBox.warning(
+                self,
+                "Manager Is Running",
+                "Stop the manager before clearing rbx-storage. This closes every Roblox window.",
+            )
+            return
+        reply = QMessageBox.question(
+            self,
+            "Clear rbx-storage",
+            "This will close all running Roblox processes and permanently delete every item inside:\n\n"
+            f"{get_roblox_storage_dir()}\n\nIt will also delete rbx-storage.db, "
+            "rbx-storage.db-wal, and rbx-storage.db-shm from the Roblox folder.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._run_merchant_fix_operation("clear_storage", self._prepare_merchant_fix_storage)
+
     def _start_merchant_fix_classic(self) -> None:
         asset_filter_controller = getattr(
             self, "_asset_request_filter_controller", None
@@ -14931,13 +15017,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        def _prepare() -> str:
-            self.merchant_fix_controller.recover_stale_acl_if_needed()
-            closed = close_roblox_processes()
-            removed = clear_roblox_storage()
-            return f"Closed {closed} Roblox process(es) and removed {removed} rbx-storage item(s)."
-
-        self._run_merchant_fix_operation("classic_prepare", _prepare)
+        self._run_merchant_fix_operation("classic_prepare", self._prepare_merchant_fix_storage)
 
     def _apply_merchant_fix_roll(self) -> None:
         if not self._merchant_fix_roll_ready:
@@ -15075,7 +15155,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._merchant_fix_pending_operation = ""
         if success:
             self.add_log(f"[Merchant Fix] {message}")
-            if operation == "classic_prepare":
+            if operation == "clear_storage":
+                QMessageBox.information(self, "rbx-storage Cleared", message)
+            elif operation == "classic_prepare":
                 reply = QMessageBox.question(
                     self,
                     "Apply Roll Fix?",
@@ -18798,7 +18880,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.auto_item_table.setColumnWidth(4, 120)
         self.auto_item_table.setColumnWidth(5, 140)
         self.auto_item_table.setColumnWidth(6, 140)
-        # Keep per-item alert controls behind the access gate.
+        # Keep optional controls behind the access gate.
         try:
             self.auto_item_table.setColumnHidden(6, not _bm_relaxed())
         except Exception:
@@ -39807,9 +39889,21 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def update_multiscope(self, rows: list):
         # rows: [{server, users, in_menu, last_biome|biome, biome_age, last_merchant|merchant, merchant_age, events}]
+        previous_rows = getattr(self, "_last_multiscope_rows", None) or []
+        try:
+            users = self.config_manager.peek_users()
+            if isinstance(users, dict):
+                eligible = {
+                    str(uid) for uid, info in users.items() if isinstance(info, dict)
+                    and not any(info.get(flag, False) for flag in ("disabled", "bad", "cap"))
+                }
+                rows = _filter_multiscope_rows(rows, eligible)
+                previous_rows = _filter_multiscope_rows(previous_rows, eligible)
+        except Exception:
+            pass
         try:
             grace_until = float(getattr(self, "_ms_resume_grace_until", 0.0) or 0.0)
-            if self._last_multiscope_rows and time.time() < grace_until:
+            if previous_rows and time.time() < grace_until:
                 has_signal = False
                 try:
                     for r in (rows or []):
@@ -39836,7 +39930,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     has_signal = False
 
                 if (not rows) or (not has_signal):
-                    return
+                    rows = previous_rows
         except Exception:
             pass
 

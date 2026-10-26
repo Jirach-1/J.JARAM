@@ -29,7 +29,8 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
     engine = None
     last_reader_health = ""
     last_snapshot_signature = None
-    pending_update_users: Optional[List[str]] = None
+    pending_update_users: Optional[dict] = None
+    tracked_user_ids: set[str] = set()
     pending_configure_webhooks: Optional[dict] = None
     pending_development_config: dict = {}
     service_waiters: dict = {}
@@ -104,6 +105,38 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
             return str(owner_by_uid.get(str(uid), "") or "")
         except Exception:
             return ""
+
+    def _update_users(cmd: dict, *, refresh_user_ids=()) -> None:
+        nonlocal tracked_user_ids
+        user_ids = [str(uid) for uid in (cmd.get("user_ids") or [])]
+        user_ids_set = set(user_ids)
+        refresh = set(refresh_user_ids)
+        incoming_usernames = cmd.get("usernames")
+        if isinstance(incoming_usernames, dict):
+            normalized = {
+                str(uid): str(name or "") for uid, name in incoming_usernames.items()
+                if str(uid) in user_ids_set
+            }
+            refresh.update(
+                uid for uid, name in normalized.items()
+                if usernames_by_uid.get(uid) != name
+            )
+            usernames_by_uid.clear()
+            usernames_by_uid.update(normalized)
+        incoming_cookies = cmd.get("cookies")
+        if isinstance(incoming_cookies, dict):
+            cookies_by_uid.clear()
+            cookies_by_uid.update({
+                str(uid): str(cookie or "") for uid, cookie in incoming_cookies.items()
+                if str(uid) in user_ids_set
+            })
+        for mapping in (usernames_by_uid, cookies_by_uid, server_label_by_uid,
+                        ps_link_by_uid, owner_by_uid):
+            for uid in list(mapping):
+                if uid not in user_ids_set:
+                    mapping.pop(uid, None)
+        engine.update_users(user_ids, refresh_user_ids=refresh)
+        tracked_user_ids = user_ids_set
 
     def _snapshot_signature(rows: List[dict]) -> tuple:
         signature = []
@@ -236,8 +269,9 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                     pass
 
                 try:
-                    if pending_update_users:
-                        engine.update_users([str(u) for u in pending_update_users])
+                    if pending_update_users is not None:
+                        _update_users(pending_update_users)
+                        pending_update_users = None
                         _publish_snapshot(force=True)
                 except Exception:
                     pass
@@ -251,59 +285,9 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
 
             elif ctype == "update_users":
                 if engine is None:
-                    user_ids = cmd.get("user_ids") or []
-                    if not isinstance(user_ids, list):
-                        user_ids = list(user_ids)
-                    pending_update_users = [str(u) for u in user_ids]
+                    pending_update_users = dict(cmd)
                     continue
-                user_ids = cmd.get("user_ids") or []
-                if not isinstance(user_ids, list):
-                    user_ids = list(user_ids)
-                user_ids = [str(u) for u in user_ids]
-                user_ids_set = set(user_ids)
-                incoming_usernames = cmd.get("usernames")
-                incoming_cookies = cmd.get("cookies")
-                refresh_user_ids: set[str] = set()
-                if "usernames" in cmd and isinstance(incoming_usernames, dict):
-                    normalized_usernames = {
-                        str(k): str(v or "")
-                        for k, v in incoming_usernames.items()
-                        if str(k) in user_ids_set
-                    }
-                    refresh_user_ids = {
-                        uid
-                        for uid, username in normalized_usernames.items()
-                        if uid in usernames_by_uid and usernames_by_uid.get(uid) != username
-                    }
-                    usernames_by_uid.clear()
-                    usernames_by_uid.update(normalized_usernames)
-                else:
-                    for uid in list(usernames_by_uid.keys()):
-                        if uid not in user_ids_set:
-                            usernames_by_uid.pop(uid, None)
-                if "cookies" in cmd and isinstance(incoming_cookies, dict):
-                    cookies_by_uid.clear()
-                    cookies_by_uid.update(
-                        {
-                            str(k): str(v or "")
-                            for k, v in incoming_cookies.items()
-                            if str(k) in user_ids_set
-                        }
-                    )
-                else:
-                    for uid in list(cookies_by_uid.keys()):
-                        if uid not in user_ids_set:
-                            cookies_by_uid.pop(uid, None)
-                for uid in list(server_label_by_uid.keys()):
-                    if uid not in user_ids_set:
-                        server_label_by_uid.pop(uid, None)
-                for uid in list(ps_link_by_uid.keys()):
-                    if uid not in user_ids_set:
-                        ps_link_by_uid.pop(uid, None)
-                for uid in list(owner_by_uid.keys()):
-                    if uid not in user_ids_set:
-                        owner_by_uid.pop(uid, None)
-                engine.update_users(user_ids, refresh_user_ids=refresh_user_ids)
+                _update_users(cmd)
                 _publish_snapshot(force=True)
 
             elif ctype == "service_reply":
@@ -387,6 +371,7 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                 if engine is None:
                     continue
                 status_by_uid = cmd.get("status") or {}
+                refresh_user_ids = set()
                 if isinstance(status_by_uid, dict):
                     for uid, st in status_by_uid.items():
                         u = str(uid)
@@ -396,11 +381,22 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                         ps_link_by_uid[u] = str(st.get("ps_link") or "")
                         owner_by_uid[u] = str(st.get("server_owner") or "")
                         if "username" in st:
-                            usernames_by_uid[u] = str(st.get("username") or usernames_by_uid.get(u, ""))
+                            username = str(st.get("username") or "")
+                            if usernames_by_uid.get(u) != username:
+                                refresh_user_ids.add(u)
+                            usernames_by_uid[u] = username
                         if "cookie" in st:
                             cookies_by_uid[u] = str(st.get("cookie") or cookies_by_uid.get(u, ""))
 
                 engine.tick(status_by_uid)
+                # Heartbeats carry the complete live/grace roster and current
+                # names. Reconcile here as well so a missed account-update
+                # command cannot leave a running user permanently unmonitored.
+                current_user_ids = set(getattr(engine, "_tracked_uids", tracked_user_ids))
+                if set(status_by_uid) != current_user_ids or refresh_user_ids:
+                    _update_users(
+                        {"user_ids": list(status_by_uid)}, refresh_user_ids=refresh_user_ids
+                    )
                 rows = engine.snapshot()
                 last_snapshot_signature = _snapshot_signature(rows)
                 # A tick reply is also the command acknowledgement used by the
@@ -487,12 +483,14 @@ class MultiScopeProcessProxy:
             }
         )
 
-    def _send_cmd(self, msg: dict) -> None:
+    def _send_cmd(self, msg: dict) -> bool:
         try:
             if self._proc.is_alive():
                 self._cmd_q.put(msg)
+                return True
         except Exception:
             pass
+        return False
 
     def _drain_out_queue(self, *, max_items: int = 200) -> None:
         logs: List[str] = []
@@ -605,14 +603,14 @@ class MultiScopeProcessProxy:
         user_ids: List[str],
         usernames_by_uid: Optional[Dict[str, str]] = None,
         cookies_by_uid: Optional[Dict[str, str]] = None,
-    ) -> None:
+    ) -> bool:
         self._drain_out_queue()
         msg = {"type": "update_users", "user_ids": list(user_ids or [])}
         if usernames_by_uid is not None:
             msg["usernames"] = dict(usernames_by_uid or {})
         if cookies_by_uid is not None:
             msg["cookies"] = dict(cookies_by_uid or {})
-        self._send_cmd(msg)
+        return self._send_cmd(msg)
 
     def configure_webhooks(
         self,

@@ -270,7 +270,8 @@ class CookieExtractionThread(QThread):
         self.should_stop = True
         if not self.extraction_completed:
             self.extraction_completed = True
-        self._cleanup_browser()
+        # WebDriver belongs to the worker. Its finally block performs cleanup;
+        # quitting here can block the UI and race an in-flight driver request.
 
 
 class ZenDriverCookieExtractionThread(QThread):
@@ -321,57 +322,87 @@ class ZenDriverCookieExtractionThread(QThread):
             if self.should_stop:
                 return
 
-            self.status_update.emit("Navigating to Roblox login page...")
-            page = await self.browser.get("https://www.roblox.com/login")
-            if self.should_stop:
-                return
-
-            self.status_update.emit("Browser ready - Please complete login manually")
-            self.browser_ready.emit()
-
-            start_time = time.monotonic()
-            login_detected = False
-            while (
-                not self.should_stop
-                and not self.extraction_completed
-                and (time.monotonic() - start_time) < self.extraction_timeout
-            ):
-                try:
-                    if self.browser.stopped:
-                        self.extraction_completed = True
-                        self.extraction_failed.emit("Browser window was closed by user")
-                        return
-
-                    current_url = str(getattr(page, "url", "") or "")
-                    if not login_detected and _is_roblox_login_success_url(current_url):
-                        login_detected = True
-                        self.status_update.emit("Login detected! Extracting cookie...")
-
-                    cookie = await self._extract_roblosecurity_cookie()
-                    if cookie:
-                        self.extraction_completed = True
-                        self.cookie_extracted.emit(cookie)
-                        return
-                except Exception as exc:
-                    if self.browser is None or self.browser.stopped:
-                        self.extraction_completed = True
-                        self.extraction_failed.emit("Browser connection lost")
-                        return
-                    # A navigation can briefly replace the active CDP target. Keep
-                    # polling while ZenDriver refreshes its list of browser tabs.
-                    self.status_update.emit(f"Waiting for login to finish... ({type(exc).__name__})")
-
-                await asyncio.sleep(1)
-
-                open_tabs = [tab for tab in self.browser.tabs if not tab.closed]
-                if open_tabs:
-                    page = open_tabs[-1]
-
-            if not self.should_stop and not self.extraction_completed:
-                self.extraction_completed = True
-                self.extraction_failed.emit("Login timeout - please try again")
+            # CDP requests can remain pending when Chrome closes. Monitor the
+            # browser independently so a pending navigation/cookie request cannot
+            # prevent cancellation, close detection, or the overall timeout.
+            tasks = [
+                asyncio.create_task(self._wait_for_login_completion()),
+                asyncio.create_task(self._watch_browser()),
+            ]
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             await self._cleanup_browser()
+
+    async def _watch_browser(self):
+        start_time = time.monotonic()
+        missing_tabs_since = None
+        while not self.should_stop and not self.extraction_completed:
+            now = time.monotonic()
+            if self.browser.tabs:
+                missing_tabs_since = None
+            elif missing_tabs_since is None:
+                missing_tabs_since = now
+
+            # Chrome can keep its process alive after the last window closes.
+            # Allow brief target replacement during navigation before failing.
+            if self.browser.stopped or (
+                missing_tabs_since is not None and now - missing_tabs_since >= 1
+            ):
+                self.extraction_completed = True
+                self.extraction_failed.emit("Browser window was closed by user")
+                return
+            if now - start_time >= self.extraction_timeout:
+                self.extraction_completed = True
+                self.extraction_failed.emit("Login timeout - please try again")
+                return
+            await asyncio.sleep(0.1)
+
+    async def _wait_for_login_completion(self):
+        self.status_update.emit("Navigating to Roblox login page...")
+        page = await asyncio.wait_for(
+            self.browser.get("https://www.roblox.com/login"), timeout=30
+        )
+        if self.should_stop or self.extraction_completed:
+            return
+
+        self.status_update.emit("Browser ready - Please complete login manually")
+        self.browser_ready.emit()
+        login_detected = False
+        while not self.should_stop and not self.extraction_completed:
+            try:
+                current_url = str(getattr(page, "url", "") or "")
+                if not login_detected and _is_roblox_login_success_url(current_url):
+                    login_detected = True
+                    self.status_update.emit("Login detected! Extracting cookie...")
+
+                cookie = await asyncio.wait_for(
+                    self._extract_roblosecurity_cookie(), timeout=10
+                )
+                if self.should_stop or self.extraction_completed:
+                    return
+                if cookie:
+                    self.extraction_completed = True
+                    self.cookie_extracted.emit(cookie)
+                    return
+            except Exception as exc:
+                # A navigation can briefly replace the active CDP target. Keep
+                # polling while ZenDriver refreshes its list of browser tabs.
+                self.status_update.emit(f"Waiting for login to finish... ({type(exc).__name__})")
+
+            await asyncio.sleep(1)
+
+            # Tab.closed indicates whether its CDP socket is open, not whether
+            # the browser tab still exists. New tabs may not be connected yet.
+            open_tabs = self.browser.tabs
+            if open_tabs:
+                page = open_tabs[-1]
 
     async def _extract_roblosecurity_cookie(self) -> Optional[str]:
         if self.browser is None:
@@ -397,13 +428,22 @@ class ZenDriverCookieExtractionThread(QThread):
         browser = self.browser
         self.browser = None
         if browser is not None:
+            # stop() first sends Browser.close, which can itself hang awaiting a
+            # CDP response after the window closes. Disconnect before stopping
+            # the owned process so cleanup does not depend on that response.
+            connection = getattr(browser, "connection", None)
+            if connection is not None:
+                try:
+                    await asyncio.wait_for(connection.aclose(), timeout=2)
+                except Exception:
+                    pass
             try:
-                await browser.stop()
+                await asyncio.wait_for(browser.stop(), timeout=5)
             except Exception:
                 pass
 
     def stop_extraction(self):
-        # The worker's asyncio loop observes this flag within one second and
+        # The independent watchdog observes this flag even during a CDP request and
         # performs ZenDriver cleanup on the same thread/event loop that owns it.
         self.should_stop = True
         if not self.extraction_completed:
@@ -562,6 +602,7 @@ class CookieExtractor(QObject):
         if self.extraction_thread and self.extraction_thread.isRunning():
             QMessageBox.warning(parent_widget, "Extraction in Progress",
                               "Cookie extraction is already in progress. Please wait.")
+            callback(None)
             return
 
         method = str(method or "selenium").strip().lower()
@@ -597,14 +638,23 @@ class CookieExtractor(QObject):
         self.progress_dialog.canceled.connect(self._cancel_extraction)
         self.progress_dialog.show()
 
+    def _close_progress_dialog(self):
+        dialog = self.progress_dialog
+        self.progress_dialog = None
+        if dialog:
+            # QProgressDialog.close() emits canceled. Completing a worker must
+            # not re-enter cancellation or depend on that signal for its callback.
+            dialog.blockSignals(True)
+            dialog.close()
+            dialog.deleteLater()
+
     def _on_cookie_extracted(self, cookie: str):
         if self.callback_called:
             return
 
         self.callback_called = True
 
-        if self.progress_dialog:
-            self.progress_dialog.close()
+        self._close_progress_dialog()
 
         if self.callback:
             self.callback(cookie)
@@ -615,21 +665,22 @@ class CookieExtractor(QObject):
 
         self.callback_called = True
 
-        if self.progress_dialog:
-            self.progress_dialog.close()
+        self._close_progress_dialog()
+
+        callback = self.callback
 
         QMessageBox.critical(None, "Cookie Extraction Failed",
                            f"Failed to extract cookie:\n\n{error_message}")
 
-        if self.callback:
-            self.callback(None)
+        if callback:
+            callback(None)
 
     def _on_status_update(self, status: str):
-        if self.progress_dialog:
+        if not self.callback_called and self.progress_dialog:
             self.progress_dialog.setLabelText(status)
 
     def _on_browser_ready(self):
-        if self.progress_dialog:
+        if not self.callback_called and self.progress_dialog:
             self.progress_dialog.setLabelText(
                 "Browser is ready!\n\n"
                 "Please complete the Roblox login process in the browser window:\n"
@@ -641,10 +692,18 @@ class CookieExtractor(QObject):
             )
 
     def _on_thread_finished(self):
-        if self.progress_dialog:
-            self.progress_dialog.close()
+        # A queued finished signal from a previous attempt must not clear a
+        # newer worker started by a completion callback.
+        thread = self.sender()
+        if thread is not None and thread is not self.extraction_thread:
+            return
 
         self.extraction_thread = None
+        self._close_progress_dialog()
+        if not self.callback_called:
+            self._on_extraction_failed(
+                "Browser login ended before a cookie could be extracted. Please try again."
+            )
 
     def _cancel_extraction(self):
         if self.callback_called:
@@ -654,7 +713,8 @@ class CookieExtractor(QObject):
 
         if self.extraction_thread:
             self.extraction_thread.stop_extraction()
-            self.extraction_thread.wait(5000)
+
+        self._close_progress_dialog()
 
         if self.callback:
             self.callback(None)

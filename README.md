@@ -73,8 +73,6 @@
 - Remote PSL grabbing plus Roblox block/unblock utilities
 - Commands: `/help`, `/status`, `/enable`, `/disable`, `/action`, `/clearflags`, `/restartall`, `/psl`, `/block`, and `/unblock` (`/list` is available in supported builds)
 - Auto-start support, an in-app command reference/log, and command usage records in `logs/discord_command_usage.jsonl`
-- In builds with Discord user linking, **Linked User Role** manages one role in a configured server. Users linked to at least one saved JARAM account receive it; every unlinked member loses it. Set the server and role IDs, enable the feature, and click **Save Config**. Synchronization runs on startup, after saving/removing links, on member joins and role changes, and every minute; **Sync Roles Now** queues an extra pass.
-- Role management requires **Server Members Intent** under Bot > Privileged Gateway Intents in the Discord Developer Portal, plus **Manage Roles** permission and a bot role higher than the linked-user role. Use an unmanaged role other than `@everyone`. Failed reads of the saved links or server member list skip synchronization and retry later.
 
 ### Resource Controls
 - `Trimmer` tab: periodically trims Roblox working-set (optional threshold)
@@ -179,11 +177,6 @@ Treat the bot token like a password. Cookie Encryption also protects it in `sett
 - Open `Extras > Merchant Fix`.
 - **Classic** applies the asset-delivery block to the whole PC and requires Roblox to be closed during preparation.
 - **Smart** applies PID-scoped blocks only to selected accounts managed by JARAM and supports a configurable log trigger/delay.
-- **Request Filter (Dev)** filters individual asset IDs in managed launches using Roblox's exported TLS session keys while preserving its server certificate. After updating JARAM, restart JARAM and the filtered Roblox clients so new launches receive the relay settings.
-- Request Filter currently handles HTTP/1.x over TLS 1.3. Unsupported protocols or missing key export are forwarded without filtering and reported as **Degraded** in the block list and activity log. On Windows, a local pipe restricted to the current user and SYSTEM receives exported keys into bounded memory, without accumulating a key file. Required keys are retained until their connection closes.
-- The relay logs lifetime connection, bypass, closure, and warning-reason totals every 30 seconds. Degraded status retains the last warning and distinguishes lifetime failures from currently unfiltered connections. HTTP/2 prefaces and HTTP/1 framing failures have separate diagnostics; HTTP/2 filtering remains unsupported.
-- Normal Request Filter helpers automatically inspect HTTP/2 request categories while HTTP/1 asset filtering continues. The existing `asset_request_filter.log` includes `http2_inspection` totals every 30 seconds and at shutdown: observed connections/requests, batch requests, batch POSTs, other/unclassified requests, and incomplete observations/errors/limits. A separate warning marks the first HTTP/2 batch request detected in that helper run. URLs, query strings, headers, bodies, and TLS secrets are omitted. Inspection failures stop only observation. Restart the helper after updating to enable collection; a paused/resumed helper keeps its previous code. `available: false` or missing-dependency counts mean `hpack` must be installed/included in the build before coverage can be assessed.
-- `tests/manual_asset_filter_http2_inspection.py` runs an isolated, inspection-only Roblox launch (requires `hpack` and existing local Roblox clients closed). Use `--join-url` with an experience/private-server link to sample in-game traffic; the link/code is omitted from reports. Unlike normal Request Filter, this standalone diagnostic also disables HTTP/1 filtering. It uses the same passive HTTP/2 observer and records only aggregate counters.
 - Administrator access may be requested for the elevated helper. 
 - Use the same window to inspect active blocks and the activity log.
 

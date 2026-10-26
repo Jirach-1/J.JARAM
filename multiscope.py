@@ -985,6 +985,10 @@ class MultiScopeEngine:
                 str(uid)
                 for uid in (
                     set(self._cur.keys())
+                    | previous_uids
+                    | set(self._status_snapshot)
+                    | set(self._first_merchant_scan_done)
+                    | set(self._menu_none_disconnect_fired_by_uid)
                     | set(self._retired_generations_by_uid.keys())
                     | set(self._menu_unknown_log_by_uid.keys())
                     | set(self._menu_none_since_by_uid.keys())
@@ -1012,6 +1016,16 @@ class MultiScopeEngine:
                 self._process_generation_by_uid.pop(uid, None)
                 self._last_disconnect_sig_by_uid.pop(uid, None)
                 self._log_resolution_suspended_uids.discard(uid)
+                self._menu_none_disconnect_fired_by_uid.discard(uid)
+                self._first_merchant_scan_done.discard(uid)
+                self._status_snapshot.pop(uid, None)
+                self._handoff_prev_biome_for_spare.pop(uid, None)
+            self._handoffs = {
+                donor: spare for donor, spare in self._handoffs.items()
+                if donor in user_ids_set and spare in user_ids_set
+            }
+            with self._event_lock:
+                self._events = [event for event in self._events if str(event[1]) in user_ids_set]
 
         # Do resolves + watcher setup without holding the engine lock
         for uid in resolve_uids:
@@ -1029,7 +1043,11 @@ class MultiScopeEngine:
                     scope.users.discard(uid_s)
                     scope.in_menu_by_uid.pop(uid_s, None)
                     scope.last_menu_ts_by_uid.pop(uid_s, None)
+                self._recompute_scope_menu(scope)
             self._sync_user_scope_memberships(user_ids_set)
+            for key, scope in list(self._scopes.items()):
+                if not scope.users:
+                    self._scopes.pop(key, None)
 
     def _retire_generation(self, uid: str, generation_id: str) -> None:
         generation = str(generation_id or "")

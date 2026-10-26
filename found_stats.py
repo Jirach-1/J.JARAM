@@ -572,7 +572,7 @@ class FoundStatsMixin:
 
                 # Periodic, feathered textures avoid hard oval edges and tile seams.
                 self._forest_fog = {
-                    "RADIANT FOREST": self._make_forest_fog(174, 133, 230),
+                    "THE RADIANT FOREST": self._make_forest_fog(174, 133, 230),
                     "LOST FOREST": self._make_forest_fog(120, 167, 143),
                 }
                 self._forest_firefly = QImage(24, 24, QImage.Format.Format_ARGB32_Premultiplied)
@@ -713,7 +713,7 @@ class FoundStatsMixin:
                 is_aurora = biome_key == "AURORA"
                 is_eggland = biome_key == "EGGLAND"
                 is_singularity = biome_key == "SINGULARITY"
-                is_radiant_forest = biome_key == "RADIANT FOREST"
+                is_radiant_forest = biome_key == "THE RADIANT FOREST"
                 is_lost_forest = biome_key == "LOST FOREST"
                 is_forest = is_radiant_forest or is_lost_forest
 

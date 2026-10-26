@@ -192,9 +192,9 @@ def main():
         try:
             from dev_only.asset_request_filter import run_proxy_helper_from_argv
         except ImportError:
-            # The Request Filter is optional. A build without its one dev_only
-            # module must still start normally; only its private helper command
-            # is unavailable.
+            # Missing optional modules must not prevent normal startup.
+            # Only this private helper command is unavailable when its
+            # implementation is absent.
             raise SystemExit(2)
 
         raise SystemExit(run_proxy_helper_from_argv(sys.argv[1:]))
