@@ -364,6 +364,8 @@ class ProcessTracker:
 class AuthenticationHandler:
     def __init__(self):
         self.token_cache = {}
+        self._token_cache_lock = threading.Lock()
+        self._token_cache_limit = 2048
 
     def retrieve_csrf_token(self, cookie):
         cookie = str(cookie or "").strip()
@@ -372,10 +374,19 @@ class AuthenticationHandler:
                 cookie = normalize_roblosecurity_cookie_value(cookie)
             except Exception:
                 cookie = str(cookie or "").strip()
-        if cookie in self.token_cache and self.token_cache[cookie]["expires"] > time.time():
-            return self.token_cache[cookie]["token"]
+        now = time.monotonic()
+        with self._token_cache_lock:
+            for key in list(self.token_cache):
+                if self.token_cache[key]["expires"] <= now:
+                    self.token_cache.pop(key, None)
+            cached = self.token_cache.get(cookie)
+            if cached is not None:
+                return cached["token"]
 
-        session = requests.Session()
+        with requests.Session() as session:
+            return self._retrieve_csrf_token_in_session(cookie, session)
+
+    def _retrieve_csrf_token_in_session(self, cookie, session):
         session.cookies[".ROBLOSECURITY"] = cookie
         session.headers.update({
             "Referer": "https://www.roblox.com/",
@@ -386,10 +397,13 @@ class AuthenticationHandler:
             response = session.post("https://auth.roblox.com/v1/authentication-ticket", timeout=5)
             if response.status_code == 403 and "x-csrf-token" in response.headers:
                 token = response.headers["x-csrf-token"]
-                self.token_cache[cookie] = {
-                    "token": token,
-                    "expires": time.time() + 1800
-                }
+                with self._token_cache_lock:
+                    self.token_cache[cookie] = {
+                        "token": token,
+                        "expires": time.monotonic() + 1800
+                    }
+                    while len(self.token_cache) > self._token_cache_limit:
+                        self.token_cache.pop(next(iter(self.token_cache)))
                 return token
         except Exception as error:
             pass
@@ -402,7 +416,10 @@ class AuthenticationHandler:
                 cookie = normalize_roblosecurity_cookie_value(cookie)
             except Exception:
                 cookie = str(cookie or "").strip()
-        session = requests.Session()
+        with requests.Session() as session:
+            return self._obtain_auth_ticket_in_session(cookie, session)
+
+    def _obtain_auth_ticket_in_session(self, cookie, session):
         auth_meta = {"mark_bad": False, "failure_reason": "no_response"}
         session.headers.update(
             {
@@ -1077,9 +1094,12 @@ class GameLauncher:
                 cookie = str(cookie or "")
         if not share_code or not cookie:
             return None, None, cookie
+        with requests.Session() as session:
+            return self._convert_share_link_in_session(share_code, cookie, session)
+
+    def _convert_share_link_in_session(self, share_code, cookie, s):
         url = "https://apis.roblox.com/sharelinks/v1/resolve-link"
         payload = {"linkId": share_code, "linkType": "Server"}
-        s = requests.Session()
         try:
             s.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com", path="/")
         except Exception:

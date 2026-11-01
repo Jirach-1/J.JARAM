@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QMessageBox,
 )
-from multiscope import APP_FOOTER
+from app_version import APP_FOOTER
 
 
 # Qt6 enum shim (matches gui.py behavior)

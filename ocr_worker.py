@@ -7,7 +7,8 @@ import re
 import threading
 import time
 import traceback
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
+from background_delivery import BackgroundDeliveryPool
 try:
     from concurrent.futures.process import BrokenProcessPool
 except Exception:  # pragma: no cover
@@ -33,7 +34,8 @@ import win32api
 from ctypes import windll, wintypes
 from dataclasses import dataclass
 
-from multiscope import APP_FOOTER
+from app_version import APP_FOOTER
+from events import EVENT_FILTER_IDS, build_event_payload, event_id_for_filter, event_webhook_targets
 from wgc_capture import capture_window_wgc, configure_wgc_captures, release_wgc_captures
 
 # -----------------------------
@@ -1050,8 +1052,10 @@ def _known_filter_id(name: str) -> str:
 
 def _filter_behavior(filter_id: str, name: str, raw_behavior: Any = None) -> str:
     behavior = str(raw_behavior or "").strip().lower()
-    if behavior in ("merchant", "verification_cap", "webhook"):
+    if behavior in ("merchant", "event", "verification_cap", "webhook"):
         return behavior
+    if filter_id in EVENT_FILTER_IDS:
+        return "event"
     if filter_id in MERCHANT_FILTER_IDS:
         return "merchant"
     if filter_id == "verification_check" or _normalize_filter_name(name).strip().lower() == "verification check":
@@ -1224,6 +1228,7 @@ def _normalize_filter_spec(raw: Dict[str, Any], *, fallback_index: int = 0) -> D
         "user_ids": _normalize_filter_user_ids(base.get("user_ids", default_spec.get("user_ids"))),
         "user_filter_mode": _normalize_user_filter_mode(base.get("user_filter_mode", default_spec.get("user_filter_mode", "whitelist"))),
         "behavior": behavior,
+        **({"event_id": event_id_for_filter(base)} if behavior == "event" else {}),
         "cooldown_group": _cooldown_group_for_filter(
             filter_id,
             behavior,
@@ -1885,7 +1890,9 @@ class OCRWorker(QThread):
         self._window_enumerator_thread: Optional[threading.Thread] = None
         self._window_enum_interval_seconds = _WINDOW_ENUM_INTERVAL_SECONDS
 
-        self._send_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr-send")
+        self._send_pool = BackgroundDeliveryPool(
+            max_workers=2, thread_name_prefix="ocr-send", overflow_log=self._log,
+        )
 
         self._apply_cfg(self._ocr_cfg, self._ms_cfg)
 
@@ -1910,6 +1917,27 @@ class OCRWorker(QThread):
             return None
 
     # -------------------- window enumeration cache --------------------
+    def _prune_window_state(self, windows: List[Any]) -> None:
+        """Keep process/window caches tied to the complete live snapshot."""
+        sessions = {
+            key for win in windows
+            if (key := self._verification_session_key(win)) is not None
+        }
+        live_pids = {pid for pid, _hwnd in sessions}
+        live_hwnds = {hwnd for _pid, hwnd in sessions}
+        for mapping in (self._cooldowns, self._verification_next_check_by_pid):
+            for pid in list(mapping):
+                if pid not in live_pids:
+                    mapping.pop(pid, None)
+        for hwnd in list(self._capture_errors):
+            if hwnd not in live_hwnds:
+                self._capture_errors.pop(hwnd, None)
+        self._verification_positive_log_sessions.intersection_update(sessions)
+        live_prefixes = {str(pid) for pid in live_pids}
+        for key in list(self._last_frame_hash_by_key):
+            if key.partition(":")[0] not in live_prefixes:
+                self._last_frame_hash_by_key.pop(key, None)
+
     def _start_window_enumerator(self) -> None:
         thread = getattr(self, "_window_enumerator_thread", None)
         if thread is not None and thread.is_alive():
@@ -2035,6 +2063,8 @@ class OCRWorker(QThread):
                 try:
                     step_started = time.perf_counter()
                     windows, snapshot_age, enum_elapsed, snapshot_ready, snapshot_error = self._get_window_snapshot()
+                    if snapshot_ready and not snapshot_error:
+                        self._prune_window_state(windows)
                     snapshot_load_elapsed = time.perf_counter() - step_started
                     if snapshot_ready:
                         self._log(
@@ -2586,11 +2616,60 @@ class OCRWorker(QThread):
         except Exception:
             pass
 
+    def _send_event_webhooks(self, spec: Dict[str, Any], pid: int,
+                             ctx: Dict[str, Any], raw_img: Image.Image) -> None:
+        event_id = event_id_for_filter(spec)
+        if not event_id:
+            self._log("[Webhook] Unknown OCR event filter.")
+            return
+        username = str(ctx.get("username") or f"PID {pid}")
+        owner_raw = str(ctx.get("owner") or "").strip()
+        server_label = str(ctx.get("server_label") or "").strip() or "Unknown"
+        ps_link = str(ctx.get("ps_link") or "").strip()
+        if self._skip_webhook_unknown_context and (
+            not owner_raw or owner_raw.lower() == "unknown"
+            or server_label.lower() == "unknown" or not ps_link
+        ):
+            self._log("[Webhook] Skipping OCR event webhook; owner or private server unknown.")
+            return
+        targets = list(event_webhook_targets(self._ms_cfg.get("event_webhooks", []), event_id))
+        if not targets:
+            self._log(f"[Webhook] No enabled Event Webhook for {spec.get('name', event_id)}.")
+            return
+        screenshot = bool(spec.get("send_screenshot", True)) and raw_img is not None
+        image_data = _image_bytes(raw_img) if screenshot else None
+        detected_at = datetime.now(timezone.utc)
+        for url, content in targets:
+            payload = build_event_payload(
+                event_id, owner=owner_raw or username, detector=username,
+                server_label=server_label, ps_link=ps_link, detected_at=detected_at,
+                footer=APP_FOOTER, content=content, screenshot=screenshot,
+            )
+
+            def _send(url=url, payload=payload) -> None:
+                try:
+                    if image_data is not None:
+                        files = {"chat.png": ("chat.png", image_data, "image/png")}
+                        requests.post(url, data={"payload_json": json.dumps(payload)}, files=files, timeout=10)
+                    else:
+                        requests.post(url, json=payload, timeout=10)
+                except Exception as exc:
+                    self._log(f"[Webhook] Error posting event detection: {type(exc).__name__}")
+
+            self._send_pool.submit(_send)
+
     def _handle_filter_match(self, spec: Dict[str, Any], pid: int, raw_img: Image.Image) -> bool:
         behavior = str(spec.get("behavior", "") or "").strip().lower()
         filter_name = str(spec.get("name", "") or "").strip() or str(spec.get("id", "") or "Filter")
         filter_id = str(spec.get("id", "") or "").strip()
         ctx = self._context_provider(pid) if self._context_provider else {}
+
+        if behavior == "event":
+            self._log(f"[DETECT] {filter_name} detected in PID {pid}.")
+            self._emit_filter_match_signal(pid, filter_id, filter_name)
+            self._send_event_webhooks(spec, pid, ctx, raw_img)
+            self._emit_filter_alert(spec, filter_name)
+            return True
 
         if behavior == "merchant":
             self._emit_filter_match_signal(pid, filter_id, filter_name)

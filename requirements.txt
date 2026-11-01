@@ -10,6 +10,7 @@ Pillow
 pyautoit
 watchdog
 rapidocr
+opencv-python-headless
 onnxruntime-directML
 discord.py
 cryptography

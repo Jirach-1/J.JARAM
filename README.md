@@ -92,6 +92,14 @@
 ### Run From Source (Windows)
 1. Install **Python 3.14 (64-bit)**.
 2. Install dependencies: `pip install -r requirements.txt`
+   RapidOCR 3.9.x also declares the desktop OpenCV package as a dependency. After
+   installing requirements, keep only the headless variant (both variants share
+   the same `cv2` files):
+
+   ```powershell
+   python -m pip uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless
+   python -m pip install --force-reinstall --no-deps opencv-python-headless
+   ```
 3. Build the native modules with the same interpreter (Visual Studio Build Tools required):
    - `cd native`
    - `python -m pip install -U "pybind11>=3.0" "setuptools>=77"`
@@ -102,6 +110,34 @@
 The `.pyd` ABI tag must match Python. Python 3.14 loads the `cp314` builds; it
 will intentionally ignore older `cp312` files. See `native/NATIVE_BUILD.md` for
 build and verification details.
+
+### Updating the Application Version
+
+Edit `APP_VERSION` in `app_version.py` (for example, `"2x95"`). The About dialog,
+application metadata, webhook footers, and default executable names use this value.
+Restart source runs or rebuild executables after changing it. An explicit build
+`-OutputName` still overrides the default executable name.
+
+### Build Windows Executables
+
+Run `build_scripts/build_nuitka.ps1` for a single executable or
+`build_scripts/build_nuitka_unbundled.ps1` for a standalone folder. Both use the
+virtual environment in the parent directory and require headless OpenCV as the
+only installed OpenCV distribution.
+
+The builds retain bundled OCR models, DirectML and CPU OCR, Windows browser
+login, and the existing Windows UI styles. Packaging excludes OpenCV video
+support, non-Windows Selenium helpers, unused Qt plugins, and OCR backends other
+than ONNX Runtime. Pillow retains BMP, GIF, ICO, JPEG, PNG, PPM, TIFF, and WebP;
+other image formats, including AVIF and PDF, are excluded from executables.
+Unused NumPy FFT, polynomial, and random modules and emoji translation tables
+are also omitted. Unicode emoji recognition and browser keyboard input retain
+their required data.
+
+For testing a separately built headless OpenCV wheel, extract it into an isolated
+directory and pass `-OpenCvRuntimeDirectory <directory>` to any build script.
+Relative paths resolve from the calling directory. The installed OpenCV package
+is used by default; selecting a runtime only changes that build's import path.
 
 ### System Requirements
 - **Operating System**: Windows 10/11

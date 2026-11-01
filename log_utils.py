@@ -128,10 +128,16 @@ class RobloxLogIndex:
         self._lock = threading.RLock()
         self._scan_lock = threading.Lock()
         self._files: Dict[str, _IndexedFile] = {}
+        self._lookup_dirty = True
+        self._files_by_username: Dict[str, list[_IndexedFile]] = {}
+        self._files_by_generation: Dict[str, _IndexedFile] = {}
+        self._pending_lookup_files: list[_IndexedFile] = []
         self._pinned_generations: set[str] = set()
         self._unreadable_candidates: set[str] = set()
         self._dirty_paths: set[str] = set()
         self._next_poll_at = 0.0
+        self._next_pinned_poll_at = 0.0
+        self._retained_since = float("inf")
         self._created_mono = time.monotonic()
         self._last_success_mono = 0.0
         self._consecutive_failures = 0
@@ -140,6 +146,9 @@ class RobloxLogIndex:
         self._stats = {
             "refreshes": 0,
             "refresh_failures": 0,
+            "last_refresh_seconds": 0.0,
+            "max_refresh_seconds": 0.0,
+            "last_refresh_error_type": "",
             "files_enumerated": 0,
             "files_scanned": 0,
             "bytes_scanned": 0,
@@ -217,6 +226,7 @@ class RobloxLogIndex:
         """Force a same-path file to be rediscovered as a new generation."""
         norm_path = self._normalize(path)
         with self._lock:
+            self._lookup_dirty = True
             state = self._files.get(norm_path)
             if state is None:
                 self.mark_dirty(path)
@@ -237,11 +247,62 @@ class RobloxLogIndex:
     def has_generation(self, generation_id: str) -> bool:
         generation = str(generation_id or "")
         with self._lock:
-            return any(state.generation_id == generation for state in self._files.values())
+            self._ensure_lookup_indexes_locked()
+            return generation in self._files_by_generation
+
+    def _ensure_lookup_indexes_locked(self) -> None:
+        if not self._lookup_dirty:
+            return
+        by_username: Dict[str, list[_IndexedFile]] = {}
+        by_generation: Dict[str, _IndexedFile] = {}
+        pending: list[_IndexedFile] = []
+        for state in self._files.values():
+            by_generation[state.generation_id] = state
+            for username in state.markers:
+                by_username.setdefault(username, []).append(state)
+            if state.read_error or (not state.classified and state.scan_pos < state.size):
+                pending.append(state)
+        self._files_by_username = by_username
+        self._files_by_generation = by_generation
+        self._pending_lookup_files = pending
+        self._lookup_dirty = False
 
     def generation_sizes(self) -> Dict[str, int]:
         with self._lock:
             return {state.generation_id: int(state.size) for state in self._files.values()}
+
+    def _refresh_pinned_sizes(self) -> None:
+        """Check attached files frequently without rescanning the directory.
+
+        Use fresh stat calls: Windows directory-entry metadata can lag writes
+        through an open handle. Replacements/truncations still go through full
+        generation discovery before the engine can consume their contents.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if self._closed or now < self._next_pinned_poll_at:
+                return
+            self._next_pinned_poll_at = now + 0.25
+            pinned = [(key, state, state.generation_id) for key, state in self._files.items()
+                      if state.generation_id in self._pinned_generations]
+        for key, state, generation in pinned:
+            try:
+                st = os.stat(state.path, follow_symlinks=False)
+            except OSError:
+                self.mark_dirty(state.path)
+                continue
+            with self._lock:
+                if self._files.get(key) is not state or state.generation_id != generation:
+                    continue
+                if self._identity(st) != state.identity or st.st_size < state.size:
+                    self.mark_dirty(state.path)
+                    continue
+                if int(st.st_size) != state.size:
+                    state.size = int(st.st_size)
+                    state.mtime_ns = int(st.st_mtime_ns)
+                    if not state.classified:
+                        state.read_pending = True
+                        self._lookup_dirty = True
 
     def _ensure_observer(self) -> None:
         with self._lock:
@@ -278,18 +339,28 @@ class RobloxLogIndex:
         with self._lock:
             self._consecutive_failures += 1
             self._stats["refresh_failures"] += 1
+            self._stats["last_refresh_error_type"] = type(exc).__name__
             self._next_poll_at = time.monotonic() + _POLL_INTERVAL_SECONDS
         _debug("log-index refresh failed for %s: %r", self.logs_dir, exc)
 
-    def refresh(self, *, force: bool = False) -> ReaderHealth:
+    def refresh(self, *, force: bool = False, not_before: Optional[float] = None) -> ReaderHealth:
         now_mono = time.monotonic()
+        cutoff = time.time() - self.discovery_seconds
+        if not_before is not None:
+            cutoff = min(cutoff, float(not_before))
         with self._lock:
             if self._closed:
                 return ReaderHealth.UNHEALTHY
-            if not force and not self._dirty_paths and now_mono < self._next_poll_at:
+            broader_lookup = not_before is not None and cutoff < self._retained_since
+            if not force and not self._dirty_paths and now_mono < self._next_poll_at and not broader_lookup:
                 return self.health()
+            pinned_paths = {
+                state.norm_path for state in self._files.values()
+                if state.generation_id in self._pinned_generations
+            }
 
-        entries: list[tuple[str, str, os.stat_result]] = []
+        entries: list[tuple[str, str, os.stat_result, float]] = []
+        enumerated_count = 0
         unreadable_candidates: set[str] = set()
         try:
             with os.scandir(self.logs_dir) as it:
@@ -299,9 +370,17 @@ class RobloxLogIndex:
                     try:
                         if not entry.is_file(follow_symlinks=False):
                             continue
-                        st = entry.stat(follow_symlinks=False)
+                        st = os.stat(entry.path, follow_symlinks=False)
+                        enumerated_count += 1
                         path = os.path.abspath(entry.path)
-                        entries.append((path, self._normalize(path), st))
+                        session_ts = self._session_started_at(path, st)
+                        norm_path = self._normalize(path)
+                        # Keep active/pinned logs even for month-long sessions.
+                        # Closed historical logs can be rediscovered lazily by
+                        # an explicit older not_before lookup.
+                        if max(session_ts, float(st.st_mtime)) < cutoff and norm_path not in pinned_paths:
+                            continue
+                        entries.append((path, norm_path, st, session_ts))
                     except (FileNotFoundError, PermissionError, OSError):
                         try:
                             unreadable_candidates.add(self._normalize(entry.path))
@@ -309,17 +388,29 @@ class RobloxLogIndex:
                             pass
                         continue
         except (FileNotFoundError, PermissionError, OSError) as exc:
+            with self._lock:
+                self._retained_since = cutoff
             self._record_refresh_failure(exc)
             return self.health()
 
         seen: set[str] = set()
         now_wall = time.time()
+        completed_mono = time.monotonic()
         with self._lock:
             self._stats["refreshes"] += 1
-            self._stats["files_enumerated"] += len(entries)
-            self._last_success_mono = now_mono
+            duration = max(0.0, completed_mono - now_mono)
+            self._stats["last_refresh_seconds"] = duration
+            self._stats["max_refresh_seconds"] = max(self._stats["max_refresh_seconds"], duration)
+            self._stats["last_refresh_error_type"] = ""
+            self._lookup_dirty = True
+            self._stats["files_enumerated"] += enumerated_count
+            # Health measures the age of a completed successful scan. Using
+            # its start time marked every scan lasting 10+ seconds unhealthy,
+            # causing poll() to skip username discovery after successful I/O.
+            self._last_success_mono = completed_mono
             self._consecutive_failures = 0
-            self._next_poll_at = now_mono + _POLL_INTERVAL_SECONDS
+            self._next_poll_at = completed_mono + _POLL_INTERVAL_SECONDS
+            self._retained_since = cutoff
             self._dirty_paths.clear()
             self._unreadable_candidates = unreadable_candidates
 
@@ -336,7 +427,7 @@ class RobloxLogIndex:
                     unreadable.read_error = True
                     unreadable.read_pending = True
 
-            for path, norm_path, st in entries:
+            for path, norm_path, st, session_ts in entries:
                 seen.add(norm_path)
                 identity = self._identity(st)
                 size = int(st.st_size)
@@ -346,7 +437,6 @@ class RobloxLogIndex:
                     if current is not None:
                         self._stats["replacements"] += 1
                         self._pinned_generations.discard(current.generation_id)
-                    session_ts = self._session_started_at(path, st)
                     self._files[norm_path] = _IndexedFile(
                         path=path,
                         norm_path=norm_path,
@@ -434,6 +524,7 @@ class RobloxLogIndex:
             want = min(_SCAN_CHUNK_BYTES, remaining, max(0, size - start))
             if want <= 0:
                 with self._lock:
+                    self._lookup_dirty = True
                     state.read_pending = False
                     state.read_error = False
                 continue
@@ -443,6 +534,7 @@ class RobloxLogIndex:
                     raw = handle.read(want)
             except (FileNotFoundError, PermissionError, OSError) as exc:
                 with self._lock:
+                    self._lookup_dirty = True
                     state.read_error = True
                     state.read_pending = True
                     self._stats["read_failures"] += 1
@@ -450,6 +542,7 @@ class RobloxLogIndex:
                 continue
             if not raw:
                 with self._lock:
+                    self._lookup_dirty = True
                     state.read_pending = False
                     state.read_error = False
                 continue
@@ -474,6 +567,7 @@ class RobloxLogIndex:
                     or state.scan_pos != start
                 ):
                     continue
+                self._lookup_dirty = True
                 state.scan_pos += len(raw)
                 state.marker_carry = combined[-_MARKER_CARRY_BYTES:]
                 state.read_error = False
@@ -498,7 +592,8 @@ class RobloxLogIndex:
         force: bool = False,
         not_before: Optional[float] = None,
     ) -> ReaderHealth:
-        health = self.refresh(force=force)
+        self._refresh_pinned_sizes()
+        health = self.refresh(force=force, not_before=not_before)
         if health is not ReaderHealth.UNHEALTHY:
             self._scan_pending(
                 not_before=not_before,
@@ -544,12 +639,12 @@ class RobloxLogIndex:
 
         health = self.health()
         with self._lock:
+            self._ensure_lookup_indexes_locked()
             cutoff = time.time() - self.discovery_seconds if not_before is None else float(not_before)
             candidates = [
                 state
-                for state in self._files.values()
-                if key in state.markers
-                and (
+                for state in self._files_by_username.get(key, ())
+                if (
                     (not_before is None and state.generation_id in self._pinned_generations)
                     or state.session_started_at >= cutoff
                 )
@@ -571,7 +666,7 @@ class RobloxLogIndex:
                 )
 
             relevant = [
-                state for state in self._files.values()
+                state for state in self._pending_lookup_files
                 if state.session_started_at >= cutoff or (state.mtime_ns / 1_000_000_000) >= cutoff
             ]
             pending = any(

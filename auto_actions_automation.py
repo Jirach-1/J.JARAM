@@ -2996,7 +2996,10 @@ class AutoActionEngine:
                 if str(rule.repeat_mode) == "count":
                     completed_startup_rows.add(int(idx))
                 elif str(rule.repeat_mode) == "once_per_pid":
-                    completed_pids.setdefault(int(idx), set()).add(int(pid or 0))
+                    # A user's previous process cannot run this row again.
+                    # Retaining every PID also misidentifies reused Windows
+                    # PIDs as sessions that have already completed the row.
+                    completed_pids[int(idx)] = {int(pid or 0)}
 
     def _condition_matches(self, hwnd: int, condition: ActionCondition, *, click_delay: float) -> bool:
         if not bool(condition.enabled):
@@ -4100,6 +4103,8 @@ class AutoActionEngine:
             pending_seq = self._pending_trigger_seq.setdefault(str(uid), {})
             consumed = self._last_trigger_seq.setdefault(str(uid), {})
             completed_pids = self._completed_pids.setdefault(str(uid), {})
+            for pids in completed_pids.values():
+                pids.intersection_update({int(pid or 0)})
             completed_startup_rows = self._completed_startup_rows.setdefault(str(uid), set())
             signatures = self._rule_signature.setdefault(str(uid), {})
 

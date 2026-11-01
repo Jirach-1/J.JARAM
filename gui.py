@@ -17,7 +17,7 @@ import traceback
 import difflib
 from collections import deque
 from typing import Any, Dict, Set, List, Tuple, Optional, Sequence, Iterable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import urlopen
 from windows_clock_sync import (
@@ -501,6 +501,7 @@ from log_utils import (
     get_roblox_log_index,
 )
 from biomes import biome_names, biome_meta, biome_duration
+from bes_event_holds import migrate_event_holds, normalize_event_holds
 from utilities_tab import (
     DEFAULT_UTILITY_TIMINGS,
     UTILITY_DELAY_MAX_SECONDS,
@@ -579,6 +580,8 @@ WEBHOOK_ROLE_PINGS_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 WEBHOOK_USER_FILTER_MODE_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 AUTO_ACTION_LINK_BORDER_ROLE = int(Qt.ItemDataRole.UserRole) + 3
 from multiscope_process import MultiScopeProcessProxy
+from app_version import APP_FOOTER, APP_VERSION_LABEL
+from events import EVENTS, EVENT_FILTER_IDS, build_event_payload, event_id_for_filter, get_event_ocr_preset, normalize_event_webhooks
 from antiafk import AntiAFK
 from ocr_worker import (
     OCRWorker,
@@ -705,6 +708,39 @@ def _filter_multiscope_rows(rows: list, user_ids: Iterable[str]) -> list:
             current.update(in_menu=None, last_menu_ts=0.0)
         filtered.append(current)
     return filtered
+
+
+def _restore_multiscope_cached_state(rows: list, cached_rows: list) -> list:
+    """Restore display state without replacing the fresh snapshot's membership."""
+    if not rows:
+        return list(cached_rows or [])
+    cached_by_server = {
+        str(row.get("server_key") or row.get("server") or ""): row
+        for row in cached_rows or [] if isinstance(row, dict)
+    }
+    restored = []
+    for row in rows:
+        has_signal = (
+            row.get("in_menu") is not None
+            or row.get("last_biome", row.get("biome"))
+            or row.get("last_merchant", row.get("merchant"))
+            or row.get("events")
+        )
+        key = str(row.get("server_key") or row.get("server") or "")
+        cached = cached_by_server.get(key)
+        matching = _filter_multiscope_rows([cached], row.get("users") or []) if cached else []
+        if has_signal or not matching:
+            restored.append(row)
+            continue
+        current = dict(row)
+        for name in ("in_menu", "last_menu_ts", "last_biome", "biome", "biome_age",
+                     "last_merchant", "merchant", "merchant_age", "events"):
+            if name in matching[0]:
+                current[name] = matching[0][name]
+        for name in ("in_menu_by_uid", "last_menu_ts_by_uid"):
+            current[name] = {**(row.get(name) or {}), **(matching[0].get(name) or {})}
+        restored.append(current)
+    return restored
 
 _SECONDS_PER_DAY = 86400.0
 _ACTIVITY_FRESH_DAYS = 1.0
@@ -1167,6 +1203,7 @@ class ConfigManager:
                 "hourly_users_report_interval_hours": 1,
             },
             "webhooks": [],
+            "event_webhooks": normalize_event_webhooks([]),
             "discord_control": {
                 "enabled": False,
                 "token": "",
@@ -1290,6 +1327,7 @@ class ConfigManager:
                 "auto_item_lead_s": 3.0,
                 # Keep unthrottled briefly after actions (small grace).
                 "auto_item_grace_s": 1.0,
+                "event_holds": {"enabled": False, "events": {}},
             },
 
             "trimmer": {
@@ -3082,6 +3120,7 @@ class ConfigManager:
                                 )
                             )
                             loaded["misc"] = misc_dict
+                    migrate_event_holds(loaded)
                     settings = self._deep_update(settings, loaded)
                     try:
                         alerts = settings.get("alerts", {}) or {}
@@ -6484,16 +6523,6 @@ class WorkerThread(QThread):
                 except Exception:
                     pass
 
-    def _trace(self, uid: str, msg: str, *, every: float = 30.0) -> None:
-        now = time.time()
-        key = (uid, msg.split()[0])
-        if not hasattr(self, "_trace_ts"):
-            self._trace_ts = {}
-        last = self._trace_ts.get(key, 0.0)
-        if now - last >= every:
-            self.log_signal.emit(f"[SCAN-TRACE] {uid}: {msg}")
-            self._trace_ts[key] = now
-
     @staticmethod
     def _private_server_code_from_link(link: str) -> str:
         text = str(link or "")
@@ -6804,7 +6833,7 @@ class WorkerThread(QThread):
             current = str((tracker.user_server or {}).get(uid_s, "") or "").strip()
         except Exception:
             current = ""
-        if current and not self._is_disconnected_like_server_label(current):
+        if current and current.upper() != "UNKNOWN" and not self._is_disconnected_like_server_label(current):
             return current
 
         info_dict = info if isinstance(info, dict) else {}
@@ -7015,6 +7044,13 @@ class WorkerThread(QThread):
         cap_watchdog_cfg = normalize_cap_watchdog_settings(cfg.get("cap_watchdog"))
         self.ms.configure_webhooks(
             biome_webhooks=cfg.get("webhooks", []),
+            event_webhooks=cfg.get("event_webhooks", []),
+            disabled_log_events=[
+                event_id_for_filter(spec)
+                for spec in _candidate_ocr_filters_from_cfg(ocr_cfg)
+                if bool(ocr_cfg.get("enabled", False)) and bool(spec.get("enabled", True))
+                and str(spec.get("behavior") or "") == "event" and event_id_for_filter(spec)
+            ],
             merchant_hook=ms_cfg.get("merchant_webhook", ""),
             enable_jester=ms_cfg.get("enable_jester", True),
             enable_mari=ms_cfg.get("enable_mari", True),
@@ -7040,6 +7076,9 @@ class WorkerThread(QThread):
             self.ms.configure_development(runtime_settings(cfg))
         except ImportError:
             pass
+        bes_cfg = cfg.get("bes") or {}
+        event_holds = bes_cfg.get("event_holds") or {}
+        self.ms.configure_bes_event_holds(event_holds if bes_cfg.get("enabled") else {})
 
     def refresh_multiscope_settings(self, cfg: dict) -> None:
         try:
@@ -7117,6 +7156,23 @@ class WorkerThread(QThread):
                 self._last_multiscope_user_sync_signature = sync_signature
         except Exception:
             pass
+
+    def _report_multiscope_runtime(self, status: dict, rows: list, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now < getattr(self, "_next_multiscope_report_at", 0.0):
+            return
+        self._next_multiscope_report_at = now + 5.0
+        try:
+            from multiscope_diagnostics import runtime_report, write_report
+            report = runtime_report(
+                saved_users=self.cfg_manager.peek_users(), manager_users=self.manager.settings,
+                user_states=self.user_states, active_pids=self._active_pids_by_uid,
+                status=status, requested_users=self._multiscope_synced_user_ids, rows=rows,
+                reader=self.ms.reader_diagnostics(),
+            )
+            write_report(self.cfg_manager.config_dir, "multiscope_runtime.json", report)
+        except Exception as exc:
+            self._log(f"[Multiscope] Runtime report failed: {exc!r}")
 
     def initialize_manager(self) -> bool:
         try:
@@ -7642,16 +7698,22 @@ class WorkerThread(QThread):
                     users_signature = self.cfg_manager.get_users_runtime_signature()
                 except Exception:
                     users_signature = None
-                if getattr(self, "_users_runtime_signature_seen", None) != users_signature:
-                    self._users_runtime_signature_seen = users_signature
+                state_users = {
+                    uid: state.get("user_info", {}) for uid, state in self.user_states.items()
+                    if isinstance(state, dict)
+                }
+                # Settings may have been assigned before a previous reload was
+                # interrupted. Reconcile the actual runtime records as well.
+                if (getattr(self, "_users_runtime_signature_seen", None) != users_signature
+                        or state_users != self.manager.settings):
                     try:
                         fresh_map = self.cfg_manager.get_users_for_manager() or {}
-                    except Exception:
-                        fresh_map = {}
+                    except Exception as exc:
+                        self._log(f"[Accounts] Could not refresh accounts; retrying next heartbeat: {exc!r}")
 
                 # Only do work if something actually changed
-                if fresh_map is not None and fresh_map != self.manager.settings:
-                    old_ids = set(self.manager.settings.keys())
+                if fresh_map is not None and (fresh_map != self.manager.settings or fresh_map != state_users):
+                    old_ids = set(self.manager.settings) | set(self.user_states)
                     new_ids = set(fresh_map.keys())
 
                     # Snapshot old flags so we can apply transition behavior (disable/enable, flag flips).
@@ -7756,7 +7818,7 @@ class WorkerThread(QThread):
                                         pass
 
                     # 4) Add new users (if any)
-                    for uid in (new_ids - old_ids):
+                    for uid in (new_ids - set(self.user_states)):
                         info = self.manager.settings.get(uid, {})
                         if not isinstance(info, dict):
                             info = {}
@@ -7781,6 +7843,9 @@ class WorkerThread(QThread):
                     # Keep the out-of-process MultiScope engine aware of live
                     # users and their metadata after users.json hot reloads.
                     self._sync_multiscope_user_list(force=True)
+
+                if fresh_map is not None:
+                    self._users_runtime_signature_seen = users_signature
 
                 # housekeeping: clean dead processes
                 if 'cleanup' not in self.timing_trackers:
@@ -8182,35 +8247,13 @@ class WorkerThread(QThread):
                             if kind == "disconnect":
                                 self._handle_multiscope_disconnect(uid, payload)
                         rows = self.ms.snapshot()            # [{server, users, biome/merchant…}]
-                        has_signal = False
-                        try:
-                            for r in (rows or []):
-                                if not isinstance(r, dict):
-                                    continue
-                                if r.get("in_menu", None) is not None:
-                                    has_signal = True
-                                    break
-                                b = r.get("last_biome", r.get("biome", ""))
-                                if str(b or "").strip():
-                                    has_signal = True
-                                    break
-                                m = r.get("last_merchant", r.get("merchant", ""))
-                                if str(m or "").strip():
-                                    has_signal = True
-                                    break
-                        except Exception:
-                            has_signal = False
-
                         if self._bootstrap_multiscope_rows and time.time() < self._bootstrap_multiscope_deadline:
-                            if (not rows) or (not has_signal):
-                                rows = self._bootstrap_multiscope_rows
-                            else:
-                                self._bootstrap_multiscope_rows = None
-                                self._bootstrap_multiscope_deadline = 0.0
+                            rows = _restore_multiscope_cached_state(rows, self._bootstrap_multiscope_rows)
                         elif rows and self._bootstrap_multiscope_rows:
                             self._bootstrap_multiscope_rows = None
                             self._bootstrap_multiscope_deadline = 0.0
                         rows = _filter_multiscope_rows(rows, self._multiscope_synced_user_ids)
+                        self._report_multiscope_runtime(status, rows)
                         ms_rows_for_limiter = rows if isinstance(rows, list) else None
                         self.multiscope_signal.emit(rows)    # GUI will render it
                 except Exception as _e:
@@ -8527,6 +8570,7 @@ class UserManagementDialogLegacy(QDialog):
             "alerts.hourly_users_report_enabled": "Hourly Users Report",
             "alerts.hourly_users_report_interval_hours": "Hourly Users Report Interval",
             "webhooks": "Webhooks",
+            "event_webhooks": "Event Webhooks",
             "ui.webhooks_hidden_biomes": "Hidden Webhook Biome Columns",
             "ui.show_tutorial_menu": "Show Tutorial Menu Item",
             "misc.skip_webhook_unknown_context": "Skip Unknown-Context Webhooks",
@@ -12929,6 +12973,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "alerts.hourly_users_report_enabled": "Hourly Users Report",
             "alerts.hourly_users_report_interval_hours": "Hourly Users Report Interval",
             "webhooks": "Webhooks",
+            "event_webhooks": "Event Webhooks",
             "ui.webhooks_hidden_biomes": "Hidden Webhook Biome Columns",
             "ui.show_tutorial_menu": "Show Tutorial Menu Item",
             "misc.skip_webhook_unknown_context": "Skip Unknown-Context Webhooks",
@@ -17084,12 +17129,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         controls_layout.addWidget(save_logs_btn)
 
         controls_layout.addStretch()
-        
-        self.watch_hit_chk = QCheckBox("WATCH-HIT/SCAN-TRACE logs", self)
-        self.watch_hit_chk.setChecked(False)  # hidden by default
-        controls_layout.addWidget(self.watch_hit_chk)
-
-        self.scan_trace_chk = self.watch_hit_chk
 
         self.multiscope_biome_chk = QCheckBox("MultiScope BIOME logs", self)
         self.multiscope_biome_chk.setChecked(False)
@@ -27168,6 +27207,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         layout.addWidget(auto_group)
 
+        from bes_event_holds_ui import BESEventHoldsWidget
+        self.bes_event_holds_widget = BESEventHoldsWidget()
+        self.bes_event_holds_widget.changed.connect(self._on_bes_ui_changed)
+        layout.addWidget(self.bes_event_holds_widget)
+
         log_group = QGroupBox("BES Log")
         log_layout = QVBoxLayout(log_group)
         self.bes_log_box = QTextEdit()
@@ -27422,6 +27466,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "exempt_users": exempt,
             "auto_item_lead_s": _float_value("auto_item_lead_s", 3.0, 0.0, 15.0),
             "auto_item_grace_s": _float_value("auto_item_grace_s", 1.0, 0.0, 10.0),
+            "event_holds": normalize_event_holds(cfg.get("event_holds")),
         }
 
     def _get_bes_settings_from_ui(self) -> Dict:
@@ -27457,6 +27502,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "exempt_users": exempt,
             "auto_item_lead_s": float(getattr(self, "bes_auto_lead_spin", None) and self.bes_auto_lead_spin.value() or 0.0),
             "auto_item_grace_s": float(getattr(self, "bes_auto_grace_spin", None) and self.bes_auto_grace_spin.value() or 0.0),
+            "event_holds": self.bes_event_holds_widget.config() if getattr(self, "bes_event_holds_widget", None) else {},
         })
 
     def _load_bes_settings(self) -> None:
@@ -27493,6 +27539,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
             self.bes_auto_lead_spin.setValue(float(cfg.get("auto_item_lead_s", 3.0)))
             self.bes_auto_grace_spin.setValue(float(cfg.get("auto_item_grace_s", 1.0)))
+            self.bes_event_holds_widget.set_config(cfg.get("event_holds"))
 
             exempt = cfg.get("exempt_users", ["", "", ""]) or ["", "", ""]
             for i, combo in enumerate(getattr(self, "bes_exempt_combos", None) or []):
@@ -27552,6 +27599,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             pass
 
+        worker = getattr(self, "worker_thread", None)
+        engine = getattr(worker, "ms", None)
+        if engine is not None:
+            engine.configure_bes_event_holds(cfg["event_holds"] if cfg["enabled"] else {})
+
         # Live-apply cycle changes
         if self.bes_controller is not None:
             try:
@@ -27602,6 +27654,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.bes_menu_exit_delay_spin.setValue(float(defaults.get("menu_exit_delay_seconds", 0.0)))
             self.bes_auto_lead_spin.setValue(float(defaults.get("auto_item_lead_s", 3.0)))
             self.bes_auto_grace_spin.setValue(float(defaults.get("auto_item_grace_s", 1.0)))
+            self.bes_event_holds_widget.set_config(defaults.get("event_holds"))
             for combo in getattr(self, "bes_exempt_combos", None) or []:
                 try:
                     combo.setCurrentIndex(0)
@@ -28276,6 +28329,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def _ocr_filter_presets_catalog(self) -> Dict[str, List[dict]]:
         return copy.deepcopy(
             {
+                "Halloween": [get_event_ocr_preset("sinister_s")],
                 "Egg Hunt": [
                     {
                         "name": "Sky Festival",
@@ -28485,8 +28539,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def _ocr_filter_behavior(self, filter_id: str, name: str, raw_behavior: str = "") -> str:
         behavior = str(raw_behavior or "").strip().lower()
-        if behavior in ("merchant", "verification_cap", "webhook"):
+        if behavior in ("merchant", "event", "verification_cap", "webhook"):
             return behavior
+        if filter_id in EVENT_FILTER_IDS:
+            return "event"
         if filter_id in self._ocr_merchant_filter_ids():
             return "merchant"
         if filter_id == "verification_check" or self._ocr_normalize_filter_name(name).lower() == "verification check":
@@ -28772,6 +28828,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "behavior": behavior,
             "cooldown_group": cooldown_group,
             "locked": bool(filter_id in default_map),
+            **({"event_id": event_id_for_filter(base)} if behavior == "event" else {}),
         }
 
     def _merge_ocr_filters_with_defaults(self, filters: List[dict]) -> List[dict]:
@@ -29721,7 +29778,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         info = QLabel(
             "Choose a preset category, then select one or more presets to add to the OCR filters table. "
-            "The webhook settings below will be copied into each added preset."
+            "Custom webhook settings below are copied into presets that support them. "
+            "Event presets use Settings > Event Webhook."
         )
         info.setWordWrap(True)
         info.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
@@ -29798,6 +29856,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         def _update_detail() -> None:
             selected_items = preset_list.selectedItems()
             presets = _current_presets()
+            selected_presets = [presets[int(item.data(Qt.ItemDataRole.UserRole))] for item in selected_items]
+            uses_settings_webhook = bool(selected_presets) and all(
+                preset.get("behavior") == "event" for preset in selected_presets
+            )
+            webhook_group.setEnabled(not uses_settings_webhook)
+            webhook_group.setToolTip("Configure event destinations in Settings > Event Webhook." if uses_settings_webhook else "")
             if len(selected_items) != 1:
                 if selected_items:
                     detail_label.setText(f"{len(selected_items)} presets selected.")
@@ -29831,8 +29895,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     preset_cfg = copy.deepcopy(presets[idx])
                 except Exception:
                     continue
-                preset_cfg["webhook_url"] = webhook_url
-                preset_cfg["webhook_message"] = webhook_message
+                if preset_cfg.get("behavior") != "event":
+                    preset_cfg["webhook_url"] = webhook_url
+                    preset_cfg["webhook_message"] = webhook_message
                 self._add_filter_row(preset_cfg)
             self._on_ocr_settings_changed()
             dlg.accept()
@@ -29852,6 +29917,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         is_locked = bool(spec.get("locked", False))
         is_merchant = str(spec.get("id") or "") in self._ocr_merchant_filter_ids() or str(spec.get("behavior") or "") == "merchant"
+        is_event = str(spec.get("behavior") or "") == "event"
         current_roi = copy.deepcopy(spec.get("roi") or self._ocr_empty_roi_cfg())
         current_shared_area_id = self._ocr_filter_shared_area_id(spec) or "chat"
 
@@ -29950,6 +30016,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         form.addRow("", area_label)
 
         layout.addLayout(form)
+
+        if is_event:
+            hook_le.setEnabled(False)
+            msg_te.setEnabled(False)
+            hook_le.setToolTip("Uses Settings > Event Webhook.")
+            msg_te.setToolTip("Uses the built-in event message format.")
 
         if is_merchant:
             hook_le.setEnabled(False)
@@ -30559,6 +30631,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         ms["jester_ping"] = _mk_ping(ms.get("jester_ping_type", "None"), ms.get("jester_ping_id", ""))
         ms["mari_ping"] = _mk_ping(ms.get("mari_ping_type", "None"), ms.get("mari_ping_id", ""))
         ms["rin_ping"] = _mk_ping(ms.get("rin_ping_type", "None"), ms.get("rin_ping_id", ""))
+        ms["event_webhooks"] = self._collect_event_webhooks_from_ui()
         return ms
 
     def calibrate_ocr_roi(self):
@@ -31773,10 +31846,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 self._normalize_webhook_role_pings_config(role_pings or {}),
             )
 
-        def _mk_mode_combo(default_text: str = "None") -> QComboBox:
+        def _mk_mode_combo(default_text: str = "None", items=("None", "Message", "Everyone")) -> QComboBox:
             cmb = QComboBox()
-            cmb.addItems(("None", "Message", "Everyone"))
-            if default_text in ("None", "Message", "Everyone"):
+            cmb.addItems(items)
+            if default_text in items:
                 cmb.setCurrentText(default_text)
 
             # Make the CLOSED state readable and consistent
@@ -32396,6 +32469,75 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         content_layout.addWidget(webhooks_group)
 
+        event_group = QGroupBox("Event Webhooks")
+        event_layout = QVBoxLayout(event_group)
+        event_info = QLabel("Set one webhook URL and notification mode for each event. Use Save Settings to apply changes.")
+        event_info.setWordWrap(True)
+        event_layout.addWidget(event_info)
+        self.event_webhooks_table = QTableWidget(0, 4)
+        event_table = self.event_webhooks_table
+        event_table.setHorizontalHeaderLabels(["Event", "Webhook URL", "Notification", "Ping Type / ID"])
+        event_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        event_table.setShowGrid(False)
+        event_table.setAlternatingRowColors(False)
+        event_header = event_table.horizontalHeader()
+        event_header.setMinimumSectionSize(150)
+        event_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        event_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        event_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        event_table.verticalHeader().setDefaultSectionSize(62)
+        event_table.verticalHeader().setMinimumSectionSize(62)
+        event_table.setMinimumHeight(self.webhooks_table.minimumHeight())
+        event_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        event_table.setColumnWidth(2, 150)
+        event_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        event_table.setColumnWidth(3, 390)
+        event_layout.addWidget(event_table)
+
+        def load_event_webhook_rows(hooks):
+            event_table.setRowCount(0)
+            for row, hook in enumerate(normalize_event_webhooks(hooks)):
+                event_id = hook["event_id"]
+                event_table.insertRow(row)
+                event_item = QTableWidgetItem(EVENTS[event_id]["name"])
+                event_item.setData(Qt.ItemDataRole.UserRole, event_id)
+                event_item.setFlags(event_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                event_table.setItem(row, 0, event_item)
+                event_table.setItem(row, 1, QTableWidgetItem(hook["url"]))
+                combo = _mk_mode_combo(hook["event_modes"][event_id])
+                _place_centered(event_table, row, 2, combo)
+                ping_cell = QWidget()
+                ping_cell.setObjectName("eventWebhookPingCell")
+                ping_cell.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                ping_cell.setStyleSheet("background: transparent;")
+                ping_layout = QHBoxLayout(ping_cell)
+                ping_layout.setContentsMargins(6, 6, 6, 6)
+                ping_layout.setSpacing(8)
+                ping_type = _mk_mode_combo(hook["ping_type"], ("None", "User ID", "Role ID"))
+                ping_type.setFixedWidth(combo.minimumWidth())
+                ping_type_holder = QWidget()
+                ping_type_layout = QHBoxLayout(ping_type_holder)
+                ping_type_layout.setContentsMargins(0, 0, 0, 0)
+                ping_type_layout.addStretch()
+                ping_type_layout.addWidget(ping_type)
+                ping_id = QLineEdit(hook["ping_id"])
+                ping_id.setPlaceholderText("numeric ID")
+                ping_id.setMinimumWidth(120)
+                ping_cell.setToolTip("Used with Message notifications. Everyone notifications use @everyone.")
+                ping_layout.addWidget(ping_type_holder, 1)
+                ping_layout.addWidget(ping_id, 1)
+                event_table.setCellWidget(row, 3, ping_cell)
+                event_table.setRowHeight(row, max(34, combo.sizeHint().height() + 6))
+
+        self._load_event_webhook_rows = load_event_webhook_rows
+        event_buttons = QHBoxLayout()
+        event_test = QPushButton("Test Webhook")
+        event_test.clicked.connect(self.test_selected_event_webhook)
+        event_buttons.addWidget(event_test)
+        event_buttons.addStretch()
+        event_layout.addLayout(event_buttons)
+        content_layout.addWidget(event_group)
+
         # --- Multiscope — Merchant & Pings (simple, no custom helpers) ---
         ms_box = QGroupBox("Merchant Webhook & Pings")
         ms_form = QFormLayout(ms_box)
@@ -32896,6 +33038,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         )
 
     def _development_service_request(self, payload: dict) -> dict:
+        if payload.get("method") in {"bes_event_hold", "bes_event_release"}:
+            from bes_event_holds import handle_service_request
+            return handle_service_request(self, payload)
         service = getattr(self, "discord_control_service", None)
         if payload.get("method") == "discord_member" and service is not None:
             return service.lookup_member(str(payload.get("guild_id") or ""), str(payload.get("user_id") or ""))
@@ -35143,8 +35288,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         stopped_state = wt.export_state()
                     except Exception:
                         stopped_state = None
-                if shutdown_ms:
-                    self._shutdown_worker_multiscope(wt)
+        if worker_stopped and shutdown_ms and self.worker_thread:
+            self._shutdown_worker_multiscope(self.worker_thread)
         self._stop_ocr_worker()
 
         # Always stop Anti-AFK when the manager stops
@@ -36591,14 +36736,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def add_log(self, message):
         message = str(message or "")
-        if message.startswith("[MultiScope] Watch hit"):
-            chk = getattr(self, "watch_hit_chk", None)
-            if chk is not None and not chk.isChecked():
-                return
-        if message.startswith("[SCAN-TRACE]"):
-            chk = getattr(self, "scan_trace_chk", None)
-            if chk is not None and not chk.isChecked():
-                return
         if (
             message.startswith("[MultiScope] BIOME ")
             or message.startswith("[MultiScope] Skipping webhook")
@@ -36974,6 +37111,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 return []
             if path == "webhooks":
                 return self._diff_webhooks_for_changes(old, new)
+            if path == "event_webhooks":
+                return self._diff_event_webhooks_for_changes(old, new)
             label = self._pretty_setting_label(path)
             return [f"{label}: {self._summarize_settings_list(old)} -> {self._summarize_settings_list(new)}"]
 
@@ -36981,6 +37120,82 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             label = self._pretty_setting_label(path)
             changes.append(f"{label}: {self._format_settings_value(old)} -> {self._format_settings_value(new)}")
         return changes
+
+    def _diff_event_webhooks_for_changes(self, old_list: list, new_list: list) -> list:
+        old_hooks = {hook["event_id"]: hook for hook in normalize_event_webhooks(old_list)}
+        changes = []
+        for hook in normalize_event_webhooks(new_list):
+            event_id = hook["event_id"]
+            previous = old_hooks[event_id]
+            label = f"Event Webhook ({EVENTS[event_id]['name']})"
+            if previous["url"] != hook["url"]:
+                changes.append(f"{label}: URL {self._format_settings_value(previous['url'])} -> {self._format_settings_value(hook['url'])}")
+            old_mode = previous["event_modes"][event_id]
+            new_mode = hook["event_modes"][event_id]
+            if old_mode != new_mode:
+                changes.append(f"{label}: Notification {old_mode} -> {new_mode}")
+            if previous["ping_type"] != hook["ping_type"]:
+                changes.append(f"{label}: Ping Type {previous['ping_type']} -> {hook['ping_type']}")
+            if previous["ping_id"] != hook["ping_id"]:
+                changes.append(f"{label}: Ping ID {self._format_settings_value(previous['ping_id'])} -> {self._format_settings_value(hook['ping_id'])}")
+        return changes
+
+    def _collect_event_webhooks_from_ui(self) -> list:
+        table = getattr(self, "event_webhooks_table", None)
+        if table is None:
+            return []
+        hooks = []
+        for row in range(table.rowCount()):
+            url_item = table.item(row, 1)
+            url = url_item.text().strip() if url_item else ""
+            event_item = table.item(row, 0)
+            event_id = event_item.data(Qt.ItemDataRole.UserRole) if event_item else ""
+            if event_id not in EVENTS:
+                continue
+            holder = table.cellWidget(row, 2)
+            combo = holder if isinstance(holder, QComboBox) else holder.findChild(QComboBox) if holder else None
+            ping_cell = table.cellWidget(row, 3)
+            ping_type = ping_cell.findChild(QComboBox) if ping_cell else None
+            ping_id = ping_cell.findChild(QLineEdit) if ping_cell else None
+            hooks.append({
+                "event_id": event_id, "name": EVENTS[event_id]["name"], "url": url,
+                "event_modes": {event_id: combo.currentText() if combo else "None"},
+                "ping_type": ping_type.currentText() if ping_type else "None",
+                "ping_id": ping_id.text().strip() if ping_id else "",
+            })
+        return normalize_event_webhooks(hooks)
+
+    def test_selected_event_webhook(self):
+        table = self.event_webhooks_table
+        rows = sorted({idx.row() for idx in table.selectedIndexes()})
+        if not rows and table.currentRow() >= 0:
+            rows = [table.currentRow()]
+        if len(rows) != 1:
+            QMessageBox.information(self, "Select Webhook", "Select a single event webhook row to test.")
+            return
+        url_item = table.item(rows[0], 1)
+        url = url_item.text().strip() if url_item else ""
+        if not url:
+            QMessageBox.warning(self, "Missing Webhook", "Selected event webhook row has no URL.")
+            return
+        event_item = table.item(rows[0], 0)
+        event_id = event_item.data(Qt.ItemDataRole.UserRole) if event_item else ""
+        if event_id not in EVENTS:
+            return
+        payload = build_event_payload(
+            event_id, owner="Test Owner", detector="Test User", server_label="Test Server",
+            ps_link="", detected_at=datetime.now(timezone.utc), footer=APP_FOOTER,
+        )
+        payload["embeds"][0]["title"] = f"Event Webhook Test - {EVENTS[event_id]['name']}"
+        try:
+            response = requests.post(url, json=payload, timeout=8)
+        except requests.RequestException as exc:
+            QMessageBox.warning(self, "Webhook Test Failed", f"Failed to send test message: {type(exc).__name__}")
+            return
+        if response.ok:
+            QMessageBox.information(self, "Event Webhook Test", "Sent test message.")
+        else:
+            QMessageBox.warning(self, "Webhook Test Failed", f"Status {response.status_code}.")
 
     def _collect_webhooks_from_ui(self) -> list:
         try:
@@ -37113,6 +37328,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 ) if hasattr(self, "hourly_users_report_interval_spin") else 1,
             },
             "webhooks": self._collect_webhooks_from_ui(),
+            "event_webhooks": self._collect_event_webhooks_from_ui(),
             "ui": {
                 "webhooks_hidden_biomes": sorted(
                     {str(b).strip().upper() for b in (getattr(self, "_webhooks_hidden_biomes", set()) or set()) if str(b).strip()}
@@ -37199,6 +37415,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 if biome in HARD_EVERYONE_BIOMES and _bm_lock_enforced():
                     continue  # This mode is forced and cannot be chosen in the table.
                 targets.append((name, biome))
+
+        old_event_everyone = {
+            (hook["url"], hook["event_id"])
+            for hook in normalize_event_webhooks(baseline.get("event_webhooks", []))
+            if hook["event_modes"][hook["event_id"]] == "Everyone"
+        }
+        for hook in normalize_event_webhooks(self._collect_event_webhooks_from_ui()):
+            event_id = hook["event_id"]
+            if (
+                hook["url"]
+                and hook["event_modes"][event_id] == "Everyone"
+                and (hook["url"], event_id) not in old_event_everyone
+            ):
+                targets.append(("Event Webhook", EVENTS[event_id]["name"]))
         return targets
 
     def _confirm_new_everyone_webhook_modes(self) -> bool:
@@ -37207,8 +37437,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return True
 
         preview = "".join(
-            f"<li>{html.escape(name)}: {html.escape(biome)}</li>"
-            for name, biome in targets[:6]
+            f"<li>{html.escape(name)}: {html.escape(target)}</li>"
+            for name, target in targets[:6]
         )
         if len(targets) > 6:
             preview += f"<li>...and {len(targets) - 6} more</li>"
@@ -37221,8 +37451,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "WARNING: @everyone will ping the entire Discord server</span>"
         )
         msg.setInformativeText(
-            "<p>Saving these biome webhook modes will send an <b>@everyone</b> ping "
-            "whenever a listed biome is found:</p>"
+            "<p>Saving these webhook modes will send an <b>@everyone</b> ping "
+            "whenever a listed biome or event is found:</p>"
             f"<ul>{preview}</ul>"
             "<p><b>Enable this at your own risk.</b></p>"
         )
@@ -37519,6 +37749,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     self._add_webhook_row(name, url, allowed, modes, users, role_pings, user_filter_mode)
                 except TypeError:
                     self._add_webhook_row(name, url, allowed)
+
+        if hasattr(self, "event_webhooks_table"):
+            self._load_event_webhook_rows(settings.get("event_webhooks", []))
 
         # ---------- Optional: Merchant + Pings (safe if widgets exist) ----------
         ms = settings.get("multiscope", {}) or {}
@@ -37881,6 +38114,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         # ---------- Webhooks table (tri-mode + legacy-compatible) ----------
         settings["webhooks"] = self._collect_webhooks_from_ui()
+        settings["event_webhooks"] = self._collect_event_webhooks_from_ui()
 
         # ---------- UI: Webhooks column visibility ----------
         ui = settings.get("ui", {}) or {}
@@ -38013,6 +38247,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 misc_cfg = settings.get("misc", {}) or {}
                 if isinstance(ms_cfg, dict) and isinstance(misc_cfg, dict):
                     ms_cfg = dict(ms_cfg)
+                    ms_cfg["event_webhooks"] = settings.get("event_webhooks", [])
                     ms_cfg["skip_webhook_unknown_context"] = bool(
                         misc_cfg.get("skip_webhook_unknown_context", False)
                     )
@@ -38035,6 +38270,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def reset_settings(self):
         """Load the hard-coded defaults from ConfigManager into the UI."""
         defaults = self.config_manager.default_settings          # ← one source of truth
+        self._load_event_webhook_rows(defaults.get("event_webhooks", []))
         t        = defaults["timeouts"]                          # short alias
 
         # ── basic limits ──────────────────────────────────────────
@@ -38308,7 +38544,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def show_about(self):
         config_info = self.config_manager.get_config_info()
         QMessageBox.about(self, "About J.JARAM",
-                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x88\n\n"
+                         f"J.JARAM (Jirach1's Just Another Roblox Account Manager) {APP_VERSION_LABEL}\n\n"
                          "Advanced multi-account Roblox session manager\n"
                          "with automated log based monitoring and process management.\n\n"
                          "Built with PySide6 and modern design principles.\n\n"
@@ -39530,6 +39766,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         threadpool_timeout_ms = 500 if closing else 2000
         child_timeout_s = 1.0 if closing else 2.0
 
+        # A previous Stop may have timed out before the worker finished. Its
+        # Multiscope queues still need closing once that worker has exited.
+        worker = getattr(self, "worker_thread", None)
+        if worker is not None and not worker.isRunning():
+            self._shutdown_worker_multiscope(worker)
+
         try:
             cleanup_timer = getattr(self, "_roblox_log_cleanup_timer", None)
             if cleanup_timer is not None:
@@ -39881,6 +40123,27 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 self._set_multiscope_table_item(r, 7, f"{merchant_age}s" if merchant_age is not None else "")
                 self._set_multiscope_table_item(r, 8, events)
 
+            try:
+                from multiscope_diagnostics import row_user_ids, write_report
+                users = sorted(row_user_ids(rows))
+                signature = (len(rows), tuple(users))
+                if signature != getattr(self, "_last_multiscope_display_signature", None):
+                    rendered_users = {
+                        uid.strip() for index in range(table.rowCount())
+                        if table.item(index, 1) is not None
+                        for uid in table.item(index, 1).text().split(",") if uid.strip()
+                    }
+                    write_report(self.config_manager.config_dir, "multiscope_display.json", {
+                        "server_rows": table.rowCount(), "user_ids": sorted(rendered_users),
+                        "received_user_ids": users,
+                        "received_missing_from_table": sorted(set(users) - rendered_users),
+                        "usernames": {uid: str((settings.get(uid) or {}).get("username") or uid)
+                                      for uid in users},
+                    })
+                    self._last_multiscope_display_signature = signature
+            except Exception:
+                pass
+
         finally:
             try:
                 table.setUpdatesEnabled(True)
@@ -39904,33 +40167,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         try:
             grace_until = float(getattr(self, "_ms_resume_grace_until", 0.0) or 0.0)
             if previous_rows and time.time() < grace_until:
-                has_signal = False
-                try:
-                    for r in (rows or []):
-                        if not isinstance(r, dict):
-                            continue
-                        if r.get("in_menu", None) is not None:
-                            has_signal = True
-                            break
-                        b = r.get("last_biome", r.get("biome", ""))
-                        if str(b or "").strip():
-                            has_signal = True
-                            break
-                        m = r.get("last_merchant", r.get("merchant", ""))
-                        if str(m or "").strip():
-                            has_signal = True
-                            break
-                        try:
-                            if int(r.get("events", 0) or 0) > 0:
-                                has_signal = True
-                                break
-                        except Exception:
-                            pass
-                except Exception:
-                    has_signal = False
-
-                if (not rows) or (not has_signal):
-                    rows = previous_rows
+                rows = _restore_multiscope_cached_state(rows, previous_rows)
         except Exception:
             pass
 
@@ -40172,7 +40409,7 @@ def main():
     app = QApplication(sys.argv)
 
     app.setApplicationName("J.JARAM")
-    app.setApplicationVersion("JX 2x88")
+    app.setApplicationVersion(APP_VERSION_LABEL)
     app.setOrganizationName("Jirach1")
     # Qt 6 ships a Windows 11 style that can change widget visuals. Force the
     # Windows 10-era style for consistent UI across OS versions.
