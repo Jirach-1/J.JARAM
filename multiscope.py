@@ -23,9 +23,12 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from app_version import APP_FOOTER
 from webhook_delivery import WebhookDeliveryPool, WebhookError, post_webhook
+from multiscope_metrics import RollingTimings
+from log_handle_cache import LogHandleCache, open_shared_log
 from events import EVENTS, EVENT_ASSET_PREFILTERS, build_event_payload, event_webhook_targets, iter_event_matches
 from log_utils import (
     RobloxLogIndex,
+    LogMatch,
     find_log_for_username,
     R_DISC_REASON, R_DISC_NOTIFY, R_DISC_SENDING, R_CONN_LOST,
 )
@@ -76,6 +79,10 @@ _CORE_LOG_LINE_MARKERS = (
 _R_RPC_MARK = "[BloxstrapRPC]"
 _R_JSON_START = re.compile(r"\{")
 _CURSOR_ANCHOR_BYTES = 256
+
+
+class _StaleLogHandle(Exception):
+    pass
 
 
 def _generation_identity_without_revision(generation_id: object) -> str:
@@ -363,6 +370,15 @@ class Cursor:
     observed_size: int = 0
     last_event_ts: float = 0.0
     dropping_oversized: bool = False
+    anchor_tail: bytes = b""
+    anchor_pos: int = 0
+
+    def remember_read(self, data: bytes, start: int) -> None:
+        """Keep the resume proof from bytes already read; snapshotting needs no I/O."""
+        previous = self.anchor_tail if self.anchor_pos == start else b""
+        self.anchor_tail = (data[-_CURSOR_ANCHOR_BYTES:] if len(data) >= _CURSOR_ANCHOR_BYTES
+                            else (previous + data)[-_CURSOR_ANCHOR_BYTES:])
+        self.anchor_pos = start + len(data)
 
 # ------------------------------------------------------------------------------
 # Engine
@@ -424,6 +440,7 @@ class MultiScopeEngine:
             "backlog_users": 0,
         }
         self._reader_stats_lock = threading.Lock()
+        self._timings = RollingTimings()
 
         # Handoff: donor_uid - spare_uid
         self._handoffs: Dict[str, str] = {}
@@ -482,6 +499,9 @@ class MultiScopeEngine:
         self._stats_stop = threading.Event()
         self._stats_writer = None
         self._stats_last_error_log = 0.0
+        self._stats_save_failures = 0
+        self._stats_last_error_type = ''
+        self._stats_last_saved_mono = 0.0
         self._load_found_stats()
         self._ensure_found_stats_catalog()
 
@@ -497,6 +517,7 @@ class MultiScopeEngine:
             max_workers=self._tail_workers,
             thread_name_prefix="ms-tail",
         )
+        self._log_handles = LogHandleCache(256, close_handle=self._close_tail_handle)
         self._tail_scope_locks: Dict[str, threading.RLock] = {}
         self._tail_scope_locks_lock = threading.Lock()
 
@@ -889,17 +910,25 @@ class MultiScopeEngine:
                                   list(value) if isinstance(value, list) else value)
                             for key, value in self._found_stats.items()} if dirty else None
             if snapshot is not None:
+                save_began = time.monotonic()
                 try:
                     self._write_found_stats_snapshot(snapshot)
-                except Exception:
+                except Exception as exc:
+                    with self._stats_lock:
+                        self._stats_save_failures += 1
+                        self._stats_last_error_type = type(exc).__name__
                     now = time.monotonic()
                     if now >= self._stats_last_error_log:
                         self._stats_last_error_log = now + 30.0
                         self._log("[MultiScope] Statistics save failed; pending changes retained for retry.")
                 else:
                     with self._stats_lock:
+                        self._stats_last_saved_mono = time.monotonic()
+                        self._stats_last_error_type = ''
                         if self._stats_revision == revision:
                             self._stats_dirty = False
+                finally:
+                    self._timings.record('statistics_write', (time.monotonic()-save_began)*1000)
                 self._stats_next_save_mono = time.monotonic() + self._stats_save_interval_seconds
             with self._stats_lock:
                 dirty = self._stats_dirty
@@ -1077,6 +1106,8 @@ class MultiScopeEngine:
         self,
         user_ids: List[str],
         refresh_user_ids: Optional[Set[str]] = None,
+        *,
+        resume_state: Optional[dict] = None,
     ) -> None:
         user_ids_set = {str(uid) for uid in (user_ids or [])}
         previous_uids = set(self._tracked_uids)
@@ -1087,8 +1118,6 @@ class MultiScopeEngine:
         resolve_uids = added_uids | refresh_uids
         # Discovery and username resolution are expensive. Existing users keep
         # their cursor; only new/renamed users need to be resolved again.
-        if resolve_uids:
-            self._log_index.poll(force=True)
         self._tracked_uids = set(user_ids_set)
         with self._lock:
             # remove stale only
@@ -1139,12 +1168,66 @@ class MultiScopeEngine:
             with self._event_lock:
                 self._events = [event for event in self._events if str(event[1]) in user_ids_set]
 
+        for uid in stale_uids:
+            self._log_handles.discard_user(uid)
+
+        # Resume saved attachments before any directory scan or multi-megabyte
+        # cold-tail seed. The full import below still validates cursor offsets,
+        # partial lines, generation revisions and deduplication state.
+        restored = set()
+        validated = {}
+        resume_reasons = {'missing_cursor': 0, 'username_changed_or_missing': 0,
+                          'validation_failed': 0}
+        if isinstance(resume_state, dict) and resume_state.get('version') == 2:
+            cursors = resume_state.get('cursors') or {}
+            if isinstance(cursors, dict):
+                pending = {}
+                for uid in sorted(resolve_uids):
+                    raw = cursors.get(uid)
+                    if not isinstance(raw, dict) or uid in self._cur:
+                        resume_reasons['missing_cursor'] += 1
+                        continue
+                    username = str(self._get_username(uid) or '').strip().lower()
+                    if username != str(raw.get('username') or '').strip().lower():
+                        resume_reasons['username_changed_or_missing'] += 1
+                        continue
+                    pending[uid] = self._tail_executor.submit(self._log_index.restore_match,
+                        username, raw.get('path'), generation_id=raw.get('generation_id'),
+                        position=raw.get('pos'), anchor_size=raw.get('anchor_size'),
+                        anchor_sha256=raw.get('anchor_sha256'),
+                    )
+                # File validation runs on the existing bounded I/O pool. Apply
+                # the results on the owner thread before any tail jobs start.
+                for uid, future in pending.items():
+                    try:
+                        match = future.result()
+                    except Exception:
+                        match = None
+                    if match is None:
+                        resume_reasons['validation_failed'] += 1
+                        continue
+                    self._cur[uid] = Cursor(path=match.path, pos=int(match.size), carry=b'',
+                                            generation_id=match.generation_id,
+                                            session_started_at=match.session_started_at,
+                                            observed_size=int(match.size))
+                    self._ever_attached_uids.add(uid)
+                    restored.add(uid)
+                    validated[uid] = match
+        discovery_uids = resolve_uids-restored
+        if discovery_uids:
+            with self._timings.measure('reader_discovery'):
+                self._log_index.poll(force=True)
         # Do resolves + watcher setup without holding the engine lock
-        for uid in resolve_uids:
-            self._resolve_current_log(uid, force=True, refresh_index=False)
-            cur = self._cur.get(uid)
-            if cur and cur.path:
-                self._log_index.mark_dirty(cur.path)
+        if discovery_uids:
+            with self._timings.measure('reader_resolve'):
+                warmstart_jobs = []
+                for uid in sorted(discovery_uids):
+                    self._resolve_current_log(uid, force=True, refresh_index=False,
+                                              _warmstart_jobs=warmstart_jobs)
+                    cur = self._cur.get(uid)
+                    if cur and cur.path:
+                        self._log_index.mark_dirty(cur.path)
+                self._warmstart_users(warmstart_jobs)
 
         # A tracked account should be visible even before a log is resolved or
         # the first GUI status tick supplies its final server label.
@@ -1161,6 +1244,15 @@ class MultiScopeEngine:
                 if not scope.users:
                     self._scopes.pop(key, None)
             self._prune_scope_caches()
+        if isinstance(resume_state, dict) and user_ids_set:
+            self.import_state(resume_state, _validated_cursors=validated)
+            self._resume_diagnostics = dict(restored=len(restored), discovery=len(discovery_uids),
+                                            **resume_reasons)
+            self._log(f'[MultiScope] Restored {len(restored)} saved log attachments; '
+                      f'{len(discovery_uids)} require discovery. '
+                      f'Missing cursors: {resume_reasons["missing_cursor"]}; '
+                      f'username unavailable/changed: {resume_reasons["username_changed_or_missing"]}; '
+                      f'validation failed: {resume_reasons["validation_failed"]}.')
 
     def _prune_scope_caches(self) -> None:
         """Called between tail batches, after retiring empty server scopes."""
@@ -1189,6 +1281,7 @@ class MultiScopeEngine:
         uid_s = str(uid)
         self._bes_event_holds.release(uid_s)
         cur = self._cur.pop(uid_s, None)
+        self._log_handles.discard_user(uid_s)
 
         try:
             if cur and cur.generation_id:
@@ -1203,6 +1296,7 @@ class MultiScopeEngine:
         *,
         force: bool = False,
         refresh_index: bool = True,
+        _warmstart_jobs: Optional[list] = None,
     ) -> None:
         uid = str(uid)
         if uid in self._log_resolution_suspended_uids:
@@ -1232,6 +1326,7 @@ class MultiScopeEngine:
                 self._log_index.unpin(cur.generation_id)
                 self._retire_generation(uid, cur.generation_id)
                 self._cur.pop(uid, None)
+                self._log_handles.discard_user(uid)
                 self._mark_menu_unknown(uid)
                 return
             if (
@@ -1243,6 +1338,7 @@ class MultiScopeEngine:
                     self._log_index.unpin(cur.generation_id)
                     self._retire_generation(uid, cur.generation_id)
                 self._cur.pop(uid, None)
+                self._log_handles.discard_user(uid)
                 self._mark_menu_unknown(uid)
             return
         if match.generation_id in self._retired_generations_by_uid.get(uid, set()):
@@ -1255,6 +1351,7 @@ class MultiScopeEngine:
             cur.observed_size = int(match.size)
             return
         cold_attach = uid not in self._ever_attached_uids
+        self._log_handles.discard_user(uid)
         if cur and cur.generation_id:
             self._log_index.unpin(cur.generation_id)
             self._retire_generation(uid, cur.generation_id)
@@ -1273,9 +1370,23 @@ class MultiScopeEngine:
         self._log_index.mark_dirty(match.path)
         self._log(f"[MultiScope] switched log for {uname} - {os.path.basename(match.path)}")
         if cold_attach:
-            self._warmstart_user_tail(uid)
+            if _warmstart_jobs is None:
+                self._warmstart_user_tail(uid)
+            else:
+                _warmstart_jobs.append(uid)
 
-    def _warmstart_user_tail(self, uid: str) -> None:
+    def _warmstart_users(self, user_ids: list) -> None:
+        # Old/cursorless transfers still need a cold state seed. Bound decoded
+        # tails to eight at a time; shared scope state stays on the owner thread.
+        for start in range(0, len(user_ids), 8):
+            pending = [(uid, self._tail_executor.submit(self._read_warmstart_tail, uid))
+                       for uid in user_ids[start:start+8]]
+            for uid, future in pending:
+                prepared = future.result()
+                if prepared is not None:
+                    self._warmstart_user_tail(uid, _prepared=prepared)
+
+    def _read_warmstart_tail(self, uid: str):
         cur = self._cur.get(uid)
         if not cur or not cur.path or not os.path.isfile(cur.path):
             return
@@ -1283,22 +1394,26 @@ class MultiScopeEngine:
             size_now = os.path.getsize(cur.path)
             with open(cur.path, "rb") as f:
                 window = 8 * 1024 * 1024
-                block_size = 256 * 1024
                 base_offset = max(0, int(size_now - window))
-                blocks: list[bytes] = []
-                read_at = int(size_now)
-                while read_at > base_offset:
-                    take = min(block_size, read_at - base_offset)
-                    read_at -= take
-                    f.seek(read_at)
-                    blocks.append(f.read(take))
-                raw = b"".join(reversed(blocks))
+                f.seek(base_offset)
+                raw = f.read(int(size_now)-base_offset)
+            if len(raw) == int(size_now) - base_offset:
+                cur.remember_read(raw, base_offset)
             if base_offset and b"\n" in raw:
                 skipped = raw.find(b"\n") + 1
                 base_offset += skipped
                 raw = raw[skipped:]
             chunk = raw.decode("utf-8", errors="replace")
         except Exception:
+            return
+        return cur, size_now, chunk
+
+    def _warmstart_user_tail(self, uid: str, *, _prepared=None) -> None:
+        prepared = _prepared if _prepared is not None else self._read_warmstart_tail(uid)
+        if prepared is None:
+            return
+        cur, size_now, chunk = prepared
+        if self._cur.get(uid) is not cur:
             return
         if self._development_runtime:
             for line in chunk.splitlines():
@@ -1976,6 +2091,7 @@ class MultiScopeEngine:
 
 
     def _emit_biome_event(self, uid: str, server_key: str, biome: str, *, event_type: str, ts_epoch: Optional[float] = None) -> None:
+        detected_mono = self._note_detection(ts_epoch if event_type == 'start' else None)
         detector     = self._get_username(uid) or uid
         server_label = self._display_server_label(server_key)
         owner_raw    = (self._get_owner(uid) or "").strip()
@@ -2088,7 +2204,7 @@ class MultiScopeEngine:
                     if role_id:
                         content = f"<@&{role_id}>"
             payload = {"content": content, "embeds": [embed]}
-            if self._queue_webhook(url, payload, f"Biome {b} {event_type}"):
+            if self._queue_webhook(url, payload, f"Biome {b} {event_type}", detected_mono=detected_mono):
                 posted_any = True
 
         if posted_any:
@@ -2100,7 +2216,16 @@ class MultiScopeEngine:
             scope.events += 1
 
 
-    def _queue_webhook(self, url: str, payload: dict, label: str) -> bool:
+    def _note_detection(self, source_epoch=None) -> float:
+        began = time.monotonic()
+        if source_epoch is not None:
+            try:
+                self._timings.record('source_to_detection', (time.time()-float(source_epoch))*1000)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return began
+
+    def _queue_webhook(self, url: str, payload: dict, label: str, *, detected_mono=None) -> bool:
         try:
             future = self._send_executor.submit(_post_webhook, url, payload)
         except Exception:
@@ -2108,6 +2233,8 @@ class MultiScopeEngine:
             return False
         if future is None:
             return False
+        if detected_mono is not None:
+            self._timings.record('detection_to_queue', (time.monotonic()-detected_mono)*1000)
 
         def completed(result):
             if result.cancelled():
@@ -2117,6 +2244,8 @@ class MultiScopeEngine:
             if error is not None:
                 detail = str(error) if isinstance(error, WebhookError) else "unexpected sender error"
                 self._log(f"[Webhook] {label}: {detail}.")
+            elif detected_mono is not None:
+                self._timings.record('detection_to_ack', (time.monotonic()-detected_mono)*1000)
 
         future.add_done_callback(completed)
         return True
@@ -2124,6 +2253,7 @@ class MultiScopeEngine:
     def _emit_merchant(self, uid: str, who: str, event_time_utc: datetime, full_line: str) -> None:
         if self._disable_log_based_merchant_detection:
             return
+        detected_mono = self._note_detection(event_time_utc.timestamp())
         try:
             self._record_found_merchant(who, ts_epoch=event_time_utc.timestamp())
         except Exception:
@@ -2174,10 +2304,11 @@ class MultiScopeEngine:
             "footer": {"text": f"{APP_FOOTER}  •  {server_label}"}
         }]}
 
-        if self._queue_webhook(self._merchant_hook, payload, f"Merchant {who}"):
+        if self._queue_webhook(self._merchant_hook, payload, f"Merchant {who}", detected_mono=detected_mono):
             scope.events += 1
 
     def _emit_game_event(self, uid: str, event_id: str, detected_at: datetime) -> None:
+        detected_mono = self._note_detection(detected_at.timestamp())
         scope_key = self._server_key_for(uid)
         scope = self._scopes.setdefault(scope_key, ServerScope(scope_key))
         scope.users.add(uid)
@@ -2193,7 +2324,7 @@ class MultiScopeEngine:
                 server_label=server_label, ps_link=ps_link, detected_at=detected_at,
                 footer=APP_FOOTER, content=content,
             )
-            if self._queue_webhook(url, payload, f"Event {EVENTS[event_id]['name']}"):
+            if self._queue_webhook(url, payload, f"Event {EVENTS[event_id]['name']}", detected_mono=detected_mono):
                 scope.events += 1
 
     def record_ocr_merchant(self, uid: str, merchant: str) -> None:
@@ -2273,7 +2404,7 @@ class MultiScopeEngine:
                     if ts_epoch is not None:
                         cur.last_event_ts = max(float(cur.last_event_ts or 0.0), ts_epoch)
             return bool(disconnect_already)
-        with self._tail_scope_lock_for(uid):
+        with self._timings.wait_for(self._tail_scope_lock_for(uid), 'reader_scope_lock_wait'):
             return self._dispatch_log_line_serial(
                 uid,
                 line,
@@ -2441,7 +2572,7 @@ class MultiScopeEngine:
         cur = self._cur.get(uid)
         if cur is not None and ts_epoch is not None:
             cur.last_event_ts = max(float(cur.last_event_ts or 0.0), float(ts_epoch))
-        with self._tail_scope_lock_for(uid):
+        with self._timings.wait_for(self._tail_scope_lock_for(uid), 'reader_scope_lock_wait'):
             self._scope(self._server_key_for(uid)).users.add(uid)
         return disconnect_hit
 
@@ -2461,6 +2592,18 @@ class MultiScopeEngine:
 
     def _tail_one(self, uid: str, *, max_bytes: Optional[int] = None) -> int:
         return self._tail_one_serial(uid, max_bytes=max_bytes)
+
+    def _open_tail_handle(self, path):
+        with self._timings.measure('reader_file_open'):
+            return open_shared_log(path)
+
+    def _close_tail_handle(self, handle):
+        with self._timings.measure('reader_file_close'):
+            handle.close()
+
+    def _run_tail_job(self, uid: str, *, max_bytes: int, submitted_at: float) -> int:
+        self._timings.record('reader_tail_queue_wait', (time.monotonic()-submitted_at)*1000)
+        return self._tail_one(uid, max_bytes=max_bytes)
 
     def _dispatch_complete_log_block(
         self, uid: str, cur: Cursor, complete: bytes, base_offset: int,
@@ -2516,19 +2659,30 @@ class MultiScopeEngine:
 
     def _tail_one_serial(self, uid: str, *, max_bytes: Optional[int] = None) -> int:
         cur = self._cur.get(uid)
-        if not cur or not cur.path or not os.path.isfile(cur.path):
+        with self._timings.measure('reader_metadata'):
+            missing = not cur or not cur.path or not os.path.isfile(cur.path)
+        if missing:
+            self._log_handles.discard_user(uid)
             self._resolve_current_log(uid, force=True)
             cur = self._cur.get(uid)
-            if not cur or not cur.path or not os.path.isfile(cur.path):
+            with self._timings.measure('reader_metadata'):
+                missing = not cur or not cur.path or not os.path.isfile(cur.path)
+            if missing:
                 return 0
 
         disconnect_hit = False
         try:
             start_pos = int(cur.pos or 0)
-            size_now = os.path.getsize(cur.path)
+            with self._timings.measure('reader_metadata'):
+                path_stat = os.stat(cur.path)
+                size_now = path_stat.st_size
             cur.observed_size = int(size_now)
             if size_now < start_pos:
+                self._log_handles.discard_user(uid)
                 self._reader_stat_add("truncations")
+                # The cursor may be ahead of the index's last metadata sample.
+                # Force a revision even if the new size exceeds that old sample.
+                self._log_index.invalidate_generation(cur.path)
                 self._log_index.mark_dirty(cur.path)
                 self._log_index.refresh(force=True)
                 self._resolve_current_log(uid, force=True)
@@ -2537,16 +2691,43 @@ class MultiScopeEngine:
                 return 0
             limit = self._per_read_cap if max_bytes is None else max(1, int(max_bytes))
             to_read = min(self._per_read_cap, limit, size_now - start_pos)
-            with open(cur.path, "rb") as f:
-                f.seek(start_pos)
-                raw = f.read(to_read)
+            with self._timings.measure('reader_file_read'):
+                key = (str(uid), cur.generation_id, os.path.normcase(os.path.abspath(cur.path)))
+                with self._log_handles.borrow(key, lambda: self._open_tail_handle(cur.path)) as f:
+                    with self._timings.measure('reader_metadata'):
+                        opened_stat = os.fstat(f.fileno())
+                        path_identity = RobloxLogIndex._identity(path_stat)
+                        opened_identity = RobloxLogIndex._identity(opened_stat)
+                        saved_identity = str(cur.generation_id).rpartition('|')[2].rpartition(':')[0]
+                        identity_text = ':'.join(str(part) for part in path_identity)
+                        if opened_identity == path_identity and opened_stat.st_size < start_pos:
+                            self._log_index.invalidate_generation(cur.path)
+                        if (opened_identity != path_identity or opened_stat.st_size < start_pos
+                                or ('|' in cur.generation_id and saved_identity != identity_text)):
+                            raise _StaleLogHandle()
+                    with self._timings.measure('reader_file_seek'):
+                        f.seek(start_pos)
+                    with self._timings.measure('reader_file_read_call'):
+                        raw = f.read(to_read)
             if not raw:
                 return 0
             cur.pos = start_pos + len(raw)
+            cur.remember_read(raw, start_pos)
+        except _StaleLogHandle:
+            self._log_handles.discard_user(uid)
+            self._log_index.mark_dirty(cur.path)
+            self._log_index.refresh(force=True)
+            self._resolve_current_log(uid, force=True, refresh_index=False)
+            return 0
         except Exception:
             self._reader_stat_add("read_failures")
             return 0
 
+        with self._timings.measure('reader_parse'):
+            return self._parse_tail_block(uid, cur, raw, start_pos)
+
+    def _parse_tail_block(self, uid: str, cur: Cursor, raw: bytes, start_pos: int) -> int:
+        disconnect_hit = False
         previous_carry = bytes(cur.carry or b"")
         combined = previous_carry + raw
         combined_base = max(0, start_pos - len(previous_carry))
@@ -2637,11 +2818,21 @@ class MultiScopeEngine:
 
     def poll_logs(self) -> dict:
         """Advance discovery and tail eligible cursors with bounded concurrency."""
+        began = time.monotonic()
+        try:
+            result = self._poll_logs_cycle()
+        finally:
+            self._timings.record('reader_cycle', (time.monotonic()-began)*1000)
+        result['timings'] = self._timings.snapshot()
+        return result
+
+    def _poll_logs_cycle(self) -> dict:
         self._bes_event_holds.tick()
         with self._stats_lock:
             self._flush_found_stats_locked()
-        self._log_index.poll()
-        generation_sizes = self._log_index.generation_sizes()
+        with self._timings.measure('reader_discovery'):
+            self._log_index.poll()
+            generation_sizes = self._log_index.generation_sizes()
         for cur in tuple(self._cur.values()):
             known_size = generation_sizes.get(cur.generation_id)
             if known_size is not None:
@@ -2650,8 +2841,11 @@ class MultiScopeEngine:
         now_mono = time.monotonic()
         if now_mono >= self._next_path_resolve_mono:
             self._next_path_resolve_mono = now_mono + 0.25
-            for uid in sorted(self._tracked_uids):
-                self._resolve_current_log(uid, refresh_index=False)
+            with self._timings.measure('reader_resolve'):
+                warmstart_jobs = []
+                for uid in sorted(self._tracked_uids):
+                    self._resolve_current_log(uid, refresh_index=False, _warmstart_jobs=warmstart_jobs)
+                self._warmstart_users(warmstart_jobs)
 
         uids = sorted(
             uid
@@ -2684,17 +2878,19 @@ class MultiScopeEngine:
         if jobs:
             self._tail_rotation = (start + len(jobs)) % len(uids)
             futures = [
-                self._tail_executor.submit(self._tail_one, uid, max_bytes=max_bytes)
+                self._tail_executor.submit(self._run_tail_job, uid, max_bytes=max_bytes,
+                                           submitted_at=time.monotonic())
                 for uid, max_bytes in jobs
             ]
             # Complete the batch before the process handles state-changing
             # commands. This keeps process ownership deterministic while the
             # expensive per-user file reads/parsers run concurrently.
-            for future in futures:
-                try:
-                    future.result()
-                except Exception:
-                    self._reader_stat_add("read_failures")
+            with self._timings.measure('reader_batch_wait'):
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception:
+                        self._reader_stat_add("read_failures")
 
         backlog_users = sum(
             1
@@ -2717,7 +2913,16 @@ class MultiScopeEngine:
         out["tracked_user_ids"] = sorted(self._tracked_uids)
         out["attached_user_ids"] = sorted(self._cur)
         out["tail_workers"] = int(self._tail_workers)
+        out['resume'] = dict(getattr(self, '_resume_diagnostics', {}))
+        out['handles'] = self._log_handles.diagnostics()
         out["delivery"] = self._send_executor.diagnostics()
+        out['timings'] = self._timings.snapshot()
+        with self._stats_lock:
+            out['statistics'] = dict(dirty=self._stats_dirty, save_failures=self._stats_save_failures,
+                                     last_error_type=self._stats_last_error_type,
+                                     writer_alive=bool(self._stats_writer and self._stats_writer.is_alive()),
+                                     seconds_since_save=max(0.0, time.monotonic()-self._stats_last_saved_mono)
+                                     if self._stats_last_saved_mono else None)
         return out
 
     def diagnostics_snapshot(self) -> dict:
@@ -2982,27 +3187,20 @@ class MultiScopeEngine:
                 if known_uids and u not in known_uids:
                     continue
                 try:
-                    stat_now = os.stat(cur.path) if getattr(cur, "path", None) else None
                     cursor_state = {
                         "path": (str(cur.path) if getattr(cur, "path", None) else None),
+                        "username": str(self._get_username(u) or ''),
                         "pos": int(getattr(cur, "pos", 0) or 0),
                         "carry_b64": base64.b64encode(bytes(getattr(cur, "carry", b"") or b"")).decode("ascii"),
                         "generation_id": str(getattr(cur, "generation_id", "") or ""),
                         "session_started_at": float(getattr(cur, "session_started_at", 0.0) or 0.0),
                         "last_event_ts": float(getattr(cur, "last_event_ts", 0.0) or 0.0),
                         "dropping_oversized": bool(getattr(cur, "dropping_oversized", False)),
-                        "size_at_snapshot": int(stat_now.st_size) if stat_now is not None else 0,
-                        "mtime_ns_at_snapshot": int(
-                            getattr(stat_now, "st_mtime_ns", int(stat_now.st_mtime * 1_000_000_000))
-                        ) if stat_now is not None else 0,
+                        "size_at_snapshot": max(int(cur.pos), int(cur.observed_size)),
                     }
-                    try:
-                        anchor_size, anchor_sha256 = _cursor_anchor(cur.path, cursor_state["pos"])
-                        if anchor_size and anchor_sha256:
-                            cursor_state["anchor_size"] = anchor_size
-                            cursor_state["anchor_sha256"] = anchor_sha256
-                    except Exception:
-                        pass
+                    if cur.anchor_pos == cur.pos and cur.anchor_tail:
+                        cursor_state['anchor_size'] = len(cur.anchor_tail)
+                        cursor_state['anchor_sha256'] = hashlib.sha256(cur.anchor_tail).hexdigest()
                     cursors[u] = cursor_state
                 except Exception:
                     continue
@@ -3063,7 +3261,7 @@ class MultiScopeEngine:
 
         return out
 
-    def import_state(self, state: dict) -> bool:
+    def import_state(self, state: dict, *, _validated_cursors: Optional[Dict[str, LogMatch]] = None) -> bool:
         """
         Restore a previously-exported runtime snapshot.
         Returns True if anything was applied.
@@ -3077,10 +3275,14 @@ class MultiScopeEngine:
         if ver not in {1, 2}:
             return False
 
+        # Handles are process-local and must never survive a cursor import.
+        for uid in self._cur:
+            self._log_handles.discard_user(uid)
+
         applied = False
         with self._lock:
             try:
-                known_uids = set(self._cur.keys())
+                known_uids = set(self._tracked_uids)
             except Exception:
                 known_uids = set()
 
@@ -3189,10 +3391,14 @@ class MultiScopeEngine:
                         continue
 
                     try:
-                        stat_now = os.stat(cur.path) if cur.path else None
-                        size_now = int(stat_now.st_size) if stat_now is not None else 0
-                        if stat_now is None:
-                            continue
+                        validated_match = (_validated_cursors or {}).get(u)
+                        if validated_match is not None:
+                            size_now = int(validated_match.size)
+                        else:
+                            stat_now = os.stat(cur.path) if cur.path else None
+                            size_now = int(stat_now.st_size) if stat_now is not None else 0
+                            if stat_now is None:
+                                continue
                         saved_pos = max(0, int(raw.get("pos", getattr(cur, "pos", 0)) or 0))
                         saved_size = int(raw.get("size_at_snapshot", raw.get("pos", 0)) or 0)
                     except Exception:
@@ -3220,6 +3426,7 @@ class MultiScopeEngine:
                     anchor_size = 0
                     anchor_sha256 = ""
                     anchor_matches = False
+                    anchor_bytes = b''
                     try:
                         anchor_size = max(0, int(raw.get("anchor_size", 0) or 0))
                         anchor_sha256 = str(raw.get("anchor_sha256") or "").strip().lower()
@@ -3231,11 +3438,14 @@ class MultiScopeEngine:
                             and size_now >= saved_pos
                             and anchor_sha256
                         ):
-                            actual_size, actual_sha256 = _cursor_anchor(
-                                cur.path,
-                                saved_pos,
-                                length=anchor_size,
-                            )
+                            if validated_match is not None:
+                                anchor_bytes = validated_match.resume_anchor
+                            else:
+                                with open(cur.path, 'rb') as handle:
+                                    handle.seek(saved_pos-anchor_size)
+                                    anchor_bytes = handle.read(anchor_size)
+                            actual_size = len(anchor_bytes)
+                            actual_sha256 = hashlib.sha256(anchor_bytes).hexdigest()
                             anchor_matches = (
                                 actual_size == anchor_size
                                 and actual_sha256.lower() == anchor_sha256
@@ -3268,6 +3478,8 @@ class MultiScopeEngine:
 
                     if content_continues:
                         cur.pos = saved_pos
+                        cur.anchor_tail = anchor_bytes
+                        cur.anchor_pos = saved_pos
                     elif truncated or not same_path or identity_changed:
                         # A genuinely new generation is intentionally replayed
                         # from its beginning so events written while paused (and
@@ -3275,6 +3487,7 @@ class MultiScopeEngine:
                         cur.pos = 0
                         cur.carry = b""
                         cur.dropping_oversized = False
+                        cur.anchor_tail = b''
                     else:
                         # Ambiguous same-path metadata/content drift must fail
                         # quiet. Replaying an old file is worse than omitting an
@@ -3282,6 +3495,7 @@ class MultiScopeEngine:
                         cur.pos = size_now
                         cur.carry = b""
                         cur.dropping_oversized = False
+                        cur.anchor_tail = b''
                     cur.observed_size = size_now
 
                     try:
@@ -3321,14 +3535,14 @@ class MultiScopeEngine:
 
             # -- Dedupe/throttle caches --------------------------------------
             try:
-                lbp = state.get("last_biome_post_by_scope") or {}
+                lbp = state.get("last_biome_post_by_scope")
                 if isinstance(lbp, dict):
                     self._last_biome_post_by_scope = {str(k): float(v) for k, v in lbp.items()}
                     applied = True
             except Exception:
                 pass
             try:
-                lmt = state.get("last_merchant_ts_by_scope") or {}
+                lmt = state.get("last_merchant_ts_by_scope")
                 if isinstance(lmt, dict):
                     merged: dict = {}
                     for scope, mm in lmt.items():
@@ -3340,13 +3554,13 @@ class MultiScopeEngine:
             except Exception:
                 pass
             try:
-                event_timestamps = state.get("last_event_ts_by_scope") or {}
+                event_timestamps = state.get("last_event_ts_by_scope")
                 if isinstance(event_timestamps, dict):
                     self._last_event_ts_by_scope = {
                         str(scope): {str(event_id): float(ts) for event_id, ts in timestamps.items()}
                         for scope, timestamps in event_timestamps.items() if isinstance(timestamps, dict)
                     }
-                fms = state.get("first_merchant_scan_done") or []
+                fms = state.get("first_merchant_scan_done")
                 if isinstance(fms, (list, tuple, set)):
                     self._first_merchant_scan_done = {
                         str(u) for u in fms if not known_uids or str(u) in known_uids
@@ -3375,11 +3589,11 @@ class MultiScopeEngine:
                         self._retired_generations_by_uid = {
                             str(uid): set(sorted(str(g) for g in (generations or []) if str(g))[-8:])
                             for uid, generations in retired.items()
-                            if isinstance(generations, (list, tuple, set))
+                            if isinstance(generations, (list, tuple, set)) and str(uid) in known_uids
                         }
                     ever = state.get("ever_attached_uids") or []
                     if isinstance(ever, (list, tuple, set)):
-                        self._ever_attached_uids.update(str(uid) for uid in ever)
+                        self._ever_attached_uids.update(str(uid) for uid in ever if str(uid) in known_uids)
                     applied = True
                 except Exception:
                     pass
@@ -3516,6 +3730,9 @@ class MultiScopeEngine:
                 tail.shutdown(wait=True, cancel_futures=True)
         except Exception:
             pass
+        handles = getattr(self, '_log_handles', None)
+        if handles is not None:
+            handles.close()
         snd = getattr(self, "_send_executor", None)
         try:
             if snd:

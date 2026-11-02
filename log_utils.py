@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import os
 import re
@@ -63,6 +64,8 @@ class LogMatch:
     marker_offset: int
     size: int
     mtime_ns: int
+    # Available only on saved-attachment validation, for the immediate import.
+    resume_anchor: bytes = field(default=b"", compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -221,6 +224,58 @@ class RobloxLogIndex:
         if generation_id:
             with self._lock:
                 self._pinned_generations.discard(generation_id)
+
+    def restore_match(self, username: str, path: str, *, generation_id: str,
+                      position: int, anchor_size: int, anchor_sha256: str) -> Optional[LogMatch]:
+        """Reattach an unchanged saved log with a bounded content/identity check.
+
+        Snapshots cannot introduce paths outside this log directory. A changed,
+        truncated, replaced or unverifiable file falls back to normal discovery.
+        """
+        key = str(username or '').strip().lower()
+        try:
+            norm_path = self._normalize(path)
+            if (not _VALID_USERNAME.fullmatch(key)
+                    or os.path.dirname(norm_path) != self._normalize(self.logs_dir)
+                    or not norm_path.endswith('.log')
+                    or not 0 < anchor_size <= 256 or position < anchor_size):
+                return None
+            with open(norm_path, 'rb') as handle:
+                st = os.fstat(handle.fileno())
+                identity = self._identity(st)
+                generation = self._generation_id(norm_path, identity)
+                if (generation.rpartition(':')[0] != str(generation_id).rpartition(':')[0]
+                        or st.st_size < position):
+                    return None
+                handle.seek(position-anchor_size)
+                anchor = handle.read(anchor_size)
+                if (len(anchor) != anchor_size
+                        or hashlib.sha256(anchor).hexdigest() != str(anchor_sha256).lower()):
+                    return None
+            with self._scan_lock, self._lock:
+                if self._closed:
+                    return None
+                current = self._files.get(norm_path)
+                if current is None or current.identity != identity:
+                    if current is not None:
+                        self._pinned_generations.discard(current.generation_id)
+                    current = _IndexedFile(
+                        path=norm_path, norm_path=norm_path, identity=identity,
+                        generation_id=generation,
+                        session_started_at=self._session_started_at(norm_path, st),
+                        size=int(st.st_size), mtime_ns=int(st.st_mtime_ns),
+                        scan_pos=int(st.st_size), classified=True, read_pending=False,
+                    )
+                    self._files[norm_path] = current
+                current.markers[key] = -1  # Saved association; marker need not be rescanned.
+                self._pinned_generations.add(current.generation_id)
+                self._lookup_dirty = True
+                self._stats['restored_matches'] = self._stats.get('restored_matches', 0)+1
+                self._stats['resume_validation_bytes'] = self._stats.get('resume_validation_bytes', 0)+len(anchor)
+                return LogMatch(key, current.path, current.generation_id, current.session_started_at,
+                                -1, int(st.st_size), int(st.st_mtime_ns), resume_anchor=anchor)
+        except (OSError, ValueError, TypeError, OverflowError):
+            return None
 
     def invalidate_generation(self, path: str | os.PathLike[str]) -> None:
         """Force a same-path file to be rediscovered as a new generation."""

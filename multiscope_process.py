@@ -138,7 +138,11 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
             for uid in list(mapping):
                 if uid not in user_ids_set:
                     mapping.pop(uid, None)
-        engine.update_users(user_ids, refresh_user_ids=refresh)
+        resume_state = cmd.get('resume_state')
+        if isinstance(resume_state, dict) and resume_state:
+            engine.update_users(user_ids, refresh_user_ids=refresh, resume_state=resume_state)
+        else:
+            engine.update_users(user_ids, refresh_user_ids=refresh)
         tracked_user_ids = user_ids_set
 
     def _snapshot_signature(rows: List[dict]) -> tuple:
@@ -192,7 +196,7 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
 
     def _poll_engine() -> bool:
         nonlocal last_reader_health, next_reader_diagnostics_at
-        if engine is None:
+        if engine is None or reader_paused:
             return False
         try:
             diagnostics = engine.poll_logs()
@@ -215,6 +219,7 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                 _READER_LOGGER.debug("autonomous log poll failed", exc_info=exc)
             return False
 
+    reader_paused = False
     poll_due = True
     commands_since_poll = 0
     messages_since_poll = 0
@@ -252,6 +257,10 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
             continue
 
         ctype = cmd.get("type")
+        # A pause snapshot is the final reader state, rather than a point from
+        # which more notifications can escape before the GUI shuts us down.
+        if reader_paused and ctype not in {'rpc', 'shutdown', 'service_reply'}:
+            continue
         try:
             if ctype == "rpc":
                 deadline = cmd.get("deadline_mono")
@@ -484,7 +493,10 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                         args = list(args)
                     if not isinstance(kwargs, dict):
                         kwargs = {}
+                    pause_reader = method == 'export_state' and bool(kwargs.pop('_pause_reader', False))
                     result = fn(*args, **kwargs)
+                    if pause_reader:
+                        reader_paused = True
                 except Exception as e:
                     ok = False
                     err = str(e)
@@ -517,6 +529,7 @@ class MultiScopeProcessProxy:
         stats_path: str,
         log_fn: Optional[Callable[[str], None]] = None,
         service_handler: Optional[Callable[[dict], dict]] = None,
+        resume_state: Optional[dict] = None,
     ):
         self._log = log_fn or (lambda _msg: None)
         self._service_handler = service_handler
@@ -531,6 +544,7 @@ class MultiScopeProcessProxy:
         self._closing = False
         self._closed = False
         self._ready = False
+        self._initial_resume_state = resume_state if isinstance(resume_state, dict) and resume_state else None
         self._last_snapshot: List[dict] = []
         self._found_statistics: Optional[dict] = None
         self._found_statistics_mono = 0.0
@@ -727,7 +741,13 @@ class MultiScopeProcessProxy:
             msg["usernames"] = dict(usernames_by_uid or {})
         if cookies_by_uid is not None:
             msg["cookies"] = dict(cookies_by_uid or {})
-        return self._send_cmd(msg)
+        initial_state = getattr(self, '_initial_resume_state', None)
+        if initial_state:
+            msg['resume_state'] = initial_state
+        accepted = self._send_cmd(msg)
+        if accepted and initial_state:
+            self._initial_resume_state = None
+        return accepted
 
     def configure_webhooks(
         self,
@@ -864,6 +884,8 @@ class MultiScopeProcessProxy:
                     if bool(reply.get("ok", False)):
                         return reply.get("result")
                     raise RuntimeError(str(reply.get("error") or "RPC failed"))
+                if not self._proc.is_alive():
+                    raise RuntimeError('MultiScope process exited during state request')
                 time.sleep(0.01)
             raise TimeoutError(f"MultiScope RPC timeout: {method}")
         finally:
@@ -936,14 +958,25 @@ class MultiScopeProcessProxy:
         return True
 
     def export_state(self) -> dict:
-        # Pause/Resume needs this to succeed even if the worker is busy processing a tick;
-        # allow a longer timeout so state isn't silently lost and values don't reset on resume.
+        return self._export_state(pause_reader=False)
+
+    def pause_and_export_state(self) -> dict:
+        """Finish the active batch and freeze reading at the exported cursor."""
+        return self._export_state(pause_reader=True)
+
+    def _export_state(self, *, pause_reader: bool) -> dict:
+        # Recent real reader batches exceed 90 seconds. Wait for the owner
+        # thread to finish safely; a stale cached cursor could replay alerts.
         if not self.wait_ready(timeout_s=10.0):
+            self._log('[MultiScope] Saved log attachments unavailable: reader not ready; '
+                      'the next resume will require discovery.')
             return {}
         try:
-            out = self._rpc("export_state", timeout_s=10.0)
+            out = self._rpc("export_state", timeout_s=180.0, _pause_reader=pause_reader)
             return out if isinstance(out, dict) else {}
-        except Exception:
+        except Exception as exc:
+            self._log(f'[MultiScope] Saved log attachments unavailable: {type(exc).__name__}; '
+                      'the next resume will require discovery.')
             return {}
 
     def import_state(self, state: dict) -> bool:

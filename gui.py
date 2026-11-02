@@ -4937,6 +4937,8 @@ class WorkerThread(QThread):
     status_signal  = Signal(object)
     process_signal = Signal(object)
     multiscope_signal = Signal(object)   # drives the Multiscope tab
+    multiscope_diagnostics_signal = Signal(object)
+    multiscope_log_signal = Signal(str)
     merchant_signal = Signal(str, str)   # uid, merchant for Auto-Actions triggers
     ready_signal = Signal()
 
@@ -6028,7 +6030,8 @@ class WorkerThread(QThread):
                 except Exception:
                     state["multiscope_rows"] = []
                 try:
-                    state["multiscope_state"] = ms.export_state()
+                    exporter = getattr(ms, 'pause_and_export_state', ms.export_state)
+                    state["multiscope_state"] = exporter()
                 except Exception:
                     state["multiscope_state"] = {}
             else:
@@ -6484,6 +6487,9 @@ class WorkerThread(QThread):
     # -------------- utilities -----------------
     def _log(self, msg: str):
         self.log_signal.emit(msg)
+
+    def _log_multiscope(self, msg: str):
+        self.multiscope_log_signal.emit(str(msg))
 
     def submit_action(self, action_name: str, *args, **kwargs) -> bool:
         try:
@@ -7170,6 +7176,9 @@ class WorkerThread(QThread):
                 status=status, requested_users=self._multiscope_synced_user_ids, rows=rows,
                 reader=self.ms.reader_diagnostics(),
             )
+            signal = getattr(self, 'multiscope_diagnostics_signal', None)
+            if signal is not None:
+                signal.emit(report)
             write_report(self.cfg_manager.config_dir, "multiscope_runtime.json", report)
         except Exception as exc:
             self._log(f"[Multiscope] Runtime report failed: {exc!r}")
@@ -7338,8 +7347,9 @@ class WorkerThread(QThread):
                 usernames_by_uid=usernames_by_uid,
                 cookies_by_uid=cookies_by_uid,
                 stats_path=str(self.cfg_manager.config_dir / "found_stats.json"),
-                log_fn=self._log,
+                log_fn=self._log_multiscope,
                 service_handler=self.development_service_handler,
+                resume_state=(resume_state or {}).get('multiscope_state'),
             )
 
 
@@ -7349,21 +7359,8 @@ class WorkerThread(QThread):
             self._sync_multiscope_user_list(initial_active, force=True)
 
             if resume_state:
-                try:
-                    ms_state = resume_state.get("multiscope_state") or {}
-                    if self.ms and isinstance(ms_state, dict) and ms_state:
-                        import_async = getattr(self.ms, "import_state_async", None)
-                        if callable(import_async):
-                            accepted = bool(import_async(ms_state))
-                        else:
-                            accepted = bool(self.ms.import_state(ms_state))
-                        if not accepted:
-                            try:
-                                self._log("[Multiscope] import_state was not accepted; using cached rows until signals")
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                # The first user update carries the snapshot atomically, so
+                # discovery cannot run ahead of the saved cursor import.
                 self._resume_state = None
 
             return True
@@ -17129,10 +17126,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         controls_layout.addWidget(save_logs_btn)
 
         controls_layout.addStretch()
-
-        self.multiscope_biome_chk = QCheckBox("MultiScope BIOME logs", self)
-        self.multiscope_biome_chk.setChecked(False)
-        controls_layout.addWidget(self.multiscope_biome_chk)
 
         self.launch_debug_chk = QCheckBox("Launch Debug", self)
         self.launch_debug_chk.setChecked(False)  # hidden by default
@@ -35224,6 +35217,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.worker_thread.process_signal.connect(self.update_process_data)
         # NEW: Multiscope snapshot updates the tab
         self.worker_thread.multiscope_signal.connect(self.update_multiscope)
+        self.worker_thread.multiscope_diagnostics_signal.connect(self.update_multiscope_diagnostics)
+        self.worker_thread.multiscope_log_signal.connect(self.add_multiscope_log)
         self.worker_thread.merchant_signal.connect(self._handle_merchant_for_auto_actions)
 
         self.worker_thread.start()
@@ -35555,6 +35550,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.worker_thread.status_signal.connect(self.update_user_status)
         self.worker_thread.process_signal.connect(self.update_process_data)
         self.worker_thread.multiscope_signal.connect(self.update_multiscope)
+        self.worker_thread.multiscope_diagnostics_signal.connect(self.update_multiscope_diagnostics)
+        self.worker_thread.multiscope_log_signal.connect(self.add_multiscope_log)
         self.worker_thread.merchant_signal.connect(self._handle_merchant_for_auto_actions)
         self.worker_thread.ready_signal.connect(self._on_resumed_worker_ready)
 
@@ -36572,6 +36569,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 self._flush_bes_log_queue()
             except Exception:
                 pass
+            try:
+                self._flush_multiscope_log_queue()
+            except Exception:
+                pass
 
     def _flush_ocr_log_queue(self) -> None:
         if not self._feature_log_tab_is_active("ocr_tab_index"):
@@ -36734,12 +36735,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             pass
 
-    def add_log(self, message):
+    def add_multiscope_log(self, message):
+        self.add_log(message, multiscope=True)
+
+    def _flush_multiscope_log_queue(self):
+        panel = getattr(self, 'multiscope_panel', None)
+        if panel is not None:
+            panel.flush_logs()
+
+    def add_log(self, message, *, multiscope=False):
         message = str(message or "")
-        if (
-            message.startswith("[MultiScope] BIOME ")
-            or message.startswith("[MultiScope] Skipping webhook")
-        ):
+        from multiscope_diagnostics import is_multiscope_log, is_multiscope_attachment_log
+        multiscope = (multiscope or is_multiscope_log(message)) and not is_multiscope_attachment_log(message)
+        if message.startswith("[MultiScope] BIOME "):
             chk = getattr(self, "multiscope_biome_chk", None)
             if not (chk and chk.isChecked()):
                 return
@@ -36764,6 +36772,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 callback(message, formatted_message)
         except Exception:
             pass
+
+        panel = getattr(self, 'multiscope_panel', None)
+        if multiscope and panel is not None:
+            panel.queue_log(formatted_message)
+            return
 
         try:
             self._log_queue.append(formatted_message)
@@ -36836,6 +36849,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
             sections = [
                 ("Main Logs", _box_text(getattr(self, "log_display", None))),
+                ("Multiscope Log", self.multiscope_panel.log_text() if getattr(self, 'multiscope_panel', None) else ''),
                 ("OCR Log", _box_text(getattr(self, "ocr_log_box", None))),
                 ("Anti-AFK Log", _box_text(getattr(self, "antiafk_status_box", None))),
                 ("Auto-Item Log", _box_text(getattr(self, "autoitem_status_box", None))),
@@ -37549,6 +37563,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             ("antiafk_tab_index", "_flush_antiafk_log_queue"),
             ("auto_item_tab_index", "_flush_autoitem_log_queue"),
             ("bes_tab_index", "_flush_bes_log_queue"),
+            ("multiscope_tab_index", "_flush_multiscope_log_queue"),
         ):
             try:
                 if getattr(self, index_attr, None) == new_index:
@@ -39974,8 +39989,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         event.accept()
     
     def setup_multiscope_tab(self):
-        multiscope_widget = QWidget()
-        layout = QVBoxLayout(multiscope_widget)
+        from multiscope_panel import MultiscopePanel
 
         self.multiscope_table = QTableWidget()
         self.multiscope_table.setColumnCount(9)
@@ -40008,16 +40022,30 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             pass
 
-        layout.addWidget(self.multiscope_table)
-
-        hint = QLabel(
-            "Multiscope groups accounts by the exact server they’re in.\n"
-            "Biome and merchant alerts persist across handoffs."
+        self.multiscope_panel = MultiscopePanel(
+            self.multiscope_table,
+            running=lambda: bool(getattr(self, 'worker_thread', None) and self.worker_thread.isRunning()),
         )
-        hint.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
-        layout.addWidget(hint)
+        self.multiscope_biome_chk = self.multiscope_panel.biome_logs
+        self.multiscope_panel.export_requested.connect(self.save_multiscope_diagnostics)
+        self.multiscope_panel.details.currentChanged.connect(
+            lambda _index: self._schedule_multiscope_table_refresh(immediate=True))
+        self.multiscope_tab_index = self.tab_widget.addTab(self.multiscope_panel, "Multiscope")
 
-        self.multiscope_tab_index = self.tab_widget.addTab(multiscope_widget, "Multiscope")
+    def update_multiscope_diagnostics(self, report):
+        self.multiscope_panel.receive_report(report)
+
+    def save_multiscope_diagnostics(self):
+        try:
+            directory = Path(self.config_manager.config_dir) / 'logs'
+            directory.mkdir(parents=True, exist_ok=True)
+            default = directory / f'multiscope_diagnostics_{datetime.now():%Y%m%d_%H%M%S}.json'
+            filename, _ = QFileDialog.getSaveFileName(self, 'Save Multiscope diagnostics', str(default), 'JSON files (*.json)')
+            if not filename:
+                return
+            Path(filename).write_text(json.dumps(self.multiscope_panel.export_data(), indent=2), encoding='utf-8')
+        except Exception as exc:
+            QMessageBox.warning(self, 'Multiscope', f'Could not save diagnostics: {exc}')
 
     def _schedule_multiscope_table_refresh(self, *, immediate: bool = False) -> None:
         self._multiscope_table_dirty = True
@@ -40025,6 +40053,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
         try:
             if self.multiscope_tab_index is not None and self.tab_widget.currentIndex() != self.multiscope_tab_index:
+                return
+            panel = getattr(self, 'multiscope_panel', None)
+            if panel is not None and panel.details.currentWidget() is not self.multiscope_table:
                 return
         except Exception:
             return
